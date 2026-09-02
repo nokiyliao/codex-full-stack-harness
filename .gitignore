@@ -1,0 +1,11 @@
+.DS_Store
+target/
+dist/
+build/
+*.log
+*.sqlite
+*.db
+.env
+*.pem
+*.key
+*.p12
