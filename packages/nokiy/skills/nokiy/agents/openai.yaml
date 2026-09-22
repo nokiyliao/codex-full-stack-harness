@@ -1,0 +1,6 @@
+interface:
+  display_name: "Nokiy"
+  short_description: "Run bounded tasks through the installed Nokiy caller"
+  default_prompt: "Use $nokiy to execute this task through the installed caller with bounded authority, then inspect the evidence for parent review."
+policy:
+  allow_implicit_invocation: true

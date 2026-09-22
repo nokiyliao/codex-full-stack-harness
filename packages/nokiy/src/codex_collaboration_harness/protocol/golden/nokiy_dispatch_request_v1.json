@@ -1,0 +1,22 @@
+{
+  "protocol_version": "tura-collaboration/v1",
+  "request_id": "tura_request_6dfb80f03db5f1293033cbcf1d9f0f8454f1dc326333df67827bfb9a966518ea",
+  "packet_id": "packet_synthetic_request_v1",
+  "mission_id": "mission.synthetic.request.v1",
+  "mission_revision": 1,
+  "mission_mode": "delivery",
+  "predicate_key": "artifact_materialized",
+  "route_id": "route.synthetic.request.v1",
+  "executor_id": "executor.tura.public",
+  "scope": ["artifact:public"],
+  "expected_scope_versions": [["artifact:public", 0]],
+  "claimed_scope_versions": [["artifact:public", 1]],
+  "expected_delta": "a synthetic artifact is materialized",
+  "abandon_if": "external state is required",
+  "recovery_budget": 1,
+  "destination": {
+    "coordinator_id": "coordinator.public",
+    "thread_id": "thread.public"
+  },
+  "lease_id": "lease_synthetic_request_v1"
+}

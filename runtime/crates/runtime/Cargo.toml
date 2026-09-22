@@ -1,0 +1,141 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lib]
+name = "runtime"
+path = "src/lib.rs"
+
+[[test]]
+name = "override_manas_direct_test"
+path = "tests/override_manas_direct_test.rs"
+
+[[test]]
+name = "override_mano_and_manas_test"
+path = "tests/override_mano_and_manas_test.rs"
+
+[[test]]
+name = "process_from_user_default_test"
+path = "tests/process_from_user_default_test.rs"
+
+[[test]]
+name = "prompt_injection_e2e"
+path = "tests/prompt_injection_e2e.rs"
+
+[[test]]
+name = "claude_code_live_e2e"
+path = "tests/live/claude_code_live_e2e.rs"
+required-features = ["live-tests"]
+
+[features]
+nokiy-ablation-benchmark = []
+business-tests = []
+live-tests = []
+performance-tests = []
+
+[[test]]
+name = "claude_code_mock_e2e"
+path = "tests/business/claude_code_mock_e2e.rs"
+required-features = ["business-tests"]
+
+[[test]]
+name = "coding_agent_mock_e2e"
+path = "tests/business/coding_agent_mock_e2e.rs"
+required-features = ["business-tests"]
+
+[[test]]
+name = "session_log_queue_recovery_flow"
+path = "tests/business/session_log_queue_recovery_flow.rs"
+required-features = ["business-tests"]
+
+[[test]]
+name = "streamed_command_run_flow"
+path = "tests/business/streamed_command_run_flow.rs"
+required-features = ["business-tests"]
+
+[[test]]
+name = "checkpoint_ack_flow"
+path = "tests/business/checkpoint_ack_flow.rs"
+required-features = ["business-tests"]
+
+[[test]]
+name = "native_codex_runner_contract"
+path = "tests/native_codex_runner_contract.rs"
+required-features = ["business-tests"]
+
+[[test]]
+name = "provider_timeout_flow"
+path = "tests/business/provider_timeout_flow.rs"
+required-features = ["business-tests"]
+
+[[test]]
+name = "provider_boundary_flow"
+path = "tests/business/provider_boundary_flow.rs"
+required-features = ["business-tests"]
+
+[[test]]
+name = "create_runtime_flow"
+path = "tests/business/create_runtime_flow.rs"
+required-features = ["business-tests"]
+
+[[test]]
+name = "runtime_context_business_flow"
+path = "tests/business/runtime_context_business_flow.rs"
+required-features = ["business-tests"]
+
+[[test]]
+name = "streamed_command_run_pressure_test"
+path = "tests/performance/streamed_command_run_pressure_test.rs"
+required-features = ["performance-tests"]
+
+[[test]]
+name = "session_log_queue_pressure_test"
+path = "tests/performance/session_log_queue_pressure_test.rs"
+required-features = ["performance-tests"]
+
+[[test]]
+name = "child_dispatch_test"
+path = "tests/child_dispatch_test.rs"
+
+[[bin]]
+name = "mock_router_for_test"
+path = "src/bin/mock_router_for_test.rs"
+
+[[bin]]
+name = "tura_runtime"
+path = "src/bin/tura_runtime.rs"
+
+[[bin]]
+name = "tura_native_codex_worker"
+path = "src/bin/tura_native_codex_worker.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+lifecycle.workspace = true
+redis.workspace = true
+provider = { workspace = true }
+agents = { workspace = true }
+personas = { workspace = true }
+router_contract.workspace = true
+runtime_contract.workspace = true
+tura_path = { workspace = true }
+tools = { workspace = true }
+session_log_contract.workspace = true
+session_lifecycle.workspace = true
+uuid.workspace = true
+sysinfo.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true
+session_log = { workspace = true }

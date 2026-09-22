@@ -1,0 +1,67 @@
+{
+  "schema_version": "tura_execution_profile_behavior_v1",
+  "profile_id": "balanced-command-graph-v1",
+  "purpose": "Freeze the performance-critical Tura execution semantics before the Native Codex thin-kernel migration.",
+  "cases": [
+    {
+      "case_id": "no_tool_completion_requires_user_response",
+      "input_shape": "provider turn completes without a tool call after the task is actually satisfied",
+      "required_observations": [
+        "the runtime emits a user-facing assistant response",
+        "the response does not expose task_status or command_run internals",
+        "liveness alone is not treated as mission completion"
+      ]
+    },
+    {
+      "case_id": "same_step_reads_then_write_barrier",
+      "input_shape": "two independent read commands share step 1 and one mutating command uses step 2",
+      "required_observations": [
+        "the two reads may execute concurrently",
+        "the mutation cannot begin before step 1 is terminal",
+        "the mutation holds an exclusive workspace lock"
+      ]
+    },
+    {
+      "case_id": "previous_step_output_binding",
+      "input_shape": "step 2 consumes #@#${scan.stdout}#@#$ from a named step 1 command",
+      "required_observations": [
+        "only a previous-step binding is admissible",
+        "exact placeholders preserve structured JSON values",
+        "embedded placeholders render a deterministic string"
+      ]
+    },
+    {
+      "case_id": "settled_command_receipt_is_not_replayed",
+      "input_shape": "the provider response is interrupted after a command has a durable known terminal receipt",
+      "required_observations": [
+        "the known terminal result is reconstructed from the receipt",
+        "the command effect is not executed again",
+        "an unknown outcome remains reconciliation-required and retry-unsafe"
+      ]
+    },
+    {
+      "case_id": "task_status_compact_context_checkpoint",
+      "input_shape": "task_status updates task_group and task_type after the work it summarizes",
+      "required_observations": [
+        "task topology is updated from the tool result",
+        "only selected task-scoped manuals are appended",
+        "the compact checkpoint replaces historical reasoning with current durable state"
+      ]
+    }
+  ],
+  "invariants": {
+    "command_batch_max_items": 20,
+    "same_step_read_concurrency": true,
+    "mutating_commands_are_barriers": true,
+    "read_lock": "shared",
+    "write_lock": "exclusive",
+    "unknown_mutating_shell_lock": "workspace_exclusive",
+    "durable_per_command_receipts": true,
+    "known_terminal_effect_replay_count": 0,
+    "task_scoped_prompt_manuals": true,
+    "completion_requires_user_facing_response": true,
+    "raw_history_reinjection_allowed": false,
+    "raw_workspace_bootstrap_reinjection_allowed": false,
+    "unselected_skill_reinjection_allowed": false
+  }
+}

@@ -1,0 +1,590 @@
+#[path = "../support/typed_session.rs"]
+mod typed_session;
+
+use lifecycle::TaskPlan;
+use session_log::SessionLogStore;
+use session_log_contract::{
+    ActivateRuntimeLeaseRequest, AppendSessionFeedEventRequest, ListSessionsRequest,
+    ReadSessionFeedRequest, RegisterRuntimeRequest, SessionFeedAppendOutcome, SessionFeedEvent,
+};
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus};
+use std::sync::{Arc, Barrier};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const TEST_TIMEOUT: Duration = Duration::from_secs(90);
+const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKSPACE_COUNT: usize = 10;
+const TASKS_PER_WORKSPACE: usize = 20;
+const RICH_RECORDS_PER_TASK: usize = 10;
+const TOTAL_RICH_RECORDS: usize = WORKSPACE_COUNT * TASKS_PER_WORKSPACE * RICH_RECORDS_PER_TASK;
+
+struct EnvRestore {
+    keys: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvRestore {
+    fn capture(keys: &[&'static str]) -> Self {
+        Self {
+            keys: keys
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        }
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (key, value) in &self.keys {
+            match value {
+                // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+                Some(value) => {
+                    #[allow(
+                        unsafe_code,
+                        reason = "Rust 2024 process-environment mutation audited at the caller"
+                    )]
+                    unsafe {
+                        std::env::set_var(key, value)
+                    }
+                }
+                // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+                None => {
+                    #[allow(
+                        unsafe_code,
+                        reason = "Rust 2024 process-environment mutation audited at the caller"
+                    )]
+                    unsafe {
+                        std::env::remove_var(key)
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct DirectDbGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+    _env: EnvRestore,
+    root: tempfile::TempDir,
+    workspaces: tempfile::TempDir,
+}
+
+impl DirectDbGuard {
+    fn new() -> Self {
+        let serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        let env = EnvRestore::capture(&["SESSION_LOG_DB_ROOT", "TURA_DB_ROOT"]);
+        let root = tempfile::tempdir().expect("tempdir");
+        let workspaces = tempfile::tempdir().expect("workspace tempdir");
+        // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+        #[allow(
+            unsafe_code,
+            reason = "Rust 2024 process-environment mutation audited at the caller"
+        )]
+        unsafe {
+            std::env::set_var("SESSION_LOG_DB_ROOT", root.path())
+        };
+        // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+        #[allow(
+            unsafe_code,
+            reason = "Rust 2024 process-environment mutation audited at the caller"
+        )]
+        unsafe {
+            std::env::remove_var("TURA_DB_ROOT")
+        };
+        Self {
+            _serial: serial,
+            _env: env,
+            root,
+            workspaces,
+        }
+    }
+
+    fn root(&self) -> &Path {
+        self.root.path()
+    }
+
+    fn workspace(&self, name: &str) -> String {
+        let path = self.workspaces.path().join(name);
+        std::fs::create_dir_all(&path).expect("workspace dir");
+        path.to_string_lossy().replace('\\', "/")
+    }
+}
+
+#[test]
+fn concurrent_typed_writes_keep_pagination_consistent() {
+    let test_started = Instant::now();
+    let db = DirectDbGuard::new();
+    let store = SessionLogStore::open_default().expect("store");
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let workspace = db.workspace(&format!("stress-{nonce}"));
+    let started = Instant::now();
+    let worker_count = 16;
+    let per_worker = 50;
+
+    let mut workers = Vec::new();
+    for worker in 0..worker_count {
+        let store = store.clone();
+        let workspace = workspace.clone();
+        let nonce = nonce.clone();
+        workers.push(std::thread::spawn(move || {
+            for index in 0..per_worker {
+                let sequence = worker * per_worker + index;
+                let session_id = format!("stress-{nonce}-{sequence}");
+                typed_session::create_with_message_in_store(
+                    &store,
+                    &session_id,
+                    &workspace,
+                    &format!("Stress {sequence}"),
+                    sequence as i64,
+                    "assistant",
+                    "concurrent typed write",
+                )
+                .expect("typed write");
+            }
+        }));
+    }
+
+    for worker in workers {
+        join_thread_with_timeout(
+            worker,
+            remaining_timeout(
+                test_started,
+                TEST_TIMEOUT,
+                "concurrent typed write pressure",
+            ),
+            "concurrent typed write worker",
+        );
+    }
+
+    let (page, sessions) = store
+        .list_sessions(ListSessionsRequest {
+            workspace,
+            page: 0,
+            page_size: 50,
+        })
+        .expect("sessions");
+
+    assert_eq!(page.total, worker_count * per_worker);
+    assert_eq!(page.page_size, 50);
+    assert_eq!(sessions.len(), 50);
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "concurrent typed write smoke test took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn high_frequency_runtime_feed_keeps_every_event_through_a_readonly_flicker() {
+    const WORKERS: usize = 12;
+    const EVENTS_PER_WORKER: usize = 100;
+    const EXPECTED_EVENTS: usize = WORKERS * EVENTS_PER_WORKER;
+
+    let test_started = Instant::now();
+    let db = DirectDbGuard::new();
+    let store = SessionLogStore::open_default().expect("store");
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let workspace = db.workspace(&format!("runtime-feed-{nonce}"));
+    let session_id = format!("runtime-feed-session-{nonce}");
+    let runtime_id = format!("runtime-feed-runtime-{nonce}");
+    let lease_id = format!("runtime-feed-lease-{nonce}");
+    typed_session::create_in_store(
+        &store,
+        &session_id,
+        &workspace,
+        "High-frequency runtime feed",
+        1,
+        TaskPlan::default(),
+    )
+    .expect("create feed session");
+    store
+        .register_runtime(RegisterRuntimeRequest {
+            runtime_id: runtime_id.clone(),
+            session_id: session_id.clone(),
+            fallback_from_id: None,
+            lifecycle: None,
+        })
+        .expect("register runtime");
+    store
+        .activate_runtime_lease(ActivateRuntimeLeaseRequest {
+            runtime_id: runtime_id.clone(),
+            lease_id: lease_id.clone(),
+        })
+        .expect("activate runtime lease");
+
+    #[cfg(windows)]
+    let readonly_release = {
+        let database_path = Path::new(&workspace)
+            .join(".tura")
+            .join("session_log.sqlite3");
+        let mut permissions = std::fs::metadata(&database_path)
+            .expect("workspace database metadata")
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&database_path, permissions)
+            .expect("start brief read-only flicker");
+        Some(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let mut permissions = std::fs::metadata(&database_path)
+                .expect("workspace database metadata")
+                .permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&database_path, permissions)
+                .expect("finish brief read-only flicker");
+        }))
+    };
+
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let mut workers = Vec::with_capacity(WORKERS);
+    for worker_index in 0..WORKERS {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        let session_id = session_id.clone();
+        let runtime_id = runtime_id.clone();
+        let lease_id = lease_id.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            for event_index in 0..EVENTS_PER_WORKER {
+                let sequence = worker_index * EVENTS_PER_WORKER + event_index;
+                let outcome = store
+                    .append_session_feed_event(AppendSessionFeedEventRequest {
+                        runtime_id: runtime_id.clone(),
+                        target_session_id: session_id.clone(),
+                        lease_id: lease_id.clone(),
+                        event_id: format!("{runtime_id}:pressure:{sequence}"),
+                        event: SessionFeedEvent::ToolCallUpdated {
+                            message_id: format!("{runtime_id}.message"),
+                            part_id: format!("{runtime_id}.tool.{sequence}"),
+                            tool_name: "pressure_probe".to_string(),
+                            call_id: format!("pressure-{sequence}"),
+                            state: serde_json::json!({
+                                "status": "completed",
+                                "sequence": sequence,
+                            }),
+                            metadata: None,
+                            runtime_status: None,
+                            context_tokens: None,
+                            usage: None,
+                            command_updates: Vec::new(),
+                            created_at: sequence as i64,
+                            updated_at: sequence as i64,
+                        },
+                    })
+                    .expect("append high-frequency runtime feed event");
+                assert!(
+                    matches!(outcome, SessionFeedAppendOutcome::Applied { .. }),
+                    "event {sequence} was not applied: {outcome:?}"
+                );
+            }
+        }));
+    }
+
+    for worker in workers {
+        join_thread_with_timeout(
+            worker,
+            remaining_timeout(test_started, TEST_TIMEOUT, "high-frequency runtime feed"),
+            "high-frequency runtime feed worker",
+        );
+    }
+    #[cfg(windows)]
+    if let Some(release) = readonly_release {
+        release.join().expect("release read-only flicker");
+    }
+
+    let mut cursor = 0_u64;
+    let mut runtime_events = 0_usize;
+    loop {
+        let (entries, next_cursor) = store
+            .read_session_feed(ReadSessionFeedRequest {
+                session_id: session_id.clone(),
+                after_cursor: cursor,
+                limit: 1_000,
+            })
+            .expect("read high-frequency runtime feed");
+        runtime_events += entries
+            .iter()
+            .filter(|entry| entry.runtime_id.as_deref() == Some(runtime_id.as_str()))
+            .filter(|entry| entry.event_id.contains(":pressure:"))
+            .count();
+        if entries.is_empty() {
+            break;
+        }
+        assert!(next_cursor > cursor, "feed cursor must advance");
+        cursor = next_cursor;
+    }
+    assert_eq!(runtime_events, EXPECTED_EVENTS);
+    assert!(
+        test_started.elapsed() < TEST_TIMEOUT,
+        "high-frequency runtime feed took {:?}",
+        test_started.elapsed()
+    );
+}
+
+#[test]
+fn cross_process_writers_share_one_queued_local_database() {
+    let test_started = Instant::now();
+    let db = DirectDbGuard::new();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let workspace = db.workspace(&format!("cross-process-{nonce}"));
+    let worker_count = 12;
+    let current_exe = std::env::current_exe().expect("current test exe");
+
+    let mut children = Vec::new();
+    for worker in 0..worker_count {
+        let session_id = format!("cross-process-{nonce}-{worker}");
+        children.push(
+            Command::new(&current_exe)
+                .args(["--exact", "cross_process_session_log_helper", "--nocapture"])
+                .env("SESSION_LOG_CROSS_PROCESS_MODE", "write")
+                .env("SESSION_LOG_CROSS_PROCESS_SESSION_ID", session_id)
+                .env("SESSION_LOG_CROSS_PROCESS_WORKSPACE", &workspace)
+                .env("SESSION_LOG_DB_ROOT", db.root())
+                .spawn()
+                .expect("spawn helper"),
+        );
+    }
+
+    for mut child in children {
+        let status = wait_child_with_timeout(
+            &mut child,
+            remaining_timeout(
+                test_started,
+                TEST_TIMEOUT,
+                "cross-process session_log pressure",
+            )
+            .min(CHILD_TIMEOUT),
+            "cross-process typed write helper",
+        );
+        assert!(status.success(), "helper exited with {status}");
+    }
+
+    let mut verify = Command::new(&current_exe)
+        .args(["--exact", "cross_process_session_log_helper", "--nocapture"])
+        .env("SESSION_LOG_CROSS_PROCESS_MODE", "verify")
+        .env("SESSION_LOG_CROSS_PROCESS_WORKSPACE", &workspace)
+        .env(
+            "SESSION_LOG_CROSS_PROCESS_EXPECTED",
+            worker_count.to_string(),
+        )
+        .env("SESSION_LOG_DB_ROOT", db.root())
+        .spawn()
+        .expect("spawn verify helper");
+    let status = wait_child_with_timeout(
+        &mut verify,
+        remaining_timeout(
+            test_started,
+            TEST_TIMEOUT,
+            "cross-process session_log pressure",
+        )
+        .min(CHILD_TIMEOUT),
+        "cross-process verify helper",
+    );
+    assert!(status.success(), "verify helper exited with {status}");
+}
+
+#[test]
+fn multi_workspace_rich_history_10_by_20_persists_2000_records() {
+    let test_started = Instant::now();
+    let db = DirectDbGuard::new();
+    let store = SessionLogStore::open_default().expect("store");
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let workspaces = (0..WORKSPACE_COUNT)
+        .map(|index| db.workspace(&format!("rich-history-{nonce}-{index}")))
+        .collect::<Vec<_>>();
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(WORKSPACE_COUNT * TASKS_PER_WORKSPACE);
+
+    for (workspace_index, workspace) in workspaces.iter().enumerate() {
+        for task_index in 0..TASKS_PER_WORKSPACE {
+            let store = store.clone();
+            let workspace = workspace.clone();
+            let session_id = format!("rich-{nonce}-{workspace_index}-{task_index}");
+            workers.push(std::thread::spawn(move || {
+                write_rich_session(&store, &session_id, &workspace, workspace_index, task_index);
+            }));
+        }
+    }
+
+    for worker in workers {
+        join_thread_with_timeout(
+            worker,
+            remaining_timeout(
+                test_started,
+                TEST_TIMEOUT,
+                "multi-workspace rich history pressure",
+            ),
+            "multi-workspace rich history worker",
+        );
+    }
+
+    let elapsed = started.elapsed();
+    for (workspace_index, workspace) in workspaces.iter().enumerate() {
+        let (page, sessions) = store
+            .list_sessions(ListSessionsRequest {
+                workspace: workspace.clone(),
+                page: 0,
+                page_size: 500,
+            })
+            .expect("workspace sessions");
+        assert_eq!(
+            page.total, TASKS_PER_WORKSPACE as u64,
+            "workspace {workspace_index} should contain every task session"
+        );
+        assert_eq!(sessions.len(), TASKS_PER_WORKSPACE);
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.message_count == RICH_RECORDS_PER_TASK as u64),
+            "workspace {workspace_index} sessions should each expose {RICH_RECORDS_PER_TASK} rich records"
+        );
+    }
+
+    let summaries = store.list_workspaces().expect("workspace summaries");
+    for workspace in &workspaces {
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.directory == *workspace)
+            .unwrap_or_else(|| panic!("missing workspace summary for {workspace}"));
+        assert_eq!(summary.session_count, TASKS_PER_WORKSPACE as u64);
+    }
+
+    eprintln!(
+        "session_log_store_multi_workspace_rich_history summary: workspaces={WORKSPACE_COUNT} tasks_per_workspace={TASKS_PER_WORKSPACE} total_rich_records={TOTAL_RICH_RECORDS} elapsed_ms={}",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "multi-workspace rich history pressure took {elapsed:?}"
+    );
+}
+
+#[test]
+fn cross_process_session_log_helper() {
+    let Ok(mode) = std::env::var("SESSION_LOG_CROSS_PROCESS_MODE") else {
+        return;
+    };
+    let store = SessionLogStore::open_default().expect("store");
+    let workspace = std::env::var("SESSION_LOG_CROSS_PROCESS_WORKSPACE").expect("workspace");
+
+    if mode == "write" {
+        let session_id = std::env::var("SESSION_LOG_CROSS_PROCESS_SESSION_ID").expect("session id");
+        typed_session::create_with_message_in_store(
+            &store,
+            &session_id,
+            &workspace,
+            "Cross-process typed write",
+            1,
+            "assistant",
+            "cross-process typed write",
+        )
+        .expect("typed write");
+        return;
+    }
+
+    assert_eq!(mode, "verify");
+    let expected = std::env::var("SESSION_LOG_CROSS_PROCESS_EXPECTED")
+        .expect("expected")
+        .parse::<u64>()
+        .expect("expected number");
+    let (page, sessions) = store
+        .list_sessions(ListSessionsRequest {
+            workspace,
+            page: 0,
+            page_size: 100,
+        })
+        .expect("sessions");
+    assert_eq!(page.total, expected);
+    assert_eq!(sessions.len() as u64, expected);
+}
+
+fn write_rich_session(
+    store: &SessionLogStore,
+    session_id: &str,
+    workspace: &str,
+    workspace_index: usize,
+    task_index: usize,
+) {
+    let sequence = (workspace_index * TASKS_PER_WORKSPACE + task_index) as i64;
+    typed_session::create_in_store(
+        store,
+        session_id,
+        workspace,
+        &format!("Rich Workspace {workspace_index} Task {task_index}"),
+        sequence,
+        TaskPlan {
+            plan_summary: "multi workspace rich history pressure".to_string(),
+            ..TaskPlan::default()
+        },
+    )
+    .expect("create rich session");
+    let entries = (0..RICH_RECORDS_PER_TASK)
+        .map(|record_index| {
+            let created = sequence * 100 + record_index as i64;
+            typed_session::message_entry(
+                record_index as u64,
+                session_id,
+                &format!("rich-message-{workspace_index}-{task_index}-{record_index}"),
+                if record_index % 2 == 0 {
+                    "user"
+                } else {
+                    "assistant"
+                },
+                &rich_text_payload(workspace_index, task_index, record_index),
+                created,
+            )
+        })
+        .collect();
+    typed_session::persist_in_store(store, session_id, 0, entries)
+        .map(|next_sequence| assert_eq!(next_sequence, RICH_RECORDS_PER_TASK as u64))
+        .expect("persist rich session delta");
+}
+
+fn rich_text_payload(workspace_index: usize, task_index: usize, record_index: usize) -> String {
+    format!(
+        "### Workspace {workspace_index} task {task_index} record {record_index}\n\n\
+Rich text payload for session_db pressure with markdown, HTML, table rows, local links, and a code fence.\n\n\
+| component | workspace | task | record |\n\
+| --- | ---: | ---: | ---: |\n\
+| session_db | {workspace_index} | {task_index} | {record_index} |\n\n\
+```json\n{{\"workspace\":{workspace_index},\"task\":{task_index},\"record\":{record_index}}}\n```\n\n\
+<b>bold marker</b> [workspace](file:///tmp/tura/workspace-{workspace_index}/task-{task_index})"
+    )
+}
+
+fn join_thread_with_timeout<T>(handle: JoinHandle<T>, timeout: Duration, label: &str) -> T
+where
+    T: Send + 'static,
+{
+    let started = Instant::now();
+    while !handle.is_finished() {
+        if started.elapsed() >= timeout {
+            panic!("{label} timed out after {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    handle.join().unwrap_or_else(|_| panic!("{label} panicked"))
+}
+
+fn wait_child_with_timeout(child: &mut Child, timeout: Duration, label: &str) -> ExitStatus {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("poll child process") {
+            return status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{label} timed out after {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn remaining_timeout(started: Instant, timeout: Duration, label: &str) -> Duration {
+    timeout
+        .checked_sub(started.elapsed())
+        .unwrap_or_else(|| panic!("{label} exceeded total timeout {timeout:?}"))
+}

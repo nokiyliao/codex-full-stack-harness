@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nokiyliao/codex-collaboration-harness/blob/v0.2.0/src/codex_collaboration_harness/protocol/tura_terminal_envelope_v1.schema.json",
+  "title": "Nokiy terminal envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "request_id",
+    "packet_id",
+    "lease_id",
+    "executor_id",
+    "kind",
+    "effect_state",
+    "effect_id",
+    "output_digest",
+    "predicate_satisfied",
+    "failure_code",
+    "failure_detail_digest"
+  ],
+  "properties": {
+    "protocol_version": {"const": "tura-collaboration/v1"},
+    "request_id": {"type": "string", "minLength": 1},
+    "packet_id": {"type": "string", "minLength": 1},
+    "lease_id": {"type": "string", "minLength": 1},
+    "executor_id": {"type": "string", "minLength": 1},
+    "kind": {"enum": ["result", "failure"]},
+    "effect_state": {"enum": ["none", "settled", "unsettled"]},
+    "effect_id": {"type": ["string", "null"]},
+    "output_digest": {"type": "string", "minLength": 1},
+    "predicate_satisfied": {"type": "boolean"},
+    "failure_code": {
+      "enum": [
+        null,
+        "STALE_IDENTITY",
+        "UNSETTLED_EFFECT",
+        "CAS_MISMATCH",
+        "EXECUTOR_ERROR",
+        "INVALID_FAILURE_CODE"
+      ]
+    },
+    "failure_detail_digest": {"type": ["string", "null"]}
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "kind": {"const": "result"},
+        "effect_state": {"enum": ["settled", "unsettled"]},
+        "effect_id": {"type": "string", "minLength": 1},
+        "failure_code": {"const": null},
+        "failure_detail_digest": {"const": null}
+      }
+    },
+    {
+      "properties": {
+        "kind": {"const": "failure"},
+        "failure_code": {
+          "enum": [
+            "STALE_IDENTITY",
+            "UNSETTLED_EFFECT",
+            "CAS_MISMATCH",
+            "EXECUTOR_ERROR",
+            "INVALID_FAILURE_CODE"
+          ]
+        },
+        "failure_detail_digest": {"type": "string", "minLength": 1}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "effect_state": {"const": "none"},
+            "effect_id": {"const": null}
+          }
+        },
+        {
+          "properties": {
+            "effect_state": {"enum": ["settled", "unsettled"]},
+            "effect_id": {"type": "string", "minLength": 1}
+          }
+        }
+      ]
+    }
+  ]
+}

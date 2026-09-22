@@ -1,0 +1,114 @@
+mod process;
+
+use crate::state_machine::agent_management::AgentManagement;
+use lifecycle::RuntimeId;
+use lifecycle::{SessionInput, SessionManagement};
+pub use process::{
+    orchestrate, orchestrate_for_session, orchestrate_for_session_in_directory,
+    orchestrate_for_session_with_lease_and_lifecycle_and_jspace_in_directory,
+    orchestrate_for_session_with_lease_and_lifecycle_in_directory,
+    orchestrate_for_session_with_lease_in_directory, process_from_user_internal,
+};
+use std::path::PathBuf;
+
+pub type SessionFactory = fn(SessionInput) -> Result<SessionManagement, String>;
+pub type ManasEntry = fn(&SessionManagement) -> Result<Vec<AgentManagement>, String>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManoProcessResult {
+    pub session: SessionManagement,
+    pub agents: Vec<AgentManagement>,
+    pub final_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ManoOverrides {
+    pub session_factory: Option<SessionFactory>,
+    pub manas_entry: Option<ManasEntry>,
+}
+
+pub fn process_from_user(input: SessionInput) -> Result<ManoProcessResult, String> {
+    orchestrate(input)
+}
+
+pub fn process_from_gateway_session(
+    session_id: String,
+    input: SessionInput,
+) -> Result<ManoProcessResult, String> {
+    orchestrate_for_session(input, session_id)
+}
+
+pub fn process_from_gateway_session_in_directory(
+    session_id: String,
+    input: SessionInput,
+    session_directory: PathBuf,
+) -> Result<ManoProcessResult, String> {
+    orchestrate_for_session_in_directory(input, session_id, session_directory)
+}
+
+pub fn process_from_gateway_session_with_lease_in_directory(
+    session_id: String,
+    runtime_id: RuntimeId,
+    lease_id: String,
+    input: SessionInput,
+    session_directory: PathBuf,
+) -> Result<ManoProcessResult, String> {
+    orchestrate_for_session_with_lease_in_directory(
+        input,
+        session_id,
+        runtime_id,
+        lease_id,
+        session_directory,
+    )
+}
+
+pub fn process_from_gateway_session_with_lease_and_lifecycle_in_directory(
+    session_id: String,
+    runtime_id: RuntimeId,
+    lease_id: String,
+    input: SessionInput,
+    session_directory: PathBuf,
+    lifecycle: runtime_contract::LifecycleExecutionContext,
+) -> Result<ManoProcessResult, String> {
+    orchestrate_for_session_with_lease_and_lifecycle_in_directory(
+        input,
+        session_id,
+        runtime_id,
+        lease_id,
+        session_directory,
+        Some(lifecycle),
+        None,
+    )
+}
+
+pub fn process_from_gateway_session_with_lease_and_lifecycle_and_jspace_in_directory(
+    session_id: String,
+    runtime_id: RuntimeId,
+    fallback_from_id: Option<RuntimeId>,
+    lease_id: String,
+    input: SessionInput,
+    session_directory: PathBuf,
+    lifecycle: runtime_contract::LifecycleExecutionContext,
+    jspace_contract: Option<serde_json::Value>,
+) -> Result<ManoProcessResult, String> {
+    orchestrate_for_session_with_lease_and_lifecycle_and_jspace_in_directory(
+        input,
+        session_id,
+        runtime_id,
+        lease_id,
+        session_directory,
+        Some(lifecycle),
+        jspace_contract,
+        fallback_from_id,
+    )
+}
+
+pub fn process_from_user_with_overrides(
+    input: SessionInput,
+    overrides: ManoOverrides,
+) -> Result<ManoProcessResult, String> {
+    if overrides.session_factory.is_none() && overrides.manas_entry.is_none() {
+        return orchestrate(input);
+    }
+    process_from_user_internal(input, overrides)
+}

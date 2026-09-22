@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nokiyliao/codex-collaboration-harness/blob/main/src/codex_collaboration_harness/protocol/native_tura_terminal_v1.schema.json",
+  "title": "Native Nokiy terminal callback v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "callback_id",
+    "parent_thread_id",
+    "task_thread_id",
+    "status",
+    "mission",
+    "predicate",
+    "predicate_delta",
+    "evidence",
+    "first_typed_blocker",
+    "authority_effect",
+    "protected_effect_count"
+  ],
+  "properties": {
+    "schema_version": {"const": "tura_native_terminal_v1"},
+    "callback_id": {"type": "string", "minLength": 1},
+    "parent_thread_id": {"type": "string", "minLength": 1},
+    "task_thread_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["PREDICATE_ADVANCED", "MISSION_COMPLETE", "BLOCKED"]},
+    "mission": {"type": "string", "minLength": 1},
+    "predicate": {"type": "string", "minLength": 1},
+    "predicate_delta": {"type": "string", "minLength": 1},
+    "evidence": {"type": "array", "maxItems": 32},
+    "first_typed_blocker": {"type": ["string", "null"]},
+    "authority_effect": {"type": "string", "minLength": 1},
+    "protected_effect_count": {"type": "integer", "minimum": 0}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "BLOCKED"}}},
+      "then": {"properties": {"first_typed_blocker": {"type": "string", "minLength": 1}}},
+      "else": {"properties": {"first_typed_blocker": {"const": null}}}
+    }
+  ]
+}

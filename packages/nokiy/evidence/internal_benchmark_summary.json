@@ -1,0 +1,33 @@
+{
+  "schema_version": "public_internal_benchmark_summary_v1",
+  "status": "INTERNAL_ENGINEERING_BENCHMARK",
+  "scope": {
+    "benchmark_type": "isolated_historical_engineering_comparison",
+    "snapshot_count": 5,
+    "pair_count": 33,
+    "trial_count": 66
+  },
+  "results": {
+    "harness_condition_verified": 33,
+    "baseline_condition_verified": 27,
+    "verified_completion_lift_percentage_points": 18.1818,
+    "mcnemar_exact_two_sided_p": 0.03125,
+    "token_reduction_fraction": 0.869245,
+    "wall_time_reduction_fraction": 0.69216,
+    "verified_completion_productivity_ratio": 9.347416
+  },
+  "safety_observations": {
+    "duplicate_effect_count": 0,
+    "protected_effect_count": 0,
+    "source_escape_count": 0,
+    "cleanup_residue_count": 0
+  },
+  "interpretation": {
+    "internal_only": true,
+    "causal_claim": false,
+    "external_validity_claim": false,
+    "production_performance_claim": false,
+    "independently_reproduced": false,
+    "note": "This is a sanitized aggregate of an isolated internal engineering benchmark. It is non-causal and is not evidence of production performance."
+  }
+}

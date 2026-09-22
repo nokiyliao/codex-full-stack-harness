@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nokiyliao/codex-collaboration-harness/blob/main/src/codex_collaboration_harness/protocol/native_tura_execution_profile_v1.schema.json",
+  "title": "Native Nokiy execution profile v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "model",
+    "thinking",
+    "target_type",
+    "project_id",
+    "environment",
+    "directory_name",
+    "profile_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "native-tura-execution-profile/v1"},
+    "model": {"type": "string", "minLength": 1},
+    "thinking": {"enum": ["low", "medium", "high", "xhigh", "max"]},
+    "target_type": {"enum": ["project", "projectless"]},
+    "project_id": {"type": ["string", "null"]},
+    "environment": {"enum": [null, "local", "worktree"]},
+    "directory_name": {"type": ["string", "null"]},
+    "profile_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "target_type": {"const": "projectless"},
+        "project_id": {"const": null},
+        "environment": {"const": null}
+      }
+    },
+    {
+      "properties": {
+        "target_type": {"const": "project"},
+        "project_id": {"type": "string", "minLength": 1},
+        "environment": {"enum": ["local", "worktree"]},
+        "directory_name": {"const": null}
+      }
+    }
+  ]
+}

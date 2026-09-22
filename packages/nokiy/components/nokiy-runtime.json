@@ -1,0 +1,25 @@
+{
+  "schema_version": "public_runtime_component_v1",
+  "component_id": "tura-collaboration-runtime",
+  "role": "optional_legacy_external_executor_runtime",
+  "license": "AGPL-3.0-or-later",
+  "repository": "https://github.com/nokiyliao/tura",
+  "public_ref": "refs/heads/codex/collaboration-runtime-public-v0.1.0",
+  "public_ref_commit": "5c1c45c53a3ce29750f31c9d37eb7a326a3f5c78",
+  "public_ref_tree": "c99f61acf626182ff8ef32a7e2ffd7c1aec45095",
+  "modified_source_parent": "5b8f1a720404a2c395889a4155302489fbb7b78f",
+  "modified_source_tree": "4ac2b9d5bf1f8d9375d473bc40d79f817aa2a7a3",
+  "benchmarked_candidate_commit": "aab663adb87b1a72b925973073ddef2502609c4a",
+  "benchmarked_candidate_tree": "4b69b1e3eadd166ce958491cd221d3eddd6be83e",
+  "upstream_repository": "https://github.com/Tura-AI/tura",
+  "upstream_base_commit": "91ac336a49ff3cc3250e9422167d87de0c8cffeb",
+  "upstream_base_tree": "c524df34bc833bd22e8a6ca6904fcacfb2127064",
+  "integration_module": "codex_collaboration_harness.adapters.tura",
+  "modification_notice": "https://github.com/nokiyliao/tura/blob/codex/collaboration-runtime-public-v0.1.0/MODIFICATIONS.md",
+  "evidence_boundaries": {
+    "public_ref": "SOURCE_PUBLICATION_ONLY",
+    "modified_source_parent": "LATER_COLLABORATION_SOURCE_NOT_BENCHMARK_EQUIVALENT",
+    "benchmarked_candidate": "ISOLATED_INTERNAL_BENCHMARK",
+    "installed_or_running": "NOT_CLAIMED"
+  }
+}

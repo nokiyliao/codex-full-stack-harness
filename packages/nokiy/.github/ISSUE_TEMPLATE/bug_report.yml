@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible defect in the public reference harness.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Please use synthetic data only. Do not include credentials, private
+        transcripts, account identifiers, or host-specific paths.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Package version or exact public commit under test.
+    validations:
+      required: true
+  - type: dropdown
+    id: python
+    attributes:
+      label: Python version
+      options:
+        - "3.11"
+        - "3.12"
+        - Other supported version
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal synthetic reproduction
+      description: Include the smallest deterministic example and exact command.
+      placeholder: |
+        Command:
+        Synthetic inputs:
+        Observed result:
+        Expected result:
+    validations:
+      required: true
+  - type: textarea
+    id: invariant
+    attributes:
+      label: Affected invariant or failure code
+      description: Name the lifecycle invariant or typed failure code, if known.
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Public-data check
+      options:
+        - label: I removed secrets, private data, raw session identifiers, and local paths.
+          required: true

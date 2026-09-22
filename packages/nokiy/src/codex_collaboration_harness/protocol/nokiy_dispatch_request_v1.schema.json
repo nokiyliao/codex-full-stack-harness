@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nokiyliao/codex-collaboration-harness/blob/v0.2.0/src/codex_collaboration_harness/protocol/tura_dispatch_request_v1.schema.json",
+  "title": "Nokiy dispatch request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "request_id",
+    "packet_id",
+    "mission_id",
+    "mission_revision",
+    "mission_mode",
+    "predicate_key",
+    "route_id",
+    "executor_id",
+    "scope",
+    "expected_scope_versions",
+    "claimed_scope_versions",
+    "expected_delta",
+    "abandon_if",
+    "recovery_budget",
+    "destination",
+    "lease_id"
+  ],
+  "properties": {
+    "protocol_version": {"const": "tura-collaboration/v1"},
+    "request_id": {"type": "string", "pattern": "^tura_request_[0-9a-f]{64}$"},
+    "packet_id": {"type": "string", "minLength": 1},
+    "mission_id": {"type": "string", "minLength": 1},
+    "mission_revision": {"type": "integer", "minimum": 1},
+    "mission_mode": {"type": "string", "minLength": 1},
+    "predicate_key": {"type": "string", "minLength": 1},
+    "route_id": {"type": "string", "minLength": 1},
+    "executor_id": {"type": "string", "minLength": 1},
+    "scope": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "expected_scope_versions": {"$ref": "#/$defs/scopeVersions"},
+    "claimed_scope_versions": {"$ref": "#/$defs/scopeVersions"},
+    "expected_delta": {"type": "string", "minLength": 1},
+    "abandon_if": {"type": "string", "minLength": 1},
+    "recovery_budget": {"type": "integer", "minimum": 0},
+    "destination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coordinator_id", "thread_id"],
+      "properties": {
+        "coordinator_id": {"type": "string", "minLength": 1},
+        "thread_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "lease_id": {"type": "string", "minLength": 1}
+  },
+  "$defs": {
+    "scopeVersions": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {"type": "string", "minLength": 1},
+          {"type": "integer", "minimum": 0}
+        ],
+        "items": false,
+        "minItems": 2,
+        "maxItems": 2
+      }
+    }
+  }
+}

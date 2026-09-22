@@ -1,0 +1,578 @@
+use lifecycle::ContextTokenStats;
+use lifecycle::RuntimeAggregate;
+use lifecycle::{ProviderConfig, ToolChoice};
+use lifecycle::{RuntimeCallResultStatus, RuntimeState};
+use runtime::runtime::create_runtime::{create_runtime, runtime_provider_config_from_tura};
+use runtime::runtime::types::RuntimeQueueItem;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tura_llm_rust::{
+    CatalogModelConfig, ModelCatalog, ProviderCatalogConfig, ProviderConfig as LlmProviderConfig,
+    ProviderEnumCatalog, RouteConfig, Settings,
+};
+
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test]
+async fn create_runtime_business_flow_builds_runtime_queue_and_provider_config_from_route() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(&[
+        ("TURA_SESSION_MODEL_OVERRIDE", "localbeta/beta-runtime"),
+        ("TURA_PROVIDER_TOTAL_TIMEOUT_MS", "12345"),
+    ]);
+    let settings = Arc::new(settings_with_routes(
+        vec![(
+            "business_runtime",
+            RouteConfig {
+                default_temperature: 0.31,
+                providers: vec![
+                    LlmProviderConfig {
+                        provider: "localalpha".to_string(),
+                        base_url: "http://127.0.0.1:1111/v1".to_string(),
+                        model: "alpha-runtime".to_string(),
+                        temperature: 0.41,
+                    },
+                    LlmProviderConfig {
+                        provider: "localgamma".to_string(),
+                        base_url: "http://127.0.0.1:3333/v1".to_string(),
+                        model: "gamma-runtime".to_string(),
+                        temperature: 0.51,
+                    },
+                ],
+            },
+        )],
+        HashMap::from([(
+            "localbeta".to_string(),
+            "http://127.0.0.1:2222/v1".to_string(),
+        )]),
+    ));
+    let messages = vec![
+        json!({"role": "system", "content": "business runtime system"}),
+        json!({"role": "user", "content": "create the runtime"}),
+    ];
+    let tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "command_run",
+            "parameters": {"type": "object"}
+        }
+    })];
+
+    let (runtime, queue_item) = create_runtime(runtime_input(
+        "session-create-runtime-business",
+        "agent-create-runtime-business",
+        "business_runtime",
+        messages.clone(),
+        tools.clone(),
+        Arc::clone(&settings),
+        true,
+    ))
+    .await
+    .unwrap_or_else(|error| panic!("create_runtime should succeed: {error}"));
+
+    assert_runtime_and_queue_are_consistent(&runtime, &queue_item, &messages, &tools);
+    assert_eq!(runtime.state, RuntimeState::Created);
+    assert_eq!(
+        runtime.call_result_status(),
+        RuntimeCallResultStatus::Pending
+    );
+    assert!(runtime.runtime_id.starts_with("runtime-"));
+    assert_eq!(runtime.session_id, "session-create-runtime-business");
+    assert_eq!(runtime.fallback_from_id, None);
+    assert_eq!(runtime.agent_id, "agent-create-runtime-business");
+    assert_eq!(runtime.provider.provider_name, "localbeta/beta-runtime");
+    assert_eq!(runtime.provider.llm_provider_name, "localbeta");
+    assert_eq!(
+        runtime.provider.provider_url_name,
+        "http://127.0.0.1:2222/v1"
+    );
+    assert_eq!(runtime.provider.model_name, "beta-runtime");
+    assert!(runtime.provider.thinking);
+    assert_eq!(runtime.provider.base.tura_llm_name, "business_runtime");
+    assert!(runtime.provider.base.stream);
+    assert_eq!(runtime.provider.base.temperature, 0.0);
+    assert_eq!(runtime.provider.base.max_tokens, 512);
+    assert_eq!(runtime.provider.base.tool_choice, ToolChoice::Auto);
+    assert_eq!(runtime.provider.base.time_out_ms, 12_345);
+    assert_eq!(queue_item.provider_name, "localbeta/beta-runtime");
+}
+
+#[tokio::test]
+async fn create_runtime_business_flow_records_retry_predecessor_in_creation_event() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear(&[
+        "TURA_SESSION_MODEL_OVERRIDE",
+        "TURA_PROVIDER_TOTAL_TIMEOUT_MS",
+    ]);
+    let settings = Arc::new(settings_with_routes(
+        vec![(
+            "retry_runtime",
+            RouteConfig {
+                default_temperature: 0.0,
+                providers: vec![LlmProviderConfig {
+                    provider: "localretry".to_string(),
+                    base_url: "http://127.0.0.1:4444/v1".to_string(),
+                    model: "retry-model".to_string(),
+                    temperature: 0.0,
+                }],
+            },
+        )],
+        HashMap::new(),
+    ));
+    let mut input = runtime_input(
+        "session-create-runtime-retry",
+        "agent-create-runtime-retry",
+        "retry_runtime",
+        vec![json!({"role": "user", "content": "retry"})],
+        Vec::new(),
+        settings,
+        false,
+    );
+    input.fallback_from_id = Some("runtime-failed-predecessor".to_string());
+
+    let (mut runtime, _) = create_runtime(input)
+        .await
+        .unwrap_or_else(|error| panic!("retry runtime should be created: {error}"));
+
+    assert_eq!(
+        runtime.fallback_from_id.as_deref(),
+        Some("runtime-failed-predecessor")
+    );
+    let replayed = RuntimeAggregate::replay(
+        runtime.runtime_id.clone(),
+        runtime.take_uncommitted_events(),
+    )
+    .unwrap_or_else(|error| panic!("retry runtime events should replay: {error}"));
+    assert_eq!(replayed, runtime);
+}
+
+#[tokio::test]
+async fn create_runtime_business_flow_rejects_unresolvable_model_override() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(&[
+        (
+            "TURA_SESSION_MODEL_OVERRIDE",
+            "missing-provider/missing-model",
+        ),
+        ("TURA_PROVIDER_TOTAL_TIMEOUT_MS", "0"),
+    ]);
+    let settings = Arc::new(settings_with_routes(
+        vec![(
+            "fallback_runtime",
+            RouteConfig {
+                default_temperature: 0.27,
+                providers: vec![LlmProviderConfig {
+                    provider: "localalpha".to_string(),
+                    base_url: "http://127.0.0.1:1111/v1".to_string(),
+                    model: "alpha-primary".to_string(),
+                    temperature: 0.37,
+                }],
+            },
+        )],
+        HashMap::new(),
+    ));
+
+    assert_error_contains(
+        create_runtime(runtime_input(
+            "session-unknown-explicit-provider",
+            "agent-unknown-explicit-provider",
+            "fallback_runtime",
+            vec![json!({"role": "user", "content": "must not create a provider request"})],
+            vec![json!({"type": "function", "function": {"name": "command_run"}})],
+            settings,
+            false,
+        ))
+        .await,
+        "unknown provider in explicit model selection: missing-provider/missing-model",
+    );
+}
+
+#[tokio::test]
+async fn create_runtime_business_flow_rejects_malformed_operator_model_override() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(&[("TURA_SESSION_MODEL_OVERRIDE", "missing-route")]);
+    let settings = settings_with_routes(
+        vec![(
+            "fast",
+            RouteConfig {
+                default_temperature: 0.2,
+                providers: vec![LlmProviderConfig {
+                    provider: "official_codex_app_server".to_string(),
+                    base_url: "http://127.0.0.1:9".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
+                    temperature: 0.2,
+                }],
+            },
+        )],
+        HashMap::from([(
+            "official_codex_app_server".to_string(),
+            "http://127.0.0.1:9".to_string(),
+        )]),
+    );
+
+    let error = runtime_provider_config_from_tura(&provider_config("fast"), &settings, false)
+        .expect_err("a malformed operator override must not fall back to fast");
+
+    assert_eq!(
+        error,
+        "invalid TURA_SESSION_MODEL_OVERRIDE `missing-route`: expected provider/model"
+    );
+}
+
+#[tokio::test]
+async fn create_runtime_business_flow_rejects_malformed_agent_model_selection() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear(&[
+        "TURA_SESSION_MODEL_OVERRIDE",
+        "TURA_PROVIDER_TOTAL_TIMEOUT_MS",
+    ]);
+    let settings = settings_with_routes(
+        vec![(
+            "fast",
+            RouteConfig {
+                default_temperature: 0.2,
+                providers: vec![LlmProviderConfig {
+                    provider: "official_codex_app_server".to_string(),
+                    base_url: "http://127.0.0.1:9".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
+                    temperature: 0.2,
+                }],
+            },
+        )],
+        HashMap::from([(
+            "official_codex_app_server".to_string(),
+            "http://127.0.0.1:9".to_string(),
+        )]),
+    );
+    let config = provider_config_with_current_model("fast", Some("fast"), Some("missing-route"));
+
+    let error = runtime_provider_config_from_tura(&config, &settings, false)
+        .expect_err("a malformed agent model selection must not fall back to fast");
+
+    assert_eq!(
+        error,
+        "invalid explicit current_model `missing-route`: expected provider/model"
+    );
+}
+
+#[tokio::test]
+async fn runtime_latency_uses_selected_model_tier_not_agent_default_tier() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear(&[
+        "TURA_SESSION_MODEL_OVERRIDE",
+        "TURA_PROVIDER_TOTAL_TIMEOUT_MS",
+    ]);
+    let settings = settings_with_routes_and_catalog(
+        vec![(
+            "fast",
+            RouteConfig {
+                default_temperature: 0.2,
+                providers: vec![LlmProviderConfig {
+                    provider: "codex".to_string(),
+                    base_url: "https://codex.test/v1".to_string(),
+                    model: "gpt-5.3-codex-spark".to_string(),
+                    temperature: 0.2,
+                }],
+            },
+        )],
+        HashMap::from([("codex".to_string(), "https://codex.test/v1".to_string())]),
+        ModelCatalog {
+            tiers: vec!["thinking".to_string(), "fast".to_string()],
+            providers: HashMap::from([(
+                "codex".to_string(),
+                ProviderCatalogConfig {
+                    models: HashMap::from([
+                        (
+                            "thinking".to_string(),
+                            vec![CatalogModelConfig::Id("gpt-5.5".to_string())],
+                        ),
+                        (
+                            "fast".to_string(),
+                            vec![CatalogModelConfig::Id("gpt-5.3-codex-spark".to_string())],
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            )]),
+        },
+    );
+    let config = provider_config_with_current_model("fast", Some("fast"), Some("codex/gpt-5.5"));
+
+    let provider = runtime_provider_config_from_tura(&config, &settings, false)
+        .unwrap_or_else(|error| panic!("provider config should resolve selected model: {error}"));
+
+    assert_eq!(provider.llm_provider_name, "codex");
+    assert_eq!(provider.model_name, "gpt-5.5");
+    assert_eq!(
+        provider.base.time_out_ms, 1_200_000,
+        "gpt-5.5 belongs to thinking, so latency must be x-high even through fast agent"
+    );
+}
+
+#[tokio::test]
+async fn runtime_latency_unknown_selected_model_falls_back_to_high() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear(&[
+        "TURA_SESSION_MODEL_OVERRIDE",
+        "TURA_PROVIDER_TOTAL_TIMEOUT_MS",
+    ]);
+    let settings = settings_with_routes_and_catalog(
+        vec![(
+            "fast",
+            RouteConfig {
+                default_temperature: 0.2,
+                providers: vec![LlmProviderConfig {
+                    provider: "codex".to_string(),
+                    base_url: "https://codex.test/v1".to_string(),
+                    model: "gpt-5.3-codex-spark".to_string(),
+                    temperature: 0.2,
+                }],
+            },
+        )],
+        HashMap::from([("codex".to_string(), "https://codex.test/v1".to_string())]),
+        ModelCatalog::default(),
+    );
+    let config =
+        provider_config_with_current_model("fast", Some("fast"), Some("codex/unknown-model"));
+
+    let provider = runtime_provider_config_from_tura(&config, &settings, false)
+        .unwrap_or_else(|error| panic!("provider config should resolve selected model: {error}"));
+
+    assert_eq!(provider.model_name, "unknown-model");
+    assert_eq!(
+        provider.base.time_out_ms, 960_000,
+        "unknown model tier must fall back to high latency, not agent fast"
+    );
+}
+
+#[tokio::test]
+async fn create_runtime_business_flow_reports_route_errors_without_queue_side_effects() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear(&[
+        "TURA_SESSION_MODEL_OVERRIDE",
+        "TURA_PROVIDER_TOTAL_TIMEOUT_MS",
+    ]);
+    let empty_settings = Arc::new(settings_with_routes(Vec::new(), HashMap::new()));
+
+    let unknown = create_runtime(runtime_input(
+        "session-missing-route",
+        "agent-missing-route",
+        "missing_runtime_route",
+        vec![json!({"role": "user", "content": "this must not enqueue"})],
+        vec![json!({"type": "function", "function": {"name": "command_run"}})],
+        Arc::clone(&empty_settings),
+        false,
+    ))
+    .await;
+    assert_error_contains(unknown, "unknown provider route: missing_runtime_route");
+
+    let no_provider_settings = Arc::new(settings_with_routes(
+        vec![(
+            "empty_runtime_route",
+            RouteConfig {
+                default_temperature: 0.0,
+                providers: Vec::new(),
+            },
+        )],
+        HashMap::new(),
+    ));
+    let empty_route = create_runtime(runtime_input(
+        "session-empty-route",
+        "agent-empty-route",
+        "empty_runtime_route",
+        vec![json!({"role": "user", "content": "no provider must not enqueue"})],
+        Vec::new(),
+        no_provider_settings,
+        false,
+    ))
+    .await;
+    assert_error_contains(
+        empty_route,
+        "provider route 'empty_runtime_route' has no configured providers",
+    );
+}
+
+fn runtime_input(
+    session_id: &str,
+    agent_id: &str,
+    route: &str,
+    messages: Vec<Value>,
+    tools: Vec<Value>,
+    settings: Arc<Settings>,
+    thinking: bool,
+) -> runtime::runtime::create_runtime::CreateRuntimeInput {
+    runtime::runtime::create_runtime::CreateRuntimeInput {
+        runtime_id: format!("runtime-{session_id}"),
+        session_id: session_id.to_string(),
+        fallback_from_id: None,
+        agent_id: agent_id.to_string(),
+        messages,
+        tools,
+        provider_config: provider_config(route),
+        tura_settings: settings,
+        thinking,
+        context_tokens: ContextTokenStats::default(),
+    }
+}
+
+fn provider_config(route: &str) -> ProviderConfig {
+    ProviderConfig {
+        tura_llm_name: route.to_string(),
+        default_model_tier: None,
+        current_model: None,
+        stream: true,
+        temperature: 0.0,
+        max_tokens: 512,
+        tool_choice: ToolChoice::Auto,
+        time_out_ms: 9_999,
+    }
+}
+
+fn provider_config_with_current_model(
+    route: &str,
+    default_model_tier: Option<&str>,
+    current_model: Option<&str>,
+) -> ProviderConfig {
+    ProviderConfig {
+        tura_llm_name: route.to_string(),
+        default_model_tier: default_model_tier.map(ToString::to_string),
+        current_model: current_model.map(ToString::to_string),
+        stream: true,
+        temperature: 0.0,
+        max_tokens: 512,
+        tool_choice: ToolChoice::Auto,
+        time_out_ms: 9_999,
+    }
+}
+
+fn settings_with_routes(
+    routes: Vec<(&str, RouteConfig)>,
+    provider_base_url: HashMap<String, String>,
+) -> Settings {
+    Settings {
+        provider_base_url,
+        routes: routes
+            .into_iter()
+            .map(|(name, route)| (name.to_string(), route))
+            .collect(),
+        model_catalog: ModelCatalog::default(),
+        provider_enums: ProviderEnumCatalog::default(),
+    }
+}
+
+fn settings_with_routes_and_catalog(
+    routes: Vec<(&str, RouteConfig)>,
+    provider_base_url: HashMap<String, String>,
+    model_catalog: ModelCatalog,
+) -> Settings {
+    Settings {
+        provider_base_url,
+        routes: routes
+            .into_iter()
+            .map(|(name, route)| (name.to_string(), route))
+            .collect(),
+        model_catalog,
+        provider_enums: ProviderEnumCatalog::default(),
+    }
+}
+
+fn assert_runtime_and_queue_are_consistent(
+    runtime: &RuntimeAggregate,
+    queue_item: &RuntimeQueueItem,
+    messages: &[Value],
+    tools: &[Value],
+) {
+    assert_eq!(queue_item.runtime_id, runtime.runtime_id);
+    assert_eq!(queue_item.session_id, runtime.session_id);
+    assert_eq!(queue_item.agent_id, runtime.agent_id);
+    assert_eq!(queue_item.created_at, runtime.created_at);
+    assert_eq!(queue_item.messages, messages);
+    assert_eq!(queue_item.tools, tools);
+}
+
+fn assert_error_contains(
+    result: Result<(RuntimeAggregate, RuntimeQueueItem), String>,
+    needle: &str,
+) {
+    match result {
+        Ok((runtime, queue_item)) => panic!(
+            "create_runtime unexpectedly succeeded: runtime={}, queue={}",
+            runtime.runtime_id, queue_item.runtime_id
+        ),
+        Err(error) => assert!(
+            error.contains(needle),
+            "expected error to contain {needle:?}, got {error:?}"
+        ),
+    }
+}
+
+struct EnvGuard {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvGuard {
+    fn set(vars: &[(&'static str, &str)]) -> Self {
+        let keys = vars.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let guard = Self::clear(&keys);
+        for (key, value) in vars {
+            // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+            #[allow(
+                unsafe_code,
+                reason = "Rust 2024 process-environment mutation audited at the caller"
+            )]
+            unsafe {
+                std::env::set_var(key, value)
+            };
+        }
+        guard
+    }
+
+    fn clear(keys: &[&'static str]) -> Self {
+        let previous = keys
+            .iter()
+            .map(|key| {
+                let previous = std::env::var_os(key);
+                // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+                #[allow(
+                    unsafe_code,
+                    reason = "Rust 2024 process-environment mutation audited at the caller"
+                )]
+                unsafe {
+                    std::env::remove_var(key)
+                };
+                (*key, previous)
+            })
+            .collect();
+        Self { previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.drain(..).rev() {
+            match value {
+                // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+                Some(value) => {
+                    #[allow(
+                        unsafe_code,
+                        reason = "Rust 2024 process-environment mutation audited at the caller"
+                    )]
+                    unsafe {
+                        std::env::set_var(key, value)
+                    }
+                }
+                // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+                None => {
+                    #[allow(
+                        unsafe_code,
+                        reason = "Rust 2024 process-environment mutation audited at the caller"
+                    )]
+                    unsafe {
+                        std::env::remove_var(key)
+                    }
+                }
+            }
+        }
+    }
+}

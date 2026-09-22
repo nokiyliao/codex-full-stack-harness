@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nokiyliao/codex-collaboration-harness/blob/main/src/codex_collaboration_harness/protocol/native_task_projection_v1.schema.json",
+  "title": "Native Nokiy task-visible projection v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "projection_kind",
+    "target",
+    "capability_ids",
+    "task_visible_pre_task_evidence_only",
+    "answer_key_used",
+    "data"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*/v1$"},
+    "task_id": {"type": "string", "minLength": 1},
+    "projection_kind": {"type": "string", "minLength": 1},
+    "target": {"type": "string", "minLength": 1},
+    "capability_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "task_visible_pre_task_evidence_only": {"const": true},
+    "answer_key_used": {"const": false},
+    "data": {}
+  }
+}

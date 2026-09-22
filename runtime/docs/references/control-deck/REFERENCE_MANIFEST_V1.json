@@ -1,0 +1,39 @@
+{
+  "schema_version": "tura_control_deck_public_reference_manifest_v1",
+  "observed_at_utc": "2026-08-31T04:03:03Z",
+  "authority_effect": "none",
+  "references": [
+    {
+      "id": "openai_symphony",
+      "url": "https://github.com/openai/symphony",
+      "commit": "8001b52e3062495a16e520e4ceaf8f9de868c4d0",
+      "license": "Apache-2.0",
+      "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "disposition": "ADAPT"
+    },
+    {
+      "id": "jscop_atc_kanban",
+      "url": "https://github.com/JSCOP/atc-kanban",
+      "commit": "c520694f73a71adaca527cab16c7eca83797b7fa",
+      "license": "MIT",
+      "license_sha256": "d44d0d6d2fd10b85336347e941fb73738cc20d87a031d26afbfc967c5f8addc4",
+      "disposition": "CONCEPT_ONLY"
+    },
+    {
+      "id": "morgadoronan_codex_agents",
+      "url": "https://github.com/morgadoronan/codex-agents",
+      "commit": "e64568f73790e42b40427ef8f2a9c9ea1db2dd66",
+      "license": "MIT",
+      "license_sha256": "b897ac6fe1cf25d1e8ed43f806bd16dd5116073143277e31a78d7942b690b36e",
+      "disposition": "CONCEPT_ONLY"
+    },
+    {
+      "id": "zetbrush_multiagents",
+      "url": "https://github.com/zetbrush/multiagents",
+      "commit": "03fcf6e875804a21650ed4e45eb9b6624460f7fb",
+      "license": "TYPED_ABSENCE",
+      "license_sha256": null,
+      "disposition": "REJECT"
+    }
+  ]
+}

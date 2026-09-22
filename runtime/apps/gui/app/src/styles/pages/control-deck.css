@@ -1,0 +1,231 @@
+.control-deck-view {
+  height: 100%;
+  overflow: auto;
+  background: var(--paper);
+  color: var(--ink);
+}
+.control-deck-header {
+  min-height: 82px;
+  padding: 22px 28px 16px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+}
+
+.rail-collapsed .control-deck-header {
+  padding-left: calc(var(--rail-open-button-size) + var(--space-7));
+}
+.control-deck-header h1 {
+  margin: 2px 0 0;
+  font-size: 24px;
+  line-height: 1.1;
+  letter-spacing: 0;
+}
+.control-deck-kicker {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+.control-deck-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.control-deck-freshness,
+.control-deck-state {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 1;
+  text-transform: lowercase;
+}
+.control-deck-freshness.current,
+.control-deck-state.present,
+.control-deck-state.ready,
+.control-deck-state.released,
+.control-deck-state.completed {
+  color: #3f9b69;
+  border-color: color-mix(in srgb, #3f9b69 45%, transparent);
+}
+.control-deck-freshness.degraded,
+.control-deck-state.typed_absence,
+.control-deck-state.typed_unknown,
+.control-deck-state.waiting_user,
+.control-deck-state.question {
+  color: #c39238;
+  border-color: color-mix(in srgb, #c39238 48%, transparent);
+}
+.control-deck-freshness.truncated,
+.control-deck-state.unavailable,
+.control-deck-state.blocked,
+.control-deck-state.failed,
+.control-deck-state.active {
+  color: #c65c55;
+  border-color: color-mix(in srgb, #c65c55 48%, transparent);
+}
+.control-deck-icon-button {
+  width: 32px;
+  height: 32px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+}
+.control-deck-icon-button:hover {
+  background: var(--wash);
+}
+.control-deck-icon-button:disabled {
+  opacity: 0.55;
+}
+.control-deck-icon-button .spinning {
+  animation: control-deck-spin 0.85s linear infinite;
+}
+@keyframes control-deck-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.control-deck-alert {
+  padding: 10px 28px;
+  border-bottom: 1px solid color-mix(in srgb, #c65c55 45%, transparent);
+  color: #c65c55;
+  font-size: 12px;
+}
+.control-deck-empty {
+  padding: 36px 28px;
+  color: var(--muted);
+}
+.control-deck-metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  border-bottom: 1px solid var(--line);
+}
+.control-deck-metrics div {
+  min-height: 72px;
+  padding: 14px 28px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  border-right: 1px solid var(--line);
+}
+.control-deck-metrics div:last-child {
+  border-right: 0;
+}
+.control-deck-metrics strong {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+.control-deck-metrics span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.control-deck-band {
+  padding: 20px 28px 24px;
+  border-bottom: 1px solid var(--line);
+}
+.control-deck-section-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.control-deck-section-title h2 {
+  margin: 0;
+  font-size: 13px;
+  letter-spacing: 0;
+}
+.control-deck-section-title > span {
+  color: var(--muted);
+  font-size: 10px;
+}
+.control-deck-table-wrap {
+  overflow-x: auto;
+}
+.control-deck-view table {
+  width: 100%;
+  min-width: 680px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.control-deck-view th {
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-align: left;
+}
+.control-deck-view td {
+  padding: 8px 9px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  font-size: 11px;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.control-deck-view tbody tr:last-child td {
+  border-bottom: 0;
+}
+.control-deck-view td small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+}
+.control-deck-view code {
+  font-family: var(--code-font-family);
+  font-size: 10px;
+}
+.control-deck-absence-list {
+  display: grid;
+  gap: 1px;
+  background: var(--line);
+}
+.control-deck-absence-list > div {
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: minmax(150px, 0.8fr) minmax(120px, 0.6fr) minmax(260px, 1.6fr);
+  align-items: center;
+  gap: 14px;
+  padding: 7px 9px;
+  background: var(--paper);
+  font-size: 10px;
+}
+.control-deck-absence-list strong {
+  color: #c39238;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.control-deck-footer {
+  padding: 13px 28px 24px;
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 10px;
+}
+@media (max-width: 760px) {
+  .control-deck-header,
+  .control-deck-band {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+  .control-deck-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .control-deck-metrics div {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+  .control-deck-absence-list > div {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+}

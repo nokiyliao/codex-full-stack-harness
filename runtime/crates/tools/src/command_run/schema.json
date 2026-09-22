@@ -1,0 +1,72 @@
+{
+  "name": "command_run",
+  "description": "Run tools as a pure batch+step command runner.",
+  "input_schema": {
+    "type": "object",
+    "required": ["commands"],
+    "additionalProperties": false,
+    "properties": {
+      "timeout_ms": {
+        "type": ["number", "null"],
+        "minimum": 1,
+        "x-tura-optional": true,
+        "description": "Optional default timeout in milliseconds for commands that do not declare their own timeout_ms."
+      },
+      "stall_timeout_ms": {
+        "type": ["number", "null"],
+        "minimum": 1000,
+        "x-tura-optional": true,
+        "description": "Optional progress watchdog in milliseconds. It is independent from timeout_ms and expires only after no stdout or stderr activity. Omit for silent workloads that have another liveness signal."
+      },
+      "execution_id": {
+        "type": ["string", "null"],
+        "x-tura-optional": true,
+        "description": "Stable Router execution identity used to bind claims, terminal receipts, and diagnosed replay."
+      },
+      "commands": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 20,
+        "description": "Executable command-line instructions. During task execution, complete all currently needed steps in one batch; prefer 5 or more commands. For simple, standalone user tasks such as quick information lookups (e.g., checking current time) or single-step queries, 1-2 commands are acceptable when that fully answers the request. Independent read/search/list commands with no output dependency must share one step. A later step may consume an earlier step's JSON output through a command output placeholder.",
+        "items": {
+          "type": "object",
+          "required": ["command_type", "command_line"],
+          "additionalProperties": false,
+          "properties": {
+            "command_type": {
+              "type": "string",
+              "description": "Target internal command name from the available commands list. For namespaced tools use the flattened name shown there exactly."
+            },
+            "command_line": {
+              "type": "string",
+              "description": "String payload for the target command. For JSON-schema commands, pass an escaped JSON object string such as {\"cmd\":\"rg -n query src\"}. For freeform commands such as apply_patch, pass the raw freeform body. For shell-like commands, plain text is also accepted and mapped to that tool's command field."
+            },
+            "id": {
+              "type": ["string", "null"],
+              "x-tura-optional": true,
+              "description": "Optional stable output binding name for this command. Later steps may reference this id; otherwise the resolved command_type is used."
+            },
+            "timeout_ms": {
+              "type": ["number", "null"],
+              "minimum": 1,
+              "x-tura-optional": true,
+              "description": "Optional timeout in milliseconds for this command. Overrides the top-level timeout_ms allowance."
+            },
+            "stall_timeout_ms": {
+              "type": ["number", "null"],
+              "minimum": 1000,
+              "x-tura-optional": true,
+              "description": "Optional no-output progress watchdog in milliseconds for this command. Overrides the top-level stall_timeout_ms allowance."
+            },
+            "step": {
+              "type": "integer",
+              "minimum": 1,
+              "x-tura-optional": true,
+              "description": "Dependency group and execution order. Commands in the same step must have no output dependency on each other and may run together. Independent read/search/list commands with no output dependency must share one step. Commands that depend on earlier output, known work, or completed edits must use a later unique ordered step. When using task_status compact_context for a checkpoint, place that task_status command after the work it summarizes."
+            }
+          }
+        }
+      }
+    }
+  }
+}

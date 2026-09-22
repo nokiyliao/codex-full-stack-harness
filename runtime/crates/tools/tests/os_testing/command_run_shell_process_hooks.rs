@@ -1,0 +1,1165 @@
+#[allow(dead_code, unused_imports)]
+#[path = "../business/helpers/command_run_current.rs"]
+mod helpers;
+
+use helpers::*;
+
+fn command_result_text(result: &Value) -> String {
+    let Some(output) = result.get("output") else {
+        return String::new();
+    };
+    if let Some(text) = output.as_str() {
+        return text.to_string();
+    }
+    let mut text = String::new();
+    for key in ["stdout", "stderr", "output"] {
+        if let Some(value) = output.get(key).and_then(Value::as_str) {
+            text.push_str(value);
+            if !value.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+    }
+    text
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nested_git_uses_task_local_fsmonitor_disable_without_config_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = env_lock().await;
+    let hostile_env = [
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "core.fsmonitor"),
+        ("GIT_CONFIG_VALUE_0", "true"),
+        ("TURA_GIT_ENV_PRESERVED", "ordinary-env"),
+    ];
+    let previous_env = hostile_env
+        .iter()
+        .map(|(name, _)| (*name, std::env::var_os(name)))
+        .collect::<Vec<_>>();
+    // SAFETY: env_lock serializes process-environment mutation in this integration test.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        for (name, value) in hostile_env {
+            std::env::set_var(name, value);
+        }
+    }
+    let root = temp_workspace("task-local-git-fsmonitor");
+    let git = |arguments: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(&root)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet"]);
+    let hook = root.join("fsmonitor-hook.sh");
+    let marker = root.join("fsmonitor-invoked");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\n(sleep 30) >/dev/null 2>&1 &\nprintf '2\\nfixture-token\\n'\n",
+            single_quoted_posix_path(&marker)
+        ),
+    )
+    .expect("write fsmonitor hook");
+    let mut permissions = fs::metadata(&hook).expect("hook metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&hook, permissions).expect("make fsmonitor hook executable");
+    git(&[
+        "config",
+        "core.fsmonitor",
+        hook.to_str().expect("UTF-8 hook path"),
+    ]);
+    let config_path = root.join(".git/config");
+    let config_before = fs::read(&config_path).expect("Git config preimage");
+
+    let router = ToolRouter::new();
+    let result = router
+        .dispatch(
+            ToolCall {
+                tool_name: "bash".to_string(),
+                call_id: "call_task_local_git_fsmonitor".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: json!({
+                        "command": "git status --porcelain && printf 'fsmonitor=%s\\nordinary=%s\\n' \"$(git config --get core.fsmonitor)\" \"$TURA_GIT_ENV_PRESERVED\"",
+                        "timeout_ms": 10_000
+                    }),
+                },
+            },
+            ToolContext::new_with_lock_scope(root.clone(), Some("git-fsmonitor-scope".to_string())),
+            false,
+        )
+        .await
+        .expect("task-local Git probe");
+    for (name, value) in previous_env {
+        restore_env_var(name, value);
+    }
+
+    assert_eq!(result.result.success, Some(true), "{result:?}");
+    let output = result.result.code_mode_result();
+    assert_eq!(output["terminal_receipt"]["process_group_empty"], true);
+    assert_eq!(output["terminal_receipt"]["termination_proven"], true);
+    let text = output["stdout"].as_str().expect("Git probe stdout");
+    assert!(text.contains("fsmonitor=false"), "{output}");
+    assert!(text.contains("ordinary=ordinary-env"), "{output}");
+    assert_eq!(
+        fs::read(&config_path).expect("Git config postimage"),
+        config_before,
+        "task-local containment must not mutate repository Git config"
+    );
+    assert!(!marker.exists(), "task-local Git must not invoke fsmonitor");
+    assert_eq!(
+        code_tools::shell_executor::retained_shell_process_scope_count_for_scope(
+            "git-fsmonitor-scope"
+        ),
+        0,
+        "completed Git probe must not retain an fsmonitor process scope"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn docker_bash_emits_task_local_git_config_in_final_child_arguments() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = env_lock().await;
+    let root = temp_workspace("docker-task-local-git-args");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create fake Docker bin directory");
+    let docker = bin_dir.join("docker");
+    fs::write(&docker, "#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n")
+        .expect("write fake Docker executable");
+    let mut permissions = fs::metadata(&docker)
+        .expect("fake Docker metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&docker, permissions).expect("make fake Docker executable");
+
+    let env_values = [
+        ("PATH", bin_dir.to_string_lossy().into_owned()),
+        (
+            "TURA_BASH_DOCKER_CONTAINER",
+            "fixture-container".to_string(),
+        ),
+        ("TURA_BASH_DOCKER_WORKDIR", "/fixture-workdir".to_string()),
+        ("GIT_CONFIG_COUNT", "1".to_string()),
+        ("GIT_CONFIG_KEY_0", "core.fsmonitor".to_string()),
+        ("GIT_CONFIG_VALUE_0", "true".to_string()),
+        ("TURA_GIT_ENV_PRESERVED", "ordinary-env".to_string()),
+    ];
+    let previous_env = env_values
+        .iter()
+        .map(|(name, _)| (*name, std::env::var_os(name)))
+        .collect::<Vec<_>>();
+    // SAFETY: env_lock serializes process-environment mutation in this integration test.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        for (name, value) in &env_values {
+            std::env::set_var(name, value);
+        }
+    }
+
+    let result = ToolRouter::new()
+        .dispatch(
+            ToolCall {
+                tool_name: "bash".to_string(),
+                call_id: "call_docker_task_local_git_args".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: json!({
+                        "command": "printf child",
+                        "timeout_ms": 10_000
+                    }),
+                },
+            },
+            ToolContext::new_with_lock_scope(
+                root,
+                Some("docker-task-local-git-args-scope".to_string()),
+            ),
+            false,
+        )
+        .await;
+    for (name, value) in previous_env {
+        restore_env_var(name, value);
+    }
+
+    let result = result.expect("fake Docker command dispatch");
+    assert_eq!(result.result.success, Some(true), "{result:?}");
+    let output = result.result.code_mode_result();
+    assert_eq!(
+        output["stdout"].as_str().expect("fake Docker stdout"),
+        "<exec>\n<-w>\n</fixture-workdir>\n<--env>\n<GIT_CONFIG_COUNT=2>\n<--env>\n<GIT_CONFIG_KEY_0=core.fsmonitor>\n<--env>\n<GIT_CONFIG_KEY_1=core.fsmonitor>\n<--env>\n<GIT_CONFIG_VALUE_0=true>\n<--env>\n<GIT_CONFIG_VALUE_1=false>\n<fixture-container>\n</bin/bash>\n<-lc>\n<printf child>\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn malformed_and_overflowing_git_config_counts_are_preserved_for_git_rejection() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = env_lock().await;
+    let root = temp_workspace("malformed-git-config-count");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create fake Git bin directory");
+    let git = bin_dir.join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\nprintf 'count=<%s>\\nkey0=<%s>\\nvalue0=<%s>\\nordinary=<%s>\\n' \"$GIT_CONFIG_COUNT\" \"$GIT_CONFIG_KEY_0\" \"$GIT_CONFIG_VALUE_0\" \"$TURA_GIT_ENV_PRESERVED\"\n",
+    )
+    .expect("write fake Git executable");
+    let mut permissions = fs::metadata(&git).expect("fake Git metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&git, permissions).expect("make fake Git executable");
+
+    let env_names = [
+        "TURA_BASH_DOCKER_CONTAINER",
+        "TURA_BASH_DOCKER_WORKDIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "TURA_GIT_ENV_PRESERVED",
+    ];
+    let previous_env = env_names
+        .iter()
+        .map(|name| (*name, std::env::var_os(name)))
+        .collect::<Vec<_>>();
+    // SAFETY: env_lock serializes process-environment mutation in this integration test.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::remove_var("TURA_BASH_DOCKER_CONTAINER");
+        std::env::remove_var("TURA_BASH_DOCKER_WORKDIR");
+        std::env::set_var("GIT_CONFIG_KEY_0", "user.name");
+        std::env::set_var("GIT_CONFIG_VALUE_0", "fixture-user");
+        std::env::set_var("TURA_GIT_ENV_PRESERVED", "ordinary-env");
+    }
+
+    let command = format!("'{}'", single_quoted_posix_path(&git));
+    let mut observed = Vec::new();
+    for (case, count) in [
+        ("malformed", "not-a-count".to_string()),
+        ("overflow", usize::MAX.to_string()),
+    ] {
+        // SAFETY: env_lock remains held for the complete mutation and child-spawn window.
+        #[allow(
+            unsafe_code,
+            reason = "Rust 2024 process-environment mutation audited at the caller"
+        )]
+        unsafe {
+            std::env::set_var("GIT_CONFIG_COUNT", &count);
+        }
+        let result = ToolRouter::new()
+            .dispatch(
+                ToolCall {
+                    tool_name: "bash".to_string(),
+                    call_id: format!("call_{case}_git_config_count"),
+                    payload: ToolPayload::Function {
+                        arguments: json!({
+                            "command": command,
+                            "timeout_ms": 10_000
+                        }),
+                    },
+                },
+                ToolContext::new_with_lock_scope(
+                    root.clone(),
+                    Some(format!("{case}-git-config-count-scope")),
+                ),
+                false,
+            )
+            .await;
+        observed.push((case, count, result));
+    }
+    for (name, value) in previous_env {
+        restore_env_var(name, value);
+    }
+
+    for (case, count, result) in observed {
+        let result = result.expect("fake Git command dispatch");
+        assert_eq!(result.result.success, Some(true), "{case}: {result:?}");
+        let output = result.result.code_mode_result();
+        assert_eq!(
+            output["stdout"].as_str().expect("fake Git stdout"),
+            format!(
+                "count=<{count}>\nkey0=<user.name>\nvalue0=<fixture-user>\nordinary=<ordinary-env>\n"
+            ),
+            "{case} count must reach Git unchanged"
+        );
+    }
+}
+
+#[test]
+fn pass_timeout_returns_quick_failure() {
+    let _guard = env_lock_blocking();
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "shell_command")
+    };
+    let root = temp_workspace("timeout");
+    let command = if cfg!(windows) {
+        "Start-Sleep -Seconds 10"
+    } else {
+        "sleep 10"
+    };
+    let started = Instant::now();
+    let output = command_run::execute(
+        &json!({
+            "commands": [
+                {
+                    "command": "shell_command",
+                    "command_line": json!({ "command": command, "timeout_ms": 500 }).to_string()
+                }
+            ]
+        }),
+        &root,
+    );
+
+    assert_eq!(output["results"][0]["success"], false);
+    assert!(command_result_text(&output["results"][0]).contains("Timed out after"));
+    assert!(
+        output["results"][0].get("error").is_none(),
+        "timeout must be returned by the shell runtime as model-visible tool output, not by dropping command_run dispatch"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn timeout_after_effect_is_unknown_outcome_and_is_not_blindly_retried() {
+    let _guard = env_lock_blocking();
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("effectful-timeout-unknown");
+    let output = command_run::execute(
+        &json!({
+            "commands": [{
+                "command_type": "bash",
+                "command_line": "mkdir .tmp-interrupted; printf 'effect\\n' >> .tmp-interrupted/effects.txt; sleep 10",
+                "timeout_ms": 500,
+                "step": 1
+            }]
+        }),
+        &root,
+    );
+
+    let result = &output["results"][0];
+    assert_eq!(result["success"], false, "{output}");
+    assert_eq!(result["output"]["outcome"], "unknown", "{output}");
+    assert_eq!(result["output"]["retry_safe"], false, "{output}");
+    assert_eq!(result["output"]["auto_retry_allowed"], false, "{output}");
+    assert_eq!(result["output"]["reconcile_required"], true, "{output}");
+    assert_eq!(result["output"]["staging_authority"], "none", "{output}");
+    assert_eq!(
+        result["output"]["failure_class"], "wrapper_wall_clock_timeout",
+        "{output}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".tmp-interrupted/effects.txt")).expect("effect marker"),
+        "effect\n",
+        "the effectful command must execute once and must not be blindly retried"
+    );
+    assert!(!root.join("canonical-publication").exists());
+}
+
+#[tokio::test]
+async fn stall_watchdog_is_distinct_from_wall_timeout_and_writes_terminal_receipt() {
+    let _guard = env_lock().await;
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("stall-watchdog");
+    let router = ToolRouter::new();
+    let call = ToolCall {
+        tool_name: "bash".to_string(),
+        call_id: "call_stall_watchdog".to_string(),
+        payload: ToolPayload::Function {
+            arguments: json!({
+                "command": "printf 'progress-before-stall\\n'; sleep 10",
+                "timeout_ms": 10_000,
+                "stall_timeout_ms": 1_000
+            }),
+        },
+    };
+    let started = Instant::now();
+    let result = router
+        .dispatch(call, ToolContext::new(root.clone()), false)
+        .await
+        .expect("stall is model-visible output");
+    let output = result.result.code_mode_result();
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(result.result.success, Some(false));
+    assert_eq!(output["error_type"], "CommandStalled", "{output}");
+    assert_eq!(output["failure_class"], "progress_stall", "{output}");
+    assert_eq!(
+        output["terminal_receipt"]["termination_origin"], "progress_watchdog",
+        "{output}"
+    );
+    let receipt_path = output["terminal_receipt_path"]
+        .as_str()
+        .expect("terminal receipt path");
+    assert!(Path::new(receipt_path).is_file(), "{output}");
+}
+
+#[tokio::test]
+async fn workload_failure_and_wrapper_timeout_have_different_failure_classes() {
+    let _guard = env_lock().await;
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("failure-classes");
+    let router = ToolRouter::new();
+    let failed = router
+        .dispatch(
+            ToolCall {
+                tool_name: "bash".to_string(),
+                call_id: "call_workload_exit".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: json!({ "command": "exit 7", "timeout_ms": 5_000 }),
+                },
+            },
+            ToolContext::new(root.clone()),
+            false,
+        )
+        .await
+        .expect("workload failure output");
+    let timed_out = router
+        .dispatch(
+            ToolCall {
+                tool_name: "bash".to_string(),
+                call_id: "call_wrapper_timeout".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: json!({ "command": "sleep 10", "timeout_ms": 1_000 }),
+                },
+            },
+            ToolContext::new(root),
+            false,
+        )
+        .await
+        .expect("wrapper timeout output");
+
+    assert_eq!(
+        failed.result.code_mode_result()["terminal_receipt"]["failure_class"],
+        "workload_exit_nonzero"
+    );
+    assert_eq!(
+        timed_out.result.code_mode_result()["failure_class"],
+        "wrapper_wall_clock_timeout"
+    );
+}
+
+#[tokio::test]
+async fn background_child_terminal_writes_one_receipt_and_duplicate_call_is_not_reexecuted() {
+    let _guard = env_lock().await;
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("background-terminal");
+    let router = ToolRouter::new();
+    let call = ToolCall {
+        tool_name: "bash".to_string(),
+        call_id: "call_background_terminal".to_string(),
+        payload: ToolPayload::Function {
+            arguments: json!({
+                "command": "sh -c 'sleep 1; printf terminal >> executions.txt' & wait",
+                "timeout_ms": 10_000,
+                "stall_timeout_ms": 5_000
+            }),
+        },
+    };
+    let first = router
+        .dispatch(call.clone(), ToolContext::new(root.clone()), false)
+        .await
+        .expect("background child terminal output");
+    let duplicate = router
+        .dispatch(call, ToolContext::new(root.clone()), false)
+        .await
+        .expect("duplicate is model-visible admission failure");
+
+    assert_eq!(first.result.success, Some(true));
+    assert_eq!(
+        first.result.code_mode_result()["terminal_receipt"]["terminal_state"],
+        "completed"
+    );
+    assert_eq!(duplicate.result.success, Some(false));
+    assert_eq!(
+        duplicate.result.code_mode_result()["error_type"],
+        "CommandExecutionClaimFailed"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("executions.txt")).expect("execution marker"),
+        "terminal",
+        "same call identity must execute the workload exactly once"
+    );
+}
+
+#[tokio::test]
+async fn detached_background_child_is_reconciled_after_parent_terminal_receipt() {
+    let _guard = env_lock().await;
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("detached-background-terminal");
+    let router = ToolRouter::new();
+    let call = ToolCall {
+        tool_name: "bash".to_string(),
+        call_id: "call_detached_background_terminal".to_string(),
+        payload: ToolPayload::Function {
+            arguments: json!({
+                "command": "sh -c 'sleep 1; printf detached-terminal >> detached.txt' &",
+                "timeout_ms": 10_000,
+                "stall_timeout_ms": 5_000
+            }),
+        },
+    };
+    let context =
+        ToolContext::new_with_lock_scope(root.clone(), Some("detached-session".to_string()));
+    let result = router
+        .dispatch(call, context, false)
+        .await
+        .expect("detached background command should return a terminal receipt");
+    assert_eq!(result.result.success, Some(true), "{result:?}");
+    assert_eq!(
+        result.result.code_mode_result()["terminal_receipt"]["terminal_state"],
+        "completed"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline && !root.join("detached.txt").exists() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(root.join("detached.txt").exists(), "{result:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline
+        && code_tools::shell_executor::retained_shell_process_scope_count_for_scope(
+            "detached-session",
+        ) != 0
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        code_tools::shell_executor::retained_shell_process_scope_count_for_scope(
+            "detached-session"
+        ),
+        0,
+        "detached child must release its retained scope after terminal completion"
+    );
+}
+
+#[test]
+fn commands_over_fifteen_seconds_complete_with_top_level_and_per_command_allowances() {
+    let _guard = env_lock_blocking();
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("declared-long-timeouts");
+    let started = Instant::now();
+    let output = command_run::execute(
+        &json!({
+            "timeout_ms": 25_000,
+            "commands": [
+                {
+                    "command_type": "bash",
+                    "command_line": "sleep 16; printf 'top-level-ok\\n'",
+                    "step": 1
+                },
+                {
+                    "command_type": "bash",
+                    "command_line": "sleep 16; printf 'per-command-ok\\n'",
+                    "timeout_ms": 26_000,
+                    "step": 1
+                }
+            ]
+        }),
+        &root,
+    );
+
+    assert_eq!(output["results"][0]["success"], true, "{output}");
+    assert_eq!(output["results"][1]["success"], true, "{output}");
+    assert!(command_result_text(&output["results"][0]).contains("top-level-ok"));
+    assert!(command_result_text(&output["results"][1]).contains("per-command-ok"));
+    assert!(started.elapsed() >= Duration::from_secs(30));
+    assert!(
+        started.elapsed() < Duration::from_secs(40),
+        "both declared allowances should complete without the 15-second default"
+    );
+}
+
+#[test]
+fn fail_timeout_kills_descendant_process_tree_quickly() {
+    let _guard = env_lock_blocking();
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("descendant-timeout");
+    let started = Instant::now();
+    let output = command_run::execute(
+        &json!({
+            "commands": [
+                {
+                    "command": "bash",
+                    "command_line": json!({ "command": "sleep 10", "timeout_ms": 500 }).to_string()
+                }
+            ]
+        }),
+        &root,
+    );
+
+    assert_eq!(output["results"][0]["success"], false);
+    assert!(command_result_text(&output["results"][0]).contains("Timed out after"));
+    assert!(
+        output["results"][0].get("error").is_none(),
+        "descendant timeout must be converted by the shell runtime instead of outer command_run timeout"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn pass_async_command_run_entry_does_not_start_nested_runtime() {
+    let _guard = env_lock().await;
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "shell_command")
+    };
+    let root = temp_workspace("async-entry");
+    let command = if cfg!(windows) {
+        "Write-Output async-ok"
+    } else {
+        "echo async-ok"
+    };
+    let output = command_run::execute_async_value(
+        json!({
+            "commands": [
+                { "command": "shell_command", "command_line": json!({ "command": command }).to_string() }
+            ]
+        }),
+        root,
+    )
+    .await;
+
+    assert_eq!(output["results"][0]["success"], true);
+    assert!(command_result_text(&output["results"][0]).contains("async-ok"));
+}
+
+#[test]
+fn pass_bash_surface_runs_posix_script_without_exposing_shell_command() {
+    let _guard = env_lock_blocking();
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("bash-script");
+    let output = command_run::execute(
+        &json!({
+            "commands": [
+                {
+                    "command": "bash",
+                    "command_line": json!({ "command": "for x in one two; do echo $x; done", "timeout_ms": 30000 }).to_string()
+                }
+            ]
+        }),
+        &root,
+    );
+
+    assert_eq!(commands::canonical_command("shell_command"), "bash");
+    assert!(output["results"][0].get("command").is_none());
+    assert_eq!(output["results"][0]["command_type"], "bash");
+    assert_eq!(
+        output["results"][0]["success"], true,
+        "bash surface should succeed: {output}"
+    );
+    assert!(command_result_text(&output["results"][0]).contains("one"));
+}
+
+#[test]
+#[cfg(unix)]
+fn pass_zsh_surface_runs_zsh_script_without_exposing_shell_command() {
+    let _guard = env_lock_blocking();
+    if !zsh_available() {
+        eprintln!("zsh unavailable; skipping zsh execution fixture");
+        return;
+    }
+    // SAFETY: this test holds the process-wide environment lock above.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "zsh")
+    };
+    let root = temp_workspace("zsh-script");
+    let output = command_run::execute(
+        &json!({
+            "commands": [
+                {
+                    "command": "zsh",
+                    "command_line": json!({ "command": "arr=(alpha beta); print -r -- ${arr[1]}; [[ -n \"$ZSH_VERSION\" ]]", "timeout_ms": 5000 }).to_string()
+                }
+            ]
+        }),
+        &root,
+    );
+
+    assert_eq!(commands::canonical_command("shell_command"), "zsh");
+    assert!(output["results"][0].get("command").is_none());
+    assert_eq!(output["results"][0]["command_type"], "zsh");
+    assert_eq!(output["results"][0]["success"], true);
+    let text = command_result_text(&output["results"][0]);
+    assert!(text.contains("alpha"), "{output}");
+    assert!(!text.contains("beta"), "{output}");
+}
+
+#[test]
+fn fail_zsh_surface_reports_missing_configured_binary() {
+    let _guard = env_lock_blocking();
+    let previous_shell = std::env::var_os("TURA_COMMAND_RUN_SHELL");
+    let previous_zsh_path = std::env::var_os("TURA_ZSH_PATH");
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "zsh")
+    };
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var(
+            "TURA_ZSH_PATH",
+            if cfg!(windows) {
+                r"C:\definitely\missing\tura-zsh.exe"
+            } else {
+                "/definitely/missing/tura-zsh"
+            },
+        )
+    };
+    let root = temp_workspace("zsh-missing");
+    let output = command_run::execute(
+        &json!({
+            "commands": [
+                {
+                    "command": "zsh",
+                    "command_line": json!({ "command": "print -r -- zsh-ok", "timeout_ms": 1000 }).to_string()
+                }
+            ]
+        }),
+        &root,
+    );
+
+    restore_env_var("TURA_COMMAND_RUN_SHELL", previous_shell);
+    restore_env_var("TURA_ZSH_PATH", previous_zsh_path);
+    assert_eq!(output["results"][0]["command_type"], "zsh");
+    assert_eq!(output["results"][0]["success"], false);
+    assert!(command_result_text(&output["results"][0]).contains("zsh executable was not found"));
+}
+
+#[test]
+fn pass_shell_surface_isolation_canonicalizes_to_one_active_shell() {
+    let _guard = env_lock_blocking();
+
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    assert_eq!(commands::canonical_command("shell_command"), "bash");
+    assert_eq!(commands::canonical_command("shll"), "bash");
+    assert_eq!(commands::canonical_command("bash"), "bash");
+    assert_eq!(commands::canonical_command("zsh"), "bash");
+
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "zsh")
+    };
+    assert_eq!(commands::canonical_command("shell_command"), "zsh");
+    assert_eq!(commands::canonical_command("shll"), "zsh");
+    assert_eq!(commands::canonical_command("bash"), "zsh");
+    assert_eq!(commands::canonical_command("zsh"), "zsh");
+
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "shll")
+    };
+    assert_eq!(commands::canonical_command("bash"), "shell_command");
+    assert_eq!(commands::canonical_command("zsh"), "shell_command");
+    assert_eq!(
+        commands::canonical_command("shell_command"),
+        "shell_command"
+    );
+}
+
+#[tokio::test]
+async fn fail_pre_tool_hook_blocks_tool_before_runtime() {
+    let _guard = env_lock().await;
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "shell_command")
+    };
+    let root = temp_workspace("pre-hook");
+    let ctx = ToolContext::new(root);
+    ctx.set_pre_hook(|call| {
+        Err(ToolError::RespondToModel(format!(
+            "blocked by hook: {}",
+            call.tool_name
+        )))
+    });
+    let router = ToolRouter::new();
+    let call = ToolCall {
+        tool_name: "shell_command".to_string(),
+        call_id: "call_pre_hook".to_string(),
+        payload: ToolPayload::Function {
+            arguments: json!({ "command": "Write-Output should-not-run", "timeout_ms": 5000 }),
+        },
+    };
+
+    let error = router
+        .dispatch(call, ctx.clone(), false)
+        .await
+        .expect_err("pre hook should block dispatch");
+
+    assert!(error.to_string().contains("blocked by hook"));
+    assert!(
+        ctx.events().is_empty(),
+        "pre hook should run before tool-started events"
+    );
+}
+
+#[tokio::test]
+async fn pass_post_tool_hook_can_replace_model_visible_response() {
+    let _guard = env_lock().await;
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "shell_command")
+    };
+    let root = temp_workspace("post-hook");
+    let ctx = ToolContext::new(root);
+    ctx.set_post_hook(|_call, output: &mut FunctionToolOutput| {
+        output.body = json!({ "output": "replaced by post hook", "metadata": { "exit_code": 0 } });
+        output.success = Some(true);
+        Ok(())
+    });
+    let router = ToolRouter::new();
+    let call = ToolCall {
+        tool_name: "shell_command".to_string(),
+        call_id: "call_post_hook".to_string(),
+        payload: ToolPayload::Function {
+            arguments: json!({ "command": "Write-Output original", "timeout_ms": 5000 }),
+        },
+    };
+
+    let result = router
+        .dispatch(call, ctx.clone(), false)
+        .await
+        .expect("post hook should allow dispatch");
+
+    assert_eq!(
+        result.result.code_mode_result()["output"],
+        "replaced by post hook"
+    );
+    assert!(ctx.events().iter().any(|event| matches!(
+        event,
+        ToolRuntimeEvent::ToolFinished {
+            call_id,
+            success: true,
+            ..
+        } if call_id == "call_post_hook"
+    )));
+}
+
+#[tokio::test]
+async fn pass_shell_runtime_records_stdout_stderr_delta_events() {
+    let _guard = env_lock().await;
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "shell_command")
+    };
+    let root = temp_workspace("stream-delta");
+    let command = if cfg!(windows) {
+        "Write-Output out-delta; [Console]::Error.WriteLine('err-delta')"
+    } else {
+        "echo out-delta; echo err-delta >&2"
+    };
+    let ctx = ToolContext::new(root);
+    let router = ToolRouter::new();
+    let call = ToolCall {
+        tool_name: "shell_command".to_string(),
+        call_id: "call_delta".to_string(),
+        payload: ToolPayload::Function {
+            arguments: json!({ "command": command, "timeout_ms": 5000 }),
+        },
+    };
+
+    let result = router
+        .dispatch(call, ctx.clone(), false)
+        .await
+        .expect("streaming command should succeed");
+
+    assert_eq!(result.result.success, Some(true));
+    let events = ctx.events();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ToolRuntimeEvent::OutputDelta {
+            call_id,
+            stream,
+            text,
+        } if call_id == "call_delta" && stream == "stdout" && text.contains("out-delta")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ToolRuntimeEvent::OutputDelta {
+            call_id,
+            stream,
+            text,
+        } if call_id == "call_delta" && stream == "stderr" && text.contains("err-delta")
+    )));
+}
+
+#[tokio::test]
+async fn fail_turn_cancellation_aborts_running_shell_command() {
+    let _guard = env_lock().await;
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "shell_command")
+    };
+    let root = temp_workspace("cancel");
+    let command = if cfg!(windows) {
+        "Start-Sleep -Seconds 10"
+    } else {
+        "sleep 10"
+    };
+    let ctx = ToolContext::new(root);
+    let cancellation = ctx.cancellation.clone();
+    let router = ToolRouter::new();
+    let call = ToolCall {
+        tool_name: "shell_command".to_string(),
+        call_id: "call_cancel".to_string(),
+        payload: ToolPayload::Function {
+            arguments: json!({ "command": command, "timeout_ms": 30000 }),
+        },
+    };
+    let started = Instant::now();
+    let task = tokio::spawn(async move { router.dispatch(call, ctx, false).await });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    cancellation.cancel();
+    let result = task
+        .await
+        .expect("dispatch task should join")
+        .expect("dispatch should return model-visible failure output");
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(result.result.success, Some(false));
+    assert!(
+        result.result.code_mode_result()["stderr"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("tool task aborted")
+    );
+}
+
+#[tokio::test]
+async fn pass_concurrent_shell_command_runs_do_not_block_async_runtime_or_cross_workspaces() {
+    let _guard = env_lock().await;
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "shell_command")
+    };
+    let roots = (0..4)
+        .map(|index| temp_workspace(&format!("concurrent-shell-{index}")))
+        .collect::<Vec<_>>();
+    let run_all = async {
+        let mut tasks = Vec::new();
+        for (index, root) in roots.iter().enumerate() {
+            let root = root.clone();
+            let marker = format!("command-run-concurrent-{index}");
+            let file_name = format!("concurrent-{index}.txt");
+            tasks.push(tokio::spawn(async move {
+                let output = command_run::execute_async_value(
+                    json!({
+                        "commands": [{
+                            "command": "shell_command",
+                            "command_line": json!({
+                                "command": format!("echo {marker} > {file_name}"),
+                                "timeout_ms": 5000
+                            }).to_string(),
+                            "step": 1
+                        }]
+                    }),
+                    root.clone(),
+                )
+                .await;
+                (index, root, marker, file_name, output)
+            }));
+        }
+
+        let mut completed = Vec::new();
+        for task in tasks {
+            completed.push(task.await.expect("command_run task should join"));
+        }
+        completed
+    };
+
+    let mut completed = tokio::time::timeout(Duration::from_secs(20), run_all)
+        .await
+        .expect("concurrent shell command_run calls should finish before the business timeout");
+    completed.sort_by_key(|(index, _, _, _, _)| *index);
+
+    for (index, root, marker, file_name, output) in completed {
+        assert_eq!(output["results"][0]["command_type"], "shell_command");
+        assert_eq!(
+            output["results"][0]["success"], true,
+            "concurrent shell command should succeed: {output}"
+        );
+        let text = fs::read_to_string(root.join(&file_name)).unwrap_or_else(|error| {
+            panic!(
+                "workspace {} should contain {file_name}: {error}",
+                root.display()
+            )
+        });
+        assert!(text.contains(&marker));
+        let serialized = output.to_string();
+        assert!(serialized.contains("shell_command"));
+        for other in 0..roots.len() {
+            if other != index {
+                assert!(
+                    !serialized.contains(&format!("concurrent-{other}.txt")),
+                    "command_run result {index} should not mention another workspace: {output}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fail_timeout_aborts_reader_drain_for_pipe_holding_descendants() {
+    let _guard = env_lock().await;
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_COMMAND_RUN_SHELL", "bash")
+    };
+    let root = temp_workspace("reader-drain");
+    let router = ToolRouter::new();
+    let call = ToolCall {
+        tool_name: "bash".to_string(),
+        call_id: "call_drain".to_string(),
+        payload: ToolPayload::Function {
+            arguments: json!({ "command": "sh -c 'sleep 10 & wait'", "timeout_ms": 500 }),
+        },
+    };
+    let started = Instant::now();
+
+    let result = router
+        .dispatch(call, ToolContext::new(root), false)
+        .await
+        .expect("timeout should be reported as tool output");
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(result.result.success, Some(false));
+    assert!(
+        result.result.code_mode_result()["stderr"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Timed out")
+    );
+}

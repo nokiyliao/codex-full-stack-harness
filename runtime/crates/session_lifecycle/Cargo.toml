@@ -1,0 +1,18 @@
+[package]
+name = "session_lifecycle"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+fs2.workspace = true
+notify.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+lifecycle.workspace = true
+runtime_contract.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

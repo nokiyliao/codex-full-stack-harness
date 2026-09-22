@@ -1,0 +1,41 @@
+{
+  "schema_version": "public_provenance_manifest_v1",
+  "prepared_date": "2026-08-31",
+  "source": {
+    "source_kind": "internal_allowlisted_aggregate_projection",
+    "source_sha256": "dabbd22b3e6dafd526a1f30af37131b78f36a64f89669c669cadc739f33bc816",
+    "digest_scope": "canonical JSON containing only the allowlisted aggregate numeric fields",
+    "fields": [
+      "clean_verified",
+      "cleanup_residue_count",
+      "duplicate_effect_count",
+      "full_verified",
+      "harness_lift_accuracy_points",
+      "mcnemar_exact_two_sided_p",
+      "pair_count",
+      "protected_effect_count",
+      "snapshot_count",
+      "source_escape_count",
+      "token_reduction_fraction",
+      "trial_count",
+      "verified_completion_productivity_ratio",
+      "wall_time_reduction_fraction"
+    ],
+    "reproducible_from_public_bytes": false,
+    "source_path_disclosed": false
+  },
+  "transformation": {
+    "method": "allowlisted aggregate field selection and neutral relabeling",
+    "private_paths_removed": true,
+    "row_level_data_included": false,
+    "causal_claim_added": false
+  },
+  "artifacts": [
+    {
+      "path": "evidence/internal_benchmark_summary.json",
+      "media_type": "application/json",
+      "sha256": "52156ac6b781df85add50977c22c7685fe2624e0a676f35785bca7fb8b3b0cec",
+      "bytes": 1119
+    }
+  ]
+}

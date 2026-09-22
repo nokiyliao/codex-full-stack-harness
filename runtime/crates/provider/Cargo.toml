@@ -1,0 +1,88 @@
+[package]
+name = "provider"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "tura_llm_rust"
+path = "src/lib.rs"
+
+[[test]]
+name = "provider_tool_call_live_smoke"
+path = "tests/live/provider_tool_call_live_smoke.rs"
+harness = false
+required-features = ["live-tests"]
+
+[[test]]
+name = "claude_code_live_smoke"
+path = "tests/live/claude_code_live_smoke.rs"
+required-features = ["live-tests"]
+
+[[test]]
+name = "responses_tier_live_smoke"
+path = "tests/live/responses_tier_live_smoke.rs"
+harness = false
+required-features = ["live-tests"]
+
+[[test]]
+name = "codex_priority_tps_live"
+path = "tests/live/codex_priority_tps_live.rs"
+required-features = ["live-tests"]
+
+[[test]]
+name = "final_turn_cache_live"
+path = "tests/live/final_turn_cache_live.rs"
+harness = false
+required-features = ["live-tests"]
+
+[[test]]
+name = "workspace_session_cache_live"
+path = "tests/live/workspace_session_cache_live.rs"
+harness = false
+required-features = ["live-tests"]
+
+[[test]]
+name = "live_model_smoke"
+path = "tests/live/live_model_smoke.rs"
+required-features = ["live-tests"]
+
+[features]
+business-tests = []
+live-tests = []
+
+[[test]]
+name = "openai_compatible_local_flow"
+path = "tests/live/openai_compatible_local_flow.rs"
+required-features = ["live-tests"]
+
+[[test]]
+name = "google_local_flow"
+path = "tests/live/google_local_flow.rs"
+required-features = ["live-tests"]
+
+[[test]]
+name = "official_codex_app_server_flow"
+path = "tests/official_codex_app_server_flow.rs"
+harness = false
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+dotenvy.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+tokio-tungstenite = "0.29"
+regex.workspace = true
+tura_path.workspace = true
+sha2 = "0.10"
+runtime_contract.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

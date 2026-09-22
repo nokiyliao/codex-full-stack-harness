@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a bounded, domain-neutral enhancement.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the collaboration failure or missing public contract.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Measurable outcome
+      description: State the observable predicate that should become true.
+    validations:
+      required: true
+  - type: textarea
+    id: route
+    attributes:
+      label: Smallest proposed route
+      description: Explain why the change belongs in this reference harness.
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Trust boundaries and non-goals
+      description: Identify authority, persistence, or provider behavior that remains external.
+    validations:
+      required: true
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Public-data check
+      options:
+        - label: This proposal uses only synthetic or already-public evidence.
+          required: true

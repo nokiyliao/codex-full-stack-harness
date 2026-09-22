@@ -1,0 +1,21 @@
+//! `tura_session_db` — the session-log SQLite owner.
+//!
+//! Gateway, router, runtime workers, and the CLI front reach the store through
+//! its socket (`session_log::ipc`). The role marker identifies this process as
+//! the embedded SQLite owner.
+
+fn main() -> anyhow::Result<()> {
+    if std::env::args_os().len() > 1 {
+        return session_log::cli::run();
+    }
+    tura_path::process_hardening::harden_current_process("session_db");
+    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+    #[allow(
+        unsafe_code,
+        reason = "Rust 2024 process-environment mutation audited at the caller"
+    )]
+    unsafe {
+        std::env::set_var("TURA_ROLE", "session_db")
+    };
+    session_log::service::run_socket_service()
+}

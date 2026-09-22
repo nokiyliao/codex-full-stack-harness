@@ -1,4 +1,52 @@
-# Codex Full Stack Harness
+# Nokiy v9 - Codex Full Stack Harness
+
+This repository now publishes the source of the local **Nokiy execution pipeline**.
+The aggregate release `v9` combines caller v9 (`0.3.21.dev0`) with the previously
+verified v8 Rust runtime artifacts. No binary is renamed or rebuilt just to align
+version numbers. This is a **source snapshot**, not a portable binary release.
+
+```text
+Parent Codex task -> Nokiy prepare -> DCF/local context + J-Space
+  -> direct/balanced Rust runtime -> tools -> terminal result -> parent acceptance
+```
+
+The default prepared `direct` profile uses execution-local Router and Session DB
+processes; Codex retains the user's task, Goal and UI ownership. The separate
+native-once path is not the default full runtime. The deterministic deploy lane
+carries an already-authorized plan, not model-generated authority.
+
+| Source | Purpose | License |
+| --- | --- | --- |
+| [packages/nokiy](packages/nokiy) | Python caller, context preparation, recovery, deployment, tests and skill | MIT |
+| [runtime](runtime) | Modified Tura-derived Rust execution engine and build inputs | AGPL-3.0-or-later |
+| [releases/v9.json](releases/v9.json) | Unified release identity, per-file source hashes and installed artifact identities | Repository license |
+
+## Verify and build
+
+```sh
+python3 scripts/verify_release.py
+python3 -m venv .venv
+.venv/bin/python -m pip install ./packages/nokiy
+.venv/bin/nokiy-embedded-run --help
+cd runtime
+cargo build --locked --release --bin tura_router --bin tura_runtime --bin tura_session_db --bin tura_exec
+```
+
+Python 3.11+ and the Rust toolchain pinned in `runtime/rust-toolchain.toml` are
+required. Building is not live installation: execution also needs a machine-local
+frozen runtime image, native Codex identity and a scoped prepared request.
+See [v9 boundaries](docs/nokiy-v9.md). Do not copy credentials or reuse another
+machine's absolute installation paths. DCF remains an external integration.
+
+Source-to-binary reproducibility and clean-machine runtime installation have not
+been established by this publication. Installed binary hashes are observations,
+not proof that the source snapshot rebuilds byte-identically. No credentials,
+session DBs, execution logs, build caches or installed binaries are published.
+
+## Historical architecture proposal
+
+The following section is retained as historical design intent. The v9 description
+and manifest above supersede its distribution status and proposed plugin topology.
 
 Codex Full Stack Harness is the integration home for a local-first Codex
 collaboration stack. It is evolving from a separate Tura runtime into a native

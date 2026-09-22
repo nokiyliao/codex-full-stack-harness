@@ -1,0 +1,861 @@
+use std::io::{self, Read};
+use std::path::PathBuf;
+
+use runtime_contract::{ModelServiceTier, SESSION_SERVICE_TIER_ENV};
+
+pub(crate) fn wants_help(args: &[String]) -> bool {
+    let start = usize::from(args.first().is_some_and(|arg| arg == "exec"));
+    let shell_help = args
+        .get(start)
+        .is_some_and(|arg| is_command_run_shell_command(arg))
+        && is_help_arg(args.get(start + 1).map(String::as_str));
+    is_help_arg(args.get(start).map(String::as_str)) || shell_help
+}
+
+pub(crate) fn print_help() {
+    println!(
+        "\
+Tura Rust CLI
+
+Usage:
+  tura exec [OPTIONS] [PROMPT...]
+  tura exec bash [OPTIONS] [PROMPT...]
+  tura exec zsh [OPTIONS] [PROMPT...]
+  tura exec shll [OPTIONS] [PROMPT...]
+  tura_exec exec [OPTIONS] [PROMPT...]
+  tura_exec [OPTIONS] [PROMPT...]
+
+Options:
+  -C, --cwd PATH                  workspace directory for the session
+  -m, --model MODEL               model override; bare names become openai/MODEL
+  -p, --priority                  enable priority model routing for this model
+      --service-tier TIER         service tier: default, priority, or ultrafast
+  -a, --agent-id ID               agent id loaded from agents/src/
+      --session-id ID             reuse a deterministic session id
+      --router-address IP:PORT    use only this caller-owned loopback Router; never autostart
+      --task-context-capsule PATH forward a validated task capsule (requires J-Space and Router)
+      --jspace-contract PATH      forward the matching J-Space authority contract
+      --timeout SECONDS           outer observation budget; command deadlines remain per-command
+      --goal                      keep the CLI session running until task_status marks done/question
+      --no-op                     disable operation manual injection unless goal/reflection overrides it
+      --json                      emit JSONL events instead of final text only
+      -log, --log                 write current-turn tokens, timing, tools, and text to stderr
+      --quiet, --silent           suppress progress on stderr
+      --output-last-message PATH  write the final assistant message to PATH
+      --model-reasoning-effort LEVEL
+                                  reasoning effort override
+      --planning MODE       planning override: auto, on, or off
+                                  (default: auto, follows selected agent config)
+      --capability DIR[,DIR...]  force-enable command package directories (repeatable)
+      --bash, --zsh, --shll       force the command-run shell surface for this turn
+      --sandbox                   restrict command_run writes/workdirs to the workspace
+  -c, --config KEY=VALUE          runtime override:
+                                  model_reasoning_effort, max_tokens,
+                                  model_max_tokens,
+                                  service_tier=default|priority|ultrafast,
+                                  planning=auto|on|off,
+                                  command_run_shell=bash|zsh|shll
+      --skip-git-repo-check       accepted for compatibility
+      --dangerously-bypass-approvals-and-sandbox
+                                  allow the exact CLI session to approve required file/process access
+  -h, --help                      show this help
+
+Output:
+  Default text mode keeps stdout script-friendly: stdout receives only the final
+  assistant message, while lightweight progress goes to stderr.
+  Use --quiet or --silent to suppress stderr progress.
+  Use --json for stdout JSONL events instead of final text mode.
+
+If PROMPT is omitted, tura_exec reads it from stdin.
+
+Examples:
+  tura exec -C . -m openai/gpt-5 \"Inspect the workspace\"
+  tura exec zsh \"Inspect shell startup files with zsh semantics\"
+  tura exec --bash \"Run command tools through bash for this turn\"
+  tura exec --shll \"Use the system shell_command surface for this turn\"
+  tura exec -C . -m openai/gpt-5 -p --model-reasoning-effort high \"Fix tests\"
+  tura exec --service-tier ultrafast \"Fix tests with ultrafast service\"
+  tura exec --quiet \"Return only the final answer\"
+  echo \"Summarize the architecture\" | tura exec --json
+"
+    );
+}
+
+#[derive(Debug)]
+pub(crate) struct CliConfig {
+    pub(crate) cwd: PathBuf,
+    pub(crate) json: bool,
+    pub(crate) log: bool,
+    pub(crate) quiet: bool,
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) service_tier: Option<ModelServiceTier>,
+    pub(crate) priority: bool,
+    pub(crate) planning_mode: Option<bool>,
+    pub(crate) goal_mode: bool,
+    pub(crate) no_op_manual: bool,
+    pub(crate) max_tokens: Option<u64>,
+    pub(crate) command_run_shell: Option<String>,
+    pub(crate) command_run_sandbox: bool,
+    pub(crate) disable_permission_restrictions: Option<bool>,
+    pub(crate) agent: Option<String>,
+    pub(crate) capability_directories: Vec<PathBuf>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) router_address: Option<std::net::SocketAddr>,
+    pub(crate) task_context_capsule: Option<PathBuf>,
+    pub(crate) jspace_contract: Option<PathBuf>,
+    pub(crate) timeout_secs: Option<u64>,
+    pub(crate) last_message_path: Option<PathBuf>,
+    /// `--embedded`: run the runtime in-process (codex-style in-process transport),
+    /// still connecting to the per-home single session_db owner. Default is the
+    /// thin-client path: dispatch the turn to the detached `tura_router` daemon.
+    pub(crate) embedded: bool,
+    prompt_parts: Vec<String>,
+}
+
+impl CliConfig {
+    pub(crate) fn parse(mut args: Vec<String>) -> Result<Self, String> {
+        if args.first().is_some_and(|arg| arg == "exec") {
+            args.remove(0);
+        }
+
+        let mut config = Self {
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            json: false,
+            log: false,
+            quiet: false,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            priority: false,
+            planning_mode: None,
+            goal_mode: false,
+            no_op_manual: false,
+            max_tokens: None,
+            command_run_shell: None,
+            command_run_sandbox: false,
+            disable_permission_restrictions: None,
+            agent: None,
+            capability_directories: Vec::new(),
+            session_id: None,
+            router_address: None,
+            task_context_capsule: None,
+            jspace_contract: None,
+            timeout_secs: None,
+            last_message_path: None,
+            embedded: false,
+            prompt_parts: Vec::new(),
+        };
+
+        if args
+            .first()
+            .is_some_and(|arg| is_command_run_shell_command(arg))
+        {
+            config.command_run_shell = Some(parse_command_run_shell_surface(&args.remove(0))?);
+        }
+
+        let mut index = 0;
+        while index < args.len() {
+            let arg = args[index].as_str();
+            if let Some(value) = arg.strip_prefix("--model=") {
+                config.model = Some(value.to_string());
+                index += 1;
+                continue;
+            }
+            if let Some(value) = arg
+                .strip_prefix("--agent-id=")
+                .or_else(|| arg.strip_prefix("--agent="))
+            {
+                config.agent = Some(value.to_string());
+                index += 1;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--model-reasoning-effort=") {
+                config.reasoning_effort = Some(value.to_string());
+                index += 1;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--service-tier=") {
+                set_service_tier(&mut config, value.parse()?);
+                index += 1;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--planning=") {
+                config.planning_mode = parse_planning_mode(value)?;
+                index += 1;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--capability=") {
+                extend_capability_directories(&mut config.capability_directories, value)?;
+                index += 1;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--timeout=") {
+                config.timeout_secs = parse_timeout_secs(value)?;
+                index += 1;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--config=") {
+                apply_config_arg(&mut config, value)?;
+                index += 1;
+                continue;
+            }
+            match arg {
+                "--router-address" => {
+                    config.router_address = Some(super::scoped::parse_router_address(
+                        &take_value(&args, index)?,
+                    )?);
+                    index += 2;
+                }
+                "--task-context-capsule" => {
+                    config.task_context_capsule = Some(PathBuf::from(take_value(&args, index)?));
+                    index += 2;
+                }
+                "--jspace-contract" => {
+                    config.jspace_contract = Some(PathBuf::from(take_value(&args, index)?));
+                    index += 2;
+                }
+                "--skip-git-repo-check" => {
+                    index += 1;
+                }
+                "--dangerously-bypass-approvals-and-sandbox" => {
+                    config.disable_permission_restrictions = Some(true);
+                    index += 1;
+                }
+                "--sandbox" => {
+                    config.command_run_sandbox = true;
+                    index += 1;
+                }
+                "--goal" => {
+                    config.goal_mode = true;
+                    index += 1;
+                }
+                "--no-op" => {
+                    config.no_op_manual = true;
+                    index += 1;
+                }
+                "--bash" | "--zsh" | "--shll" => {
+                    config.command_run_shell = Some(parse_command_run_shell_flag(arg)?);
+                    index += 1;
+                }
+                "--json" => {
+                    config.json = true;
+                    index += 1;
+                }
+                "-log" | "--log" => {
+                    config.log = true;
+                    index += 1;
+                }
+                "--quiet" | "--silent" => {
+                    config.quiet = true;
+                    index += 1;
+                }
+                "--embedded" => {
+                    config.embedded = true;
+                    index += 1;
+                }
+                "--planning" => {
+                    config.planning_mode = parse_planning_mode(&take_value(&args, index)?)?;
+                    index += 2;
+                }
+                "-p" | "--priority" => {
+                    set_service_tier(&mut config, ModelServiceTier::Priority);
+                    index += 1;
+                }
+                "-C" | "--cwd" => {
+                    let value = take_value(&args, index)?;
+                    config.cwd = PathBuf::from(value);
+                    index += 2;
+                }
+                "-m" | "--model" => {
+                    config.model = Some(take_value(&args, index)?);
+                    index += 2;
+                }
+                "--model-reasoning-effort" | "--reasoning-effort" => {
+                    config.reasoning_effort = Some(take_value(&args, index)?);
+                    index += 2;
+                }
+                "--service-tier" => {
+                    set_service_tier(&mut config, take_value(&args, index)?.parse()?);
+                    index += 2;
+                }
+                "--output-last-message" => {
+                    config.last_message_path = Some(PathBuf::from(take_value(&args, index)?));
+                    index += 2;
+                }
+                "-a" | "--agent" | "--agent-id" | "--agent-name" => {
+                    config.agent = Some(take_value(&args, index)?);
+                    index += 2;
+                }
+                "--session-id" => {
+                    config.session_id = Some(take_value(&args, index)?);
+                    index += 2;
+                }
+                "--timeout" | "--timeout-secs" => {
+                    config.timeout_secs = parse_timeout_secs(&take_value(&args, index)?)?;
+                    index += 2;
+                }
+                "--capability" => {
+                    let value = take_value(&args, index)?;
+                    extend_capability_directories(&mut config.capability_directories, &value)?;
+                    index += 2;
+                }
+                "-c" | "--config" => {
+                    apply_config_arg(&mut config, &take_value(&args, index)?)?;
+                    index += 2;
+                }
+                value if value.starts_with('-') => {
+                    return Err(format!("unsupported tura option: {value}"));
+                }
+                _ => {
+                    config.prompt_parts.extend(args[index..].iter().cloned());
+                    break;
+                }
+            }
+        }
+
+        super::scoped::validate_options(&config)?;
+        Ok(config)
+    }
+
+    pub(crate) fn prompt(&self) -> Result<String, String> {
+        let prompt = self.prompt_parts.join(" ").trim().to_string();
+        if !prompt.is_empty() {
+            return Ok(prompt);
+        }
+        let mut stdin = String::new();
+        io::stdin()
+            .read_to_string(&mut stdin)
+            .map_err(|err| format!("failed to read prompt from stdin: {err}"))?;
+        let stdin = stdin.trim().to_string();
+        if stdin.is_empty() {
+            return Err("prompt cannot be empty".to_string());
+        }
+        Ok(stdin)
+    }
+
+    pub(crate) fn effective_service_tier(&self) -> ModelServiceTier {
+        self.service_tier
+            .or_else(|| {
+                std::env::var(SESSION_SERVICE_TIER_ENV)
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap_or_else(|| {
+                if self.priority {
+                    ModelServiceTier::Priority
+                } else {
+                    ModelServiceTier::Default
+                }
+            })
+    }
+}
+
+fn parse_timeout_secs(value: &str) -> Result<Option<u64>, String> {
+    let seconds = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("timeout must be a positive number of seconds: {value}"))?;
+    if seconds == 0 {
+        return Err("timeout must be greater than zero".to_string());
+    }
+    Ok(Some(seconds))
+}
+
+fn extend_capability_directories(
+    directories: &mut Vec<PathBuf>,
+    value: &str,
+) -> Result<(), String> {
+    let mut found = false;
+    for item in value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        found = true;
+        let path = PathBuf::from(item);
+        if !directories.contains(&path) {
+            directories.push(path);
+        }
+    }
+    if !found {
+        return Err("--capability requires at least one directory".to_string());
+    }
+    Ok(())
+}
+
+fn take_value(args: &[String], index: usize) -> Result<String, String> {
+    args.get(index + 1)
+        .cloned()
+        .ok_or_else(|| format!("missing value for {}", args[index]))
+}
+
+fn set_service_tier(config: &mut CliConfig, service_tier: ModelServiceTier) {
+    config.service_tier = Some(service_tier);
+    config.priority = service_tier == ModelServiceTier::Priority;
+}
+
+fn apply_config_arg(config: &mut CliConfig, value: &str) -> Result<(), String> {
+    let Some((key, raw_value)) = value.split_once('=') else {
+        return Ok(());
+    };
+    let value = raw_value.trim().trim_matches('"');
+    match key.trim() {
+        "model_reasoning_effort" | "reasoning_effort" | "model_variant" => {
+            config.reasoning_effort = Some(value.to_string())
+        }
+        "model_acceleration_enabled" if is_truthy(value) => {
+            set_service_tier(config, ModelServiceTier::Priority)
+        }
+        "max_tokens" | "model_max_tokens" => {
+            if let Ok(max_tokens) = value.parse::<u64>() {
+                config.max_tokens = Some(max_tokens);
+            }
+        }
+        "service_tier" => set_service_tier(config, value.parse()?),
+        "planning" => {
+            if let Ok(mode) = parse_planning_mode(value) {
+                config.planning_mode = mode;
+            }
+        }
+        "command_run_shell" => {
+            if let Ok(shell) = parse_command_run_shell_surface(value) {
+                config.command_run_shell = Some(shell);
+            }
+        }
+        "disable_permission_restrictions" if is_truthy(value) => {
+            config.disable_permission_restrictions = Some(true)
+        }
+        "disable_permission_restrictions" if is_falsy(value) => {
+            config.disable_permission_restrictions = Some(false)
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_help_arg(value: Option<&str>) -> bool {
+    matches!(value, Some("help") | Some("--help") | Some("-h"))
+}
+
+fn is_command_run_shell_command(value: &str) -> bool {
+    matches!(value, "bash" | "zsh" | "shll")
+}
+
+fn parse_command_run_shell_flag(value: &str) -> Result<String, String> {
+    parse_command_run_shell_surface(value.trim_start_matches('-'))
+}
+
+fn parse_command_run_shell_surface(value: &str) -> Result<String, String> {
+    match value.trim() {
+        "bash" => Ok("bash".to_string()),
+        "zsh" => Ok("zsh".to_string()),
+        "shll" => Ok("shell_command".to_string()),
+        other => Err(format!(
+            "invalid command-run shell surface: {other}; expected bash, zsh, or shll"
+        )),
+    }
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "enabled" | "priority"
+    )
+}
+
+fn is_falsy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off" | "disabled"
+    )
+}
+
+fn parse_planning_mode(value: &str) -> Result<Option<bool>, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "auto" || normalized == "default" || normalized == "agent" {
+        return Ok(None);
+    }
+    if is_truthy(&normalized) {
+        return Ok(Some(true));
+    }
+    if is_falsy(&normalized) {
+        return Ok(Some(false));
+    }
+    Err(format!(
+        "invalid --planning value: {value}; expected auto, on, or off"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planning_mode_is_unspecified_without_cli_override() {
+        let config = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--agent-id".to_string(),
+            "thoughtful".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse cli");
+
+        assert_eq!(config.planning_mode, None);
+    }
+
+    #[test]
+    fn quiet_and_silent_suppress_progress() {
+        let quiet = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--quiet".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse quiet cli");
+        let silent = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--silent".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse silent cli");
+
+        assert!(quiet.quiet);
+        assert!(silent.quiet);
+    }
+
+    #[test]
+    fn log_flag_enables_stderr_turn_diagnostics_without_entering_prompt() {
+        let short = CliConfig::parse(vec![
+            "exec".to_string(),
+            "-log".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse -log cli");
+        let long = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--log".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse --log cli");
+
+        assert!(short.log);
+        assert!(long.log);
+        assert_eq!(short.prompt().as_deref(), Ok("inspect"));
+        assert_eq!(long.prompt().as_deref(), Ok("inspect"));
+    }
+
+    #[test]
+    fn planning_mode_respects_explicit_cli_on_and_off() {
+        let enabled = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--planning".to_string(),
+            "on".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse enabled cli");
+        let disabled = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--planning=off".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse disabled cli");
+
+        assert_eq!(enabled.planning_mode, Some(true));
+        assert_eq!(disabled.planning_mode, Some(false));
+    }
+
+    #[test]
+    fn service_tier_is_typed_across_flag_config_and_priority_alias() {
+        let flag = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--service-tier=ultrafast".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse ultrafast flag");
+        let config = CliConfig::parse(vec![
+            "exec".to_string(),
+            "-c".to_string(),
+            "service_tier=default".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse default config");
+        let priority = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--priority".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse priority alias");
+
+        assert_eq!(flag.service_tier, Some(ModelServiceTier::Ultrafast));
+        assert_eq!(flag.effective_service_tier(), ModelServiceTier::Ultrafast);
+        assert!(!flag.priority);
+        assert_eq!(config.service_tier, Some(ModelServiceTier::Default));
+        assert_eq!(priority.service_tier, Some(ModelServiceTier::Priority));
+        assert!(priority.priority);
+    }
+
+    #[test]
+    fn service_tier_rejects_unknown_values_before_execution() {
+        let error = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--service-tier".to_string(),
+            "turbo".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect_err("unknown service tier should fail closed");
+
+        assert_eq!(error, "TURA_SESSION_SERVICE_TIER_INVALID:turbo");
+    }
+
+    #[test]
+    fn goal_flag_enables_goal_mode() {
+        let config = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--goal".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse goal cli");
+
+        assert!(config.goal_mode);
+        assert_eq!(config.prompt().as_deref(), Ok("inspect"));
+    }
+
+    #[test]
+    fn no_op_flag_disables_operation_manuals() {
+        let config = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--no-op".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse no-op cli");
+
+        assert!(config.no_op_manual);
+        assert_eq!(config.prompt().as_deref(), Ok("inspect"));
+    }
+
+    #[test]
+    fn old_planning_cli_aliases_are_not_supported() {
+        for old_arg in [
+            "--force-planning",
+            "--planning-mode",
+            "--enable-planning",
+            "--no-force-planning",
+        ] {
+            let error = CliConfig::parse(vec![
+                "exec".to_string(),
+                old_arg.to_string(),
+                "inspect".to_string(),
+            ])
+            .expect_err("old planning alias should be rejected");
+            assert!(error.contains("unsupported tura option"));
+        }
+    }
+
+    #[test]
+    fn planning_config_arg_can_set_auto_on_or_off() {
+        let automatic = CliConfig::parse(vec![
+            "exec".to_string(),
+            "-c".to_string(),
+            "planning=auto".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse auto config");
+        let enabled = CliConfig::parse(vec![
+            "exec".to_string(),
+            "-c".to_string(),
+            "planning=on".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse enabled config");
+        let disabled = CliConfig::parse(vec![
+            "exec".to_string(),
+            "-c".to_string(),
+            "planning=off".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse disabled config");
+
+        assert_eq!(automatic.planning_mode, None);
+        assert_eq!(enabled.planning_mode, Some(true));
+        assert_eq!(disabled.planning_mode, Some(false));
+    }
+
+    #[test]
+    fn command_run_shell_commands_override_the_runtime_surface() {
+        let bash = CliConfig::parse(vec![
+            "exec".to_string(),
+            "bash".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse bash command surface");
+        let zsh = CliConfig::parse(vec![
+            "exec".to_string(),
+            "zsh".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse zsh command surface");
+        let shll = CliConfig::parse(vec![
+            "exec".to_string(),
+            "shll".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse shll command surface");
+
+        assert_eq!(bash.command_run_shell.as_deref(), Some("bash"));
+        assert_eq!(zsh.command_run_shell.as_deref(), Some("zsh"));
+        assert_eq!(shll.command_run_shell.as_deref(), Some("shell_command"));
+    }
+
+    #[test]
+    fn command_run_shell_flags_override_the_runtime_surface() {
+        let bash = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--bash".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse bash flag surface");
+        let zsh = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--zsh".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse zsh flag surface");
+        let shll = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--shll".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse shll flag surface");
+
+        assert_eq!(bash.command_run_shell.as_deref(), Some("bash"));
+        assert_eq!(zsh.command_run_shell.as_deref(), Some("zsh"));
+        assert_eq!(shll.command_run_shell.as_deref(), Some("shell_command"));
+    }
+
+    #[test]
+    fn command_run_shell_config_accepts_only_the_documented_surfaces() {
+        let zsh = CliConfig::parse(vec![
+            "exec".to_string(),
+            "-c".to_string(),
+            "command_run_shell=zsh".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse zsh config surface");
+        let typo = CliConfig::parse(vec![
+            "exec".to_string(),
+            "zash".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse prompt that begins with unsupported shell-like word");
+
+        assert_eq!(zsh.command_run_shell.as_deref(), Some("zsh"));
+        assert_eq!(typo.command_run_shell, None);
+        assert_eq!(typo.prompt_parts, vec!["zash", "inspect"]);
+    }
+
+    #[test]
+    fn sandbox_flag_enables_command_run_workspace_sandbox() {
+        let config = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--sandbox".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse sandbox flag");
+        let compat = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse compatibility flag");
+
+        assert!(config.command_run_sandbox);
+        assert!(!compat.command_run_sandbox);
+        assert_eq!(compat.disable_permission_restrictions, Some(true));
+    }
+
+    #[test]
+    fn config_parses_explicit_permission_restriction_override() {
+        let enabled = CliConfig::parse(vec![
+            "exec".to_string(),
+            "-c".to_string(),
+            "disable_permission_restrictions=true".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse enabled permission override");
+        let disabled = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--config=disable_permission_restrictions=false".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse disabled permission override");
+
+        assert_eq!(enabled.disable_permission_restrictions, Some(true));
+        assert_eq!(disabled.disable_permission_restrictions, Some(false));
+    }
+
+    #[test]
+    fn capability_accepts_comma_separated_and_repeated_directories() {
+        let config = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--capability".to_string(),
+            "first, second".to_string(),
+            "--capability=third,first".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse capability directories");
+
+        assert_eq!(
+            config.capability_directories,
+            vec![
+                PathBuf::from("first"),
+                PathBuf::from("second"),
+                PathBuf::from("third")
+            ]
+        );
+    }
+
+    #[test]
+    fn capability_rejects_an_empty_directory_list() {
+        let error = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--capability=, ,".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect_err("empty capability list should fail");
+
+        assert!(error.contains("at least one directory"), "{error}");
+    }
+
+    #[test]
+    fn timeout_is_an_outer_observation_budget_not_a_command_deadline() {
+        let equals = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--timeout=14400".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse equals timeout");
+        let separated = CliConfig::parse(vec![
+            "exec".to_string(),
+            "--timeout-secs".to_string(),
+            "900".to_string(),
+            "inspect".to_string(),
+        ])
+        .expect("parse separated timeout");
+
+        assert_eq!(equals.timeout_secs, Some(14_400));
+        assert_eq!(separated.timeout_secs, Some(900));
+    }
+
+    #[test]
+    fn timeout_rejects_zero_and_non_numeric_values() {
+        for value in ["0", "not-a-duration"] {
+            let error = CliConfig::parse(vec![
+                "exec".to_string(),
+                format!("--timeout={value}"),
+                "inspect".to_string(),
+            ])
+            .expect_err("invalid timeout should fail closed");
+            assert!(error.contains("timeout"), "{error}");
+        }
+    }
+}

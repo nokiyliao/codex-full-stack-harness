@@ -1,0 +1,14 @@
+{
+  "protocol_version": "tura-collaboration/v1",
+  "request_id": "tura_request_synthetic_result_v1",
+  "packet_id": "packet_synthetic_result_v1",
+  "lease_id": "lease_synthetic_result_v1",
+  "executor_id": "executor.tura.public",
+  "kind": "result",
+  "effect_state": "settled",
+  "effect_id": "effect.tura.synthetic.result.v1",
+  "output_digest": "4e919b70243785633415ccb7727383657e5d884967a0572f7d1bc0d95c56d5b5",
+  "predicate_satisfied": true,
+  "failure_code": null,
+  "failure_detail_digest": null
+}

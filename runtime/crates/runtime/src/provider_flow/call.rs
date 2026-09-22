@@ -1,0 +1,911 @@
+use chrono::Utc;
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+use tracing::error;
+
+use crate::profile_timings;
+use crate::provider_flow::checkpointing;
+use crate::provider_flow::errors::{
+    finish_provider_call_failure, finish_runtime_failure, finish_runtime_failure_with_retry_policy,
+    runtime_timeout,
+};
+use crate::provider_flow::official_codex::{
+    OfficialCodexRuntimeInput, call_runtime_official_codex,
+};
+use crate::provider_flow::provider_response::apply_provider_response;
+use crate::provider_flow::provider_streaming::{RuntimeStreamingInput, call_runtime_streaming};
+pub use crate::provider_flow::request_options::route_by_name;
+use crate::provider_flow::request_options::{
+    normalize_provider_messages, parallel_tool_calls_enabled, prompt_cache_key,
+    route_for_provider_name, session_max_tokens, session_model_override_route,
+    session_reasoning_effort, session_service_tier, stream_options,
+};
+use crate::provider_flow::usage::usage_report_from_metrics;
+use crate::runtime::types::RuntimeQueueItem;
+use crate::runtime_event_writer::RuntimeEventWriter;
+use lifecycle::RuntimeAggregate;
+use lifecycle::{RuntimeState, SessionId};
+
+#[cfg(feature = "nokiy-ablation-benchmark")]
+#[path = "ablation.rs"]
+mod ablation;
+
+pub struct CallRuntimeInput {
+    pub runtime: RuntimeAggregate,
+    pub messages: Vec<serde_json::Value>,
+    pub tools: Vec<serde_json::Value>,
+    pub provider_name: String,
+    pub stream: bool,
+    pub max_tokens: u32,
+    pub tool_choice: Option<serde_json::Value>,
+    pub session_directory: PathBuf,
+    pub allowed_command_run_commands: Option<BTreeSet<String>>,
+    pub disable_permission_restrictions: bool,
+    pub jspace_contract: Option<serde_json::Value>,
+    pub require_startup_task_state: bool,
+}
+
+pub async fn call_runtime(
+    input: CallRuntimeInput,
+    tura_settings: Arc<tura_llm_rust::Settings>,
+    tura_config: Arc<tura_llm_rust::TuraConfig>,
+) -> Result<RuntimeAggregate, String> {
+    call_runtime_with_writer(input, tura_settings, tura_config, None).await
+}
+
+pub(crate) async fn call_runtime_with_writer(
+    input: CallRuntimeInput,
+    tura_settings: Arc<tura_llm_rust::Settings>,
+    tura_config: Arc<tura_llm_rust::TuraConfig>,
+    mut runtime_event_writer: Option<&mut RuntimeEventWriter>,
+) -> Result<RuntimeAggregate, String> {
+    let mut runtime = input.runtime;
+    tura_config.reload();
+    let now = Utc::now();
+    let profiling = profile_timings::enabled();
+    let normalize_start = Instant::now();
+    let turn_context = input
+        .messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.get("role").and_then(serde_json::Value::as_str)
+                == Some(crate::context::USER_AGENT_CONTEXT_ROLE)
+        })
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let provider_messages = normalize_provider_messages(input.messages);
+    profile_timings::log_elapsed(
+        "call_runtime.normalize_provider_messages",
+        normalize_start,
+        serde_json::json!({
+            "session_id": runtime.session_id,
+            "runtime_id": runtime.runtime_id,
+            "provider_message_count": provider_messages.len(),
+            "provider_messages_bytes": if profiling {
+                profile_timings::json_vec_bytes(&provider_messages)
+            } else {
+                0
+            },
+        }),
+    );
+    let clone_input_start = Instant::now();
+    let input_messages = provider_messages.clone();
+    let input_tools = input.tools.clone();
+    profile_timings::log_elapsed(
+        "call_runtime.clone_provider_input",
+        clone_input_start,
+        serde_json::json!({
+            "session_id": runtime.session_id,
+            "runtime_id": runtime.runtime_id,
+            "message_count": input_messages.len(),
+            "messages_bytes": if profiling {
+                profile_timings::json_vec_bytes(&input_messages)
+            } else {
+                0
+            },
+            "tool_count": input_tools.len(),
+            "tools_bytes": if profiling {
+                profile_timings::json_vec_bytes(&input_tools)
+            } else {
+                0
+            },
+        }),
+    );
+
+    runtime
+        .transition(RuntimeState::Dispatching)
+        .map_err(|e| format!("failed to transition runtime to Dispatching: {e}"))?;
+    runtime
+        .mark_called(now)
+        .map_err(|e| format!("failed to mark runtime called: {e}"))?;
+    runtime
+        .mark_waiting_first_token()
+        .map_err(|e| format!("failed to mark runtime waiting for first token: {e}"))?;
+    flush_runtime_events(&mut runtime_event_writer, &mut runtime)?;
+
+    macro_rules! pre_provider_or_failed_runtime {
+        ($stage:literal, $result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    finish_pre_provider_runtime_failure(
+                        &mut runtime,
+                        &mut runtime_event_writer,
+                        $stage,
+                        error.to_string(),
+                    )?;
+                    return Ok(runtime);
+                }
+            }
+        };
+    }
+
+    let turn_started_start = Instant::now();
+    pre_provider_or_failed_runtime!(
+        "turn_started_checkpoint",
+        checkpointing::turn_started(&runtime)
+    );
+    profile_timings::log_elapsed(
+        "call_runtime.checkpoint_turn_started",
+        turn_started_start,
+        serde_json::json!({
+            "session_id": runtime.session_id,
+            "runtime_id": runtime.runtime_id,
+        }),
+    );
+
+    let taskcore_full_core = pre_provider_or_failed_runtime!(
+        "taskcore_context_admission",
+        taskcore_context_admitted(
+            std::env::var("TURA_TASKCORE_JSPACE_SHA256").ok().as_deref(),
+            input.disable_permission_restrictions,
+            &input.session_directory,
+            input.jspace_contract.as_ref(),
+        )
+    );
+    #[cfg(feature = "nokiy-ablation-benchmark")]
+    let taskcore_full_core = taskcore_full_core || pre_provider_or_failed_runtime!(
+        "nokiy_readonly_ablation_admission",
+        ablation::admitted(&input.session_directory, input.disable_permission_restrictions)
+    );
+    if !taskcore_full_core && legacy_codex_provider_requested(&input.provider_name) {
+        return finish_provider_route_admission_failure(
+            runtime,
+            runtime_event_writer,
+            "legacy provider 'codex' is disabled; use 'official_codex_app_server'".to_string(),
+        );
+    }
+
+    let direct_route = route_for_provider_name(tura_settings.as_ref(), &input.provider_name);
+    let configured_route = route_by_name(tura_settings.as_ref(), &input.provider_name);
+    let route_config_base = pre_provider_or_failed_runtime!(
+        "provider_route_resolution",
+        direct_route
+            .as_ref()
+            .or(configured_route)
+            .ok_or_else(|| format!("unknown provider route: {}", input.provider_name))
+    );
+    let override_route = pre_provider_or_failed_runtime!(
+        "session_model_override_resolution",
+        session_model_override_route(tura_settings.as_ref(), route_config_base)
+    );
+    let route_config = override_route.as_ref().unwrap_or(route_config_base);
+    let context_window = active_model_context_window(tura_settings.as_ref(), route_config);
+
+    let prompt_cache_key = prompt_cache_key(
+        route_config,
+        &input.provider_name,
+        &runtime.session_id,
+        &input_tools,
+    );
+    let model_service_tier =
+        pre_provider_or_failed_runtime!("session_service_tier_resolution", session_service_tier());
+    let call_options = tura_llm_rust::CallOptions {
+        tools: if input.tools.is_empty() {
+            None
+        } else {
+            Some(input.tools)
+        },
+        stream: Some(input.stream),
+        parallel_tool_calls: parallel_tool_calls_enabled(route_config, !input_tools.is_empty()),
+        prompt_cache_key,
+        stream_options: stream_options(route_config, input.stream),
+        reasoning_effort: session_reasoning_effort(),
+        service_tier: model_service_tier.map(|tier| tier.as_str().to_string()),
+        max_tokens: session_max_tokens(input.max_tokens),
+        store: Some(false),
+        tool_choice: input.tool_choice.clone(),
+        context_window,
+        ..Default::default()
+    };
+    let set_input_start = Instant::now();
+    pre_provider_or_failed_runtime!(
+        "provider_input_capture",
+        runtime.set_input(serde_json::json!({
+            "messages": input_messages,
+            "tools": input_tools,
+            "options": {
+                "stream": input.stream,
+                "parallel_tool_calls": call_options.parallel_tool_calls,
+                "prompt_cache_key": call_options.prompt_cache_key.clone(),
+                "stream_options": call_options.stream_options.clone(),
+                "reasoning_effort": call_options.reasoning_effort.clone(),
+                "service_tier": call_options.service_tier.clone(),
+                "max_tokens": call_options.max_tokens,
+                "store": call_options.store,
+                "tool_choice": call_options.tool_choice.clone(),
+                "context_window": call_options.context_window,
+            }
+        }))
+    );
+    pre_provider_or_failed_runtime!(
+        "provider_input_flush",
+        flush_runtime_events(&mut runtime_event_writer, &mut runtime)
+    );
+    profile_timings::log_elapsed(
+        "call_runtime.set_input",
+        set_input_start,
+        serde_json::json!({
+            "session_id": runtime.session_id,
+            "runtime_id": runtime.runtime_id,
+        }),
+    );
+
+    let provider_call_started_start = Instant::now();
+    pre_provider_or_failed_runtime!(
+        "provider_call_started_checkpoint",
+        checkpointing::provider_call_started(&runtime)
+    );
+    profile_timings::log_elapsed(
+        "call_runtime.checkpoint_provider_call_started",
+        provider_call_started_start,
+        serde_json::json!({
+            "session_id": runtime.session_id,
+            "runtime_id": runtime.runtime_id,
+        }),
+    );
+
+    let official_provider = match provider_for_execution(route_config, taskcore_full_core) {
+        Ok(provider) => provider,
+        Err(error) => {
+            return finish_provider_route_admission_failure(
+                runtime,
+                runtime_event_writer,
+                format!("official Codex admission rejected route: {error}"),
+            );
+        }
+    };
+    let call_result = if let Some(provider) = official_provider {
+        let fallback_from_id = runtime.fallback_from_id.clone();
+        let commander_continuation = runtime_event_writer
+            .as_deref()
+            .and_then(RuntimeEventWriter::commander_continuation)
+            .cloned();
+        call_runtime_official_codex(
+            &mut runtime,
+            provider,
+            OfficialCodexRuntimeInput {
+                messages: provider_messages,
+                turn_context,
+                dynamic_tools: input_tools,
+                session_directory: input.session_directory.clone(),
+                allowed_command_run_commands: input.allowed_command_run_commands.clone(),
+                disable_permission_restrictions: input.disable_permission_restrictions,
+                jspace_contract: input.jspace_contract.clone(),
+                commander_continuation,
+                fallback_from_id,
+                service_tier: model_service_tier,
+            },
+            runtime_event_writer.as_deref_mut(),
+        )
+        .await
+    } else if input.stream || !input_tools.is_empty() {
+        call_runtime_streaming(
+            &mut runtime,
+            route_config,
+            &tura_config,
+            RuntimeStreamingInput {
+                messages: provider_messages,
+                options: call_options,
+                session_directory: input.session_directory.clone(),
+                allowed_command_run_commands: input.allowed_command_run_commands.clone(),
+                jspace_contract: input.jspace_contract.clone(),
+                require_startup_task_state: input.require_startup_task_state,
+            },
+            runtime_event_writer.as_deref_mut(),
+        )
+        .await
+    } else {
+        call_runtime_non_streaming(
+            &mut runtime,
+            route_config,
+            &tura_config,
+            provider_messages,
+            call_options,
+            runtime_event_writer.as_deref_mut(),
+        )
+        .await
+    };
+
+    flush_runtime_events(&mut runtime_event_writer, &mut runtime)?;
+    match call_result {
+        Ok(()) => {
+            checkpointing::provider_call_finished(&runtime)?;
+            checkpointing::terminal_turn(&runtime)?;
+        }
+        Err(error) => {
+            checkpointing::best_effort_turn_failed(&runtime);
+            return Err(error);
+        }
+    }
+
+    Ok(runtime)
+}
+
+fn taskcore_context_admitted(
+    marker: Option<&str>,
+    disable_permission_restrictions: bool,
+    directory: &std::path::Path,
+    contract: Option<&serde_json::Value>,
+) -> Result<bool, String> {
+    let Some(marker) = marker else { return Ok(false) };
+    if disable_permission_restrictions {
+        return Err("TASKCORE_PERMISSION_BYPASS_FORBIDDEN".into());
+    }
+    let contract = contract.ok_or("TASKCORE_JSPACE_MISSING")?;
+    let matcher = tura_path::jspace::JSpaceMatcher::from_value(directory, contract)
+        .map_err(|error| error.to_string())?;
+    if marker != matcher.content_sha256() {
+        return Err("TASKCORE_JSPACE_BINDING_MISMATCH".into());
+    }
+    Ok(true)
+}
+
+fn provider_for_execution(
+    route: &tura_llm_rust::RouteConfig,
+    taskcore_full_core: bool,
+) -> Result<Option<&tura_llm_rust::ProviderConfig>, String> {
+    if taskcore_full_core {
+        if route.providers.len() != 1 || route.providers[0].provider != "codex" {
+            return Err("TASKCORE_SINGLE_CODEX_PROVIDER_REQUIRED".into());
+        }
+        // Keep the full-core model/tool loop. Authentication and tool authority
+        // still use their existing implementations; this selects no fallback.
+        Ok(None)
+    } else {
+        route.official_codex_app_server_provider().map_err(|error| error.to_string())
+    }
+}
+
+fn finish_pre_provider_runtime_failure(
+    runtime: &mut RuntimeAggregate,
+    runtime_event_writer: &mut Option<&mut RuntimeEventWriter>,
+    stage: &str,
+    error: String,
+) -> Result<(), String> {
+    let error = format!("{stage}: {error}");
+    finish_runtime_failure_with_retry_policy(
+        runtime,
+        Utc::now(),
+        "PRE_PROVIDER_EXECUTE_TURN_FAILED",
+        error,
+        RuntimeState::Failed,
+        false,
+    )?;
+    flush_runtime_events(runtime_event_writer, runtime)?;
+    checkpointing::best_effort_turn_failed(runtime);
+    Ok(())
+}
+
+fn legacy_codex_provider_requested(provider_name: &str) -> bool {
+    provider_name
+        .trim()
+        .split_once('/')
+        .map_or(provider_name.trim(), |(provider, _)| provider.trim())
+        .eq_ignore_ascii_case("codex")
+        || std::env::var("TURA_SESSION_MODEL_OVERRIDE")
+            .ok()
+            .and_then(|value| {
+                value
+                    .split_once('/')
+                    .map(|(provider, _)| provider.to_string())
+            })
+            .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("codex"))
+}
+
+fn finish_provider_route_admission_failure(
+    mut runtime: RuntimeAggregate,
+    mut runtime_event_writer: Option<&mut RuntimeEventWriter>,
+    message: String,
+) -> Result<RuntimeAggregate, String> {
+    let finished_at = Utc::now();
+    runtime.set_output(serde_json::json!({"error": message}))?;
+    flush_runtime_events(&mut runtime_event_writer, &mut runtime)?;
+    finish_runtime_failure_with_retry_policy(
+        &mut runtime,
+        finished_at,
+        "PROVIDER_ROUTE_ADMISSION_REJECTED",
+        message,
+        RuntimeState::Failed,
+        false,
+    )?;
+    flush_runtime_events(&mut runtime_event_writer, &mut runtime)?;
+    checkpointing::best_effort_turn_failed(&runtime);
+    Ok(runtime)
+}
+
+fn active_model_context_window(
+    settings: &tura_llm_rust::Settings,
+    route_config: &tura_llm_rust::RouteConfig,
+) -> Option<u64> {
+    let provider = route_config.providers.first()?;
+    let catalog = settings.model_catalog.providers.get(&provider.provider)?;
+    catalog
+        .models
+        .values()
+        .flatten()
+        .find(|entry| {
+            tura_llm_rust::Settings::normalize_model_name(&provider.provider, entry.id())
+                == provider.model
+                || entry.id() == provider.model
+        })?
+        .detail()
+        .map(|detail| u64::from(detail.limit.context))
+}
+
+async fn call_runtime_non_streaming(
+    runtime: &mut RuntimeAggregate,
+    route_config: &tura_llm_rust::RouteConfig,
+    tura_config: &Arc<tura_llm_rust::TuraConfig>,
+    messages: Vec<serde_json::Value>,
+    options: tura_llm_rust::CallOptions,
+    mut runtime_event_writer: Option<&mut RuntimeEventWriter>,
+) -> Result<(), String> {
+    let started_at = Utc::now();
+    let timeout_duration = runtime_timeout(runtime);
+
+    match tokio::time::timeout(
+        timeout_duration,
+        route_config.run(tura_config.as_ref(), messages, options),
+    )
+    .await
+    {
+        Err(_) => {
+            let finished_at = Utc::now();
+            let message = format!(
+                "runtime call timed out after {} ms",
+                timeout_duration.as_millis()
+            );
+            error!(error = %message, "runtime call timed out");
+            runtime.set_output(serde_json::json!({
+                "error": message
+            }))?;
+            flush_runtime_events(&mut runtime_event_writer, runtime)?;
+            finish_runtime_failure(
+                runtime,
+                finished_at,
+                "CALL_TIMED_OUT",
+                message,
+                RuntimeState::TimedOut,
+            )?;
+            flush_runtime_events(&mut runtime_event_writer, runtime)?;
+        }
+        Ok(Ok(response)) => {
+            let finished_at = Utc::now();
+            runtime.set_output(response.content.clone())?;
+            apply_provider_response(runtime, &response.content, finished_at)?;
+
+            runtime
+                .mark_first_token(finished_at)
+                .map_err(|e| format!("failed to mark first token: {e}"))?;
+
+            let usage =
+                usage_report_from_metrics(response.metrics, started_at, finished_at, finished_at);
+
+            flush_runtime_events(&mut runtime_event_writer, runtime)?;
+            runtime
+                .finish_success(finished_at, usage)
+                .map_err(|e| format!("failed to finish runtime success: {e}"))?;
+            flush_runtime_events(&mut runtime_event_writer, runtime)?;
+        }
+        Ok(Err(e)) => {
+            let finished_at = Utc::now();
+            error!(error = %e, "runtime call failed");
+            runtime.set_output(serde_json::json!({
+                "error": e.to_string()
+            }))?;
+            flush_runtime_events(&mut runtime_event_writer, runtime)?;
+            finish_provider_call_failure(runtime, finished_at, &e, RuntimeState::Failed)?;
+            flush_runtime_events(&mut runtime_event_writer, runtime)?;
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn flush_runtime_events(
+    writer: &mut Option<&mut RuntimeEventWriter>,
+    runtime: &mut RuntimeAggregate,
+) -> Result<(), String> {
+    if let Some(writer) = writer.as_deref_mut() {
+        writer.flush(runtime)?;
+    }
+    Ok(())
+}
+
+pub async fn dequeue_runtime(
+    session_id: &SessionId,
+    redis_url: &str,
+) -> Result<Option<RuntimeQueueItem>, String> {
+    let client = redis::Client::open(redis_url)
+        .map_err(|e| format!("failed to create redis client: {e}"))?;
+
+    let mut con = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|e| format!("failed to get redis connection: {e}"))?;
+
+    let queue_key = format!("runtime:queue:{session_id}");
+
+    let result: Option<String> = redis::cmd("LPOP")
+        .arg(&queue_key)
+        .query_async(&mut con)
+        .await
+        .map_err(|e| format!("failed to dequeue runtime: {e}"))?;
+
+    match result {
+        Some(payload) => {
+            let item: RuntimeQueueItem = serde_json::from_str(&payload)
+                .map_err(|e| format!("failed to deserialize queue item: {e}"))?;
+            Ok(Some(item))
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CallRuntimeInput, call_runtime, provider_for_execution, taskcore_context_admitted};
+    use chrono::Utc;
+    use lifecycle::{ProviderConfig, ToolChoice};
+    use lifecycle::{RuntimeAggregate, RuntimeProviderConfig};
+    use serde_json::json;
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::Arc;
+    use tura_llm_rust::{
+        ModelCatalog, ProviderConfig as LlmProviderConfig, ProviderEnumCatalog, RouteConfig,
+        Settings, TuraConfig,
+    };
+
+    fn runtime() -> RuntimeAggregate {
+        RuntimeAggregate::new(
+            "runtime-call-test".to_string(),
+            "session-call-test".to_string(),
+            "agent-call-test".to_string(),
+            RuntimeProviderConfig {
+                base: ProviderConfig {
+                    tura_llm_name: "fast".to_string(),
+                    default_model_tier: None,
+                    current_model: None,
+                    stream: true,
+                    temperature: 0.0,
+                    max_tokens: 1024,
+                    tool_choice: ToolChoice::Auto,
+                    time_out_ms: 30_000,
+                },
+                thinking: false,
+                provider_name: "openai".to_string(),
+                model_name: "gpt-test".to_string(),
+                provider_url_name: "openai".to_string(),
+                llm_provider_name: "openai".to_string(),
+            },
+            Utc::now(),
+        )
+    }
+
+    fn missing_key_settings() -> Arc<Settings> {
+        Arc::new(Settings {
+            provider_base_url: HashMap::new(),
+            routes: HashMap::from([(
+                "missing-key-route".to_string(),
+                RouteConfig {
+                    default_temperature: 0.0,
+                    providers: vec![LlmProviderConfig {
+                        provider: "definitely_missing_provider_for_call_runtime_test".to_string(),
+                        base_url: "http://127.0.0.1:9".to_string(),
+                        model: "local-test-model".to_string(),
+                        temperature: 0.0,
+                    }],
+                },
+            )]),
+            model_catalog: ModelCatalog::default(),
+            provider_enums: ProviderEnumCatalog::default(),
+        })
+    }
+
+    fn empty_settings() -> Arc<Settings> {
+        Arc::new(Settings {
+            provider_base_url: HashMap::new(),
+            routes: HashMap::new(),
+            model_catalog: ModelCatalog::default(),
+            provider_enums: ProviderEnumCatalog::default(),
+        })
+    }
+
+    fn legacy_codex_settings() -> Arc<Settings> {
+        Arc::new(Settings {
+            provider_base_url: HashMap::new(),
+            routes: HashMap::from([(
+                "legacy-codex-route".to_string(),
+                RouteConfig {
+                    default_temperature: 0.0,
+                    providers: vec![LlmProviderConfig {
+                        provider: "codex".to_string(),
+                        base_url: "http://127.0.0.1:9".to_string(),
+                        model: "gpt-5.6-sol".to_string(),
+                        temperature: 0.0,
+                    }],
+                },
+            )]),
+            model_catalog: ModelCatalog::default(),
+            provider_enums: ProviderEnumCatalog::default(),
+        })
+    }
+
+    fn taskcore_contract(root: &std::path::Path) -> serde_json::Value {
+        let mut contract = json!({
+            "schema_version": "jspace_contract_v1", "repo_root": root,
+            "dcf_generation": {"repo_root": root},
+            "read_scopes": ["answer.txt"], "write_scopes": ["answer.txt"],
+            "allowed_operations": ["read", "modify"], "denied_operations": ["delete"],
+            "command_prefixes": [], "declared_targets": ["answer.txt"],
+            "matched_surface_ids": [], "focused_verifiers": [], "provenance": {},
+            "expansion": {"mode": "exact_target_only", "mutation_on_expansion": false,
+                "error_code": "JSPACE_EXPANSION_REQUIRED"}
+        });
+        contract["semantic_sha256"] = json!(tura_path::jspace::semantic_sha256(&contract));
+        contract
+    }
+
+    #[test]
+    fn taskcore_selector_requires_exact_valid_contract_and_permission_enforcement() {
+        let root = tempfile::tempdir().unwrap();
+        let contract = taskcore_contract(root.path());
+        let digest = contract["semantic_sha256"].as_str().unwrap();
+        assert_eq!(taskcore_context_admitted(None, false, root.path(), None), Ok(false));
+        assert_eq!(taskcore_context_admitted(Some(digest), false, root.path(), Some(&contract)), Ok(true));
+        assert!(taskcore_context_admitted(Some(digest), true, root.path(), Some(&contract)).is_err());
+        assert!(taskcore_context_admitted(Some(digest), false, root.path(), None).is_err());
+        assert!(taskcore_context_admitted(Some("wrong"), false, root.path(), Some(&contract)).is_err());
+        let mut tampered = contract.clone();
+        tampered["write_scopes"] = json!(["**"]);
+        assert!(taskcore_context_admitted(Some(digest), false, root.path(), Some(&tampered)).is_err());
+        let other = tempfile::tempdir().unwrap();
+        assert!(taskcore_context_admitted(Some(digest), false, other.path(), Some(&contract)).is_err());
+    }
+
+    #[test]
+    fn taskcore_provider_is_explicit_single_route_not_a_native_default_change() {
+        let settings = legacy_codex_settings();
+        let mut route = settings.routes["legacy-codex-route"].clone();
+        assert!(provider_for_execution(&route, false).is_err());
+        assert!(provider_for_execution(&route, true).unwrap().is_none());
+        route.providers.push(route.providers[0].clone());
+        assert!(provider_for_execution(&route, true).is_err());
+        route.providers.pop();
+        route.providers[0].provider = "official_codex_app_server".into();
+        assert!(provider_for_execution(&route, false).unwrap().is_some());
+        assert!(provider_for_execution(&route, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_route_finishes_exact_runtime_before_provider_request() {
+        let runtime_id = "runtime-pre-provider-failure";
+        let runtime = call_runtime(
+            CallRuntimeInput {
+                runtime: RuntimeAggregate::new(
+                    runtime_id.to_string(),
+                    "session-pre-provider-failure".to_string(),
+                    "agent-pre-provider-failure".to_string(),
+                    RuntimeProviderConfig {
+                        base: ProviderConfig {
+                            tura_llm_name: "missing-route".to_string(),
+                            default_model_tier: None,
+                            current_model: None,
+                            stream: true,
+                            temperature: 0.0,
+                            max_tokens: 1024,
+                            tool_choice: ToolChoice::Auto,
+                            time_out_ms: 30_000,
+                        },
+                        thinking: false,
+                        provider_name: "missing-route".to_string(),
+                        model_name: "never-dispatched".to_string(),
+                        provider_url_name: "missing".to_string(),
+                        llm_provider_name: "missing".to_string(),
+                    },
+                    Utc::now(),
+                ),
+                messages: vec![json!({ "role": "user", "content": "never dispatch" })],
+                tools: Vec::new(),
+                provider_name: "missing-route".to_string(),
+                stream: false,
+                max_tokens: 128,
+                tool_choice: None,
+                session_directory: std::env::temp_dir(),
+                allowed_command_run_commands: Some(BTreeSet::new()),
+                disable_permission_restrictions: false,
+                jspace_contract: None,
+                require_startup_task_state: false,
+            },
+            empty_settings(),
+            Arc::new(TuraConfig::new(".env.pre-provider-failure-test")),
+        )
+        .await
+        .expect("pre-provider failure should remain on the exact runtime");
+
+        assert_eq!(runtime.runtime_id, runtime_id);
+        assert_eq!(runtime.state, lifecycle::RuntimeState::Failed);
+        assert!(runtime.input.is_none());
+        assert!(runtime.usage.is_none());
+        let error = runtime
+            .error
+            .expect("pre-provider failure must be recorded");
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("PRE_PROVIDER_EXECUTE_TURN_FAILED")
+        );
+        assert_eq!(
+            error.error_text.as_deref(),
+            Some("provider_route_resolution: unknown provider route: missing-route")
+        );
+        assert!(!error.retry_allowed);
+        assert!(!error.fallback_allowed);
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_admission_finishes_non_retryable_runtime_without_network() {
+        let runtime = call_runtime(
+            CallRuntimeInput {
+                runtime: runtime(),
+                messages: vec![json!({ "role": "user", "content": "hello" })],
+                tools: Vec::new(),
+                provider_name: "legacy-codex-route".to_string(),
+                stream: false,
+                max_tokens: 128,
+                tool_choice: None,
+                session_directory: std::env::temp_dir(),
+                allowed_command_run_commands: Some(BTreeSet::new()),
+                disable_permission_restrictions: false,
+                jspace_contract: None,
+                require_startup_task_state: false,
+            },
+            legacy_codex_settings(),
+            Arc::new(TuraConfig::new(".env.legacy-codex-admission-test")),
+        )
+        .await
+        .expect("legacy route rejection should be captured on the runtime");
+
+        assert_eq!(runtime.state, lifecycle::RuntimeState::Failed);
+        let error = runtime.error.expect("runtime error should be set");
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("PROVIDER_ROUTE_ADMISSION_REJECTED")
+        );
+        assert!(!error.retry_allowed);
+        assert!(!error.fallback_allowed);
+        assert!(
+            error
+                .error_text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("legacy provider 'codex' is disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_legacy_codex_model_finishes_before_route_resolution() {
+        let runtime = call_runtime(
+            CallRuntimeInput {
+                runtime: runtime(),
+                messages: vec![json!({ "role": "user", "content": "hello" })],
+                tools: Vec::new(),
+                provider_name: "codex/gpt-5.6-sol".to_string(),
+                stream: false,
+                max_tokens: 128,
+                tool_choice: None,
+                session_directory: std::env::temp_dir(),
+                allowed_command_run_commands: Some(BTreeSet::new()),
+                disable_permission_restrictions: false,
+                jspace_contract: None,
+                require_startup_task_state: false,
+            },
+            legacy_codex_settings(),
+            Arc::new(TuraConfig::new(".env.explicit-legacy-codex-test")),
+        )
+        .await
+        .expect("explicit legacy model should be captured on the runtime");
+
+        assert_eq!(runtime.state, lifecycle::RuntimeState::Failed);
+        let error = runtime.error.expect("runtime error should be set");
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("PROVIDER_ROUTE_ADMISSION_REJECTED")
+        );
+        assert!(!error.retry_allowed);
+        assert!(
+            error
+                .error_text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("legacy provider 'codex' is disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn call_runtime_provider_config_failure_finishes_failed_without_network() {
+        // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+        #[allow(
+            unsafe_code,
+            reason = "Rust 2024 process-environment mutation audited at the caller"
+        )]
+        unsafe {
+            std::env::remove_var("DEFINITELY_MISSING_PROVIDER_FOR_CALL_RUNTIME_TEST_API_KEY")
+        };
+        let settings = missing_key_settings();
+        let config = Arc::new(TuraConfig::new(".env.missing-for-call-runtime-test"));
+
+        let runtime = call_runtime(
+            CallRuntimeInput {
+                runtime: runtime(),
+                messages: vec![json!({ "role": "user", "content": "hello" })],
+                tools: Vec::new(),
+                provider_name: "missing-key-route".to_string(),
+                stream: false,
+                max_tokens: 128,
+                tool_choice: None,
+                session_directory: std::env::temp_dir(),
+                allowed_command_run_commands: Some(BTreeSet::new()),
+                disable_permission_restrictions: false,
+                jspace_contract: None,
+                require_startup_task_state: false,
+            },
+            settings,
+            config,
+        )
+        .await
+        .expect("provider config failure should be captured on the runtime");
+
+        assert_eq!(runtime.state, lifecycle::RuntimeState::Failed);
+        assert_eq!(
+            runtime.call_result_status(),
+            lifecycle::RuntimeCallResultStatus::Failed
+        );
+        let output = runtime.output.expect("failure output should be persisted");
+        let error = output
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("failure output should contain text");
+        assert!(
+            error.contains("API Key not found"),
+            "unexpected failure output: {error}"
+        );
+        let runtime_error = runtime.error.expect("runtime error should be set");
+        assert_eq!(runtime_error.error_code.as_deref(), Some("CALL_FAILED"));
+        assert!(!runtime_error.retry_allowed);
+        assert!(!runtime_error.fallback_allowed);
+        assert!(
+            runtime_error
+                .error_text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("API Key not found")
+        );
+    }
+}

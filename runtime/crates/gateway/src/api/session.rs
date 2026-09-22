@@ -1,0 +1,1216 @@
+//! Session API handlers
+
+use crate::api::product::current_user_snapshot;
+use crate::contracts::*;
+use crate::mock::global_store;
+use crate::router_client::RouterClient;
+use crate::session::config::{TuraSessionConfig, load_config, merge_config};
+use crate::session::{MessageRole as SessionMessageRole, session_store};
+use axum::{
+    Json,
+    extract::{Path, Query, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
+use std::time::Duration;
+
+use lifecycle::{
+    ACKNOWLEDGED_CHILD_CALLBACK_IDENTITY_SCHEMA_VERSION, AcknowledgedChildCallbackIdentityV1,
+    SessionAggregate, SessionCommand, SessionEvent, SessionState, StartCondition,
+    canonical_value_sha256,
+};
+use router_contract::AcknowledgeChildCallbackResponse;
+
+// ============================================================================
+// Session List & Create
+// ============================================================================
+
+pub async fn list_sessions(
+    headers: HeaderMap,
+    Query(params): Query<SessionListParams>,
+) -> Json<Vec<Session>> {
+    Json(list_sessions_value(params, encoded_header(&headers, "x-opencode-directory")).await)
+}
+
+pub async fn list_sessions_value(
+    params: SessionListParams,
+    header_directory: Option<String>,
+) -> Vec<Session> {
+    let directory = params
+        .directory
+        .clone()
+        .or(params.workspace.clone())
+        .or(header_directory)
+        .or_else(|| global_store().get_current_directory());
+
+    let mut sessions = filter_list_sessions(
+        session_store().list_sessions(),
+        &params,
+        directory.as_deref(),
+    );
+    sessions.sort_by(|a, b| {
+        session_sort_time(b)
+            .cmp(&session_sort_time(a))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    if let Some(limit) = params.limit.filter(|limit| *limit > 0) {
+        sessions.truncate(limit);
+    }
+
+    fn session_sort_time(session: &Session) -> i64 {
+        session.last_user_message_at.unwrap_or(0)
+    }
+
+    sessions
+}
+
+fn filter_list_sessions(
+    sessions: Vec<Session>,
+    params: &SessionListParams,
+    directory: Option<&str>,
+) -> Vec<Session> {
+    let directory_key = directory
+        .map(workspace_key)
+        .filter(|value| !value.is_empty());
+    let search = params
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+
+    sessions
+        .into_iter()
+        .filter(|session| {
+            if let Some(directory_key) = &directory_key
+                && workspace_key(session.directory.as_deref().unwrap_or_default()) != *directory_key
+            {
+                return false;
+            }
+            if (params.roots == Some(true) || !params.include_children)
+                && session.parent_id.is_some()
+            {
+                return false;
+            }
+            if let Some(start) = params.start
+                && session.updated_at < start
+            {
+                return false;
+            }
+            if let Some(search) = &search {
+                let title = session
+                    .name
+                    .as_deref()
+                    .unwrap_or("New Session")
+                    .to_ascii_lowercase();
+                if !title.contains(search) && !session.id.to_ascii_lowercase().contains(search) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+fn workspace_key(directory: &str) -> String {
+    let value = directory.trim().replace('\\', "/");
+    if value.is_empty() {
+        return String::new();
+    }
+    if value.len() == 3
+        && value.as_bytes()[1] == b':'
+        && value.ends_with('/')
+        && value.as_bytes()[0].is_ascii_alphabetic()
+    {
+        return value;
+    }
+    if value.chars().all(|ch| ch == '/') {
+        return "/".to_string();
+    }
+    value.trim_end_matches('/').to_string()
+}
+
+pub async fn get_session(Path(session_id): Path<String>) -> Json<Session> {
+    Json(get_session_value(session_id))
+}
+
+pub fn get_session_value(session_id: String) -> Session {
+    session_store()
+        .get_session(&session_id)
+        .unwrap_or_else(|| Session {
+            id: session_id,
+            name: None,
+            parent_id: None,
+            created_at: 0,
+            updated_at: 0,
+            last_user_message_at: None,
+            task_start_at: None,
+            directory: None,
+            model: None,
+            agent: None,
+            session_type: Some("coding".to_string()),
+            auto_session_name: true,
+            kill_processes_on_start: false,
+            validator_enabled: false,
+            force_planning: false,
+            disable_permission_restrictions: false,
+            model_variant: None,
+            model_acceleration_enabled: false,
+            status: SessionStatus::Idle,
+            message_count: 0,
+            task_management: serde_json::json!({}),
+            context_tokens: SessionContextTokens::default(),
+            usage: Default::default(),
+            plan_summary: None,
+            session_display_name: None,
+        })
+}
+
+pub async fn create_session(
+    headers: HeaderMap,
+    Query(params): Query<SessionDirectoryParams>,
+    payload: Option<Json<CreateSessionRequest>>,
+) -> impl IntoResponse {
+    let payload = payload.map(|Json(payload)| payload).unwrap_or_default();
+    match create_session_value(
+        params,
+        payload,
+        encoded_header(&headers, "x-opencode-directory"),
+    )
+    .await
+    {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => session_mutation_error(error),
+    }
+}
+
+pub async fn create_session_value(
+    params: SessionDirectoryParams,
+    payload: CreateSessionRequest,
+    header_directory: Option<String>,
+) -> Result<Session, String> {
+    let directory = payload
+        .directory
+        .clone()
+        .or(params.directory)
+        .or(header_directory)
+        .or_else(|| global_store().get_current_directory());
+    let persisted_config = directory.as_deref().map(load_config).unwrap_or_default();
+    let kill_processes_on_start = payload
+        .kill_processes_on_start
+        .or(persisted_config.kill_processes_on_start)
+        .unwrap_or(false);
+    let validator_enabled = payload
+        .validator_enabled
+        .or(persisted_config.validator_enabled)
+        .unwrap_or(false);
+    let force_planning = payload
+        .force_planning
+        .or(persisted_config.force_planning)
+        .unwrap_or(false);
+    let model_variant = payload
+        .model_variant
+        .clone()
+        .or(persisted_config.model_variant);
+    let model_acceleration_enabled = payload
+        .model_acceleration_enabled
+        .or(persisted_config.model_acceleration_enabled)
+        .unwrap_or(false);
+    let disable_permission_restrictions = payload.disable_permission_restrictions.unwrap_or(false);
+    let auto_session_name = payload.auto_session_name.unwrap_or(true);
+    if kill_processes_on_start {
+        tracing::info!(
+            "kill_processes_on_start requested; workspace-wide process scanning is disabled, router-owned workers are stopped by session id"
+        );
+    }
+    let requested_session_type = payload
+        .session_type
+        .clone()
+        .or(persisted_config.session_type.clone())
+        .unwrap_or_else(|| "coding".to_string());
+    let requested_agent = payload
+        .agent
+        .clone()
+        .or(persisted_config.active_agent.clone());
+    let mut info = session_store().build_session_info(
+        directory,
+        payload.model.clone().or(persisted_config.model),
+        requested_agent,
+        Some(requested_session_type),
+        kill_processes_on_start,
+        validator_enabled,
+        force_planning,
+        model_variant,
+        model_acceleration_enabled,
+        disable_permission_restrictions,
+    );
+    info.auto_session_name = auto_session_name;
+    let initial_task_plan_patch = payload
+        .task_management
+        .map(|task_management| session_store().parse_initial_task_management(task_management))
+        .transpose()?;
+    let task_plan = info.projection.task_plan.clone();
+    let session = session_store().create_canonical_session_with_patch(
+        info,
+        SessionCommand::CreateSession { task_plan },
+        initial_task_plan_patch,
+    )?;
+    Ok(session)
+}
+
+fn session_mutation_error(error: String) -> axum::response::Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "session_service_mutation_failed",
+            "message": error,
+        })),
+    )
+        .into_response()
+}
+
+pub async fn get_session_config(
+    headers: HeaderMap,
+    Query(params): Query<SessionDirectoryParams>,
+) -> Json<TuraSessionConfig> {
+    let directory = params
+        .directory
+        .or_else(|| encoded_header(&headers, "x-opencode-directory"))
+        .or_else(|| global_store().get_current_directory());
+    Json(get_session_config_value(directory))
+}
+
+pub fn get_session_config_value(directory: Option<String>) -> TuraSessionConfig {
+    directory.as_deref().map(load_config).unwrap_or_default()
+}
+
+pub async fn patch_session_config(
+    headers: HeaderMap,
+    Query(params): Query<SessionDirectoryParams>,
+    Json(payload): Json<TuraSessionConfig>,
+) -> Json<TuraSessionConfig> {
+    let directory = params
+        .directory
+        .or_else(|| encoded_header(&headers, "x-opencode-directory"))
+        .or_else(|| global_store().get_current_directory());
+    Json(patch_session_config_value(directory, payload))
+}
+
+pub fn patch_session_config_value(
+    directory: Option<String>,
+    payload: TuraSessionConfig,
+) -> TuraSessionConfig {
+    let Some(directory) = directory else {
+        return TuraSessionConfig::default();
+    };
+    match merge_config(directory, payload) {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to patch session config");
+            TuraSessionConfig::default()
+        }
+    }
+}
+
+fn encoded_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    let value = headers.get(name)?.to_str().ok()?;
+    Some(percent_decode(value))
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2]))
+        {
+            output.push((high << 4) | low);
+            index += 3;
+            continue;
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// Session Operations
+// ============================================================================
+
+pub async fn delete_session(Path(session_id): Path<String>) -> Json<bool> {
+    Json(delete_session_value(session_id).await)
+}
+
+pub async fn delete_session_value(session_id: String) -> bool {
+    let abort = abort_session_value(&session_id);
+    tracing::info!(
+        session_id,
+        aborted_sessions = ?abort.sessions,
+        "aborted session scope before delete"
+    );
+    let delete_result = session_store().delete_canonical_session(&session_id);
+    if let Err(error) = &delete_result {
+        tracing::warn!(session_id, error, "failed to delete canonical session");
+    }
+    if let Ok(Some(info)) = &delete_result {
+        session_store().push_event(GlobalEvent::SessionDeleted {
+            properties: SessionDeletedProperties {
+                session_id,
+                info: info.clone(),
+            },
+        });
+    }
+    delete_result.is_ok()
+}
+
+pub async fn update_session(
+    Path(session_id): Path<String>,
+    Json(payload): Json<UpdateSessionRequest>,
+) -> impl IntoResponse {
+    match update_session_value(session_id, payload) {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => session_mutation_error(error),
+    }
+}
+
+pub fn update_session_value(
+    session_id: String,
+    payload: UpdateSessionRequest,
+) -> Result<Session, String> {
+    let session = session_store().update_session_from_request(&session_id, payload)?;
+
+    Ok(session)
+}
+
+pub async fn update_session_task_management(
+    Path(session_id): Path<String>,
+    Json(payload): Json<UpdateSessionTaskManagementRequest>,
+) -> impl IntoResponse {
+    match update_session_task_management_value(session_id, payload) {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => session_mutation_error(error),
+    }
+}
+
+pub fn update_session_task_management_value(
+    session_id: String,
+    payload: UpdateSessionTaskManagementRequest,
+) -> Result<Session, String> {
+    let session =
+        session_store().execute_task_management_patch(&session_id, payload.task_management)?;
+    Ok(session)
+}
+
+pub async fn abort_session(Path(session_id): Path<String>) -> Json<AbortResponse> {
+    Json(abort_session_value(&session_id))
+}
+
+pub fn abort_session_value(session_id: &str) -> AbortResponse {
+    let aborted_sessions = session_store().cancellation_scope_session_ids(session_id);
+    let mut cleanups = Vec::new();
+    let router = RouterClient::global();
+    for id in &aborted_sessions {
+        let mut active_runtime_id = session_store()
+            .session_lifecycle_projection(id)
+            .and_then(|projection| projection.active_runtime_id);
+        if active_runtime_id.is_none() {
+            active_runtime_id = router
+                .probe_sessions(std::slice::from_ref(id))
+                .ok()
+                .and_then(|payload| active_runtime_id_from_probe(id, &payload));
+        }
+        let lifecycle_error = session_store()
+            .execute_canonical_session_command(id, SessionCommand::CancelSession)
+            .err();
+        let cancel_result = active_runtime_id.as_deref().map_or_else(
+            || {
+                Ok(serde_json::json!({
+                    "status": "stopped",
+                    "session_id": id,
+                    "runtime_id": null,
+                    "stopped_worker": false,
+                }))
+            },
+            |runtime_id| router.cancel_runtime(id, runtime_id),
+        );
+        cleanups.push(match (cancel_result, lifecycle_error) {
+            (Ok(payload), None) => AbortCleanup {
+                session_id: id.clone(),
+                status: payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                stopped_worker: payload
+                    .get("stopped_worker")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                error: None,
+            },
+            (Ok(payload), Some(error)) => AbortCleanup {
+                session_id: id.clone(),
+                status: payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                stopped_worker: payload
+                    .get("stopped_worker")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                error: Some(error),
+            },
+            (Err(error), lifecycle_error) => AbortCleanup {
+                session_id: id.clone(),
+                status: "error".to_string(),
+                stopped_worker: false,
+                error: Some(match lifecycle_error {
+                    Some(lifecycle_error) => {
+                        format!("{error}; session cancellation failed: {lifecycle_error}")
+                    }
+                    None => error.to_string(),
+                }),
+            },
+        });
+    }
+
+    AbortResponse {
+        aborted: cleanups.iter().all(|cleanup| cleanup.error.is_none()),
+        sessions: aborted_sessions,
+        cleanup: cleanups.first().cloned(),
+        cleanups,
+    }
+}
+
+fn active_runtime_id_from_probe(session_id: &str, payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("sessions")?
+        .as_array()?
+        .iter()
+        .find(|entry| {
+            entry.get("session_id").and_then(serde_json::Value::as_str) == Some(session_id)
+        })?
+        .get("runtime_id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+pub async fn fork_session(
+    Path(session_id): Path<String>,
+    Json(payload): Json<ForkSessionRequest>,
+) -> impl IntoResponse {
+    match fork_session_value(session_id, payload).await {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => session_mutation_error(error),
+    }
+}
+
+pub async fn fork_session_value(
+    session_id: String,
+    payload: ForkSessionRequest,
+) -> Result<Session, String> {
+    let original = session_store().get_session(&session_id);
+    let info = session_store().build_session_info(
+        payload
+            .directory
+            .or_else(|| original.as_ref().and_then(|s| s.directory.clone())),
+        payload
+            .model
+            .or_else(|| original.as_ref().and_then(|s| s.model.clone())),
+        payload
+            .agent
+            .or_else(|| original.as_ref().and_then(|s| s.agent.clone())),
+        original.as_ref().and_then(|s| s.session_type.clone()),
+        original
+            .as_ref()
+            .map(|session| session.kill_processes_on_start)
+            .unwrap_or(false),
+        original
+            .as_ref()
+            .map(|session| session.validator_enabled)
+            .unwrap_or(false),
+        original
+            .as_ref()
+            .map(|session| session.force_planning)
+            .unwrap_or(false),
+        original
+            .as_ref()
+            .and_then(|session| session.model_variant.clone()),
+        original
+            .as_ref()
+            .map(|session| session.model_acceleration_enabled)
+            .unwrap_or(false),
+        original
+            .as_ref()
+            .map(|session| session.disable_permission_restrictions)
+            .unwrap_or(false),
+    );
+    let new_session = session_store().create_canonical_fork(
+        info,
+        session_id,
+        payload.copy_context.unwrap_or(true),
+    )?;
+    Ok(new_session)
+}
+
+pub async fn session_status() -> Json<std::collections::HashMap<String, serde_json::Value>> {
+    let sessions = session_store().list_sessions();
+    let statuses = sessions
+        .into_iter()
+        .map(|s| {
+            (
+                s.id.clone(),
+                serde_json::json!({
+                    "status": session_status_value(&s.status),
+                    "task_management": s.task_management,
+                    "context_tokens": s.context_tokens,
+                    "usage": s.usage,
+                    "plan_summary": s.plan_summary,
+                    "session_display_name": s.session_display_name,
+                }),
+            )
+        })
+        .collect();
+    Json(statuses)
+}
+
+pub(crate) fn session_status_value(status: &SessionStatus) -> serde_json::Value {
+    match status {
+        SessionStatus::Idle => serde_json::json!({ "type": "idle" }),
+        SessionStatus::Busy => serde_json::json!({ "type": "busy" }),
+        SessionStatus::Error => serde_json::json!({ "type": "error" }),
+    }
+}
+
+pub async fn share_session(Path(session_id): Path<String>) -> Json<ShareResponse> {
+    Json(ShareResponse {
+        url: format!("https://share.example.com/session/{session_id}"),
+    })
+}
+
+// ============================================================================
+// Session Children
+// ============================================================================
+
+pub async fn session_children(Path(session_id): Path<String>) -> Json<Vec<Session>> {
+    Json(session_store().list_child_sessions(&session_id))
+}
+
+pub async fn session_user_commands(Path(session_id): Path<String>) -> impl IntoResponse {
+    let root_session_id = session_store().root_session_id(&session_id);
+    let result = session_store().execute_canonical_session_command(
+        &root_session_id,
+        SessionCommand::ConsumeQueuedUserInputs,
+    );
+    match result {
+        Ok(result) => match result.event {
+            SessionEvent::QueuedUserInputsConsumed { inputs } => Json(serde_json::json!({
+                "session_id": session_id,
+                "commands": inputs,
+            }))
+            .into_response(),
+            event => session_mutation_error(format!(
+                "session service returned unexpected queued-input event: {event:?}"
+            )),
+        },
+        Err(error) => session_mutation_error(error),
+    }
+}
+
+pub(crate) fn append_user_command_for_runtime(
+    session_id: &str,
+    command: String,
+) -> Result<Vec<String>, String> {
+    let root_session_id = session_store().root_session_id(session_id);
+    let result = session_store().execute_canonical_session_command(
+        &root_session_id,
+        SessionCommand::QueueUserInputWhileBusy { input: command },
+    )?;
+    Ok(result.projection.pending_user_inputs)
+}
+
+pub async fn append_session_user_command(
+    Path(session_id): Path<String>,
+    Json(payload): Json<AppendUserCommandRequest>,
+) -> impl IntoResponse {
+    match append_user_command_for_runtime(&session_id, payload.command) {
+        Ok(commands) => Json(serde_json::json!({
+            "ok": true,
+            "session_id": session_id,
+            "commands": commands,
+        }))
+        .into_response(),
+        Err(error) => session_mutation_error(error),
+    }
+}
+
+pub async fn register_child_session(
+    Path(session_id): Path<String>,
+    payload: Result<Json<RegisterChildSessionRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "child_admission_invalid",
+                    "message": error.body_text(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if session_id != payload.parent_session_id {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "child_admission_parent_path_conflict",
+            })),
+        )
+            .into_response();
+    }
+    if let Err(error) = payload.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "child_admission_invalid",
+                "message": error,
+            })),
+        )
+            .into_response();
+    }
+    match tokio::task::spawn_blocking(move || {
+        RouterClient::global().register_child_session(payload)
+    })
+    .await
+    {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            let status = if message.contains("_CONFLICT")
+                || message.contains("EXISTING_CHILD_WITHOUT_IDENTITY")
+            {
+                StatusCode::CONFLICT
+            } else if message.contains("PARENT_SESSION_NOT_FOUND") {
+                StatusCode::NOT_FOUND
+            } else if message.contains("_MISSING") || message.contains("_INVALID") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "child_admission_failed",
+                    "message": message,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "child_admission_failed",
+                "message": format!("router child admission task failed: {error}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn acknowledge_child_callback(
+    Path((parent_session_id, child_session_id)): Path<(String, String)>,
+    Json(payload): Json<AcknowledgeChildCallbackRequest>,
+) -> impl IntoResponse {
+    if parent_session_id != payload.parent_session_id
+        || child_session_id != payload.child_session_id
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "child_callback_ack_path_conflict",
+            })),
+        )
+            .into_response();
+    }
+    if let Err(error) = payload.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "child_callback_ack_invalid",
+                "message": error,
+            })),
+        )
+            .into_response();
+    }
+    match tokio::task::spawn_blocking(move || {
+        converge_child_callback_ack_result(
+            RouterClient::global().acknowledge_child_callback(payload),
+        )
+    })
+    .await
+    {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            let status = child_callback_ack_error_status(&message);
+            (
+                status,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "child_callback_ack_failed",
+                    "message": message,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "child_callback_ack_failed",
+                "message": format!("router child callback ACK task failed: {error}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn converge_child_callback_ack_result(
+    result: anyhow::Result<AcknowledgeChildCallbackResponse>,
+) -> anyhow::Result<AcknowledgeChildCallbackResponse> {
+    let response = result?;
+    converge_acknowledged_child_callback(&response).map_err(anyhow::Error::msg)?;
+    Ok(response)
+}
+
+fn converge_acknowledged_child_callback(
+    response: &AcknowledgeChildCallbackResponse,
+) -> Result<(), String> {
+    let store = session_store();
+    let parent_session_id = response.parent_session_id.as_str();
+    let child_session_id = response.child_session_id.as_str();
+    let effect_identity = serde_json::to_value(&response.effect_identity).map_err(|error| {
+        format!(
+            "PARENT_TASK_CHILD_CALLBACK_IDENTITY_INVALID:{parent_session_id}:{child_session_id}:{error}"
+        )
+    })?;
+    let acknowledgment = AcknowledgedChildCallbackIdentityV1 {
+        schema_version: ACKNOWLEDGED_CHILD_CALLBACK_IDENTITY_SCHEMA_VERSION.to_string(),
+        parent_mission_revision_sha256: response.parent_mission_revision_sha256.clone(),
+        commander_thread_id: response.commander_thread_id.clone(),
+        child_session_id: response.child_session_id.clone(),
+        child_runtime_id: response.child_runtime_id.clone(),
+        child_lease_id: response.child_lease_id.clone(),
+        child_transaction_id: response.transaction_id.clone(),
+        event_id: response.event_id.clone(),
+        callback_payload_sha256: response.callback_payload_sha256.clone(),
+        effect_identity_sha256: canonical_value_sha256(&effect_identity),
+    };
+    store
+        .execute_canonical_session_command(
+            parent_session_id,
+            SessionCommand::ConvergeAcknowledgedChildCallback { acknowledgment },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "PARENT_TASK_CHILD_CALLBACK_CONVERGENCE_FAILED:{parent_session_id}:{child_session_id}:{error}"
+            )
+        })
+}
+
+fn child_callback_ack_error_status(message: &str) -> StatusCode {
+    if message.contains("_NOT_FOUND") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("ACKNOWLEDGED_CHILD_CALLBACK_DISPATCH_CLAIM_MISSING")
+        || message.contains("ACKNOWLEDGED_CHILD_CALLBACK_DISPATCH_CLAIM_AMBIGUOUS")
+        || message.contains("PARENT_TASK_CHILD_BINDING_MISSING")
+        || message.contains("PARENT_TASK_CHILD_BINDING_AMBIGUOUS")
+        || message.contains("CHILD_CALLBACK_ACK_RECONCILED_CONTINUATION_REQUIRED")
+        || message.contains("CONTINUATION_DELIVERY_UNSETTLED_NO_BLIND_RETRY")
+        || message.contains("_MISMATCH")
+        || message.contains("_CONFLICT")
+        || message.contains("UNSETTLED_EFFECT_ACK_BLOCKED")
+    {
+        StatusCode::CONFLICT
+    } else if message.contains("_MISSING") || message.contains("_INVALID") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+pub async fn update_session_status_for_runtime(
+    Path(session_id): Path<String>,
+    Json(payload): Json<RuntimeSessionStatusRequest>,
+) -> impl IntoResponse {
+    if session_store().get_session(&session_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "session_not_found",
+                "session_id": session_id,
+            })),
+        )
+            .into_response();
+    }
+    let (state, api_status) = match payload.status.as_str() {
+        "idle" => (SessionState::Completed, SessionStatus::Idle),
+        "busy" => (SessionState::Running, SessionStatus::Busy),
+        "error" => (SessionState::Failed, SessionStatus::Error),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "invalid_session_status",
+                    "allowed": ["idle", "busy", "error"],
+                })),
+            )
+                .into_response();
+        }
+    };
+    if let Some(projection) = session_store().session_lifecycle_projection(&session_id) {
+        if projection.active_runtime_id.is_some() {
+            let session = session_store().get_session(&session_id);
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "session_status_transition_rejected",
+                    "requested": payload.status,
+                    "actual": session.as_ref().map(|session| session.status.clone()),
+                })),
+            )
+                .into_response();
+        }
+        let aggregate = SessionAggregate {
+            session_id: projection.session_id,
+            state: projection.state,
+            parent_id: projection.parent_id,
+            task_plan: projection.task_plan,
+            pending_user_inputs: projection.pending_user_inputs,
+            cancelled: projection.cancelled,
+            runtime_ids: projection.runtime_ids,
+            active_runtime_id: projection.active_runtime_id,
+        };
+        if aggregate
+            .decide(SessionCommand::ApplyRuntimeState { state })
+            .is_err()
+        {
+            let session = session_store().get_session(&session_id);
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "session_status_transition_rejected",
+                    "requested": payload.status,
+                    "actual": session.as_ref().map(|session| session.status.clone()),
+                })),
+            )
+                .into_response();
+        }
+    }
+    if let Err(error) = session_store().execute_canonical_session_command_with_status_event(
+        &session_id,
+        SessionCommand::ApplyRuntimeState { state },
+    ) {
+        return session_mutation_error(error);
+    }
+    let session = session_store().get_session(&session_id);
+    if session
+        .as_ref()
+        .is_none_or(|session| session.status != api_status)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "session_status_transition_rejected",
+                "requested": payload.status,
+                "actual": session.as_ref().map(|session| session.status.clone()),
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(SessionStatusResponse {
+                session_id,
+                status: api_status,
+                task_management: session
+                    .as_ref()
+                    .map(|session| session.task_management.clone())
+                    .unwrap_or_else(|| serde_json::json!({})),
+                context_tokens: session
+                    .as_ref()
+                    .map(|session| session.context_tokens)
+                    .unwrap_or_default(),
+                usage: session
+                    .as_ref()
+                    .map(|session| session.usage.clone())
+                    .unwrap_or_default(),
+                plan_summary: session
+                    .as_ref()
+                    .and_then(|session| session.plan_summary.clone()),
+                session_display_name: session.and_then(|session| session.session_display_name),
+            })
+            .unwrap_or_else(|_| {
+                serde_json::json!({
+                    "ok": false,
+                    "error": "session_status_response_encode_failed",
+                })
+            }),
+        ),
+    )
+        .into_response()
+}
+
+// ============================================================================
+// Message Operations
+// ============================================================================
+
+#[path = "session_messages.rs"]
+mod session_messages;
+pub use crate::contracts::{MessageListParams, SessionCommandRequest, SessionCommandResponse};
+pub use session_messages::{
+    get_message, get_message_part, get_todos, list_messages, list_messages_value, send_message,
+    session_command,
+};
+pub async fn revert_session(Path(session_id): Path<String>) -> Json<bool> {
+    Json(
+        apply_session_change_records(&session_id, ChangeDirection::Revert).unwrap_or_else(
+            |error| {
+                tracing::warn!(session_id, error = %error, "session revert failed");
+                false
+            },
+        ),
+    )
+}
+
+pub async fn unrevert_session(Path(session_id): Path<String>) -> Json<bool> {
+    Json(
+        apply_session_change_records(&session_id, ChangeDirection::Unrevert).unwrap_or_else(
+            |error| {
+                tracing::warn!(session_id, error = %error, "session unrevert failed");
+                false
+            },
+        ),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChangeDirection {
+    Revert,
+    Unrevert,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SessionChangeRecord {
+    path: String,
+    before_exists: bool,
+    before_content: Option<String>,
+    after_exists: bool,
+    after_content: Option<String>,
+    #[serde(default)]
+    reverted: bool,
+}
+
+fn apply_session_change_records(
+    session_id: &str,
+    direction: ChangeDirection,
+) -> Result<bool, String> {
+    let directory = session_store()
+        .get_session(session_id)
+        .and_then(|session| session.directory)
+        .ok_or_else(|| format!("session {session_id} has no directory"))?;
+    let tracker_path = session_change_tracker_path(&directory, session_id);
+    let content = fs::read_to_string(&tracker_path).map_err(|error| {
+        format!(
+            "failed to read change tracker {}: {error}",
+            tracker_path.display()
+        )
+    })?;
+    let mut records: Vec<SessionChangeRecord> = serde_json::from_str(&content)
+        .map_err(|error| format!("failed to parse change tracker: {error}"))?;
+    let mut changed_any = false;
+    let mut skipped = false;
+
+    match direction {
+        ChangeDirection::Revert => {
+            for record in records.iter_mut().rev().filter(|record| !record.reverted) {
+                match apply_single_change(record, true) {
+                    Ok(true) => {
+                        record.reverted = true;
+                        changed_any = true;
+                    }
+                    Ok(false) => skipped = true,
+                    Err(error) => {
+                        tracing::warn!(path = %record.path, error = %error, "failed to revert tracked file change");
+                        skipped = true;
+                    }
+                }
+            }
+        }
+        ChangeDirection::Unrevert => {
+            for record in records.iter_mut().filter(|record| record.reverted) {
+                match apply_single_change(record, false) {
+                    Ok(true) => {
+                        record.reverted = false;
+                        changed_any = true;
+                    }
+                    Ok(false) => skipped = true,
+                    Err(error) => {
+                        tracing::warn!(path = %record.path, error = %error, "failed to unrevert tracked file change");
+                        skipped = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let updated = serde_json::to_string_pretty(&records)
+        .map_err(|error| format!("failed to serialize change tracker: {error}"))?;
+    fs::write(&tracker_path, updated).map_err(|error| {
+        format!(
+            "failed to write change tracker {}: {error}",
+            tracker_path.display()
+        )
+    })?;
+    Ok(changed_any && !skipped)
+}
+
+fn apply_single_change(record: &SessionChangeRecord, revert: bool) -> Result<bool, String> {
+    let path = PathBuf::from(&record.path);
+    let expected = if revert {
+        record.after_content.as_deref()
+    } else {
+        record.before_content.as_deref()
+    };
+    let current = fs::read_to_string(&path).ok();
+    if current.as_deref() != expected {
+        return Ok(false);
+    }
+
+    let target_exists = if revert {
+        record.before_exists
+    } else {
+        record.after_exists
+    };
+    let target_content = if revert {
+        record.before_content.as_deref()
+    } else {
+        record.after_content.as_deref()
+    };
+
+    if target_exists {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "failed to create change target directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        fs::write(&path, target_content.unwrap_or_default()).map_err(|error| {
+            format!(
+                "failed to write change target file {}: {error}",
+                path.display()
+            )
+        })?;
+    } else if path.exists() {
+        fs::remove_file(&path).map_err(|error| {
+            format!(
+                "failed to remove change target file {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(true)
+}
+
+fn session_change_tracker_path(directory: &str, session_id: &str) -> PathBuf {
+    PathBuf::from(directory)
+        .join(".tura")
+        .join("session_changes")
+        .join(format!("{session_id}.json"))
+}
+
+// ============================================================================
+// Session Summarize
+// ============================================================================
+
+#[path = "session_summary.rs"]
+mod session_summary;
+pub use crate::contracts::SummaryResponse;
+pub use session_summary::summarize_session;
+
+// ============================================================================
+// Session Shell
+// ============================================================================
+
+#[path = "session_shell.rs"]
+mod session_shell;
+pub use crate::contracts::{ShellRequest, ShellResponse};
+pub use session_shell::session_shell;
+use session_shell::{run_session_shell_command, truncate_summary_text};
+
+// ============================================================================
+// Async Prompt
+// ============================================================================
+
+#[path = "session_prompt.rs"]
+mod session_prompt;
+pub(crate) use session_prompt::frontend_safe_reply_message;
+#[cfg(test)]
+use session_prompt::{
+    config_model_override, first_prompt_part_id, prompt_command_run_shell, prompt_message_id,
+    prompt_model_acceleration, prompt_model_variant, prompt_text,
+};
+use session_prompt::{final_agent_message, run_mano_for_prompt};
+pub use session_prompt::{prompt_async, prompt_async_value, start_task_scheduler};
+#[cfg(any(feature = "business-tests", feature = "os-tests"))]
+pub use session_prompt::{
+    run_due_task_scheduler_tick_for_business_test,
+    run_due_task_scheduler_tick_for_store_business_test,
+};
+#[path = "session_format.rs"]
+mod session_format;
+#[cfg(test)]
+use crate::session::store::frontend_safe_value;
+pub(crate) use session_format::api_message_from_store;
+use session_format::{message_with_parts_from_store, part_json};
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;

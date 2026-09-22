@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install package and build tooling
+        run: |
+          python -m pip install pip==26.2.1
+          python -m pip install '.[dev]'
+      - name: Run review-ready checks
+        run: make check PYTHON=python
+      - name: Verify installed package import
+        run: make installed-smoke PYTHON=python
+      - name: Build and verify clean release artifacts
+        if: matrix.python-version == '3.12'
+        run: make release-check PYTHON=python

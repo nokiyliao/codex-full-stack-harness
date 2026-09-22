@@ -1,0 +1,28 @@
+{
+  "name": "shell_command",
+  "description": "Internal command_run command for session shell commands.",
+  "input_schema": {
+    "type": "object",
+    "required": ["command_line"],
+    "properties": {
+      "command_line": {
+        "type": "string"
+      },
+      "step": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "timeout_secs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "stall_timeout_ms": {
+        "type": "integer",
+        "minimum": 1000
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object"
+  }
+}

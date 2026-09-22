@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-collaboration-harness"
+version = "0.3.21.dev0"
+description = "A deterministic, domain-neutral harness for bounded multi-agent collaboration."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "nokiyliao" },
+]
+maintainers = [
+  { name = "nokiyliao" },
+]
+keywords = ["agents", "collaboration", "codex", "deterministic", "harness"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.scripts]
+nokiy-taskpacket = "codex_collaboration_harness.native_nokiy:main"
+nokiy-graph-tool = "codex_collaboration_harness.graph_entry:main"
+nokiy-embedded-run = "codex_collaboration_harness.embedded_nokiy:main"
+
+[project.urls]
+Homepage = "https://github.com/nokiyliao/codex-collaboration-harness"
+Repository = "https://github.com/nokiyliao/codex-collaboration-harness"
+Issues = "https://github.com/nokiyliao/codex-collaboration-harness/issues"
+
+[project.optional-dependencies]
+graph = ["mcp>=1.23.3,<2", "filelock>=3.20,<4"]
+dev = [
+  "build==1.6.0",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+codex_collaboration_harness = [
+  "agents/*.toml",
+  "py.typed",
+  "protocol/*.json",
+  "protocol/golden/*.json",
+]

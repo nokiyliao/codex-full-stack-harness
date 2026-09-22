@@ -1,0 +1,766 @@
+//! Gateway/router/session_db lifecycle E2E coverage.
+//!
+//! This is a local stability test: it starts the real gateway binary, verifies
+//! that it starts one router/session_db pair, proves a second gateway cannot
+//! take the same home, then checks explicit shutdown and front-lease idle
+//! cleanup paths.
+
+use anyhow::{Context, Result, anyhow, bail};
+use lifecycle::{SessionCommand, TaskPlan};
+use serde_json::json;
+use session_log_contract::{
+    CreateSessionRequest, ExecuteSessionCommandRequest, RegisterRuntimeRequest, SessionLogCommand,
+    SessionLogResponse, SessionRecordProjection,
+};
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+#[test]
+fn gateway_router_session_db_conflict_and_shutdown_e2e() -> Result<()> {
+    let repo = repo_root();
+    ensure_backend_binary(&repo, "router", "tura_router")?;
+    ensure_backend_binary(&repo, "session_log", "tura_session_db")?;
+
+    let root = temp_root("gateway-lifecycle-e2e")?;
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&workspace)?;
+
+    let port = free_port()?;
+    let gateway_url = format!("http://127.0.0.1:{port}");
+    let mut gateway = GatewayGuard::start(&repo, &home, &workspace, port)?;
+    wait_for_http_ok(port, "/global/health", Duration::from_secs(30))?;
+    wait_for_endpoint(&router_addr_path(&home), Duration::from_secs(30))?;
+    wait_for_endpoint(&service_addr_path(&home), Duration::from_secs(30))?;
+
+    let service_status = http_json(port, "/service/status")?;
+    assert_eq!(
+        service_status["router"]["status"], "running",
+        "router should report running after gateway startup: {service_status}"
+    );
+
+    let conflict = spawn_conflicting_gateway(&repo, &home, &workspace, port)?;
+    assert!(
+        !conflict.status.success(),
+        "second gateway with same TURA_HOME should fail, stdout={}, stderr={}",
+        conflict.stdout,
+        conflict.stderr
+    );
+    assert!(
+        conflict
+            .stderr
+            .contains("gateway ownership lock refused startup"),
+        "conflict stderr should explain ownership lock refusal, got: {}",
+        conflict.stderr
+    );
+
+    let shutdown = shutdown_router(&home)?;
+    assert!(
+        shutdown["ok"].as_bool().unwrap_or(false),
+        "shutdown failed: {shutdown}"
+    );
+    assert_eq!(shutdown["payload"]["status"], "shutting_down");
+    wait_for_missing(&router_addr_path(&home), Duration::from_secs(10))?;
+    wait_for_missing(&service_addr_path(&home), Duration::from_secs(10))?;
+
+    assert!(
+        http_get(port, "/global/health", Duration::from_secs(2))?.starts_with("HTTP/1.1 200"),
+        "gateway should stay alive until its owner process is explicitly stopped"
+    );
+
+    gateway.stop()?;
+    assert!(
+        !router_endpoint_reachable(&home),
+        "router endpoint must be unreachable after graceful shutdown"
+    );
+    assert!(
+        !session_db_endpoint_reachable(&home),
+        "session_db endpoint must be unreachable after graceful shutdown"
+    );
+    assert!(
+        !router_addr_path(&home).exists() && !service_addr_path(&home).exists(),
+        "shutdown must remove endpoint files under {gateway_url}"
+    );
+    Ok(())
+}
+
+#[test]
+fn gateway_stdin_eof_shuts_down_router_session_db_and_runtime_e2e() -> Result<()> {
+    let repo = repo_root();
+    ensure_backend_binary(&repo, "router", "tura_router")?;
+    ensure_backend_binary(&repo, "session_log", "tura_session_db")?;
+
+    let root = temp_root("gateway-stdin-eof-lifecycle-e2e")?;
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&workspace)?;
+
+    let port = free_port()?;
+    let mut gateway = GatewayGuard::start_with_stdin_lease(&repo, &home, &workspace, port)?;
+    wait_for_http_ok(port, "/global/health", Duration::from_secs(30))?;
+    wait_for_endpoint(&router_addr_path(&home), Duration::from_secs(30))?;
+    wait_for_endpoint(&service_addr_path(&home), Duration::from_secs(30))?;
+
+    gateway.close_stdin()?;
+    let status = gateway.wait_for_exit(Duration::from_secs(15))?;
+    assert!(
+        status.success(),
+        "gateway should exit cleanly after stdin EOF, got {status}"
+    );
+    wait_for_missing(&router_addr_path(&home), Duration::from_secs(15))?;
+    wait_for_missing(&service_addr_path(&home), Duration::from_secs(15))?;
+    assert!(!router_endpoint_reachable(&home));
+    assert!(!session_db_endpoint_reachable(&home));
+    Ok(())
+}
+
+#[test]
+fn gateway_listener_survives_if_the_durable_session_feed_reducer_terminates() -> Result<()> {
+    let repo = repo_root();
+    ensure_backend_binary(&repo, "router", "tura_router")?;
+    ensure_backend_binary(&repo, "session_log", "tura_session_db")?;
+
+    let root = temp_root("gateway-feed-owner-e2e")?;
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&workspace)?;
+
+    let port = free_port()?;
+    let mut gateway = GatewayGuard::start(&repo, &home, &workspace, port)?;
+    wait_for_http_ok(port, "/global/health", Duration::from_secs(30))?;
+    wait_for_endpoint(&service_addr_path(&home), Duration::from_secs(30))?;
+
+    publish_runtime_terminal_projection(&home, &workspace, "completed", false)?;
+    wait_for_http_ok(port, "/global/health", Duration::from_secs(5))?;
+    publish_runtime_terminal_projection(&home, &workspace, "failed", true)?;
+    wait_for_http_ok(port, "/global/health", Duration::from_secs(5))?;
+
+    publish_reducer_invalid_terminal_message(&home, &workspace)?;
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        gateway
+            .child
+            .as_mut()
+            .expect("gateway child")
+            .try_wait()?
+            .is_none(),
+        "unexpected feed termination must not exit the gateway owner"
+    );
+    wait_for_http_ok(port, "/global/health", Duration::from_secs(5))?;
+    gateway.stop()?;
+    Ok(())
+}
+
+#[test]
+fn control_deck_reconstructs_authoritative_state_without_chat_context() -> Result<()> {
+    let repo = repo_root();
+    ensure_backend_binary(&repo, "router", "tura_router")?;
+    ensure_backend_binary(&repo, "session_log", "tura_session_db")?;
+
+    let root = temp_root("gateway-control-deck-e2e")?;
+    let home = root.join("home");
+    let workspace = root.join("workspace-private-path");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&workspace)?;
+
+    let port = free_port()?;
+    let mut gateway = GatewayGuard::start(&repo, &home, &workspace, port)?;
+    wait_for_http_ok(port, "/global/health", Duration::from_secs(30))?;
+    wait_for_endpoint(&router_addr_path(&home), Duration::from_secs(30))?;
+    wait_for_endpoint(&service_addr_path(&home), Duration::from_secs(30))?;
+
+    let session_id = format!("commander-control-deck-{}", uuid::Uuid::new_v4());
+    let runtime_id = format!("runtime-control-deck-{}", uuid::Uuid::new_v4());
+    create_and_register_runtime(&home, &workspace, &session_id, &runtime_id)?;
+
+    let first = http_json(port, "/control-deck")?;
+    assert_eq!(
+        first["schema_version"],
+        "tura_commander_control_deck_snapshot_v2"
+    );
+    assert_eq!(first["authority_effect"], "none");
+    assert_eq!(first["state_head"].as_str().map(str::len), Some(64));
+    assert_eq!(
+        first["ready_set_state_head"].as_str().map(str::len),
+        Some(64)
+    );
+    assert_eq!(first["ready_set"].as_array().map(Vec::len), Some(0));
+    assert_eq!(first["sessions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(first["sessions"][0]["session_id"], session_id);
+    assert_eq!(first["sessions"][0]["terminal"], false);
+    assert_eq!(first["runtimes"].as_array().map(Vec::len), Some(1));
+    assert_eq!(first["runtimes"][0]["runtime_id"], runtime_id);
+    assert_eq!(first["runtimes"][0]["lease_active"], false);
+    assert_eq!(first["runtimes"][0]["terminal"], false);
+    assert_eq!(first["convergence"][0]["availability"], "typed_absence");
+    assert!(first["typed_absences"].as_array().is_some_and(|entries| {
+        entries.iter().any(|entry| {
+            entry["identity"] == session_id
+                && entry["field"] == "mission_revision_sha256"
+                && entry["reason"] == "MISSION_REVISION_TYPED_ABSENCE"
+        })
+    }));
+
+    let serialized = serde_json::to_string(&first)?;
+    assert!(!serialized.contains(&workspace.display().to_string()));
+    assert!(!serialized.contains("workspace-private-path"));
+
+    let second = http_json(port, "/control-deck")?;
+    assert_eq!(first["state_head"], second["state_head"]);
+    assert_eq!(
+        first["session_db_state_head"],
+        second["session_db_state_head"]
+    );
+    assert_eq!(
+        first["convergence_state_head"],
+        second["convergence_state_head"]
+    );
+    assert_eq!(
+        first["ready_set_state_head"],
+        second["ready_set_state_head"]
+    );
+
+    let stale_id = "0".repeat(64);
+    let event = http_first_sse_event(port, "/control-deck/events", Some(&stale_id))?;
+    assert!(event.contains("event: control_deck_changed"), "{event}");
+    assert!(
+        event.contains(first["state_head"].as_str().expect("state head")),
+        "{event}"
+    );
+    assert!(!event.contains("workspace-private-path"));
+
+    gateway.stop()?;
+    wait_for_missing(&router_addr_path(&home), Duration::from_secs(10))?;
+    wait_for_missing(&service_addr_path(&home), Duration::from_secs(10))?;
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
+
+fn publish_runtime_terminal_projection(
+    home: &Path,
+    workspace: &Path,
+    label: &str,
+    failed: bool,
+) -> Result<()> {
+    let session_id = format!("feed-{label}-{}", uuid::Uuid::new_v4());
+    let runtime_id = format!("runtime-{label}-{}", uuid::Uuid::new_v4());
+    create_and_register_runtime(home, workspace, &session_id, &runtime_id)?;
+    let terminal = if failed {
+        SessionCommand::RuntimeFailed {
+            runtime_id: runtime_id.clone(),
+        }
+    } else {
+        SessionCommand::RuntimeCompleted {
+            runtime_id: runtime_id.clone(),
+        }
+    };
+    expect_session_command(call_session_db(
+        home,
+        SessionLogCommand::ExecuteSessionCommand(ExecuteSessionCommandRequest {
+            command_id: format!("terminal-{label}"),
+            session_id: session_id.clone(),
+            session_command: terminal,
+            message_projection: None,
+        }),
+    )?)
+}
+
+fn publish_reducer_invalid_terminal_message(home: &Path, workspace: &Path) -> Result<()> {
+    let session_id = format!("feed-invalid-{}", uuid::Uuid::new_v4());
+    let runtime_id = format!("runtime-invalid-{}", uuid::Uuid::new_v4());
+    create_and_register_runtime(home, workspace, &session_id, &runtime_id)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    expect_session_command(call_session_db(
+        home,
+        SessionLogCommand::ExecuteSessionCommand(ExecuteSessionCommandRequest {
+            command_id: "terminal-invalid-message".to_string(),
+            session_id: session_id.clone(),
+            session_command: SessionCommand::RuntimeFailed { runtime_id },
+            message_projection: Some(SessionRecordProjection {
+                session_id: session_id.clone(),
+                message_id: "invalid-message".to_string(),
+                role: "assistant".to_string(),
+                created_at: now,
+                updated_at: now,
+                record: json!({
+                    "id": "invalid-message",
+                    "session_id": session_id,
+                    "role": "assistant"
+                }),
+            }),
+        }),
+    )?)
+}
+
+fn create_and_register_runtime(
+    home: &Path,
+    workspace: &Path,
+    session_id: &str,
+    runtime_id: &str,
+) -> Result<()> {
+    expect_session_command(call_session_db(
+        home,
+        SessionLogCommand::CreateSession(Box::new(CreateSessionRequest {
+            command_id: format!("create-{session_id}"),
+            session_id: session_id.to_string(),
+            creation_command: SessionCommand::CreateSession {
+                task_plan: TaskPlan::default(),
+            },
+            copy_context: false,
+            workspace: workspace.display().to_string(),
+            session_directory: workspace.display().to_string(),
+            name: session_id.to_string(),
+            created_at: chrono::Utc::now().timestamp_millis(),
+            model: None,
+            agent: None,
+            session_type: "coding".to_string(),
+            kill_processes_on_start: false,
+            validator_enabled: false,
+            force_planning: false,
+            model_variant: None,
+            model_acceleration_enabled: false,
+            disable_permission_restrictions: false,
+            use_last_tool_call_response: false,
+            auto_session_name: false,
+            initial_task_plan_patch: None,
+        })),
+    )?)?;
+    match call_session_db(
+        home,
+        SessionLogCommand::RegisterRuntime(RegisterRuntimeRequest {
+            runtime_id: runtime_id.to_string(),
+            session_id: session_id.to_string(),
+            fallback_from_id: None,
+            lifecycle: None,
+        }),
+    )? {
+        SessionLogResponse::RuntimeRegistered { .. } => Ok(()),
+        response => bail!("unexpected register runtime response: {response:?}"),
+    }
+}
+
+fn expect_session_command(response: SessionLogResponse) -> Result<()> {
+    match response {
+        SessionLogResponse::SessionCommandApplied { .. } => Ok(()),
+        response => bail!("unexpected session command response: {response:?}"),
+    }
+}
+
+fn call_session_db(home: &Path, command: SessionLogCommand) -> Result<SessionLogResponse> {
+    let endpoint = read_endpoint(&service_addr_path(home))?;
+    let addr = endpoint
+        .get("addr")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("session_db endpoint missing addr: {endpoint}"))?;
+    let response = call_jsonl(addr, &serde_json::to_value(command)?)?;
+    serde_json::from_value(response).context("decode session_db response")
+}
+
+struct GatewayGuard {
+    child: Option<Child>,
+    home: PathBuf,
+}
+
+impl GatewayGuard {
+    fn start(repo: &Path, home: &Path, workspace: &Path, port: u16) -> Result<Self> {
+        let child = Command::new(gateway_bin())
+            .current_dir(workspace)
+            .envs(gateway_env(repo, home, workspace, port))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawn tura_gateway")?;
+        Ok(Self {
+            child: Some(child),
+            home: home.to_path_buf(),
+        })
+    }
+
+    fn start_with_stdin_lease(
+        repo: &Path,
+        home: &Path,
+        workspace: &Path,
+        port: u16,
+    ) -> Result<Self> {
+        let mut env = gateway_env(repo, home, workspace, port);
+        env.push((
+            "TURA_GATEWAY_SHUTDOWN_ON_STDIN_EOF".to_string(),
+            "1".to_string(),
+        ));
+        env.push((
+            "TURA_GATEWAY_ROUTER_LEASE_TTL_SECS".to_string(),
+            "1".to_string(),
+        ));
+        env.push((
+            "TURA_ROUTER_IDLE_SHUTDOWN_SECS".to_string(),
+            "2".to_string(),
+        ));
+        let child = Command::new(gateway_bin())
+            .current_dir(workspace)
+            .envs(env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawn stdin-lease tura_gateway")?;
+        Ok(Self {
+            child: Some(child),
+            home: home.to_path_buf(),
+        })
+    }
+
+    fn close_stdin(&mut self) -> Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            drop(child.stdin.take());
+        }
+        Ok(())
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> Result<ExitStatus> {
+        let Some(child) = self.child.as_mut() else {
+            bail!("gateway process already consumed");
+        };
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if started.elapsed() >= timeout {
+                child
+                    .kill()
+                    .context("kill gateway after stdin EOF timeout")?;
+                let _ = child.wait();
+                bail!(
+                    "gateway did not exit within {}ms after stdin EOF",
+                    timeout.as_millis()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        let _ = shutdown_router(&self.home);
+        if let Some(mut child) = self.child.take() {
+            if child.try_wait()?.is_none() {
+                child.kill().context("kill gateway")?;
+            }
+            let _ = child.wait();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GatewayGuard {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+struct CommandOutput {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+fn spawn_conflicting_gateway(
+    repo: &Path,
+    home: &Path,
+    workspace: &Path,
+    existing_port: u16,
+) -> Result<CommandOutput> {
+    let conflict_port = loop {
+        let candidate = free_port()?;
+        if candidate != existing_port {
+            break candidate;
+        }
+    };
+    let mut child = Command::new(gateway_bin())
+        .current_dir(workspace)
+        .envs(gateway_env(repo, home, workspace, conflict_port))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn conflicting tura_gateway")?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            child.kill().context("kill hung conflicting gateway")?;
+            bail!("conflicting gateway did not exit within 10s");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    Ok(CommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn gateway_env(repo: &Path, home: &Path, workspace: &Path, port: u16) -> Vec<(String, String)> {
+    vec![
+        ("PORT".to_string(), port.to_string()),
+        ("TURA_GATEWAY_PORT".to_string(), port.to_string()),
+        (
+            "TURA_GATEWAY_URL".to_string(),
+            format!("http://127.0.0.1:{port}"),
+        ),
+        ("TURA_HOME".to_string(), home.display().to_string()),
+        ("TURA_PROJECT_ROOT".to_string(), repo.display().to_string()),
+        ("TURA_CWD".to_string(), workspace.display().to_string()),
+        (
+            "TURA_PROVIDER_CONFIG".to_string(),
+            repo.join("crates")
+                .join("provider")
+                .join("config")
+                .join("provider_config.json")
+                .display()
+                .to_string(),
+        ),
+    ]
+}
+
+fn shutdown_router(home: &Path) -> Result<serde_json::Value> {
+    let endpoint = read_endpoint(&router_addr_path(home))?;
+    let addr = endpoint
+        .get("addr")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("router endpoint missing addr: {endpoint}"))?;
+    call_jsonl(
+        addr,
+        &json!({
+            "request_id": "process-lifecycle-shutdown",
+            "kind": "call",
+            "method": "execution.shutdown",
+            "payload": {}
+        }),
+    )
+}
+
+fn call_jsonl(addr: &str, payload: &serde_json::Value) -> Result<serde_json::Value> {
+    let socket: SocketAddr = addr
+        .parse()
+        .with_context(|| format!("invalid router address {addr}"))?;
+    let mut stream = TcpStream::connect_timeout(&socket, Duration::from_secs(2))
+        .with_context(|| format!("connect router at {addr}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(serde_json::to_string(payload)?.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    if line.trim().is_empty() {
+        bail!("router closed without shutdown response");
+    }
+    serde_json::from_str(line.trim()).context("parse router shutdown response")
+}
+
+fn router_endpoint_reachable(home: &Path) -> bool {
+    endpoint_reachable(&router_addr_path(home))
+}
+
+fn session_db_endpoint_reachable(home: &Path) -> bool {
+    endpoint_reachable(&service_addr_path(home))
+}
+
+fn endpoint_reachable(path: &Path) -> bool {
+    let Ok(endpoint) = read_endpoint(path) else {
+        return false;
+    };
+    let Some(addr) = endpoint.get("addr").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Ok(socket) = addr.parse::<SocketAddr>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&socket, Duration::from_millis(200)).is_ok()
+}
+
+fn read_endpoint(path: &Path) -> Result<serde_json::Value> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read endpoint {}", path.display()))?;
+    serde_json::from_str(raw.trim()).with_context(|| format!("parse endpoint {}", path.display()))
+}
+
+fn wait_for_endpoint(path: &Path, timeout: Duration) -> Result<()> {
+    wait_until(timeout, || path.exists())
+        .with_context(|| format!("wait for endpoint {}", path.display()))
+}
+
+fn wait_for_missing(path: &Path, timeout: Duration) -> Result<()> {
+    wait_until(timeout, || !path.exists())
+        .with_context(|| format!("wait for endpoint cleanup {}", path.display()))
+}
+
+fn wait_for_http_ok(port: u16, path: &str, timeout: Duration) -> Result<()> {
+    wait_until(timeout, || {
+        http_get(port, path, Duration::from_secs(1))
+            .map(|response| response.starts_with("HTTP/1.1 200"))
+            .unwrap_or(false)
+    })
+}
+
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> Result<()> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if condition() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!("timed out after {}ms", timeout.as_millis())
+}
+
+fn http_json(port: u16, path: &str) -> Result<serde_json::Value> {
+    let response = http_get(port, path, Duration::from_secs(5))?;
+    let body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .ok_or_else(|| anyhow!("HTTP response missing body: {response}"))?;
+    serde_json::from_str(body.trim()).with_context(|| format!("parse HTTP body for {path}"))
+}
+
+fn http_get(port: u16, path: &str, timeout: Duration) -> Result<String> {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+        .with_context(|| format!("connect gateway on port {port}"))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+fn http_first_sse_event(port: u16, path: &str, last_event_id: Option<&str>) -> Result<String> {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let timeout = Duration::from_secs(5);
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+        .with_context(|| format!("connect gateway SSE on port {port}"))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let last_event_header = last_event_id
+        .map(|value| format!("Last-Event-ID: {value}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n{last_event_header}Connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    let mut headers_complete = false;
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            bail!("SSE stream closed before first event: {response}");
+        }
+        response.push_str(&line);
+        if !headers_complete {
+            if line == "\r\n" {
+                headers_complete = true;
+            }
+            continue;
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        if response.len() > 64 * 1024 {
+            bail!("SSE first event exceeded 64 KiB");
+        }
+    }
+    if !response.starts_with("HTTP/1.1 200") {
+        bail!("SSE endpoint did not return HTTP 200: {response}");
+    }
+    Ok(response)
+}
+
+fn free_port() -> Result<u16> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn router_addr_path(home: &Path) -> PathBuf {
+    home.join("db").join("session_log").join("router.addr")
+}
+
+fn service_addr_path(home: &Path) -> PathBuf {
+    home.join("db").join("session_log").join("service.addr")
+}
+
+fn temp_root(prefix: &str) -> Result<PathBuf> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let path = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+fn gateway_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_tura_gateway"))
+}
+
+fn ensure_backend_binary(repo: &Path, package: &str, bin: &str) -> Result<()> {
+    let executable = if cfg!(windows) {
+        format!("{bin}.exe")
+    } else {
+        bin.to_string()
+    };
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo.join("target"));
+    let candidate = target_dir.join("debug").join(&executable);
+    if candidate.exists() {
+        return Ok(());
+    }
+    let status = Command::new("cargo")
+        .current_dir(repo)
+        .args(["build", "-p", package, "--bin", bin])
+        .status()
+        .with_context(|| format!("build {package}::{bin}"))?;
+    if !status.success() {
+        bail!("cargo build -p {package} --bin {bin} failed with {status}");
+    }
+    if candidate.exists() {
+        Ok(())
+    } else {
+        bail!(
+            "expected backend binary not found after build: {}",
+            candidate.display()
+        )
+    }
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("gateway crate should live under crates/gateway")
+        .to_path_buf()
+}

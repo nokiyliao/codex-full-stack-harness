@@ -1,0 +1,25 @@
+{
+  "schema": "tura.runtime-session-phase1-evidence.v2",
+  "phase": 1,
+  "status": "completed_and_superseded_by_direct_switch",
+  "scope": "historical extraction of shared Runtime and Session lifecycle types before production-flow cutover",
+  "reference": {
+    "commit": "cdfe91bce2ed4fb62b4dcf276e6ee8ace40264df",
+    "capture": "tests/equivalence/runtime_session/reference/runtime-session.json",
+    "inventory": "tests/equivalence/runtime_session/reference/inventory.json"
+  },
+  "outcome": {
+    "domain_owner": "crates/lifecycle",
+    "runtime_aggregate": "crates/lifecycle/src/runtime.rs",
+    "session_aggregate": "crates/lifecycle/src/session.rs",
+    "session_management": "crates/lifecycle/src/session_management.rs",
+    "session_projection": "crates/lifecycle/src/session_projection.rs",
+    "dependency_direction": "runtime, gateway, router, and session_log consume lifecycle domain types directly"
+  },
+  "superseded_paths": {
+    "reason": "The original field inventory named temporary runtime-owned wrappers and pre-cutover producer paths that were intentionally deleted during Phase 2.",
+    "current_evidence": "tests/equivalence/runtime_session/direct-switch-evidence.json",
+    "historical_inventory": "tests/equivalence/runtime_session/reference/inventory.json"
+  },
+  "policy": "This summary records the Phase 1 outcome. Current producer, protocol, compatibility, and remote-gate evidence is owned by the direct-switch audit; the frozen Phase 0 inventory is not rewritten."
+}

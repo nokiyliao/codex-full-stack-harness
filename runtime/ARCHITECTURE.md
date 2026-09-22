@@ -1,0 +1,875 @@
+# Tura Architecture
+
+This document is the map of the current `tura` architecture. The design is
+CLI-driven: runtime, gateway, provider, tools, and router behavior belong in
+crates and command modules, not in a collection of independent long-running
+services that happen to know about one another.
+
+The project root is the repository root. Paths in docs and config are relative
+to it. One root is enough; inventing another would mostly create archaeology.
+
+## Operational Logs
+
+### Session Log
+
+Durable session, task-management, message, todo, and workspace session history
+is stored by `crates/session_log` using embedded SQLite. `tura_session_db` is
+the single service that owns the store and every other process reaches it over
+the service socket. The per-instance index and durable write queue live under
+`tura_path::home_db_dir()` as `index.sqlite3`; the full session log for a
+workspace lives with that workspace at `<workspace>/.tura/session_log.sqlite3`.
+dev and release builds therefore share a workspace's session log while keeping
+their per-home sockets, locks, and indexes isolated.
+
+Gateway and runtime must not write session state directly to
+`.tura/sessions/*.json`. Gateway creates sessions and applies typed
+`SessionCommand`s through `SessionDbClient`; creation commands own parent links
+and task state. Runtime persists bounded context and record projections through
+`SessionLogClient::persist_session_delta` and resumes sessions through
+`SessionLogClient::get_session`, scoped by workspace.
+
+Developer query commands:
+
+```powershell
+'{"command":"list_workspaces"}' | target\debug\tura_gateway.exe session-log
+'{"command":"list_sessions","workspace":"C:/repo","page":0,"page_size":50}' | target\debug\tura_gateway.exe session-log
+'{"command":"get_session","session_id":"session-id"}' | target\debug\tura_gateway.exe session-log
+'{"command":"list_session_records","session_id":"session-id","page":0,"page_size":100}' | target\debug\tura_gateway.exe session-log
+```
+
+HTTP query endpoints:
+
+```text
+GET /session-log/workspaces
+GET /session-log/sessions?workspace=C%3A%2Frepo&page=0&page_size=50
+GET /session-log/{sessionID}/records?page=0&page_size=100
+```
+
+### Provider Call Logs
+
+Provider call logs are written only by `crates/provider` under
+`log/provider/YYYY-MM-DD/HHMMSS_mmm_<call_id>.json` by default. `LOG_PATH`
+overrides the provider log root. The file payload is a JSON `llm_call` record
+containing provider, model, base URL, request, normalized response, metrics,
+duration, success, and error/traceback fields. Do not store provider requests
+inside session-log records except as normalized runtime/session events.
+
+## Repository Layout
+
+```text
+.
+  apps/
+    gui/
+    tui/
+
+  agents/
+
+  crates/
+    gateway/
+    lifecycle/
+    provider/
+    router/
+    router_contract/
+    runtime/
+    runtime_contract/
+    session_log/
+    session_log_contract/
+    tools/
+
+  db/
+
+  scripts/
+    build-debug.ps1
+    build-debug.sh
+    build-release.ps1
+    build-release.sh
+    register-cli.ps1
+    register-cli.sh
+    start.ps1
+    start.sh
+    unregister-cli.ps1
+    unregister-cli.sh
+    installers/
+    packages/
+
+  target/
+  tests/
+  xtask/
+    scripts/
+```
+
+## Crate Names And Runnable Packages
+
+Directory names describe architecture ownership. Cargo package names match the
+owning directory names.
+
+```text
+crates/gateway     -> package gateway (binaries: tura_gateway, tura_exec)
+crates/lifecycle   -> package lifecycle, library lifecycle
+crates/runtime     -> package runtime (binary: tura_runtime), library runtime
+crates/runtime_contract -> package runtime_contract, library runtime_contract
+crates/session_log -> package session_log (binary: tura_session_db), library session_log
+crates/session_log_contract -> package session_log_contract, library session_log_contract
+crates/path        -> package tura_path, library tura_path
+agents      -> package agents, library tura_agents
+crates/provider    -> package provider, library tura_llm_rust
+crates/tools       -> package tools, library code_tools
+crates/router      -> package router, default binary tura_router
+crates/router_contract -> package router_contract, library router_contract
+```
+
+Use the directory-matching package names in build, check, install, and start
+commands.
+
+`crates/lifecycle` owns the canonical Session and Runtime aggregates, states,
+commands, events, queries, projections, and transition rules. Gateway, router,
+runtime, and session-log services consume those types through the lifecycle and
+contract crates; they do not define a second lifecycle state machine. The
+`router_contract`, `runtime_contract`, and `session_log_contract` crates own
+strict wire DTOs and clients only, and do not depend back on service
+implementations. The resolved dependency and state-ownership constraints are
+enforced by `crates/lifecycle/tests/service_dependency_architecture.rs` and the
+Runtime / Session equivalence gate documented in
+`tests/equivalence/runtime_session/README.md`.
+
+### Binary topology (single backend pipeline, many thin fronts)
+
+One isolated backend per **instance_home** (selected by `TURA_HOME`; derives all
+sockets/locks/db via `tura_path`), reused by every front:
+
+| Binary | Role | Instances |
+|---|---|---|
+| `tura_session_db` | **single SQLite session-store owner**; serves a concurrent socket IPC | 1 / home |
+| `tura_router` | dispatch/registry/supervision; `serve-socket` runs it as the per-home socket daemon, publishes `addr/version/pid/process_start_time`, owns session_db, spawns runtime workers, and executes `command_run`; `serve` is the stdin/stdout mode | 1 / home |
+| `tura_runtime` | per-session agent worker, spawned by the router, completes-and-dies | many |
+| `gateway` | HTTP/SSE front (GUI/TUI); when launched by a front it holds a stdin lifetime lease and sends router heartbeat leases | 1 / home |
+| `cli` | CLI thin front: probe-first connects to (or detaches) the router daemon, dispatches a turn, renders from session_db; `--embedded` runs runtime in-process against the shared owner | per call |
+| `tura-command-*` | local tool binaries (read_media / web_discover) | per call |
+
+Fronts never own the session database directly. They talk to the router daemon,
+and the router owns session_db, runtime workers, and shell/tool child process
+trees. GUI/TUI-launched gateways keep a stdin lifetime lease and send router
+heartbeat leases; closing the front closes the pipe and exits gateway, then the
+router observes that no valid gateway or exec lease remains and self-shuts down
+after its idle grace, stopping runtime workers, router-owned `command_run`, and
+session_db. Standalone CLI calls use a long-lived request socket; if that socket
+closes mid-turn, router cancels the active runtime and aborts router-owned
+`command_run` tasks for that connection. The router's socket IPC is
+**`request_id`-multiplexed** (a slow `enqueue_turn` never head-of-line-blocks a
+`health_check`).
+
+## Architectural Boundaries
+
+### `apps/gui`
+
+The GUI is the browser/desktop client. It talks to backend behavior only through
+`apps/gui/sdk/gateway`; it must not call runtime, provider, router, tools, or
+shell functionality directly. The current GUI app is organized around one app
+shell, page folders, feature modules, hooks, state, and style parts:
+
+```text
+apps/gui/app/src/
+  app/
+  components/
+  conversation/
+  features/
+  hooks/
+  mock/
+  pages/
+    files/
+    plan/
+    settings/
+  state/
+  styles/
+    parts/
+  utils/
+```
+
+Settings are intentionally limited to appearance, providers, and models. Other
+settings categories must not remain as hidden frontend pages or sidebar entries.
+All settings text goes through `src/i18n.ts`. Model settings are driven by the
+gateway model config API and display tier options as provider/model pairs.
+
+Frontend refactors must keep `bun --cwd apps/gui/app typecheck` and
+`bun --cwd apps/gui/app unused:check` passing before merging. New page-level
+code belongs in a page folder; shared state, formatting, and gateway behavior
+belong in their existing shared folders instead of being embedded into a single
+large component.
+
+### `apps/tui`
+
+The TUI is the TypeScript terminal client. It talks to gateway HTTP/SSE APIs and
+must not call Rust runtime/provider/tool crates directly. CLI and terminal UI
+code live together under `apps/tui`.
+
+### `apps/tauri`
+
+The desktop shell lives under `apps/tauri`. It hosts the GUI frontend and starts
+the same gateway/router path used by browser and terminal clients.
+
+### `crates/gateway`
+
+Gateway is the middleware between the frontend and backend crates. It provides
+the UI-facing API surface, forwards agent turns to the router, persists UI-facing
+session data, owns the provider OAuth credential lifecycle, launches the router,
+and streams backend events back to the frontend.
+
+Gateway owns frontend-facing API routes, payload validation, session/thread/turn
+APIs, UI/session persistence through `session_log`, event streaming, permission
+request forwarding, provider config projection, OAuth credential lifecycle,
+process/PTY adapters, workspace config, router launch, and `POST /run_agent`
+forwarding to the router.
+
+Gateway does not own agent loops, an in-process runtime, provider request
+formatting, tool execution, shell sandboxing, file locks, command registration,
+or CLI forwarding rules. It never runs the agent loop in-process; every agent
+turn is forwarded to the router, which dispatches a runtime worker.
+
+The `gateway` package also contains the direct Rust CLI binary `tura_exec`
+(formerly `tura`). That binary is a local prompt-execution entrypoint, not the
+HTTP gateway surface. As a thin front it never owns the session database: it
+ensures the per-home `tura_session_db` owner is running (starting it detached if
+needed) and connects to it, so its runtime persists through the single DB
+owner. Its default
+text output contract is intentionally script-friendly: only the final assistant
+message is printed to `stdout`; lightweight runtime/tool progress is printed to
+`stderr`; `--quiet`/`--silent` suppresses that progress; `--json` uses `stdout`
+JSONL events instead of final-text mode.
+
+### `crates/runtime`
+
+Runtime is the agent orchestration crate. It uses the MANO/MANAS split as
+internal modules. Runtime is a
+library executed inside a runtime worker — the standalone `tura_runtime` binary
+(`TURA_ROLE=runtime_worker`) dispatched by the router after a version handshake.
+It is never spawned directly by the gateway and does not bind a fixed service port.
+
+Runtime owns session creation/resume, agent activation, state machines, prompt
+assembly, tool catalog selection, one provider turn at a time, tool-call
+**consumption** (not parsing — that's provider-side), tool execution
+orchestration through `crates/tools`, gateway event publishing,
+final-response forcing, and session completion. Runtime emits/consumes the
+canonical OpenAI Responses-API content shape only.
+
+Runtime does not own:
+
+- provider auth or any per-provider format branch (response parsing,
+  `<thought>` stripping, prompt-cache key flag, SSE usage flag, unsupported
+  content-type fallback) — these live in `crates/provider`;
+- shell execution details, file locks, router command registration, CLI
+  forwarding, or runtime-worker dispatch.
+
+For multi-agent dispatch, runtime spawns child sub-sessions by invoking
+`tura_router run-agent` as a subprocess (stdin/stdout JSON). It never calls
+the router or gateway over HTTP/URL. See `crates/runtime/src/manas/child_dispatch.rs`.
+
+### `agents`
+
+Agents are configured under `agents`.
+
+Agents own identity, default prompts, provider defaults, command selections,
+planning/multiple-task defaults, and static or dynamic agent configuration.
+Runtime loads agent config from this crate instead of hard-coding agent
+defaults.
+
+Current agent-owned files live under:
+
+```text
+agents/src/<agent_id>/
+  agent_config.json
+  prompt.md
+```
+
+Agent-specific prompt text stays in `prompt.md`. Persona resources are
+independent from agent configuration. Runtime prompt fragments and command
+prompts are injected separately by their owning crates.
+
+### `crates/provider`
+
+Provider owns model access and model-account control: route lookup, model
+aliases, auth/token resolution, OAuth/login state, provider settings,
+pause/resume controls, retry/backoff, streaming and non-streaming calls,
+response normalization, tool-call normalization, token usage, cost records,
+monitoring, and logs.
+
+Runtime decides what to do with provider output. Provider only performs and
+normalizes model calls.
+
+OpenAI OAuth discovery and refresh are Provider responsibilities. OAuth mode is
+selected from `OPENAI_LOGIN=oauth`, `provider_auth.openai.login=oauth`, or local
+Codex auth discovery through `CODEX_HOME/auth.json` / `~/.codex/auth.json`.
+Provider must propagate access token, refresh token, and account id into the
+OpenAI Codex responses call path and must surface refresh failures instead of
+falling back to an empty API key.
+
+### `crates/tools`
+
+Tools owns the model-visible tool layer and command execution.
+
+Tools owns:
+
+- The compact `command_run` visible tool.
+- Command handlers under `crates/tools/commands`.
+- Command prompts, schemas, handlers, and policies.
+- Runtime validation.
+- Permission checks.
+- Sandbox policy.
+- File locks.
+- Audit records.
+- Output truncation and display-ready normalization.
+- `shell_command`, `bash`, `zsh`, `apply_patch`, `read_media`, and future commands.
+- mode-gated commands such as `compact_context` and `planning`.
+- `task_status` as an internal command inside `command_run`, not as a separate
+  top-level model-visible tool.
+
+`command_run` remains the compact model-visible request shape. It accepts
+command items, canonicalizes the command names through
+`crates/tools/src/commands` (`canonical_command`), and then executes the
+selected `crates/tools/commands/<command>` handler.
+
+`command_run` executes commands in ascending `step` order. Independent
+read-only commands in the same step may run concurrently. Mutating commands,
+unknown commands, and commands that touch shared workspace files act as
+barriers and use the existing command queue and file-lock behavior; new
+schedulers or custom lock layers should not be introduced for session/task
+work.
+
+Long-running service commands must not be blocking foreground commands. The
+`shell_command`, `bash`, and `zsh` command prompts are injected into the `command_run`
+description so agents see the same service rule: keep the process handle/PID,
+write stdout/stderr logs, poll readiness and process exit together, fail
+immediately with exit code and log tail if the service exits before readiness,
+and clean up only the started process tree on timeout.
+
+### `crates/router`
+
+Router owns CLI forwarding, agent registration metadata, runtime-worker
+dispatch, and runtime-worker lifecycle. It no longer uses ports as the service
+boundary.
+
+Router owns:
+
+- Agent registry (agent spec resolution).
+- CLI forwarding rules (`POST /run_tool`: resolve a tool binary, forward stdio).
+- Runtime-worker dispatch via `POST /run_agent`: agent resolution, worker
+  environment contract assembly, and worker subprocess lifecycle.
+- Runtime-worker concurrency guards (planning depth and active-worker
+  limits, returning `429` on breach).
+- Worker status monitoring via `/services/status`.
+- Health checks that do not depend on port allocation.
+
+Router does not own command implementation logic, command alias canonicalization
+(owned by `crates/tools`), agent loops, prompt assembly, provider request
+formatting, provider credentials, shell execution, file locks, or port
+allocation. It resolves an agent or tool-binary request to the worker that
+should execute it, and it owns lifecycle for any worker needed to serve that
+request. Spawning is single-direction: gateway → router → runtime worker.
+
+### `scripts`
+
+Scripts owns setup, startup, install manifests, package environments, and
+persistent reusable CLI workflows.
+
+Scripts owns one-click install/start scripts, toolchain verification, frontend
+dependency install, Rust dependency fetch/build helpers, Python package
+environment manifests, shell/app/module installer manifests, persistent script
+manifests, and reusable script entrypoints used by router/tools commands.
+
+## End-To-End Flow
+
+```text
+apps/gui or apps/tui
+  -> crates/gateway API
+  -> gateway session manager
+  -> gateway translates request and loads UI/session config
+  -> gateway forwards POST /run_agent to crates/router
+  -> router resolves agent spec and dispatches a runtime worker
+     (the standalone tura_runtime binary, TURA_ROLE=runtime_worker)
+  -> crates/runtime (in the worker) starts or resumes session
+  -> agents supplies active agent config
+  -> crates/runtime builds prompt/context/tool catalog
+  -> crates/provider calls selected model
+  -> crates/provider normalizes text/tool calls (extract_response_text,
+     extract_tool_calls, strip_thought_blocks); runtime consumes ProviderToolCall
+  -> crates/runtime (optional) spawns child sub-sessions via
+     `tura_router run-agent` CLI subprocess for multi-agent concurrent /
+     recursive dispatch (never over HTTP/URL)
+  -> crates/tools receives command_run requests
+  -> crates/router resolves CLI forwarding and starts managed services when needed
+  -> crates/tools/commands executes the selected command handler
+  -> crates/runtime stores compact tool results and usage
+  -> crates/gateway streams events and replayable state
+  -> apps/gui or apps/tui renders rollout, tool state, usage, and final response
+```
+
+## Prompt System
+
+Prompt text has three owners:
+
+- Agent prompts: `agents/src/<agent_name>/`, loaded by
+  `crates/runtime/src/manas/agent_prompts.rs`.
+- Runtime prompt fragments: `crates/runtime/src/prompt_style/`.
+- The `command_run` visible tool description:
+  `crates/tools/src/command_run/schema.json`, augmented at runtime by
+  `crates/runtime/src/manas/tool_catalog.rs`.
+- Command prompts: `crates/tools/src/commands/<command>/prompt.md`.
+
+Rules:
+
+- Fixed runtime prompt text belongs in Rust constants under `prompt_style/`.
+- Dynamic runtime values are inserted by named builder sections.
+- Tool-specific instructions belong near the command.
+- Command-specific prompts that affect model behavior through `command_run`
+  must be carried through `crates/runtime/src/manas/tool_catalog.rs`; do not
+  read prompt files and discard them.
+- Agent prompts describe behavior and priorities, not every tool schema detail.
+- `command_run` should remain last in the provider tool list for cache
+  stability.
+- Prompt-cache identity should not include dynamic command-run runtime limits.
+
+## Agent Config
+
+Current `agents` layout:
+
+```text
+agents/
+  Cargo.toml
+  ARCHITECTURE.md
+  src/
+    lib.rs
+    coding_agent.rs
+    store.rs
+    thoughtful/
+      agent_config.json
+      prompt.md
+    balanced/
+      agent_config.json
+      prompt.md
+    direct/
+      agent_config.json
+      prompt.md
+    direct-text-only/
+      agent_config.json
+      prompt.md
+```
+
+Agent config should define agent id, provider route defaults, stream/tool
+choice defaults, enabled command ids, persona bindings, planning defaults, and
+validator/final-response policy. The loader scans only `agents/src/<agent_id>`;
+root-level `agents/<agent_id>` directories are not read.
+
+Default coding-agent behavior:
+
+- Inspect before editing.
+- Prefer compact `command_run` batches for search, reads, shell, tests, and CLI
+  calls.
+- Put independent read-only work in the same step.
+- Put dependent work, edits, and tests in later steps.
+- Use `apply_patch` for source edits when available.
+- Preserve user changes.
+- Run focused checks.
+- End with a concise final response.
+
+## Tools And Commands
+
+Current `crates/tools` layout:
+
+```text
+crates/tools/
+  Cargo.toml
+  ARCHITECTURE.md
+  src/
+    lib.rs
+    command_run/
+      mod.rs
+      handler.rs
+      schema.json
+      policy.toml
+
+    runtime/
+      mod.rs
+      tool.rs
+      file_locks/
+        mod.rs
+        policy.toml
+
+    commands/
+      mod.rs
+      command_safety.rs
+      shell_command/
+        mod.rs
+        src/
+          execution.rs
+          process.rs
+          read_batch.rs
+          readonly.rs
+          request.rs
+          response.rs
+          shell.rs
+        tests/
+          mod.rs
+        schema.json
+        prompt.md
+        policy.toml
+      apply_patch/
+        mod.rs
+        schema.json
+        prompt.md
+        policy.toml
+      read_media/
+        mod.rs
+        src/
+          config.rs
+        schema.json
+        prompt.md
+        policy.toml
+      compact_context/
+        mod.rs
+        schema.json
+        prompt.md
+        policy.toml
+      planning/
+        mod.rs
+        schema.json
+        prompt.md
+        policy.toml
+      web_discover/
+        mod.rs
+        src/
+          access.rs
+          args.rs
+          download.rs
+          files.rs
+          filter.rs
+          html.rs
+          media.rs
+          output.rs
+          policy.rs
+          runner.rs
+          search.rs
+          types.rs
+          util.rs
+          website.rs
+        tests/
+          mod.rs
+        schema.json
+        prompt.md
+        policy.toml
+      task_status/
+        mod.rs
+        schema.json
+        prompt.md
+        policy.toml
+      bash/
+        mod.rs
+        schema.json
+        prompt.md
+        policy.toml
+      zsh/
+        mod.rs
+        schema.json
+        prompt.md
+        policy.toml
+
+    modes/
+      code/
+        mod.rs
+        prompt.md
+        policy.toml
+
+  tests/
+    business/
+      flow/
+        command_run_current_flow.rs
+      live/
+        web_discover_live_provider_check.rs
+```
+
+Command files:
+
+- `mod.rs` or a focused `handler.rs`: argument normalization and high-level
+  command handling. Larger commands may keep helper modules under command-local
+  `src/` directories.
+- `schema.json`: validation and UI/handler matching.
+- `prompt.md`: compact model-facing usage guidance.
+- `policy.toml`: read/write/network/background/permission policy. Commands may
+  add a small `[configurable]` table for bounded non-secret defaults using
+  `{ default = "...", enum = ["...", "..."] }`.
+
+Schemas are for validation and handlers. Compact prompts are what should enter
+model context.
+
+## Command Run
+
+`command_run` is the default compact visible tool. It wraps command items but no
+longer owns the command registry. All registered command names and aliases live
+in `crates/router`.
+
+Provider-facing shape:
+
+```json
+{
+  "step_summary": "Inspect files and run focused checks.",
+  "commands": [
+    {
+      "command_type": "shell_command",
+      "step": 1,
+      "command_line": "rg \"pattern\" crates/runtime",
+      "timeout_secs": 30,
+      "env_keys": []
+    }
+  ]
+}
+```
+
+Execution rules:
+
+- `step` is optional in the provider-facing schema to match codex-current; the
+  handler treats a missing step as the command's original 1-based order.
+- Every command item executes with a positive integer `step` after
+  normalization.
+- Same-step read-only commands may run concurrently as a **macro_command**
+  batch. The opt-in is per command handler via the unified trait method
+  `supports_macro_command` (formerly `supports_parallel_tool_calls`); the
+  command-run router checks it via `tool_supports_macro_command`. The OpenAI
+  request field `parallel_tool_calls` is a separate provider-side concept and
+  keeps its upstream name.
+- Different steps run in ascending order.
+- A later step may reference a successful earlier-step result with
+  `#@#${<command id or command_type>.<JSON path>}#@#$`. Commands may set an
+  `id` to disambiguate repeated command types. Same-step and future-step
+  references fail before dispatch.
+- Mutating commands need compatible file locks.
+- Partial results may be emitted after each step group.
+- Agent-visible and persisted command outputs retain their original structure.
+  JSON text, fenced JSON, shell `stdout`, and MCP text content are parsed only
+  into an in-memory projection used to resolve later-step placeholders.
+
+Built-in command families:
+
+- `shell_command`
+- `bash`
+- `zsh`
+- `apply_patch`
+- `read_media`
+- `web_discover`
+- `task_status`
+- `compact_context`
+- `planning`
+
+This version exposes console shell commands (`shell_command`, `powershell:*`,
+`bash:*`, `zsh:*`, `shell:*`), `apply_patch`, read-only local media inspection,
+network-backed web/media discovery, internal task status, and mode-gated
+context/task lifecycle commands through `command_run`.
+
+Shell surface selection is controlled by `TURA_COMMAND_RUN_SHELL`. Windows
+defaults to PowerShell-backed `shell_command`, macOS defaults to `zsh`, and
+other Unix systems default to `bash`. macOS execution prefers the user's
+supported shell, then zsh, bash, and sh; `TURA_ZSH_PATH` can point explicit zsh
+execution at a custom binary.
+Install/start scripts check `shell_command`, `bash`, and `zsh` coverage on all
+platforms. Install scripts try to install missing bash/zsh dependencies before
+probing coverage: Windows uses MSYS2 via winget/pacman, macOS uses Homebrew,
+and Linux uses common system package managers. Start scripts only report
+coverage and never install dependencies. `TURA_STRICT_SHELL_TOOL_COVERAGE=1`
+turns optional coverage warnings into failures.
+
+`command_type` is the canonical provider-facing command field. Handler input
+normalization may accept `command` payloads at the boundary, but prompt and
+schema text should use `command_type`.
+
+### Compact Context
+
+`compact_context` is a command-run command used for long coding sessions. It is
+injected for coding agents and should be placed in the last step of a batch
+when used. The command asks the model for a structured handoff summary covering
+current progress, user requirements, relevant files/docs, completed and
+remaining work, validation status, and concrete next steps.
+
+After the command completes, runtime:
+
+- removes prior tool-call history from retained context;
+- converts the compact summary into the next user-context item;
+- preserves the active session and task state machine;
+- reinjects the workspace snapshot and recent-file snapshot just like a fresh
+  session;
+- keeps non-compact commands from the same batch and their outputs in order;
+- does not retain raw compact command scaffolding as extra prompt noise.
+
+If estimated context passes the high-water mark, runtime injects a short
+continuation prompt asking the agent to compact before continuing. The prompt is
+only a trigger; the token savings come from the context-management reset above.
+
+### Media Reading
+
+`read_media` is a read-only command for local images, PDFs, and video metadata
+or sampled frames. It returns compact textual observations to the model. Binary
+payloads and raw base64 are not kept in retained context; later turns recall the
+media through the summarized tool output.
+
+Tools policy configurables are standardized across commands: use a single
+`[configurable]` table, one inline table per setting, a `default` string, and an
+`enum` string list. `read_media` uses this for media compression, PDF default
+page count, directory expansion count, document attachment size, and audio
+preview size; `web_discover` uses it for ordered search route fallback.
+
+## File Locks
+
+File locks are owned by `crates/tools/runtime/file_locks`.
+
+Rules:
+
+- Lock keys are canonical workspace-relative paths.
+- Reads acquire shared locks.
+- Writes acquire exclusive locks.
+- Mutating commands such as `apply_patch` declare affected paths before
+  execution.
+- Unknown mutating shell commands acquire a workspace-wide exclusive lock.
+- Locks are acquired in sorted path order.
+- Locks are released on success, error, timeout, and cancellation.
+- Background commands hold startup locks only unless their manifest declares a
+  long-lived write lease.
+
+## Router CLI Forwarding
+
+Current `crates/router` layout:
+
+```text
+crates/router/
+  Cargo.toml
+  README.md
+  ARCHITECTURE.md
+  src/
+    main.rs
+    services.rs
+    services/
+      managed_process.rs
+      manager.rs
+      models.rs
+      rust_service.rs
+      worker_process.rs
+    utils/
+      tura_exec.rs
+      port.rs
+      process.rs
+```
+
+Command registration records should include command id, aliases, owning crate
+path, handler or binary target, CLI argument schema, default timeout, permission
+scope, startup mode, health check, restart policy, and stdio strategy. They
+should not require port allocation.
+
+Router owns CLI forwarding metadata and lifecycle. The owning crate owns
+behavior.
+
+## Adding A Command
+
+1. Create `crates/tools/src/commands/<name>/`.
+2. Add Rust handler code, `schema.json`, `prompt.md`, `policy.toml`, and tests.
+3. Export the module from `crates/tools/src/commands/mod.rs`.
+4. Add `ToolRouter` dispatch when the command should be callable as a direct
+   routed tool.
+5. Add router aliases, CLI forwarding metadata, and lifecycle metadata in
+   `crates/router` only when the command needs router discovery or a managed
+   process.
+6. Enable it in the target `agents/src/<agent_id>/agent_config.json`.
+7. Run focused tools and runtime checks.
+
+## Adding CLI Routing
+
+1. Implement behavior in the owning crate or `crates/tools/commands`.
+2. Add command and lifecycle metadata in `crates/router`.
+3. Add timeout, health check, restart, and permission/sandbox policy.
+4. Add agent command selection in `agents`.
+5. Update scripts only when startup/build/install detection changes.
+
+## Workspace Members
+
+Workspace members should follow the current crate layout:
+
+```toml
+members = [
+  "agents",
+  "crates/gateway",
+  "crates/provider",
+  "crates/router",
+  "crates/runtime",
+  "crates/tools"
+]
+```
+
+Package names for those members still follow the Tura package-name table above.
+
+## Runnable Build And Start Paths
+
+Install scripts should keep the Tura-style runnable path:
+
+```text
+scripts/build-release.ps1; scripts/register-cli.ps1
+scripts/build-release.sh; scripts/register-cli.sh
+scripts/start.ps1
+scripts/start.sh
+```
+
+Core Rust build targets should use package names:
+
+```text
+cargo build -p router
+cargo build -p gateway
+cargo build -p runtime
+cargo build -p tools
+```
+
+Command-owned dependencies are installed from the command directories, not from
+shared script packages:
+
+```text
+commands/read_media/install.ps1
+commands/read_media/install.sh
+commands/web_discover/install.ps1
+commands/web_discover/install.sh
+```
+
+Playwright support for frontend debugging workflows remains a Bun workspace in
+`scripts/packages/playwright_node`.
+
+The normal local path is CLI-driven. Router may start managed local services as
+needed, but those services are not addressed through fixed ports:
+
+```text
+cargo run -p router --bin tura_router -- forward <command> [args...]
+```
+
+Direct package checks should use the same package names as the build targets.
+
+## Focused Build Rules
+
+- `crates/gateway/**`: `cargo fmt -p gateway`, `cargo check -p gateway`.
+- `crates/runtime/**`: `cargo fmt -p runtime`,
+  `cargo check -p runtime`.
+- `agents/**`: `cargo fmt -p agents`,
+  `cargo check -p agents`, plus affected agent interface checks.
+- `crates/provider/**`: `cargo fmt -p provider`,
+  `cargo check -p provider`.
+- `crates/tools/**`: `cargo fmt -p tools`, `cargo check -p tools`.
+- `crates/router/**`: `cargo fmt -p router`,
+  `cargo check -p router`.
+- `apps/gui/**`: GUI typecheck/build and focused frontend tests.
+- `apps/tui/**`: TUI build and focused CLI/TUI tests.
+- `scripts/**`: manifest validation and install dry run when possible.
+
+## Documentation Ownership
+
+- `ARCHITECTURE.md`: whole-project architecture and flow.
+- `crates/gateway/ARCHITECTURE.md`: gateway API/session/event design.
+- `crates/runtime/ARCHITECTURE.md`: runtime, state machines, prompt flow, and
+  turn flow.
+- `agents/ARCHITECTURE.md`: agent config and prompt rules.
+- `crates/provider/ARCHITECTURE.md`: provider auth, settings, routing, usage,
+  and monitoring.
+- `crates/tools/ARCHITECTURE.md`: command-run, commands, policies, file locks,
+  and output rules.
+- `crates/router/ARCHITECTURE.md`: CLI forwarding, command registration,
+  lifecycle management, status monitoring, routing metadata, and permission
+  forwarding.
+- `scripts/ARCHITECTURE.md`: install/start/package/persistent-script rules.
