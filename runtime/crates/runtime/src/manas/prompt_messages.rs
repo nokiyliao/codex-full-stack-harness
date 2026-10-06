@@ -86,16 +86,9 @@ fn user_new_command_message_from_commands(commands: &[String]) -> Option<String>
     if commands.is_empty() {
         return None;
     }
-    let commands = commands
-        .iter()
-        .enumerate()
-        .map(|(index, command)| format!("{}. {}", index + 1, command))
-        .collect::<Vec<_>>()
-        .join("\n");
     Some(
         PromptBuilder::new()
             .part(user_new_command::USER_NEW_COMMAND)
-            .section("user_new_commands", commands)
             .render(),
     )
 }
@@ -238,8 +231,9 @@ fn current_planning_task(session: &SessionManagement) -> Option<(usize, &TaskSte
 #[cfg(test)]
 mod tests {
     use super::{
-        messages_for_turn_with_context_limit, planning_objective_block,
-        push_no_tool_task_status_retry_message, record_user_new_commands,
+        append_user_new_command_messages, messages_for_turn_with_context_limit,
+        planning_objective_block, push_no_tool_task_status_retry_message, record_user_new_commands,
+        user_new_command_message_from_commands,
     };
     use crate::context::{build_messages_from_session, compact_session_context};
     use chrono::Utc;
@@ -481,5 +475,29 @@ mod tests {
             joined.contains("current_run/user: change direction and inspect the new failure"),
             "{joined}"
         );
+    }
+
+    #[test]
+    fn user_new_command_notice_does_not_duplicate_command_text() {
+        let commands = vec![
+            "inspect the new failure".to_string(),
+            "keep the current task identity".to_string(),
+        ];
+        let mut messages = Vec::new();
+        append_user_new_command_messages(&mut messages, &commands);
+        messages.push(serde_json::json!({
+            "role": "developer",
+            "content": user_new_command_message_from_commands(&commands).expect("notice"),
+        }));
+        let joined = messages
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(joined.matches("inspect the new failure").count(), 1);
+        assert_eq!(joined.matches("keep the current task identity").count(), 1);
+        assert!(joined.contains("User new command received while this task is already running"));
+        assert!(joined.contains("Do not restart from scratch"));
     }
 }

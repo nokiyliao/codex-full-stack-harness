@@ -1,6 +1,16 @@
 # Source Provenance
 
+## Nokiy v157
+
+This is the current snapshot. It includes `packages/nokiy` (MIT; source version
+field `0.3.21.dev0`; installed wheel `0.3.157.dev0`) and `runtime`
+(AGPL-3.0-or-later, modified Tura-derived engine). `releases/v157.json` records
+base commits and per-file hashes, including local uncommitted modifications.
+The base commits do not identify clean snapshots. Binary hashes do not constitute
+a reproducible-build claim. The v9 section below is the previous publication.
+
 ## Nokiy v9
+
 
 This snapshot includes `packages/nokiy` (MIT, caller `0.3.21.dev0`) and
 `runtime` (AGPL-3.0-or-later, modified Tura-derived engine). Their licenses and

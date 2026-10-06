@@ -1,6 +1,6 @@
 use crate::context::{
-    ContextualUserFragment, USER_AGENT_CONTEXT_ROLE, WorkspaceSnapshot, accumulate_message,
-    build_messages_from_session, user_input_content_matches, user_input_content_value,
+    USER_AGENT_CONTEXT_ROLE, accumulate_message, build_messages_from_session,
+    user_input_content_matches, user_input_content_value, workspace_snapshot_for_session,
 };
 use crate::prompt_style::context_blocks;
 use lifecycle::SessionManagement;
@@ -14,7 +14,7 @@ pub(crate) fn initial_messages_for_session(
     if session.session_current_turn == 0 && !session_has_initial_user_message(session) {
         let snapshot_message = serde_json::json!({
             "role": "developer",
-            "content": workspace_snapshot_message(&session.session_directory),
+            "content": workspace_snapshot_for_session(session),
         });
         let environment_message = serde_json::json!({
             "role": "developer",
@@ -111,12 +111,6 @@ fn context_shell_name() -> &'static str {
     }
 }
 
-fn workspace_snapshot_message(cwd: &std::path::Path) -> String {
-    WorkspaceSnapshot::from_cwd(cwd)
-        .map(|snapshot| snapshot.render())
-        .unwrap_or_else(|| "<WORKSPACE_SNAPSHOT>\n\n</WORKSPACE_SNAPSHOT>".to_string())
-}
-
 fn runtime_context_message(session: &SessionManagement) -> Option<serde_json::Value> {
     let content = session
         .input
@@ -198,6 +192,7 @@ mod tests {
     use lifecycle::SessionInput;
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use tempfile::TempDir;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -379,6 +374,47 @@ mod tests {
             2,
             "{:?}",
             session.session_log
+        );
+    }
+
+    #[test]
+    fn scoped_jspace_initial_messages_do_not_disclose_workspace_inventory() {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(temp.path().join("admitted.txt"), "allowed").expect("admitted file");
+        std::fs::write(temp.path().join("unadmitted.txt"), "private").expect("unadmitted file");
+        let now = chrono::Utc::now();
+        let mut session = SessionManagement::new(
+            "scoped-initial-messages".to_string(),
+            "scoped initial messages".to_string(),
+            temp.path().to_path_buf(),
+            false,
+            "coding".to_string(),
+            SessionInput {
+                user_input: "read admitted.txt".to_string(),
+                file_input: Vec::new(),
+                agent: None,
+                runtime_context: None,
+                planning_mode_override: None,
+            },
+            "read admitted.txt".to_string(),
+            now,
+        );
+        session.jspace_contract = Some(serde_json::json!({
+            "schema_version": "jspace_contract_v2",
+            "allowed_operations": ["read"],
+            "read_scopes": ["admitted.txt"],
+        }));
+
+        let messages = initial_messages_for_session(&mut session).expect("initial messages");
+        let snapshot = messages[0]["content"].as_str().expect("workspace snapshot");
+        assert!(snapshot.contains("active J-Space contract"));
+        assert!(!snapshot.contains("unadmitted.txt"));
+        assert!(snapshot.len() < 200);
+        assert!(
+            session
+                .session_log
+                .iter()
+                .any(|entry| entry.contains("active J-Space contract"))
         );
     }
 }

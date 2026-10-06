@@ -1585,7 +1585,7 @@ mod tests {
             payload: json!({
                 "session_id": "disconnect-session",
                 "runtime_id": "disconnect-runtime",
-                "session_directory": workspace.path().display().to_string(),
+                "session_directory": workspace.path().canonicalize()?.display().to_string(),
                 "arguments": {
                     "commands": [{
                         "command": "shell_command",

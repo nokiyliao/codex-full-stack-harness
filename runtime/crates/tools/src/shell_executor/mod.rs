@@ -1,4 +1,5 @@
 mod execution;
+mod focused_verifier;
 mod process;
 mod read_batch;
 mod readonly;
@@ -10,8 +11,13 @@ pub use execution::{
     begin_command_run_batch, complete_command_run_batch, mark_command_run_batch_call_accepted,
     terminalize_interrupted_command_run_claims,
 };
+pub use focused_verifier::{
+    VerifierObservation, execute_remote_focused_verifier, focused_verifier_policy,
+    execute_focused_verifier, focused_verifier_not_started, focused_verifier_sandbox_available,
+};
 pub(crate) use execution::{
-    run_in_process_command_with_terminal_receipt, terminalize_pre_execution_zero_effect,
+    preview_in_process_terminal_response, run_in_process_command_with_terminal_receipt,
+    terminalize_pre_execution_zero_effect,
 };
 pub use process::{
     ShellProcessScopeStrategy, current_shell_process_scope_strategy,

@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(content[0]["type"], "input_text");
         let text = content[0]["text"].as_str().expect("text item");
         assert!(text.contains("omitted_from_text"));
-        assert!(text.contains("\"count\": 2"));
+        assert!(text.contains("\"count\":2"));
         assert!(!text.contains("AAA"));
         assert!(!text.contains("BBB"));
         assert!(!text.contains("PDFDATA"));

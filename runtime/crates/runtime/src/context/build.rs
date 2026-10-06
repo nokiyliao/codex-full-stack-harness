@@ -27,7 +27,8 @@ pub fn build_context(input: ContextInput<'_>) -> Result<ContextOutput, String> {
     let total_start = Instant::now();
     let profiling = profile_timings::enabled();
     let build_messages_start = Instant::now();
-    let mut messages = build_messages_from_session_with_options(input.session);
+    let mut messages =
+        build_messages_from_session_with_options(input.session, Some(&input.runtime.provider));
     let build_messages_elapsed = build_messages_start.elapsed();
     let initial_message_count = messages.len();
     let initial_messages_bytes = if profiling {
@@ -389,15 +390,43 @@ fn push_input_text_part(parts: &mut Vec<serde_json::Value>, text: &str) {
 }
 
 pub fn build_messages_from_session(session: &SessionManagement) -> Vec<serde_json::Value> {
-    build_messages_from_session_with_options(session)
+    build_messages_from_session_with_options(session, None)
 }
 
-fn build_messages_from_session_with_options(session: &SessionManagement) -> Vec<serde_json::Value> {
+fn build_messages_from_session_with_options(
+    session: &SessionManagement,
+    provider: Option<&lifecycle::RuntimeProviderConfig>,
+) -> Vec<serde_json::Value> {
     let mut messages = Vec::new();
     let mut raw_history_messages = Vec::new();
     let mut saw_context_compaction = false;
     for entry in &session.session_log {
         let value = entry.value();
+        if let Some(items) =
+            crate::provider_flow::responses_continuity::record_items(value, provider)
+        {
+            if items.is_empty() {
+                messages.retain(|item| {
+                    !crate::provider_flow::responses_continuity::is_opaque_reasoning(item)
+                });
+            } else {
+                messages.extend(items);
+            }
+            continue;
+        }
+        if value.get("type").and_then(serde_json::Value::as_str)
+            == Some("runtime_provider_observation")
+            && provider.is_some_and(|current| {
+                value
+                    .pointer("/provider_observation/model")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(current.model_name.as_str())
+            })
+        {
+            messages.retain(|item| {
+                !crate::provider_flow::responses_continuity::is_opaque_reasoning(item)
+            });
+        }
         if value.get("type").and_then(|kind| kind.as_str()) == Some("context_compaction") {
             saw_context_compaction = true;
             messages.clear();
@@ -522,6 +551,196 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     const PROMPT_STYLE_BODY_FIXTURE: &str = "Prompt style body fixture";
+
+    #[test]
+    fn valid_legacy_pretty_tool_output_is_replayed_without_reformatting() {
+        let pretty = serde_json::to_string_pretty(&json!({"results":[{
+            "success":false, "output":{"stderr":" failure\n", "exit_code":7,
+            "terminal_receipt":{"outcome":"unknown", "reconcile_required":true}}
+        }]})).unwrap();
+        let messages = json!([
+            {"type":"function_call", "name":"command_run", "call_id":"old",
+             "arguments":"{\"commands\":[]}"},
+            {"type":"function_call_output", "call_id":"old", "output":pretty}
+        ]);
+        let entry = json!({"type":"tool_result", "tool_name":"command_run",
+                          "context_messages":messages});
+        let actual = super::immutable_context_messages_from_log_entry(entry);
+        assert_eq!(serde_json::Value::Array(actual), messages);
+        assert_eq!(messages[1]["output"], pretty);
+    }
+
+    fn continuity_runtime(session: &SessionManagement, id: &str) -> RuntimeAggregate {
+        let mut runtime = runtime(session);
+        runtime.runtime_id = id.into();
+        runtime.provider.llm_provider_name = "codex".into();
+        runtime.provider.model_name = "model".into();
+        runtime.provider.provider_url_name = "route".into();
+        runtime
+    }
+
+    fn continuity_item(id: &str) -> serde_json::Value {
+        json!({"type":"reasoning", "id":id, "summary":[], "encrypted_content":format!("opaque-{id}")})
+    }
+
+    #[test]
+    fn reasoning_observation_is_durable_without_entering_model_context() {
+        use crate::provider_flow::responses_continuity::capture_reasoning;
+        use crate::turn_loop::provider_step::accumulate_session_from_runtime;
+        let mut session = session();
+        let mut runtime = continuity_runtime(&session, "diagnostic");
+        runtime
+            .set_output(capture_reasoning(
+                json!("visible reply"),
+                &json!({"status":"completed", "model":"model", "output":[]}),
+                &runtime.provider,
+            ))
+            .unwrap();
+        runtime.state = lifecycle::RuntimeState::Finished;
+        accumulate_session_from_runtime(&mut session, &runtime, true).unwrap();
+        let restored: SessionManagement =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert!(
+            restored
+                .session_log
+                .iter()
+                .any(|record| record.contains("no_reasoning_items"))
+        );
+        let next = continuity_runtime(&restored, "next");
+        let messages = build_context(ContextInput {
+            session: &restored,
+            runtime: &next,
+            additional_messages: vec![],
+        })
+        .unwrap()
+        .messages;
+        let serialized = serde_json::to_string(&messages).unwrap();
+        assert!(serialized.contains("visible reply"));
+        assert!(!serialized.contains("responses_continuity_observation"));
+        assert!(!serialized.contains("reasoning_item_count"));
+        assert!(!serialized.contains("no_reasoning_items"));
+    }
+
+    #[test]
+    fn responses_continuity_two_tool_rounds_checkpoint_and_compaction() {
+        use crate::provider_flow::responses_continuity::{attach_reasoning, is_opaque_reasoning};
+        use crate::turn_loop::provider_step::accumulate_session_from_runtime;
+        let mut session = session();
+        for index in 1..=2 {
+            let id = format!("r{index}");
+            let mut runtime = continuity_runtime(&session, &id);
+            let output = attach_reasoning(
+                json!({"tool_calls":[]}),
+                &json!({"status":"completed", "model":"model", "output":[continuity_item(&id)]}),
+                &runtime.provider,
+            )
+            .unwrap();
+            runtime
+                .set_output_with_provider_observation(
+                    output,
+                    Some(crate::provider_flow::usage::provider_observation(
+                        &json!({"model":"model"}),
+                    )),
+                )
+                .unwrap();
+            runtime.state = lifecycle::RuntimeState::Finished;
+            accumulate_session_from_runtime(&mut session, &runtime, false).unwrap();
+            accumulate_session_from_runtime(&mut session, &runtime, false).unwrap();
+            session.push_log(json!({"type":"tool_result", "tool_name":"command_run",
+                "context_messages":[
+                    {"type":"function_call", "call_id":id, "name":"command_run", "arguments":"{\"commands\":[]}"},
+                    {"type":"function_call_output", "call_id":id, "output":"{}"}
+                ]}).to_string(), Utc::now());
+        }
+        let build = |session: &SessionManagement| {
+            let runtime = continuity_runtime(session, "next");
+            build_context(ContextInput {
+                session,
+                runtime: &runtime,
+                additional_messages: vec![],
+            })
+            .unwrap()
+            .messages
+        };
+        let messages = build(&session);
+        let opaque: Vec<_> = messages
+            .iter()
+            .filter(|item| is_opaque_reasoning(item))
+            .cloned()
+            .collect();
+        assert_eq!(opaque, vec![continuity_item("r1"), continuity_item("r2")]);
+        let kinds: Vec<_> = messages
+            .iter()
+            .filter_map(|item| item["type"].as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "reasoning",
+                "function_call",
+                "function_call_output",
+                "reasoning",
+                "function_call",
+                "function_call_output"
+            ]
+        );
+        assert!(
+            !build_messages_from_session(&session)
+                .iter()
+                .any(is_opaque_reasoning)
+        );
+        let restored: SessionManagement =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert_eq!(build(&restored), messages);
+        compact_session_context(&mut session, "completed checkpoint summary").unwrap();
+        assert!(!build(&session).iter().any(is_opaque_reasoning));
+    }
+
+    #[test]
+    fn responses_continuity_failed_runtime_and_model_switch_do_not_reuse_items() {
+        use crate::provider_flow::responses_continuity::{attach_reasoning, is_opaque_reasoning};
+        use crate::turn_loop::provider_step::accumulate_session_from_runtime;
+        let mut session = session();
+        let mut runtime = continuity_runtime(&session, "original");
+        let output = attach_reasoning(
+            json!({"tool_calls":[]}),
+            &json!({"status":"completed", "model":"model", "output":[continuity_item("r1")]}),
+            &runtime.provider,
+        )
+        .unwrap();
+        runtime
+            .set_output_with_provider_observation(
+                output,
+                Some(crate::provider_flow::usage::provider_observation(
+                    &json!({"model":"model"}),
+                )),
+            )
+            .unwrap();
+        runtime.state = lifecycle::RuntimeState::Failed;
+        accumulate_session_from_runtime(&mut session, &runtime, false).unwrap();
+        assert!(
+            !session
+                .session_log
+                .iter()
+                .any(|entry| entry.value()["type"] == "responses_continuity")
+        );
+        runtime.state = lifecycle::RuntimeState::Finished;
+        accumulate_session_from_runtime(&mut session, &runtime, false).unwrap();
+        session.push_log(
+            json!({"type":"runtime_provider_observation",
+            "provider_observation":{"model":"other-model"}})
+            .to_string(),
+            Utc::now(),
+        );
+        let messages = build_context(ContextInput {
+            session: &session,
+            runtime: &runtime,
+            additional_messages: vec![],
+        })
+        .unwrap()
+        .messages;
+        assert!(!messages.iter().any(is_opaque_reasoning));
+    }
 
     fn session() -> SessionManagement {
         let now = Utc::now();
@@ -724,6 +943,34 @@ mod tests {
             "command_run context without provider metadata must not create orphan tool outputs: {joined}"
         );
         assert!(joined.contains("new-output"));
+    }
+
+    #[test]
+    fn scoped_jspace_compaction_omits_unadmitted_workspace_inventory() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(root.path().join("unadmitted.rs"), "private").expect("fixture");
+        let mut session = session();
+        session.session_directory = root.path().to_path_buf();
+        session.jspace_contract = Some(json!({
+            "schema_version": "jspace_contract_v2",
+            "allowed_operations": ["read"],
+            "read_scopes": ["admitted.rs"],
+        }));
+
+        compact_session_context(&mut session, "Continue with the admitted file.")
+            .expect("compact should write");
+        let record = session
+            .session_log
+            .iter()
+            .filter_map(|entry| serde_json::from_str::<serde_json::Value>(entry).ok())
+            .find(|value| value["type"] == "context_compaction")
+            .expect("compaction record");
+        let snapshot = record["workspace_snapshot"]
+            .as_str()
+            .expect("workspace snapshot");
+        assert!(snapshot.contains("active J-Space contract"));
+        assert!(!snapshot.contains("unadmitted.rs"));
+        assert!(snapshot.len() < 200);
     }
 
     #[test]

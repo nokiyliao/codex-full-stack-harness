@@ -8,7 +8,8 @@ use crate::manas::{ManasInput, process_manas_internal};
 use crate::mano::{ManoOverrides, ManoProcessResult};
 use crate::runtime_event_writer::RuntimeEventWriter;
 use crate::session_bootstrap::{
-    bootstrap_orchestration_session, create_session_with_topic, initial_messages_for_session,
+    InitialTaskState, bootstrap_session_for_initial_task_state, create_session_with_topic,
+    initial_messages_with_task_state,
 };
 use crate::session_log_client::SessionLogClient;
 use crate::state_machine::agent_management::{AgentCapabilityItem, AgentManagement};
@@ -157,17 +158,20 @@ fn orchestrate_with_config_and_session(
 ) -> Result<ManoProcessResult, String> {
     let now = Utc::now();
     let create_missing_session = runtime_event_writer.is_none();
+    let initial_task_state = InitialTaskState::from_env()?;
 
     info!(
         user_input = %input.user_input,
         "starting orchestration"
     );
 
-    let mut session = bootstrap_orchestration_session(
+    let (mut session, first_execution) = bootstrap_session_for_initial_task_state(
         input,
         config.session_directory.clone(),
         gateway_session_id,
         now,
+        initial_task_state.is_some(),
+        initial_runtime_id.as_deref(),
     )
     .map_err(|e| {
         error!(error = %e, "failed to bootstrap session");
@@ -209,7 +213,12 @@ fn orchestrate_with_config_and_session(
         )?),
         None => None,
     };
-    let initial_messages = initial_messages_for_session(&mut session)?;
+    let initial_messages = initial_messages_with_task_state(
+        &mut session,
+        initial_task_state.as_ref(),
+        first_execution,
+        initial_fallback_from_id.is_some(),
+    )?;
     if create_missing_session {
         ensure_canonical_session(&session)?;
     }
@@ -494,6 +503,7 @@ pub fn process_from_user_internal(
 mod tests {
     use super::*;
     use crate::context::{USER_AGENT_CONTEXT_ROLE, build_messages_from_session};
+    use crate::session_bootstrap::initial_messages_for_session;
     use chrono::Utc;
     use lifecycle::{
         ProviderConfig, RuntimeAggregate, RuntimeError, RuntimeProviderConfig, RuntimeState,

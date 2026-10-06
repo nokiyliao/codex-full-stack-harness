@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use code_tools::command_run::CommandRunTerminalStatusGuard;
 use serde_json::Value;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -28,6 +29,8 @@ use lifecycle::RuntimeProjection;
 use lifecycle::{RuntimeAggregate, ToolCallRecord};
 
 const COMMAND_RUN_TOOL_NAME: &str = "command_run";
+const TERMINAL_STATUS_STREAM_ERROR: &str =
+    "TERMINAL_STATUS_STREAM_INCOMPLETE: task_status done requires healthy provider completion, no remaining input or work, and no cancellation or discard";
 
 #[derive(Clone)]
 pub(crate) struct StreamedCommandRunState {
@@ -35,6 +38,7 @@ pub(crate) struct StreamedCommandRunState {
     pub(crate) inputs: Arc<Mutex<Vec<Value>>>,
     pub(crate) events: Arc<Mutex<Vec<Value>>>,
     pub(crate) seen: Arc<AtomicBool>,
+    provider_completed_healthy: Arc<AtomicBool>,
     pub(crate) cancelled: Arc<AtomicBool>,
     pub(crate) apply_patch_failed: Arc<AtomicBool>,
     pub(crate) startup_apply_patch_discarded: Arc<AtomicBool>,
@@ -48,6 +52,7 @@ impl StreamedCommandRunState {
             inputs: Arc::new(Mutex::new(Vec::new())),
             events: Arc::new(Mutex::new(Vec::new())),
             seen: Arc::new(AtomicBool::new(false)),
+            provider_completed_healthy: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
             apply_patch_failed: Arc::new(AtomicBool::new(false)),
             startup_apply_patch_discarded: Arc::new(AtomicBool::new(false)),
@@ -57,6 +62,16 @@ impl StreamedCommandRunState {
 
     pub(crate) fn mark_seen(&self) {
         self.seen.store(true, Ordering::SeqCst);
+    }
+
+    // Only the successful provider owner, after delivering final-response commands,
+    // may set this. A disconnected receiver is not evidence of healthy completion.
+    pub(crate) fn mark_provider_completed_healthy(&self) {
+        self.provider_completed_healthy.store(true, Ordering::SeqCst);
+    }
+
+    fn provider_completed_healthy(&self) -> bool {
+        self.provider_completed_healthy.load(Ordering::SeqCst)
     }
 
     pub(crate) fn should_cancel_after_results(&self) -> bool {
@@ -153,6 +168,9 @@ struct QueuedStreamCommand {
     command_index: usize,
     command: Value,
     step: u64,
+    declared_step: Option<u64>,
+    terminal_done: bool,
+    terminal_error: Option<&'static str>,
     order: usize,
 }
 
@@ -197,6 +215,9 @@ pub(crate) fn spawn_streamed_command_run_task(
         let mut halted_before_finish = false;
         let mut next_order = 0usize;
         let mut step_normalizer = StreamStepNormalizer;
+        let mut prior_stream_step = 0;
+        let mut terminal_status_guard = CommandRunTerminalStatusGuard::default();
+        let mut pending_done: Option<QueuedStreamCommand> = None;
         let mut output_bindings = code_tools::command_run::CommandRunOutputBindings::default();
         let mut pending_binding_results = Vec::new();
         let (completion_tx, completion_rx) = mpsc::channel::<StreamCommandCompletion>();
@@ -204,6 +225,14 @@ pub(crate) fn spawn_streamed_command_run_task(
         loop {
             while let Ok(completion) = completion_rx.try_recv() {
                 running = running.saturating_sub(1);
+                if completion.binding_results.is_empty() {
+                    terminal_status_guard.observe_result(None);
+                }
+                for result in &completion.binding_results {
+                    terminal_status_guard
+                        .observe_result(result.get("success").and_then(Value::as_bool));
+                    terminal_status_guard.observe_step(result.get("step").and_then(Value::as_u64));
+                }
                 pending_binding_results.extend(completion.binding_results.iter().cloned());
                 append_ordered_results(&mut ordered_results, &completion);
                 emit_cli_live_command_run_results(&completion.completed, &mut live_item_index);
@@ -259,6 +288,29 @@ pub(crate) fn spawn_streamed_command_run_task(
             );
 
             if !receiver_open && running == 0 && pending.is_empty() {
+                if let Some(mut done) = pending_done.take() {
+                    done.terminal_error = if input.state.should_stop_accepting_commands()
+                        || !input.state.provider_completed_healthy()
+                    {
+                        Some(TERMINAL_STATUS_STREAM_ERROR)
+                    } else {
+                        terminal_status_guard.done_error(done.declared_step, true)
+                    };
+                    publish_stream_output_bindings(
+                        &mut output_bindings,
+                        &mut pending_binding_results,
+                    );
+                    start_stream_command(
+                        &input,
+                        &completion_tx,
+                        done,
+                        &mut running,
+                        &streamed_commands,
+                        &results,
+                        &output_bindings,
+                    );
+                    continue;
+                }
                 break;
             }
 
@@ -272,7 +324,7 @@ pub(crate) fn spawn_streamed_command_run_task(
                     let Some(command_event) = command_run_stream_event_command(event) else {
                         continue;
                     };
-                    let queued = match prepare_stream_command(
+                    let mut queued = match prepare_stream_command(
                         &input,
                         command_event,
                         &mut command_run_started,
@@ -288,6 +340,28 @@ pub(crate) fn spawn_streamed_command_run_task(
                         }
                     };
                     next_order += 1;
+                    if let Some(mut done) = pending_done.take() {
+                        done.terminal_error = Some(CommandRunTerminalStatusGuard::ORDER_ERROR);
+                        start_stream_command(
+                            &input,
+                            &completion_tx,
+                            done,
+                            &mut running,
+                            &streamed_commands,
+                            &results,
+                            &output_bindings,
+                        );
+                    }
+                    let ordered_step = queued.declared_step.filter(|declared| {
+                        *declared == queued.step && *declared >= prior_stream_step
+                    });
+                    prior_stream_step = prior_stream_step.max(queued.step);
+                    if queued.terminal_done {
+                        queued.declared_step = ordered_step;
+                        pending_done = Some(queued);
+                        continue;
+                    }
+                    terminal_status_guard.observe_step(ordered_step);
                     enqueue_or_start_stream_command(
                         &input,
                         &completion_tx,
@@ -308,6 +382,14 @@ pub(crate) fn spawn_streamed_command_run_task(
         }
         let final_results = ordered_stream_results(ordered_results);
         let checkpoint_ack_failed = input.state.was_cancelled();
+        let command_run_status = if halted_before_finish
+            || checkpoint_ack_failed
+            || !input.state.provider_completed_healthy()
+        {
+            "error"
+        } else {
+            "completed"
+        };
         if !streamed_commands.is_empty() {
             let finished_at = Utc::now();
             if let Err(error) = publish_streamed_command_run_update(StreamedCommandRunUpdate {
@@ -317,11 +399,7 @@ pub(crate) fn spawn_streamed_command_run_task(
                 call_id: &input.call_id,
                 commands: &streamed_commands,
                 results: &final_results,
-                status: if halted_before_finish || checkpoint_ack_failed {
-                    "error"
-                } else {
-                    "completed"
-                },
+                status: command_run_status,
                 started_at: input.started_at,
                 ended_at: Some(finished_at),
                 runtime_status: input.runtime_status.clone(),
@@ -335,11 +413,6 @@ pub(crate) fn spawn_streamed_command_run_task(
                 );
                 input.state.cancelled.store(true, Ordering::SeqCst);
             }
-            let command_run_status = if halted_before_finish || checkpoint_ack_failed {
-                "error"
-            } else {
-                "completed"
-            };
             if let Err(error) = checkpointing::command_run_finished(
                 &input.session_id,
                 &input.runtime_id,
@@ -408,6 +481,7 @@ fn prepare_stream_command(
         return None;
     }
     let original_command = command;
+    let (declared_step, _) = CommandRunTerminalStatusGuard::command_metadata(&original_command);
     let mut command = match code_tools::command_run::normalize_command_value_for_execution(
         original_command.clone(),
         command_index,
@@ -424,6 +498,7 @@ fn prepare_stream_command(
         }
     };
     let step = step_normalizer.normalize(&mut command);
+    let (_, terminal_done) = CommandRunTerminalStatusGuard::command_metadata(&command);
     if input.require_startup_task_state && command_is_apply_patch(&command) {
         tracing::warn!(
             session_id = %input.session_id,
@@ -523,6 +598,9 @@ fn prepare_stream_command(
         command_index,
         command,
         step,
+        declared_step,
+        terminal_done,
+        terminal_error: None,
         order,
     })
 }
@@ -685,8 +763,53 @@ fn start_stream_command(
     }
     let live_command = queued.command.clone();
     let completion_command = live_command.clone();
+    let terminal_done = queued.terminal_done;
     let mut command = queued.command;
-    let resolution_error = resolve_router_command_bindings(&mut command, output_bindings).err();
+    let resolution_error = queued
+        .terminal_error
+        .map(str::to_string)
+        .or_else(|| resolve_router_command_bindings(&mut command, output_bindings).err())
+        .or_else(|| {
+            // A binding must not turn ordinary work into an unfenced terminal marker.
+            (!terminal_done && CommandRunTerminalStatusGuard::command_metadata(&command).1)
+                .then(|| CommandRunTerminalStatusGuard::ORDER_ERROR.to_string())
+        });
+    let publish_started = || {
+        let mut live_results = results.to_vec();
+        live_results.push(command_run_live_delta_result(
+            &live_command,
+            "",
+            "",
+            command_started_at,
+        ));
+        if let Err(error) = publish_streamed_command_run_update(StreamedCommandRunUpdate {
+            session_id: &input.session_id,
+            runtime_id: &input.runtime_id,
+            provider: &input.provider,
+            call_id: &input.call_id,
+            commands: streamed_commands,
+            results: &live_results,
+            status: "running",
+            started_at: input.started_at,
+            ended_at: None,
+            runtime_status: input.runtime_status.clone(),
+            publisher: input.feed_publisher.as_ref(),
+        }) {
+            tracing::warn!(
+                session_id = %input.session_id,
+                runtime_id = %input.runtime_id,
+                error = %error,
+                "failed to publish streamed command start"
+            );
+            input.state.cancelled.store(true, Ordering::SeqCst);
+        }
+    };
+    // Fence the terminal dispatch behind its start publication without delaying
+    // ordinary same-step commands behind gateway callbacks.
+    if terminal_done {
+        publish_started();
+    }
+    let state = input.state.clone();
     let session_directory = input.session_directory.clone();
     let allowed_commands = input.allowed_command_run_commands.clone();
     let jspace_contract = input.jspace_contract.clone();
@@ -696,6 +819,11 @@ fn start_stream_command(
     let completion_tx = completion_tx.clone();
     *running += 1;
     std::thread::spawn(move || {
+        let resolution_error = resolution_error.or_else(|| {
+            (terminal_done
+                && (state.should_stop_accepting_commands() || !state.provider_completed_healthy()))
+            .then(|| TERMINAL_STATUS_STREAM_ERROR.to_string())
+        });
         let mut result = if let Some(error) = resolution_error {
             crate::router_command_run::RouterCommandRunCommandResult {
                 results: vec![serde_json::json!({
@@ -741,33 +869,8 @@ fn start_stream_command(
         });
     });
 
-    let mut live_results = results.to_vec();
-    live_results.push(command_run_live_delta_result(
-        &live_command,
-        "",
-        "",
-        command_started_at,
-    ));
-    if let Err(error) = publish_streamed_command_run_update(StreamedCommandRunUpdate {
-        session_id: &input.session_id,
-        runtime_id: &input.runtime_id,
-        provider: &input.provider,
-        call_id: &input.call_id,
-        commands: streamed_commands,
-        results: &live_results,
-        status: "running",
-        started_at: input.started_at,
-        ended_at: None,
-        runtime_status: input.runtime_status.clone(),
-        publisher: input.feed_publisher.as_ref(),
-    }) {
-        tracing::warn!(
-            session_id = %input.session_id,
-            runtime_id = %input.runtime_id,
-            error = %error,
-            "failed to publish streamed command start"
-        );
-        input.state.cancelled.store(true, Ordering::SeqCst);
+    if !terminal_done {
+        publish_started();
     }
 }
 
@@ -1047,6 +1150,72 @@ mod tests {
     use tokio::net::TcpListener;
 
     static STREAMING_TEST_ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn streaming_positional_range_preserves_payload_identity_and_steps() {
+        let _guard = STREAMING_TEST_ENV
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let router = MockStreamingRouter::start();
+        let _router_env = EnvGuard::set("TURA_ROUTER_ADDR", &router.addr);
+        let _gateway_env = EnvGuard::set("TURA_GATEWAY_CALLBACKS", "off");
+        let (stream_tx, state, handle) = spawn_terminal_test_stream(false);
+        stream_tx
+            .send(stream_command_event("step1-a", 1, 0))
+            .expect("held first step");
+        router.wait_for_started(&["step1-a"], Duration::from_secs(2));
+
+        // Ready-event consumer coverage; raw JSON accumulation belongs to the producer.
+        // Whitespace and escaped quotes must survive without decoding/re-encoding the range.
+        let command_line = r#" [ "src/file[1].rs", 2, 50, null, true ] "#;
+        let command = json!({
+            "command_type": "source_read", "command_line": command_line,
+            "id": "compact-range", "label": "compact-range", "step": 2,
+        });
+        for _ in 0..2 {
+            stream_tx
+                .send(stream_command_value_event(command.clone(), 1))
+                .expect("ready command and duplicate");
+        }
+        wait_for_stream_counts(&state, 2, 0);
+        assert!(router.received("compact-range").is_none());
+
+        router.release_step1();
+        wait_for_stream_counts(&state, 2, 2);
+        assert!(!state.provider_completed_healthy());
+        assert!(
+            !handle.is_finished(),
+            "dispatch must precede stream closure"
+        );
+        let dispatched = router.received("compact-range").expect("range dispatched");
+        assert_eq!(dispatched["command_type"], "source_read");
+        assert_eq!(dispatched["command_line"].as_str(), Some(command_line));
+        assert_eq!(dispatched["id"], "compact-range");
+        assert_eq!(dispatched["step"], 2);
+
+        state.mark_provider_completed_healthy();
+        drop(stream_tx);
+        let results = handle.join().expect("stream task");
+        assert_eq!(state.snapshot().commands.len(), 2);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result["success"] == true));
+        assert_eq!(results[0]["step"], 1);
+        assert_eq!(results[1]["step"], 2);
+        assert_eq!(results[1]["id"], "compact-range");
+        assert_eq!(results[1]["command_index"], 1);
+        assert_eq!(
+            results[1]["command_id"],
+            "stream-terminal-call:stream-tool-call:1"
+        );
+        assert_eq!(
+            router
+                .started()
+                .iter()
+                .filter(|label| label.as_str() == "compact-range")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn streamed_command_dedupe_matches_provider_call_id_and_index() {
@@ -1517,24 +1686,397 @@ mod tests {
         assert_eq!(snapshot.commands[0]["label"], "before-discard");
     }
 
+    #[test]
+    fn streaming_terminal_done_waits_for_healthy_owner_and_settled_work() {
+        let _guard = STREAMING_TEST_ENV
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let router = MockStreamingRouter::start();
+        let _router_env = EnvGuard::set("TURA_ROUTER_ADDR", &router.addr);
+        let _gateway_env = EnvGuard::set("TURA_GATEWAY_CALLBACKS", "off");
+        let (stream_tx, state, handle) = spawn_terminal_test_stream(false);
+        for (index, label) in ["step1-a", "step1-b"].into_iter().enumerate() {
+            stream_tx
+                .send(stream_command_event(label, 1, index))
+                .expect("same-step command");
+        }
+        router.wait_for_started(&["step1-a", "step1-b"], Duration::from_secs(2));
+        assert!(router.max_active() >= 2);
+        stream_tx
+            .send(stream_binding_command_event(
+                "binding-producer", Some("producer"), 2, 2, "{}",
+            ))
+            .expect("binding producer");
+        let mut done = terminal_done_command(json!(3));
+        done["command_line"] = json!({
+            "status": "done",
+            "task_group": concat!("#@#$", "{producer.output.structuredContent.document_id}", "#@#$")
+        })
+        .to_string()
+        .into();
+        stream_tx
+            .send(stream_command_value_event(done, 3))
+            .expect("final done");
+        wait_for_stream_counts(&state, 4, 0);
+        state.mark_provider_completed_healthy();
+        assert!(router.received("terminal-done").is_none());
+        router.release_step1();
+        wait_for_stream_counts(&state, 4, 3);
+        assert!(
+            router.received("terminal-done").is_none(),
+            "healthy owner alone does not close input"
+        );
+        assert!(!handle.is_finished());
+        drop(stream_tx);
+        let results = handle.join().expect("healthy terminal stream");
+        assert_eq!(results.len(), 4);
+        assert!(results.iter().all(|result| result["success"] == true));
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result["step"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(1), json!(1), json!(2), json!(3)]
+        );
+        assert_eq!(results[3]["id"], "terminal");
+        assert_eq!(results[3]["command_index"], 3);
+        assert_eq!(results[3]["command_run_id"], "stream-terminal-call");
+        assert_eq!(
+            results[3]["command_id"],
+            "stream-terminal-call:stream-tool-call:3"
+        );
+        let dispatched = router.received("terminal-done").expect("final done dispatched");
+        let arguments: Value =
+            serde_json::from_str(dispatched["command_line"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["task_group"], "document-17");
+        assert_eq!(
+            router
+                .started()
+                .iter()
+                .filter(|label| label.as_str() == "terminal-done")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn streaming_terminal_done_retains_failed_and_unknown_results_after_binding_drains() {
+        let _guard = STREAMING_TEST_ENV
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let router = MockStreamingRouter::start();
+        let _router_env = EnvGuard::set("TURA_ROUTER_ADDR", &router.addr);
+        let _gateway_env = EnvGuard::set("TURA_GATEWAY_CALLBACKS", "off");
+        for (command_type, prior_results) in [
+            (
+                "shell_command",
+                json!([{"success": false, "error": "command failed"}]),
+            ),
+            (
+                "command_run",
+                json!([{"success": false, "error": "parse failed"}]),
+            ),
+            ("source_read", json!([])),
+            ("source_read", json!([{"output": {}}])),
+            (
+                "source_read",
+                json!([{"success": false, "error": "source admission failed"}]),
+            ),
+            ("focused_verifier", json!([{"success": null}])),
+            (
+                "focused_verifier",
+                json!([{"success": false, "error": "verification failed"}]),
+            ),
+        ] {
+            let prior_count = prior_results.as_array().unwrap().len();
+            let (stream_tx, state, handle) = spawn_terminal_test_stream(false);
+            let mut prior = stream_command_value("prior-result", 1);
+            prior.as_object_mut().unwrap().remove("command");
+            prior["command_type"] = json!(command_type);
+            prior["mock_results"] = prior_results;
+            stream_tx
+                .send(stream_command_value_event(prior, 0))
+                .expect("prior result");
+            stream_tx
+                .send(stream_binding_command_event(
+                    "binding-producer", Some("producer"), 2, 1, "{}",
+                ))
+                .expect("successful later step");
+            // Advancing to step 2 drains step 1's binding results, not its failure evidence.
+            wait_for_stream_counts(&state, 2, prior_count + 1);
+            stream_tx
+                .send(stream_command_value_event(
+                    terminal_done_command(json!(3)), 2,
+                ))
+                .expect("done");
+            state.mark_provider_completed_healthy();
+            drop(stream_tx);
+            let results = handle.join().expect("prior-outcome stream");
+            assert_eq!(results.len(), prior_count + 2);
+            assert_terminal_not_dispatched(
+                &router,
+                results.last().unwrap(),
+                "TERMINAL_STATUS_PRIOR_RESULT",
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_terminal_done_denies_binding_failures_and_binding_created_markers() {
+        let _guard = STREAMING_TEST_ENV
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let router = MockStreamingRouter::start();
+        let _router_env = EnvGuard::set("TURA_ROUTER_ADDR", &router.addr);
+        let _gateway_env = EnvGuard::set("TURA_GATEWAY_CALLBACKS", "off");
+        let mut missing_binding = stream_command_value("binding-missing", 1);
+        missing_binding["command_line"] = json!({
+            "document_id": concat!("#@#$", "{missing.output.structuredContent.document_id}", "#@#$")
+        })
+        .to_string()
+        .into();
+        let results = run_healthy_terminal_commands(vec![
+            missing_binding,
+            terminal_done_command(json!(2)),
+        ]);
+        assert_eq!(results[0]["success"], false);
+        assert!(router.received("binding-missing").is_none());
+        assert_terminal_not_dispatched(&router, &results[1], "TERMINAL_STATUS_PRIOR_RESULT");
+
+        let mut producer = stream_command_value("marker-producer", 1);
+        producer["id"] = json!("producer");
+        producer["mock_results"] = json!([
+            {"success": true, "output": {"structuredContent": {"status": "done"}}}
+        ]);
+        let mut marker = terminal_done_command(json!(2));
+        marker["label"] = json!("binding-marker");
+        marker["id"] = json!("binding-marker");
+        marker["command_line"] = json!({
+            "status": concat!("#@#$", "{producer.output.structuredContent.status}", "#@#$")
+        })
+        .to_string()
+        .into();
+        let results =
+            run_healthy_terminal_commands(vec![producer, marker, terminal_done_command(json!(3))]);
+        assert_eq!(results[1]["success"], false);
+        assert!(
+            results[1]["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("TERMINAL_STATUS_BATCH_ORDER")
+        );
+        assert!(router.received("binding-marker").is_none());
+        assert_terminal_not_dispatched(&router, &results[2], "TERMINAL_STATUS_PRIOR_RESULT");
+    }
+
+    #[test]
+    fn streaming_terminal_done_denies_bad_raw_steps_and_later_work() {
+        let _guard = STREAMING_TEST_ENV
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let router = MockStreamingRouter::start();
+        let _router_env = EnvGuard::set("TURA_ROUTER_ADDR", &router.addr);
+        let _gateway_env = EnvGuard::set("TURA_GATEWAY_CALLBACKS", "off");
+        let mut missing_prior_step = stream_command_value("missing-step", 1);
+        missing_prior_step.as_object_mut().unwrap().remove("step");
+        let mut missing_done_step = terminal_done_command(json!(2));
+        missing_done_step.as_object_mut().unwrap().remove("step");
+        for commands in [
+            vec![stream_command_value("prior", 1), missing_done_step],
+            vec![
+                stream_command_value("prior", 1),
+                terminal_done_command(Value::Null),
+            ],
+            vec![stream_command_value("prior", 1), terminal_done_command(json!(0))],
+            vec![stream_command_value("prior", 1), terminal_done_command(json!(-1))],
+            vec![
+                stream_command_value("prior", 1),
+                terminal_done_command(json!("bad")),
+            ],
+            vec![stream_command_value("prior", 1), terminal_done_command(json!(1))],
+            vec![missing_prior_step, terminal_done_command(json!(2))],
+            vec![
+                stream_command_value("prior", 2),
+                stream_command_value("late-lower", 1),
+                terminal_done_command(json!(3)),
+            ],
+            vec![
+                stream_command_value("prior", 1),
+                terminal_done_command(json!(2)),
+                stream_command_value("later-work", 3),
+            ],
+            vec![
+                stream_command_value("prior", 1),
+                terminal_done_command(json!(2)),
+                terminal_done_command(json!(3)),
+            ],
+        ] {
+            let count = commands.len();
+            let results = run_healthy_terminal_commands(commands);
+            assert_eq!(results.len(), count);
+            for (index, result) in results.iter().enumerate() {
+                assert_eq!(result["command_index"], index);
+                if result["id"] == "terminal" {
+                    assert_terminal_not_dispatched(&router, result, "TERMINAL_STATUS_");
+                } else {
+                    assert_eq!(
+                        result["success"], true,
+                        "ordinary work is not serialized or discarded: {result}"
+                    );
+                }
+            }
+        }
+        assert!(router.received("later-work").is_some());
+    }
+
+    #[test]
+    fn streaming_terminal_done_denies_partial_cancelled_and_discarded_streams() {
+        let _guard = STREAMING_TEST_ENV
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _gateway_env = EnvGuard::set("TURA_GATEWAY_CALLBACKS", "off");
+        for gate in ["partial", "cancelled", "apply_patch_failed", "startup_discard"] {
+            let router = MockStreamingRouter::start();
+            let _router_env = EnvGuard::set("TURA_ROUTER_ADDR", &router.addr);
+            let (stream_tx, state, handle) = spawn_terminal_test_stream(gate == "startup_discard");
+            stream_tx
+                .send(stream_command_event("step1-a", 1, 0))
+                .expect("held prior command");
+            stream_tx
+                .send(stream_command_value_event(
+                    terminal_done_command(json!(2)), 1,
+                ))
+                .expect("done");
+            wait_for_stream_counts(&state, 2, 0);
+            if gate != "partial" {
+                state.mark_provider_completed_healthy();
+            }
+            match gate {
+                "cancelled" => state.cancelled.store(true, Ordering::SeqCst),
+                "apply_patch_failed" => state.apply_patch_failed.store(true, Ordering::SeqCst),
+                "startup_discard" => stream_tx
+                    .send(stream_apply_patch_event(2))
+                    .expect("discarded trailing patch"),
+                _ => {}
+            }
+            drop(stream_tx);
+            router.release_step1();
+            let results = handle.join().expect("unhealthy terminal stream");
+            assert_eq!(results.len(), 2, "{gate}: {results:?}");
+            assert_terminal_not_dispatched(
+                &router,
+                &results[1],
+                "TERMINAL_STATUS_STREAM_INCOMPLETE",
+            );
+            if gate == "startup_discard" {
+                assert!(state.should_finish_startup_apply_patch_discard());
+                assert!(!state.was_cancelled());
+            }
+        }
+    }
+
+    fn spawn_terminal_test_stream(
+        require_startup_task_state: bool,
+    ) -> (
+        mpsc::Sender<tura_llm_rust::ProviderStreamEvent>,
+        StreamedCommandRunState,
+        std::thread::JoinHandle<Vec<Value>>,
+    ) {
+        let (stream_tx, stream_rx) = mpsc::channel();
+        let state = StreamedCommandRunState::new();
+        let handle = spawn_streamed_command_run_task(SpawnStreamedCommandRunTask {
+            stream_rx,
+            session_directory: std::env::temp_dir(),
+            allowed_command_run_commands: None,
+            jspace_contract: None,
+            session_id: "stream-terminal-session".to_string(),
+            runtime_id: "stream-terminal-runtime".to_string(),
+            provider: json!({"provider": "test"}),
+            call_id: "stream-terminal-call".to_string(),
+            started_at: Utc::now(),
+            state: state.clone(),
+            runtime_status: runtime().lifecycle_projection(),
+            feed_publisher: None,
+            require_startup_task_state,
+        });
+        (stream_tx, state, handle)
+    }
+
+    fn terminal_done_command(step: Value) -> Value {
+        json!({
+            "step": step, "label": "terminal-done", "id": "terminal",
+            "command_type": "task_status", "command_line": "{\"status\":\"done\"}"
+        })
+    }
+
+    fn run_healthy_terminal_commands(commands: Vec<Value>) -> Vec<Value> {
+        let (stream_tx, state, handle) = spawn_terminal_test_stream(false);
+        for (index, command) in commands.into_iter().enumerate() {
+            stream_tx
+                .send(stream_command_value_event(command, index))
+                .expect("test command");
+        }
+        state.mark_provider_completed_healthy();
+        drop(stream_tx);
+        handle.join().expect("terminal stream task")
+    }
+
+    fn wait_for_stream_counts(state: &StreamedCommandRunState, commands: usize, results: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let snapshot = state.snapshot();
+            if snapshot.commands.len() >= commands && snapshot.results.len() >= results {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("stream did not reach {commands} commands and {results} results");
+    }
+
+    fn assert_terminal_not_dispatched(router: &MockStreamingRouter, result: &Value, prefix: &str) {
+        assert_eq!(result["command_type"], "task_status", "{result}");
+        assert_eq!(result["success"], false, "{result}");
+        assert_eq!(result["id"], "terminal", "{result}");
+        assert!(result.get("output").is_none(), "{result}");
+        assert!(
+            result["error"].as_str().unwrap().starts_with(prefix),
+            "{result}"
+        );
+        assert!(
+            router.received("terminal-done").is_none(),
+            "done must not reach the router"
+        );
+    }
+
     fn stream_command_event(
         label: &str,
         step: u64,
         command_index: usize,
     ) -> tura_llm_rust::ProviderStreamEvent {
+        stream_command_value_event(stream_command_value(label, step), command_index)
+    }
+
+    fn stream_command_value_event(
+        command: Value,
+        command_index: usize,
+    ) -> tura_llm_rust::ProviderStreamEvent {
         tura_llm_rust::ProviderStreamEvent::CommandRunCommandReady {
             tool_call_id: "stream-tool-call".to_string(),
             command_index,
-            command: json!({
-                "step": step,
-                "label": label,
-                "command": "shell_command",
-                "command_line": json!({
-                    "command": "Test-Path .",
-                    "timeout_ms": 5000
-                }).to_string()
-            }),
+            command,
         }
+    }
+
+    fn stream_command_value(label: &str, step: u64) -> Value {
+        json!({
+            "step": step,
+            "label": label,
+            "command": "shell_command",
+            "command_line": json!({
+                "command": "Test-Path .",
+                "timeout_ms": 5000
+            }).to_string()
+        })
     }
 
     fn stream_apply_patch_event(command_index: usize) -> tura_llm_rust::ProviderStreamEvent {
@@ -1707,13 +2249,21 @@ mod tests {
                 .push(command.clone());
             self.record_started(label.clone());
             if label.starts_with("step1-") {
-                while !self.release_step1.load(Ordering::SeqCst) {
-                    self.release_notify.notified().await;
+                loop {
+                    let released = self.release_notify.notified();
+                    if self.release_step1.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    released.await;
                 }
             }
             if label == "step2-block" {
-                while !self.release_step2.load(Ordering::SeqCst) {
-                    self.release_notify.notified().await;
+                loop {
+                    let released = self.release_notify.notified();
+                    if self.release_step2.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    released.await;
                 }
             }
             self.active.fetch_sub(1, Ordering::SeqCst);
@@ -1726,6 +2276,9 @@ mod tests {
             } else {
                 Value::String(label)
             };
+            let results = command.get("mock_results").cloned().unwrap_or_else(|| {
+                json!([{"success": true, "output": output}])
+            });
             json!({
                 "request_id": request_id,
                 "ok": true,
@@ -1733,10 +2286,7 @@ mod tests {
                     "status": "finished",
                     "owner": "mock-router",
                     "result": {
-                        "results": [{
-                            "success": true,
-                            "output": output
-                        }]
+                        "results": results
                     }
                 }
             })

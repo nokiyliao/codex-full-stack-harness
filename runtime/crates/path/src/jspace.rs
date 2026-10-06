@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -160,6 +161,17 @@ impl PathTrie {
         }
         self.nodes[node_index].exact
     }
+
+    fn matches_exact(&self, relative: &str) -> bool {
+        let mut node_index = 0;
+        for component in relative.split('/').filter(|part| !part.is_empty()) {
+            let Some(next_index) = self.nodes[node_index].children.get(component) else {
+                return false;
+            };
+            node_index = *next_index;
+        }
+        self.nodes[node_index].exact
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,9 +291,48 @@ pub struct JSpaceMatcher {
     allowed_operations: HashSet<String>,
     denied_operations: HashSet<String>,
     command_templates: Vec<CommandTemplate>,
+    command_template_index: HashMap<Vec<String>, usize>,
     read_commands: Option<Value>,
+    verifier_commands: Vec<VerifierCommand>,
+    verifier_artifact_root: Option<PathBuf>,
+    source_read: bool,
+    local_directory_source_read: bool,
     effect_capabilities: Vec<EffectCapabilityMatcher>,
     declared_target_projection: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierPinnedFile {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierCommand {
+    pub argv: Vec<String>,
+    pub executable_sha256: String,
+    pub pinned_files: Vec<VerifierPinnedFile>,
+    pub timeout_seconds: u64,
+    pub scratch_root: PathBuf,
+    pub network: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_python_import_roots"
+    )]
+    pub python_import_roots: Option<Vec<PathBuf>>,
+}
+
+fn deserialize_python_import_roots<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<PathBuf>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Only omission means None; an explicit null is not a list of roots.
+    Vec::<PathBuf>::deserialize(deserializer).map(Some)
 }
 
 impl JSpaceMatcher {
@@ -356,6 +407,24 @@ impl JSpaceMatcher {
         let denied_values = required_string_array(object, "denied_operations")?;
         let allowed_operations = operation_set(allowed_values, "allowed_operations")?;
         let denied_operations = operation_set(denied_values, "denied_operations")?;
+        let source_read = source_read_grant(object)?;
+        let (verifier_artifact_root, verifier_commands) =
+            parse_verifier_grant(object, &session_root, &schema_version)?;
+        if !verifier_commands.is_empty()
+            && (!allowed_operations.contains("read")
+                || !allowed_operations.contains("command")
+                || denied_operations.contains("read")
+                || denied_operations.contains("command")
+                || !denied_operations.contains("network")
+                || allowed_operations.contains("network"))
+        {
+            return Err(JSpaceError::new(
+                "JSPACE_VERIFIER_OPERATION_DENIED",
+                "admission",
+                "verifier_commands",
+                "v2 verifiers require read and command allowed and network denied",
+            ));
+        }
         if allowed_operations
             .iter()
             .any(|operation| denied_operations.contains(operation))
@@ -461,21 +530,80 @@ impl JSpaceMatcher {
         let read_commands = object.get("read_commands").cloned();
         if let Some(policy) = &read_commands {
             if schema_version != JSPACE_SINGLE_ROOT_SCHEMA_VERSION
-                || !allowed_operations.contains("read") || !allowed_operations.contains("command")
-                || denied_operations.contains("read") || denied_operations.contains("command") {
-                return Err(JSpaceError::new("JSPACE_READ_COMMAND_DENIED", "admission", "", "read/command v2 grants required"));
+                || !allowed_operations.contains("read")
+                || !allowed_operations.contains("command")
+                || denied_operations.contains("read")
+                || denied_operations.contains("command")
+            {
+                return Err(JSpaceError::new(
+                    "JSPACE_READ_COMMAND_DENIED",
+                    "admission",
+                    "",
+                    "read/command v2 grants required",
+                ));
             }
             for root in read_commands::validate(policy)? {
                 if !canonical_read_scopes.contains(&format!("{root}/**")) {
-                    return Err(JSpaceError::new("JSPACE_READ_COMMAND_DENIED", "admission", &root, "recursive read scope required"));
+                    return Err(JSpaceError::new(
+                        "JSPACE_READ_COMMAND_DENIED",
+                        "admission",
+                        &root,
+                        "recursive read scope required",
+                    ));
                 }
                 let path = session_root.join(&root);
                 if !path.is_dir() || path.canonicalize().ok().as_deref() != Some(path.as_path()) {
-                    return Err(JSpaceError::new("JSPACE_READ_COMMAND_DENIED", "admission", &root, "canonical directory required"));
+                    return Err(JSpaceError::new(
+                        "JSPACE_READ_COMMAND_DENIED",
+                        "admission",
+                        &root,
+                        "canonical directory required",
+                    ));
                 }
             }
         }
-        if allowed_operations.contains("command") && command_templates.is_empty() && read_commands.is_none() {
+        let local_directory_source_read = source_read
+            && schema_version == JSPACE_SINGLE_ROOT_SCHEMA_VERSION
+            && read_commands.is_some()
+            && object.get("dcf_generation").is_some_and(|generation| {
+                generation.get("context_mode").and_then(Value::as_str)
+                    == Some("local_workspace_jspace")
+                    && generation.get("dcf_available").and_then(Value::as_bool) == Some(false)
+            });
+        if source_read {
+            let scoped_read = if schema_version == JSPACE_SCHEMA_VERSION {
+                effect_capabilities.iter().any(|capability| {
+                    capability.allowed_operations.contains("read")
+                        && capability
+                            .read_projection
+                            .iter()
+                            .any(|scope| !scope.ends_with("/**"))
+                })
+            } else {
+                allowed_operations.contains("read")
+                    && canonical_read_scopes
+                        .iter()
+                        .any(|scope| !scope.ends_with("/**"))
+            };
+            if !allowed_operations.contains("command")
+                || denied_operations.contains("command")
+                || denied_operations.contains("read")
+                || (!scoped_read && !local_directory_source_read)
+            {
+                return Err(JSpaceError::new(
+                    "JSPACE_SOURCE_READ_DENIED",
+                    "read",
+                    "source_read",
+                    "source_read requires command and a scoped read grant",
+                ));
+            }
+        }
+        if allowed_operations.contains("command")
+            && command_templates.is_empty()
+            && read_commands.is_none()
+            && !source_read
+            && verifier_commands.is_empty()
+        {
             return Err(JSpaceError::new(
                 "JSPACE_COMMAND_TEMPLATE_MISSING",
                 "command",
@@ -484,7 +612,13 @@ impl JSpaceMatcher {
             ));
         }
 
-        Ok(Self {
+        // Retain the earliest template if a legacy contract contains repeated argv.
+        let mut command_template_index = HashMap::with_capacity(command_templates.len());
+        for (index, template) in command_templates.iter().enumerate() {
+            command_template_index.entry(template.argv.clone()).or_insert(index);
+        }
+
+        let matcher = Self {
             schema_version,
             repo_root: session_root,
             lexical_repo_root,
@@ -500,10 +634,23 @@ impl JSpaceMatcher {
             allowed_operations,
             denied_operations,
             command_templates,
+            command_template_index,
             read_commands,
+            verifier_commands,
+            verifier_artifact_root,
+            source_read,
+            local_directory_source_read,
             effect_capabilities,
             declared_target_projection,
-        })
+        };
+        for command in &matcher.verifier_commands {
+            for pinned in &command.pinned_files {
+                matcher.check_path("read", &pinned.path)?;
+                verifier_file(&pinned.path, &pinned.sha256, false, false)?;
+            }
+            verifier_python_import_roots(command, &matcher)?;
+        }
+        Ok(matcher)
     }
 
     pub fn semantic_sha256(&self) -> &str {
@@ -520,6 +667,55 @@ impl JSpaceMatcher {
 
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
+    }
+
+    pub fn source_read_enabled(&self) -> bool {
+        self.source_read
+    }
+
+    pub fn verifier_artifact_root(&self) -> Option<&Path> {
+        self.verifier_artifact_root.as_deref()
+    }
+
+    pub fn verifier_commands(&self) -> &[VerifierCommand] {
+        &self.verifier_commands
+    }
+
+    pub fn check_verifier_command(&self, index: usize) -> Result<&VerifierCommand, JSpaceError> {
+        self.check_operation("command", "focused_verifier")?;
+        self.verifier_commands.get(index).ok_or_else(|| {
+            JSpaceError::new(
+                "JSPACE_VERIFIER_NOT_GRANTED",
+                "command",
+                &index.to_string(),
+                "verifier index is not in the admitted exact grant",
+            )
+        })
+    }
+
+    pub fn revalidate_verifier_paths(&self) -> Result<(), JSpaceError> {
+        let Some(root) = self.verifier_artifact_root.as_deref() else {
+            return Ok(());
+        };
+        verifier_path_without_symlink(root, true)?;
+        if !root.is_dir() || root.canonicalize().ok().as_deref() != Some(root) {
+            return Err(verifier_error(
+                "JSPACE_VERIFIER_ARTIFACT_ROOT_INVALID",
+                root,
+                "artifact root identity changed",
+            ));
+        }
+        for command in &self.verifier_commands {
+            let executable = Path::new(&command.argv[0]);
+            verifier_file(executable, &command.executable_sha256, true, true)?;
+            for pinned in &command.pinned_files {
+                self.check_path("read", &pinned.path)?;
+                verifier_file(&pinned.path, &pinned.sha256, false, true)?;
+            }
+            verifier_python_import_roots(command, self)?;
+            verifier_scratch(&command.scratch_root, root, &self.repo_root, true)?;
+        }
+        Ok(())
     }
 
     pub fn scope_projection(&self) -> &JSpaceScopeProjection {
@@ -578,25 +774,47 @@ impl JSpaceMatcher {
                 "command type is not in the local J-Space tool set",
             ));
         }
+        // These are not shell commands. Patch paths are checked by the router
+        // against create/modify/delete grants after the patch is parsed.
+        if matches!(
+            command_type.as_str(),
+            "apply_patch" | "planning" | "task_status"
+        ) {
+            if self.source_read
+                && command_type == "apply_patch"
+                && !self.has_declared_patch_target()
+            {
+                return Err(JSpaceError::new(
+                    "JSPACE_COMMAND_DENIED",
+                    "command",
+                    &command_type,
+                    "source_read does not authorize an unscoped apply_patch",
+                ));
+            }
+            return Ok(());
+        }
         self.check_operation("command", &command_type)?;
         match command_type.as_str() {
             "shell_command" | "bash" | "zsh" => {
                 let (command, workdir) = shell_command_parts(command_line);
                 let argv = parse_shell_argv(&command)?;
-                if self.read_commands.is_some() && !self.command_templates.iter().any(|template| template.argv == argv) {
+                let template_index = self.command_template_index.get(&argv).copied();
+                if self.read_commands.is_some() && template_index.is_none() {
                     let cwd = match workdir {
                         Some(ref directory) => {
                             self.resolve_target(Path::new(directory), "read")?;
-                            if Path::new(directory).is_absolute() { PathBuf::from(directory) } else { self.repo_root.join(directory) }
+                            if Path::new(directory).is_absolute() {
+                                PathBuf::from(directory)
+                            } else {
+                                self.repo_root.join(directory)
+                            }
                         }
                         None => self.repo_root.clone(),
                     };
                     return read_commands::check(self, &argv, &cwd);
                 }
-                let template = self
-                    .command_templates
-                    .iter()
-                    .find(|template| template.argv == argv)
+                let template = template_index
+                    .map(|index| &self.command_templates[index])
                     .ok_or_else(|| {
                         JSpaceError::new(
                             "JSPACE_COMMAND_DENIED",
@@ -626,7 +844,12 @@ impl JSpaceMatcher {
                 }
                 Ok(())
             }
-            "apply_patch" | "planning" | "task_status" => Ok(()),
+            "source_read" => Err(JSpaceError::new(
+                "JSPACE_SOURCE_READ_INVALID",
+                "read",
+                "source_read",
+                "source_read requires an exact target preflight",
+            )),
             "web_discover" => Err(JSpaceError::new(
                 "JSPACE_NETWORK_DENIED",
                 "network",
@@ -651,6 +874,65 @@ impl JSpaceMatcher {
                 &command_type,
                 "command type is not supported",
             )),
+        }
+    }
+
+    pub fn check_source_read(&self, target: &Path) -> Result<(), JSpaceError> {
+        if !self.source_read {
+            return Err(JSpaceError::new(
+                "JSPACE_SOURCE_READ_DENIED",
+                "read",
+                &target.display().to_string(),
+                "source_read is not explicitly granted",
+            ));
+        }
+        self.check_operation("command", "source_read")?;
+        self.check_path("read", target)?;
+        let exact = if self.schema_version == JSPACE_SCHEMA_VERSION {
+            self.effect_capabilities.iter().any(|capability| {
+                capability.allowed_operations.contains("read")
+                    && capability
+                        .resolve_target(target, "read")
+                        .ok()
+                        .is_some_and(|relative| capability.read_scopes.matches_exact(&relative))
+            })
+        } else {
+            self.resolve_target(target, "read")
+                .ok()
+                .is_some_and(|relative| self.read_scopes.matches_exact(&relative))
+        };
+        if !exact {
+            if self.local_directory_source_read {
+                return read_commands::check_file(self, target);
+            }
+            return Err(JSpaceError::new(
+                JSPACE_EXPANSION_REQUIRED,
+                "read",
+                &target.display().to_string(),
+                "source_read requires the exact file path in a read scope",
+            ));
+        }
+        Ok(())
+    }
+
+    fn has_declared_patch_target(&self) -> bool {
+        let writable = |operations: &HashSet<String>| {
+            operations.contains("create") || operations.contains("modify")
+        };
+        if self.schema_version == JSPACE_SCHEMA_VERSION {
+            self.effect_capabilities.iter().any(|capability| {
+                writable(&capability.allowed_operations)
+                    && capability
+                        .declared_projection
+                        .iter()
+                        .any(|target| capability.write_scopes.matches(target))
+            })
+        } else {
+            writable(&self.allowed_operations)
+                && self
+                    .declared_target_projection
+                    .iter()
+                    .any(|target| self.write_scopes.matches(target))
         }
     }
 
@@ -1064,6 +1346,518 @@ fn is_lower_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn verifier_error(code: &str, path: &Path, detail: &str) -> JSpaceError {
+    JSpaceError::new(code, "admission", &path.display().to_string(), detail)
+}
+
+fn verifier_path_without_symlink(path: &Path, must_exist: bool) -> Result<(), JSpaceError> {
+    let raw = path.to_str().unwrap_or_default();
+    if !path.is_absolute()
+        || raw.contains('\0')
+        || raw
+            .split('/')
+            .skip(1)
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(verifier_error(
+            "JSPACE_VERIFIER_PATH_INVALID",
+            path,
+            "path must be canonical absolute syntax",
+        ));
+    }
+    let mut prefix = PathBuf::new();
+    let mut missing = false;
+    for component in path.components() {
+        prefix.push(component.as_os_str());
+        if missing {
+            continue;
+        }
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(verifier_error(
+                    "JSPACE_VERIFIER_SYMLINK_DENIED",
+                    &prefix,
+                    "symlink component is not admitted",
+                ));
+            }
+            Ok(metadata) if prefix.as_path() != path && !metadata.is_dir() => {
+                return Err(verifier_error(
+                    "JSPACE_VERIFIER_PATH_INVALID",
+                    &prefix,
+                    "path ancestor must be a directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !must_exist => {
+                missing = true
+            }
+            Err(_) => {
+                return Err(verifier_error(
+                    "JSPACE_VERIFIER_PATH_INVALID",
+                    &prefix,
+                    "path unavailable",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verifier_python_import_roots(
+    command: &VerifierCommand,
+    matcher: &JSpaceMatcher,
+) -> Result<(), JSpaceError> {
+    let Some(roots) = &command.python_import_roots else {
+        return Ok(());
+    };
+    const CODE: &str = "JSPACE_VERIFIER_PYTHON_IMPORT_ROOTS_INVALID";
+    let executable = Path::new(&command.argv[0]);
+    let name = executable.file_name().and_then(|part| part.to_str()).unwrap_or_default();
+    let cpython_name = name.strip_prefix("python").is_some_and(|suffix| {
+        suffix.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.')
+    });
+    let ignores_environment = command.argv[1..].iter().any(|arg| {
+        arg.starts_with('-') && !arg.starts_with("--")
+            // Attached -W/-X values and -m/-c entrypoints are not flag clusters.
+            && arg[1..].bytes()
+                .take_while(|byte| !matches!(*byte, b'W' | b'X' | b'm' | b'c'))
+                .any(|byte| matches!(byte, b'I' | b'E'))
+    });
+    if !(1..=4).contains(&roots.len()) || !cpython_name || ignores_environment {
+        return Err(verifier_error(
+            CODE, executable,
+            "1..4 import roots require a CPython-named executable without -I/-E",
+        ));
+    }
+    let workspace = matcher.repo_root();
+    let mut seen = HashSet::new();
+    for root in roots {
+        let raw = root.to_str().unwrap_or_default();
+        let relative = root.strip_prefix(workspace).ok();
+        if raw.is_empty() || raw.contains(':') || raw.chars().count() > 1024
+            || !seen.insert(root.clone())
+            || relative.is_none()
+            || relative.is_some_and(|path| {
+                path.as_os_str().is_empty() || path.components().any(|part| {
+                    part.as_os_str().to_str().is_some_and(|name| name.starts_with('.'))
+                })
+            })
+        {
+            return Err(verifier_error(
+                CODE, root, "distinct bounded non-hidden workspace descendants required",
+            ));
+        }
+        verifier_path_without_symlink(root, true)?;
+        if !root.is_dir() || root.canonicalize().ok().as_deref() != Some(root.as_path()) {
+            return Err(verifier_error(CODE, root, "canonical existing directory required"));
+        }
+        // Import roots are context, not grants: inspect only existing scope anchors,
+        // never enumerate the root or expand the OS/read scope to cover it.
+        let contains_read_scope = matcher.scope_projection().read_scopes.iter().any(|scope| {
+            let anchor = if scope == "**" {
+                workspace.to_path_buf()
+            } else {
+                workspace.join(scope.strip_suffix("/**").unwrap_or(scope))
+            };
+            anchor.starts_with(root)
+                && verifier_path_without_symlink(&anchor, true).is_ok()
+                && anchor.canonicalize().ok().as_deref() == Some(anchor.as_path())
+                && matcher.check_path("read", &anchor).is_ok()
+        });
+        if !contains_read_scope {
+            return Err(verifier_error(CODE, root, "root must contain an existing admitted read scope"));
+        }
+    }
+    Ok(())
+}
+
+fn verifier_file(
+    path: &Path,
+    expected: &str,
+    executable: bool,
+    stale: bool,
+) -> Result<(), JSpaceError> {
+    use std::os::unix::fs::PermissionsExt;
+    verifier_path_without_symlink(path, true)?;
+    if !is_lower_sha256(expected) {
+        return Err(verifier_error(
+            "JSPACE_VERIFIER_GRANT_MALFORMED",
+            path,
+            "lowercase SHA-256 required",
+        ));
+    }
+    let metadata = std::fs::metadata(path).map_err(|_| {
+        verifier_error(
+            "JSPACE_VERIFIER_PATH_INVALID",
+            path,
+            "verifier file unavailable",
+        )
+    })?;
+    if !metadata.is_file() || (executable && metadata.permissions().mode() & 0o111 == 0) {
+        return Err(verifier_error(
+            "JSPACE_VERIFIER_GRANT_MALFORMED",
+            path,
+            "regular executable file required",
+        ));
+    }
+    let mut file = std::fs::File::open(path).map_err(|_| {
+        verifier_error(
+            "JSPACE_VERIFIER_PATH_INVALID",
+            path,
+            "verifier file unavailable",
+        )
+    })?;
+    let mut header = [0u8; 4];
+    if executable {
+        file.read_exact(&mut header).map_err(|_| {
+            verifier_error(
+                "JSPACE_VERIFIER_GRANT_MALFORMED",
+                path,
+                "pinned Mach-O executable required",
+            )
+        })?;
+        if !matches!(
+            header,
+            [0xfe, 0xed, 0xfa, 0xce]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xbe, 0xba, 0xfe, 0xca]
+                | [0xca, 0xfe, 0xba, 0xbf]
+                | [0xbf, 0xba, 0xfe, 0xca]
+        ) {
+            return Err(verifier_error(
+                "JSPACE_VERIFIER_GRANT_MALFORMED",
+                path,
+                "pinned Mach-O executable required",
+            ));
+        }
+        use std::io::Seek;
+        file.rewind().map_err(|_| {
+            verifier_error(
+                "JSPACE_VERIFIER_PATH_INVALID",
+                path,
+                "verifier file unavailable",
+            )
+        })?;
+    }
+    let mut shebang = [0u8; 256];
+    let count = file.read(&mut shebang).map_err(|_| {
+        verifier_error(
+            "JSPACE_VERIFIER_PATH_INVALID",
+            path,
+            "verifier file unavailable",
+        )
+    })?;
+    if shebang[..count].starts_with(b"#!") {
+        let line = shebang[2..count]
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        let ascii = line
+            .iter()
+            .copied()
+            .filter(u8::is_ascii)
+            .collect::<Vec<_>>();
+        let text = String::from_utf8_lossy(&ascii);
+        let mut words = text.split_whitespace();
+        let first = words
+            .next()
+            .unwrap_or_default()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default();
+        let second = words
+            .next()
+            .unwrap_or_default()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default();
+        let is_shell = |name: &str| {
+            matches!(
+                name,
+                "sh" | "bash"
+                    | "dash"
+                    | "zsh"
+                    | "fish"
+                    | "csh"
+                    | "tcsh"
+                    | "ksh"
+                    | "env"
+                    | "osascript"
+            )
+        };
+        if is_shell(first) || (first == "env" && is_shell(second)) {
+            return Err(verifier_error(
+                "JSPACE_VERIFIER_GRANT_MALFORMED",
+                path,
+                "shell and env verifier entries are not admitted",
+            ));
+        }
+    }
+    use std::io::Seek;
+    file.rewind().map_err(|_| {
+        verifier_error(
+            "JSPACE_VERIFIER_PATH_INVALID",
+            path,
+            "verifier file unavailable",
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = file.read(&mut buffer).map_err(|_| {
+            verifier_error(
+                "JSPACE_VERIFIER_PATH_INVALID",
+                path,
+                "verifier file unavailable",
+            )
+        })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if format!("{:x}", hasher.finalize()) != expected {
+        return Err(verifier_error(
+            if stale {
+                "NOKIY_LOCAL_CONTEXT_STALE"
+            } else {
+                "JSPACE_VERIFIER_FILE_MISMATCH"
+            },
+            path,
+            "verifier file SHA-256 changed",
+        ));
+    }
+    Ok(())
+}
+
+fn verifier_scratch(
+    path: &Path,
+    root: &Path,
+    workspace: &Path,
+    must_exist: bool,
+) -> Result<(), JSpaceError> {
+    verifier_path_without_symlink(path, must_exist)?;
+    if path == root || !path.starts_with(root) || path.starts_with(workspace) {
+        return Err(verifier_error(
+            "JSPACE_VERIFIER_SCRATCH_INVALID",
+            path,
+            "scratch must be strictly below artifact root and outside workspace",
+        ));
+    }
+    let mut current = path;
+    loop {
+        if current == root {
+            break;
+        }
+        match std::fs::symlink_metadata(current) {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(verifier_error(
+                    "JSPACE_VERIFIER_SCRATCH_INVALID",
+                    current,
+                    "scratch components must be directories",
+                ));
+            }
+            Err(error) if !must_exist && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(verifier_error(
+                    "JSPACE_VERIFIER_SCRATCH_NOT_READY",
+                    current,
+                    "scratch directory unavailable",
+                ));
+            }
+            _ => {}
+        }
+        current = current.parent().ok_or_else(|| {
+            verifier_error(
+                "JSPACE_VERIFIER_SCRATCH_INVALID",
+                path,
+                "invalid scratch parent",
+            )
+        })?;
+    }
+    if must_exist && path.canonicalize().ok().as_deref() != Some(path) {
+        return Err(verifier_error(
+            "JSPACE_VERIFIER_SCRATCH_NOT_READY",
+            path,
+            "scratch identity changed",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_verifier_grant(
+    object: &Map<String, Value>,
+    workspace: &Path,
+    schema: &str,
+) -> Result<(Option<PathBuf>, Vec<VerifierCommand>), JSpaceError> {
+    if !object.contains_key("verifier_commands") && !object.contains_key("verifier_artifact_root") {
+        return Ok((None, Vec::new()));
+    }
+    if schema != JSPACE_SINGLE_ROOT_SCHEMA_VERSION {
+        return Err(JSpaceError::new(
+            "JSPACE_VERIFIER_GRANT_UNSUPPORTED",
+            "admission",
+            "verifier_commands",
+            "typed verifier fields require single-root v2",
+        ));
+    }
+    let raw_commands = object.get("verifier_commands").ok_or_else(|| {
+        JSpaceError::new(
+            "JSPACE_VERIFIER_GRANT_MALFORMED",
+            "admission",
+            "verifier_commands",
+            "paired fields required",
+        )
+    })?;
+    let commands: Vec<VerifierCommand> =
+        serde_json::from_value(raw_commands.clone()).map_err(|error| {
+            JSpaceError::new(
+                "JSPACE_VERIFIER_GRANT_MALFORMED",
+                "admission",
+                "verifier_commands",
+                error.to_string(),
+            )
+        })?;
+    if !(1..=8).contains(&commands.len()) {
+        return Err(JSpaceError::new(
+            "JSPACE_VERIFIER_GRANT_MALFORMED",
+            "admission",
+            "verifier_commands",
+            "1..8 commands required",
+        ));
+    }
+    let root = object
+        .get("verifier_artifact_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            JSpaceError::new(
+                "JSPACE_VERIFIER_GRANT_MALFORMED",
+                "admission",
+                "verifier_artifact_root",
+                "paired absolute root required",
+            )
+        })?;
+    verifier_path_without_symlink(&root, true)?;
+    if !root.is_dir()
+        || root.canonicalize().ok().as_deref() != Some(root.as_path())
+        || root.starts_with(workspace)
+    {
+        return Err(verifier_error(
+            "JSPACE_VERIFIER_ARTIFACT_ROOT_INVALID",
+            &root,
+            "canonical artifact directory must be outside workspace",
+        ));
+    }
+    let mut argv_seen = HashSet::new();
+    let mut scratches = HashSet::new();
+    for command in &commands {
+        if !(1..=32).contains(&command.argv.len())
+            || !(1..=8).contains(&command.pinned_files.len())
+            || !(1..=300).contains(&command.timeout_seconds)
+            || command.network
+            || !argv_seen.insert(command.argv.clone())
+        {
+            return Err(JSpaceError::new(
+                "JSPACE_VERIFIER_GRANT_MALFORMED",
+                "admission",
+                "verifier_commands",
+                "invalid bounds, network policy or duplicate argv",
+            ));
+        }
+        if command.argv.iter().any(|arg| {
+            arg.is_empty()
+                || arg.chars().count() > 1024
+                || arg.chars().any(|ch| {
+                    matches!(
+                        ch,
+                        ';' | '&'
+                            | '|'
+                            | '<'
+                            | '>'
+                            | '$'
+                            | '`'
+                            | '\\'
+                            | '"'
+                            | '\''
+                            | '\r'
+                            | '\n'
+                            | '\0'
+                            | '*'
+                            | '?'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '('
+                            | ')'
+                    )
+                })
+        }) {
+            return Err(JSpaceError::new(
+                "JSPACE_VERIFIER_GRANT_MALFORMED",
+                "admission",
+                "verifier_commands",
+                "argv must be bounded and shell-free",
+            ));
+        }
+        let executable = Path::new(&command.argv[0]);
+        let name = executable
+            .file_name()
+            .and_then(|part| part.to_str())
+            .unwrap_or_default();
+        if matches!(
+            name,
+            "sh" | "bash" | "dash" | "zsh" | "fish" | "csh" | "tcsh" | "ksh" | "env" | "osascript"
+        ) || (["python", "node", "ruby", "perl", "php"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+            && command.argv[1..]
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-c" | "-e" | "--eval" | "--execute")))
+        {
+            return Err(JSpaceError::new(
+                "JSPACE_VERIFIER_GRANT_MALFORMED",
+                "admission",
+                "verifier_commands",
+                "shell or inline interpreter invocation denied",
+            ));
+        }
+        verifier_file(executable, &command.executable_sha256, true, false)?;
+        verifier_scratch(&command.scratch_root, &root, workspace, false)?;
+        if !scratches.insert(command.scratch_root.clone()) {
+            return Err(verifier_error(
+                "JSPACE_VERIFIER_SCRATCH_INVALID",
+                &command.scratch_root,
+                "duplicate scratch root",
+            ));
+        }
+        let mut pinned = HashSet::new();
+        for file in &command.pinned_files {
+            if !is_lower_sha256(&file.sha256)
+                || !pinned.insert(file.path.clone())
+                || !command
+                    .argv
+                    .iter()
+                    .any(|arg| file.path.to_str() == Some(arg.as_str()))
+            {
+                return Err(verifier_error(
+                    "JSPACE_VERIFIER_GRANT_MALFORMED",
+                    &file.path,
+                    "pinned file must have a valid digest and occur in exact argv",
+                ));
+            }
+        }
+    }
+    Ok((Some(root), commands))
+}
+
 fn claimed_contract_digests(
     object: &Map<String, Value>,
     schema_version: &str,
@@ -1171,9 +1965,21 @@ pub fn authorization_semantic_sha256(contract: &Value) -> Result<String, JSpaceE
             "contract must be an object",
         )
     })?;
+    if (object.contains_key("verifier_commands") || object.contains_key("verifier_artifact_root"))
+        && object.get("schema_version").and_then(Value::as_str)
+            != Some(JSPACE_SINGLE_ROOT_SCHEMA_VERSION)
+    {
+        return Err(JSpaceError::new(
+            "JSPACE_VERIFIER_GRANT_UNSUPPORTED",
+            "admission",
+            "verifier_commands",
+            "typed verifier fields require single-root v2",
+        ));
+    }
     if object.get("schema_version").and_then(Value::as_str) == Some(JSPACE_SCHEMA_VERSION) {
         return normalized_effect_authorization_sha256(object);
     }
+    let source_read = source_read_grant(object)?;
     let generation = object
         .get("dcf_generation")
         .and_then(Value::as_object)
@@ -1231,12 +2037,48 @@ pub fn authorization_semantic_sha256(contract: &Value) -> Result<String, JSpaceE
         read_commands::validate(policy)?;
         payload["read_commands"] = policy.clone();
     }
+    if let Some(commands) = object.get("verifier_commands") {
+        payload["verifier_commands"] = commands.clone();
+        payload["verifier_artifact_root"] = object
+            .get("verifier_artifact_root")
+            .cloned()
+            .unwrap_or(Value::Null);
+    } else if object.contains_key("verifier_artifact_root") {
+        payload["verifier_artifact_root"] = object
+            .get("verifier_artifact_root")
+            .cloned()
+            .unwrap_or(Value::Null);
+    }
+    if source_read {
+        payload["source_read"] = Value::Bool(true);
+    }
     Ok(semantic_sha256(&payload))
+}
+
+fn source_read_grant(object: &Map<String, Value>) -> Result<bool, JSpaceError> {
+    match object.get("source_read") {
+        None => Ok(false),
+        Some(Value::Bool(true))
+            if matches!(
+                object.get("schema_version").and_then(Value::as_str),
+                Some(JSPACE_SCHEMA_VERSION | JSPACE_SINGLE_ROOT_SCHEMA_VERSION)
+            ) =>
+        {
+            Ok(true)
+        }
+        _ => Err(JSpaceError::new(
+            "JSPACE_SOURCE_READ_GRANT_INVALID",
+            "admission",
+            "source_read",
+            "source_read must be true on a v2 or v3 contract",
+        )),
+    }
 }
 
 fn normalized_effect_authorization_sha256(
     object: &Map<String, Value>,
 ) -> Result<String, JSpaceError> {
+    let source_read = source_read_grant(object)?;
     let generation = object
         .get("dcf_generation")
         .and_then(Value::as_object)
@@ -1326,7 +2168,7 @@ fn normalized_effect_authorization_sha256(
     global_allowed.sort();
     let mut global_denied = denied_operations.into_iter().collect::<Vec<_>>();
     global_denied.sort();
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "schema_version": JSPACE_EFFECT_AUTHORIZATION_SCHEMA_VERSION,
         "repo_root": normalized_root(Path::new(&required_string(object, "repo_root")?))?,
         "required_domain_bindings": generation
@@ -1340,6 +2182,9 @@ fn normalized_effect_authorization_sha256(
         "command_templates": template_values,
         "expansion": object.get("expansion").cloned().unwrap_or(Value::Null),
     });
+    if source_read {
+        payload["source_read"] = Value::Bool(true);
+    }
     Ok(semantic_sha256(&payload))
 }
 
@@ -2187,6 +3032,7 @@ fn is_known_command_type(command_type: &str) -> bool {
             | "web_discover"
             | "generate_media"
             | "read_media"
+            | "source_read"
     )
 }
 
@@ -2528,6 +3374,585 @@ mod tests {
         (root, worktree, metadata)
     }
 
+    fn verifier_fixture() -> (tempfile::TempDir, tempfile::TempDir, Value) {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let artifacts = tempfile::tempdir().expect("artifacts");
+        let workspace_path = fs::canonicalize(workspace.path()).expect("canonical workspace");
+        let artifact_path = fs::canonicalize(artifacts.path()).expect("canonical artifact root");
+        fs::create_dir(workspace_path.join("src")).expect("src");
+        let pinned = workspace_path.join("src/test.rs");
+        fs::write(&pinned, b"test entry").expect("pinned entry");
+        let binary = workspace_path.join("runner");
+        fs::write(&binary, [0xfe, 0xed, 0xfa, 0xcf, 1, 2, 3, 4]).expect("binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("executable");
+        let mut value = contract(&workspace_path);
+        value["read_scopes"] = json!(["src/test.rs"]);
+        value["write_scopes"] = json!([]);
+        value["declared_targets"] = json!([]);
+        value["command_templates"] = json!([]);
+        value["source_read"] = json!(true);
+        value["verifier_artifact_root"] = json!(artifact_path);
+        value["verifier_commands"] = json!([{
+            "argv": [binary, pinned],
+            "executable_sha256": format!("{:x}", Sha256::digest(fs::read(&binary).unwrap())),
+            "pinned_files": [{"path": pinned, "sha256": format!("{:x}", Sha256::digest(fs::read(&pinned).unwrap()))}],
+            "timeout_seconds": 30, "scratch_root": artifact_path.join("scratch"), "network": false
+        }]);
+        (workspace, artifacts, value)
+    }
+
+    fn python_verifier_fixture() -> (tempfile::TempDir, tempfile::TempDir, Value) {
+        let (workspace, artifacts, mut value) = verifier_fixture();
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let executable = root.join("python3.13");
+        fs::rename(value["verifier_commands"][0]["argv"][0].as_str().unwrap(), &executable).unwrap();
+        value["verifier_commands"][0]["argv"][0] = json!(executable);
+        value["verifier_commands"][0]["python_import_roots"] = json!([root.join("src")]);
+        (workspace, artifacts, reseal(value))
+    }
+
+    #[test]
+    fn python_import_roots_preserve_legacy_shape_and_do_not_grant_reads() {
+        let (workspace, _artifacts, value) = python_verifier_fixture();
+        let matcher = JSpaceMatcher::from_value(workspace.path(), &value).unwrap();
+        let grant = matcher.check_verifier_command(0).unwrap();
+        assert_eq!(serde_json::to_value(grant).unwrap(), value["verifier_commands"][0]);
+        let root = &grant.python_import_roots.as_ref().unwrap()[0];
+        assert_eq!(matcher.check_path("read", root).unwrap_err().code(), JSPACE_EXPANSION_REQUIRED);
+        fs::create_dir(&grant.scratch_root).unwrap();
+        matcher.revalidate_verifier_paths().unwrap();
+
+        let mut legacy = value.clone();
+        legacy["verifier_commands"][0].as_object_mut().unwrap().remove("python_import_roots");
+        let legacy = reseal(legacy);
+        let old = JSpaceMatcher::from_value(workspace.path(), &legacy).unwrap();
+        assert!(old.verifier_commands()[0].python_import_roots.is_none());
+        let serialized = serde_json::to_value(old.verifier_commands()).unwrap();
+        assert_eq!(serialized, legacy["verifier_commands"]);
+        let mut roundtrip = legacy.clone();
+        roundtrip["verifier_commands"] = serialized;
+        assert_eq!(authorization_semantic_sha256(&roundtrip).unwrap(), old.authorization_semantic_sha256());
+        assert_ne!(old.authorization_semantic_sha256(), matcher.authorization_semantic_sha256());
+
+        let mut recursive = value;
+        recursive["read_scopes"] = json!(["src/**"]);
+        recursive.as_object_mut().unwrap().remove("source_read");
+        JSpaceMatcher::from_value(workspace.path(), &reseal(recursive)).unwrap();
+    }
+
+    #[test]
+    fn python_import_roots_reject_malformed_bounds_and_paths() {
+        let (workspace, artifacts, value) = python_verifier_fixture();
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let src = root.join("src");
+        fs::create_dir_all(root.join(".hidden/pkg")).unwrap();
+        fs::create_dir(root.join("colon:root")).unwrap();
+        let cases = vec![
+            json!(null), json!(false), json!("src"), json!({"root":src}), json!([1]),
+            json!([]), json!(["src"]), json!([""]), json!([src, src]),
+            json!([src, src, src, src, src]), json!([root.join("missing")]),
+            json!([root]), json!([fs::canonicalize(artifacts.path()).unwrap()]),
+            json!([root.join("src/test.rs")]), json!([root.join(".hidden")]),
+            json!([root.join(".hidden/pkg")]), json!([root.join("colon:root")]),
+            json!([format!("{}/src/.", root.display())]),
+            json!([format!("{}/src/../src", root.display())]),
+            json!([format!("{}//src", root.display())]),
+            json!([format!("{}/src/", root.display())]), json!(["x".repeat(1025)]),
+        ];
+        for roots in cases {
+            let mut invalid = value.clone();
+            invalid["verifier_commands"][0]["python_import_roots"] = roots.clone();
+            assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).is_err(), "{roots}");
+        }
+    }
+
+    #[test]
+    fn python_import_roots_require_existing_scopes_and_reject_symlink_chains() {
+        use std::os::unix::fs::symlink;
+        let (workspace, _artifacts, value) = python_verifier_fixture();
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let imports = root.join("imports");
+        fs::create_dir(&imports).unwrap();
+        let mut ungranted = value.clone();
+        ungranted["verifier_commands"][0]["python_import_roots"] = json!([imports]);
+        assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(ungranted.clone())).is_err());
+        ungranted["read_scopes"] = json!(["src/test.rs", "imports/module.py"]);
+        assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(ungranted.clone())).is_err());
+        fs::write(imports.join("module.py"), "module").unwrap();
+        JSpaceMatcher::from_value(workspace.path(), &reseal(ungranted.clone())).unwrap();
+
+        fs::create_dir(root.join("src/pkg")).unwrap();
+        symlink(root.join("src"), root.join("alias")).unwrap();
+        for path in [root.join("alias"), root.join("alias/pkg")] {
+            let mut invalid = value.clone();
+            invalid["verifier_commands"][0]["python_import_roots"] = json!([path]);
+            assert_eq!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).unwrap_err().code(),
+                "JSPACE_VERIFIER_SYMLINK_DENIED");
+        }
+        symlink(root.join("src/test.rs"), imports.join("link.py")).unwrap();
+        ungranted["read_scopes"] = json!(["src/test.rs", "imports/link.py"]);
+        assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(ungranted)).is_err());
+    }
+
+    #[test]
+    fn python_import_roots_accept_four_distinct_roots_and_revalidate_scope_drift() {
+        let (workspace, _artifacts, mut value) = python_verifier_fixture();
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        for name in ["one", "two", "three"] {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::write(root.join(name).join("module.py"), "module").unwrap();
+        }
+        value["read_scopes"] = json!(["src/test.rs", "one/module.py", "two/**", "three"]);
+        value["verifier_commands"][0]["python_import_roots"] =
+            json!([root.join("src"), root.join("one"), root.join("two"), root.join("three")]);
+        let mut matcher = JSpaceMatcher::from_value(workspace.path(), &reseal(value)).unwrap();
+        fs::create_dir(&matcher.verifier_commands()[0].scratch_root).unwrap();
+        matcher.revalidate_verifier_paths().unwrap();
+        matcher.scope_projection.read_scopes.retain(|scope| scope != "three");
+        assert!(matcher.revalidate_verifier_paths().is_err());
+        matcher.scope_projection.read_scopes.push("three".into());
+        fs::rename(root.join("one/module.py"), root.join("one/moved.py")).unwrap();
+        assert!(matcher.revalidate_verifier_paths().is_err());
+    }
+
+    #[test]
+    fn python_import_roots_revalidate_missing_and_symlinked_root_drift() {
+        use std::os::unix::fs::symlink;
+        let (workspace, _artifacts, mut value) = python_verifier_fixture();
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let imports = root.join("imports");
+        fs::create_dir(&imports).unwrap();
+        fs::write(imports.join("module.py"), "module").unwrap();
+        value["read_scopes"] = json!(["src/test.rs", "imports/module.py"]);
+        value["verifier_commands"][0]["python_import_roots"] = json!([imports]);
+        let matcher = JSpaceMatcher::from_value(workspace.path(), &reseal(value)).unwrap();
+        fs::create_dir(&matcher.verifier_commands()[0].scratch_root).unwrap();
+        matcher.revalidate_verifier_paths().unwrap();
+        let moved = root.join("moved");
+        fs::rename(&imports, &moved).unwrap();
+        assert!(matcher.revalidate_verifier_paths().is_err());
+        symlink(&moved, &imports).unwrap();
+        assert_eq!(matcher.revalidate_verifier_paths().unwrap_err().code(), "JSPACE_VERIFIER_SYMLINK_DENIED");
+    }
+
+    #[test]
+    fn python_import_roots_require_cpython_names_and_environment_aware_flags() {
+        let (workspace, _artifacts, value) = python_verifier_fixture();
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let source = value["verifier_commands"][0]["argv"][0].as_str().unwrap();
+        for name in ["python", "python3", "node", "pypy3", "python3-config", "pythonw", "Python3", "python3x"] {
+            let executable = root.join(name);
+            fs::copy(source, &executable).unwrap();
+            let mut changed = value.clone();
+            changed["verifier_commands"][0]["argv"][0] = json!(executable);
+            assert_eq!(JSpaceMatcher::from_value(workspace.path(), &reseal(changed)).is_ok(),
+                matches!(name, "python" | "python3"), "{name}");
+        }
+        for flag in ["-I", "-E", "-IE", "-sE", "-BI"] {
+            let mut invalid = value.clone();
+            invalid["verifier_commands"][0]["argv"].as_array_mut().unwrap().insert(1, json!(flag));
+            assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).is_err(), "{flag}");
+        }
+        for flag in ["-B", "-Werror::ImportWarning", "-Xfoo=Environment"] {
+            let mut aware = value.clone();
+            aware["verifier_commands"][0]["argv"].as_array_mut().unwrap().insert(1, json!(flag));
+            JSpaceMatcher::from_value(workspace.path(), &reseal(aware)).unwrap();
+        }
+    }
+
+    #[test]
+    fn python_import_roots_raw_field_is_authorization_bound() {
+        let (workspace, _artifacts, value) = python_verifier_fixture();
+        let original = authorization_semantic_sha256(&value).unwrap();
+        for roots in [json!([]), json!(null), json!(["/different/root"])] {
+            let mut changed = value.clone();
+            changed["verifier_commands"][0]["python_import_roots"] = roots;
+            assert_ne!(authorization_semantic_sha256(&changed).unwrap(), original);
+            changed["content_sha256"] = json!(semantic_sha256(&changed));
+            assert!(JSpaceMatcher::from_value(workspace.path(), &changed).is_err());
+        }
+        let mut removed = value;
+        removed["verifier_commands"][0].as_object_mut().unwrap().remove("python_import_roots");
+        assert_ne!(authorization_semantic_sha256(&removed).unwrap(), original);
+        removed["content_sha256"] = json!(semantic_sha256(&removed));
+        assert!(JSpaceMatcher::from_value(workspace.path(), &removed).is_err());
+    }
+
+    #[test]
+    fn verifier_grant_is_exact_and_coexists_with_source_read_without_shell_grant() {
+        let (workspace, _artifacts, value) = verifier_fixture();
+        let baseline = contract(workspace.path());
+        assert_eq!(
+            JSpaceMatcher::from_value(workspace.path(), &baseline)
+                .unwrap()
+                .verifier_commands()
+                .len(),
+            0
+        );
+        let admitted = JSpaceMatcher::from_value(workspace.path(), &reseal(value.clone()))
+            .expect("verifier grant");
+        assert_ne!(
+            admitted.authorization_semantic_sha256(),
+            baseline["authorization_semantic_sha256"].as_str().unwrap()
+        );
+        assert_eq!(admitted.verifier_commands().len(), 1);
+        assert_eq!(
+            admitted.verifier_artifact_root().unwrap().to_str(),
+            value["verifier_artifact_root"].as_str()
+        );
+        assert_eq!(
+            admitted.check_verifier_command(0).unwrap().timeout_seconds,
+            30
+        );
+        assert_eq!(
+            admitted.check_verifier_command(1).unwrap_err().code(),
+            "JSPACE_VERIFIER_NOT_GRANTED"
+        );
+        let pinned = value["verifier_commands"][0]["pinned_files"][0]["path"]
+            .as_str()
+            .unwrap();
+        admitted
+            .check_source_read(std::path::Path::new(pinned))
+            .expect("source read retained");
+        assert_eq!(
+            admitted
+                .check_command("shell_command", "git status --short")
+                .unwrap_err()
+                .code(),
+            "JSPACE_COMMAND_DENIED"
+        );
+        let scratch = std::path::Path::new(
+            value["verifier_commands"][0]["scratch_root"]
+                .as_str()
+                .unwrap(),
+        );
+        assert!(admitted.revalidate_verifier_paths().is_err());
+        fs::create_dir(scratch).expect("scratch created by caller");
+        admitted.revalidate_verifier_paths().expect("paths ready");
+        let old = authorization_semantic_sha256(&baseline).unwrap();
+        assert_eq!(
+            old,
+            baseline["authorization_semantic_sha256"].as_str().unwrap()
+        );
+        assert_eq!(old, authorization_semantic_sha256(&baseline).unwrap());
+    }
+
+    #[test]
+    fn verifier_fields_are_paired_versioned_and_digest_bound() {
+        let (workspace, _artifacts, value) = verifier_fixture();
+        for field in ["verifier_commands", "verifier_artifact_root"] {
+            let mut incomplete = value.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                JSpaceMatcher::from_value(workspace.path(), &reseal(incomplete))
+                    .unwrap_err()
+                    .code(),
+                "JSPACE_VERIFIER_GRANT_MALFORMED"
+            );
+        }
+        let (topology, worktree, metadata) = effect_topology();
+        let mut unsupported = effect_contract(topology.path(), &worktree, &metadata);
+        unsupported["verifier_commands"] = value["verifier_commands"].clone();
+        unsupported["verifier_artifact_root"] = value["verifier_artifact_root"].clone();
+        assert_eq!(
+            JSpaceMatcher::from_value(topology.path(), &unsupported)
+                .unwrap_err()
+                .code(),
+            "JSPACE_VERIFIER_GRANT_UNSUPPORTED"
+        );
+        let sealed = reseal(value.clone());
+        let mut changed = sealed.clone();
+        changed["verifier_commands"][0]["timeout_seconds"] = json!(20);
+        assert_eq!(
+            JSpaceMatcher::from_value(workspace.path(), &changed)
+                .unwrap_err()
+                .code(),
+            "JSPACE_AUTHORIZATION_DIGEST_MISMATCH"
+        );
+        let mut changed = sealed;
+        changed["verifier_artifact_root"] = json!("/elsewhere");
+        assert_eq!(
+            JSpaceMatcher::from_value(workspace.path(), &changed)
+                .unwrap_err()
+                .code(),
+            "JSPACE_AUTHORIZATION_DIGEST_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_network_bounds_shell_and_pinned_scope() {
+        use sha2::Digest;
+        let (workspace, _artifacts, value) = verifier_fixture();
+        let mut invalid = value.clone();
+        invalid["denied_operations"] = json!(["install", "system_mutation"]);
+        assert_eq!(
+            JSpaceMatcher::from_value(workspace.path(), &reseal(invalid))
+                .unwrap_err()
+                .code(),
+            "JSPACE_VERIFIER_OPERATION_DENIED"
+        );
+        let mut invalid = value.clone();
+        invalid["verifier_commands"][0]["network"] = json!(true);
+        assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).is_err());
+        let mut invalid = value.clone();
+        invalid["verifier_commands"][0]["timeout_seconds"] = json!(301);
+        assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).is_err());
+        let long_arg = "x".repeat(1025);
+        for arg in ["arg;whoami", "", long_arg.as_str()] {
+            let mut invalid = value.clone();
+            invalid["verifier_commands"][0]["argv"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(arg));
+            assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).is_err());
+        }
+        let mut invalid = value.clone();
+        invalid["verifier_commands"][0]["argv"] = json!([]);
+        assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).is_err());
+        let mut invalid = value.clone();
+        invalid["verifier_commands"][0]["argv"]
+            .as_array_mut()
+            .unwrap()
+            .extend((0..31).map(|_| json!("safe")));
+        assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).is_err());
+        let mut invalid = value.clone();
+        invalid["verifier_commands"][0]["argv"][0] = json!("/bin/sh");
+        assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).is_err());
+        let mut invalid = value.clone();
+        invalid["verifier_commands"][0]["pinned_files"][0]["path"] =
+            json!(_artifacts.path().join("elsewhere"));
+        assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).is_err());
+        let outside = std::path::Path::new(value["verifier_artifact_root"].as_str().unwrap())
+            .join("outside.rs");
+        fs::write(&outside, "outside").expect("outside entry");
+        let mut invalid = value.clone();
+        invalid["verifier_commands"][0]["pinned_files"][0]["path"] = json!(outside);
+        invalid["verifier_commands"][0]["pinned_files"][0]["sha256"] = json!(format!(
+            "{:x}",
+            sha2::Sha256::digest(fs::read(&outside).unwrap())
+        ));
+        invalid["verifier_commands"][0]["argv"][1] = json!(outside);
+        assert_eq!(
+            JSpaceMatcher::from_value(workspace.path(), &reseal(invalid))
+                .unwrap_err()
+                .code(),
+            "JSPACE_PATH_OUTSIDE_ROOT"
+        );
+        let mut invalid = value.clone();
+        invalid["read_scopes"] = json!(["src/other.rs"]);
+        assert_eq!(
+            JSpaceMatcher::from_value(workspace.path(), &reseal(invalid))
+                .unwrap_err()
+                .code(),
+            JSPACE_EXPANSION_REQUIRED
+        );
+        let mut invalid = value.clone();
+        invalid["verifier_commands"][0]["scratch_root"] = json!(workspace.path().join("scratch"));
+        assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).is_err());
+        let mut invalid = value.clone();
+        invalid["verifier_commands"][0]["scratch_root"] = value["verifier_artifact_root"].clone();
+        assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).is_err());
+        let mut invalid = value.clone();
+        invalid["verifier_commands"]
+            .as_array_mut()
+            .unwrap()
+            .push(value["verifier_commands"][0].clone());
+        assert!(JSpaceMatcher::from_value(workspace.path(), &reseal(invalid)).is_err());
+    }
+
+    #[test]
+    fn verifier_rejects_stale_files_and_symlink_traversal() {
+        use std::os::unix::fs::symlink;
+        let (workspace, _artifacts, value) = verifier_fixture();
+        let matcher =
+            JSpaceMatcher::from_value(workspace.path(), &reseal(value.clone())).expect("admitted");
+        let pinned = matcher.verifier_commands()[0].pinned_files[0].path.clone();
+        fs::write(&pinned, "changed").expect("stale file");
+        assert_eq!(
+            matcher.revalidate_verifier_paths().unwrap_err().code(),
+            "NOKIY_LOCAL_CONTEXT_STALE"
+        );
+        assert_eq!(
+            JSpaceMatcher::from_value(workspace.path(), &reseal(value.clone()))
+                .unwrap_err()
+                .code(),
+            "JSPACE_VERIFIER_FILE_MISMATCH"
+        );
+        fs::write(&pinned, "test entry").expect("restore pin");
+        let executable =
+            std::path::PathBuf::from(value["verifier_commands"][0]["argv"][0].as_str().unwrap());
+        let executable_bytes = fs::read(&executable).expect("binary");
+        let mut stale_executable = executable_bytes.clone();
+        *stale_executable.last_mut().unwrap() ^= 1;
+        fs::write(&executable, stale_executable).expect("stale executable");
+        assert_eq!(
+            matcher.revalidate_verifier_paths().unwrap_err().code(),
+            "NOKIY_LOCAL_CONTEXT_STALE"
+        );
+        fs::write(&executable, executable_bytes).expect("restore executable");
+        let mut invalid = value.clone();
+        let link =
+            std::path::Path::new(value["verifier_artifact_root"].as_str().unwrap()).join("link");
+        symlink(workspace.path().join("src"), &link).expect("symlink");
+        invalid["verifier_commands"][0]["scratch_root"] = json!(link.join("scratch"));
+        assert_eq!(
+            JSpaceMatcher::from_value(workspace.path(), &reseal(invalid))
+                .unwrap_err()
+                .code(),
+            "JSPACE_VERIFIER_SYMLINK_DENIED"
+        );
+        let pinned_link = workspace.path().join("src/link.rs");
+        symlink(&pinned, &pinned_link).expect("pinned link");
+        let mut invalid = value;
+        invalid["verifier_commands"][0]["argv"][1] = json!(pinned_link);
+        invalid["verifier_commands"][0]["pinned_files"][0]["path"] = json!(pinned_link);
+        assert_eq!(
+            JSpaceMatcher::from_value(workspace.path(), &reseal(invalid))
+                .unwrap_err()
+                .code(),
+            "JSPACE_VERIFIER_SYMLINK_DENIED"
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_inline_interpreter_and_duplicate_scratch() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        let (workspace, _artifacts, value) = verifier_fixture();
+        let node = workspace.path().join("node");
+        fs::write(&node, [0xfe, 0xed, 0xfa, 0xcf, 1, 2, 3, 4]).expect("node fixture");
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).expect("node executable");
+        let mut invalid = value.clone();
+        invalid["verifier_commands"][0]["argv"][0] = json!(node);
+        invalid["verifier_commands"][0]["executable_sha256"] =
+            json!(format!("{:x}", Sha256::digest(fs::read(&node).unwrap())));
+        invalid["verifier_commands"][0]["argv"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("--eval"));
+        assert_eq!(
+            JSpaceMatcher::from_value(workspace.path(), &reseal(invalid))
+                .unwrap_err()
+                .code(),
+            "JSPACE_VERIFIER_GRANT_MALFORMED"
+        );
+
+        let mut invalid = value.clone();
+        let mut second = value["verifier_commands"][0].clone();
+        second["argv"].as_array_mut().unwrap().push(json!("safe"));
+        invalid["verifier_commands"]
+            .as_array_mut()
+            .unwrap()
+            .push(second);
+        assert_eq!(
+            JSpaceMatcher::from_value(workspace.path(), &reseal(invalid))
+                .unwrap_err()
+                .code(),
+            "JSPACE_VERIFIER_SCRATCH_INVALID"
+        );
+    }
+
+    #[test]
+    fn source_read_requires_an_exact_grant_without_changing_shell_or_patch_metadata() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::create_dir(root.path().join("src")).expect("source directory");
+        fs::write(root.path().join("src/main.rs"), "fn main() {}\n").expect("source file");
+        let mut value = contract(root.path());
+        value["read_scopes"] = json!(["src/main.rs"]);
+        value["write_scopes"] = json!(["src/main.rs"]);
+        value["command_templates"] = json!([]);
+        value["source_read"] = json!(true);
+        let admitted = JSpaceMatcher::from_value(root.path(), &reseal(value.clone()))
+            .expect("source read grant");
+        assert!(admitted.source_read_enabled());
+        assert!(
+            admitted
+                .check_source_read(&root.path().join("src/main.rs"))
+                .is_ok()
+        );
+        assert_eq!(
+            admitted
+                .check_source_read(&root.path().join("src/other.rs"))
+                .unwrap_err()
+                .code(),
+            JSPACE_EXPANSION_REQUIRED
+        );
+        assert_eq!(
+            admitted
+                .check_command("bash", "cat src/main.rs")
+                .unwrap_err()
+                .code(),
+            "JSPACE_COMMAND_DENIED"
+        );
+        assert!(admitted.check_command("apply_patch", "").is_ok());
+        assert!(admitted.check_command("task_status", "done").is_ok());
+        assert!(admitted.check_command("planning", "[]").is_ok());
+
+        value["declared_targets"] = json!([]);
+        let no_patch_target = JSpaceMatcher::from_value(root.path(), &reseal(value.clone()))
+            .expect("read grant without patch target");
+        assert_eq!(
+            no_patch_target
+                .check_command("apply_patch", "")
+                .unwrap_err()
+                .code(),
+            "JSPACE_COMMAND_DENIED"
+        );
+
+        value["read_scopes"] = json!(["src/**"]);
+        assert_eq!(
+            JSpaceMatcher::from_value(root.path(), &reseal(value))
+                .unwrap_err()
+                .code(),
+            "JSPACE_SOURCE_READ_DENIED"
+        );
+    }
+
+    #[test]
+    fn source_read_v3_requires_an_exact_effect_domain_scope() {
+        let root = tempfile::tempdir().expect("workspace");
+        let root_path = fs::canonicalize(root.path()).expect("canonical workspace");
+        fs::create_dir(root.path().join("src")).expect("source directory");
+        fs::write(root.path().join("src/main.rs"), "fn main() {}\n").expect("source file");
+        let mut value = contract(&root_path);
+        value["schema_version"] = json!("jspace_contract_v3");
+        value["dcf_generation"]["context_mode"] = json!("local_workspace_jspace");
+        value["dcf_generation"]["dcf_available"] = json!(false);
+        value.as_object_mut().expect("object").remove("read_scopes");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("write_scopes");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("declared_targets");
+        value["allowed_operations"] = json!(["command"]);
+        value["command_templates"] = json!([]);
+        value["effect_capabilities"] = json!([{
+            "domain_id": "workspace", "root": root_path,
+            "read_scopes": ["src/main.rs", "src/**"], "write_scopes": [],
+            "allowed_operations": ["read"], "declared_targets": []
+        }]);
+        value["source_read"] = json!(true);
+        let admitted =
+            JSpaceMatcher::from_value(&root_path, &reseal(value)).expect("v3 source read grant");
+        assert!(
+            admitted
+                .check_source_read(&root_path.join("src/main.rs"))
+                .is_ok()
+        );
+        assert_eq!(
+            admitted
+                .check_source_read(&root_path.join("src/other.rs"))
+                .unwrap_err()
+                .code(),
+            JSPACE_EXPANSION_REQUIRED
+        );
+    }
+
     #[test]
     fn authorization_digest_matches_dcf_cross_language_vector() {
         let value = json!({
@@ -2580,16 +4005,31 @@ mod tests {
         }
         value["command_effect_policy"] = json!("trusted_argv_effects_v1");
         let canonical = reseal(value);
-        assert!(super::verified_contract_digests(
-            &canonical, canonical.as_object().unwrap(), "jspace_contract_v2"
-        ).is_ok());
+        assert!(
+            super::verified_contract_digests(
+                &canonical,
+                canonical.as_object().unwrap(),
+                "jspace_contract_v2"
+            )
+            .is_ok()
+        );
         let mut stripped = canonical;
-        stripped.as_object_mut().unwrap().remove("command_effect_policy");
+        stripped
+            .as_object_mut()
+            .unwrap()
+            .remove("command_effect_policy");
         stripped.as_object_mut().unwrap().remove("content_sha256");
         stripped["content_sha256"] = json!(semantic_sha256(&stripped));
-        assert_eq!(super::verified_contract_digests(
-            &stripped, stripped.as_object().unwrap(), "jspace_contract_v2"
-        ).unwrap_err().code(), "JSPACE_AUTHORIZATION_DIGEST_MISMATCH");
+        assert_eq!(
+            super::verified_contract_digests(
+                &stripped,
+                stripped.as_object().unwrap(),
+                "jspace_contract_v2"
+            )
+            .unwrap_err()
+            .code(),
+            "JSPACE_AUTHORIZATION_DIGEST_MISMATCH"
+        );
     }
 
     #[test]
@@ -2607,12 +4047,356 @@ mod tests {
         let admitted = JSpaceMatcher::from_value(root.path(), &reseal(value.clone())).unwrap();
         assert!(admitted.check_command("bash", "cat src/a.txt").is_ok());
         assert!(admitted.check_command("bash", "cat secret.txt").is_err());
-        assert!(admitted.check_command("bash", "cat src/a.txt; pwd").is_err());
-        assert!(admitted.check_path("modify", &root.path().join("src/a.txt")).is_err());
+        assert!(
+            admitted
+                .check_command("bash", "cat src/a.txt; pwd")
+                .is_err()
+        );
+        assert!(
+            admitted
+                .check_path("modify", &root.path().join("src/a.txt"))
+                .is_err()
+        );
         value["command_templates"][0]["argv"][1] = json!("secret.txt");
         value["command_templates"][0]["targets"][0]["path"] = json!("secret.txt");
         let outside = JSpaceMatcher::from_value(root.path(), &reseal(value)).unwrap();
         assert!(outside.check_command("bash", "cat secret.txt").is_err());
+    }
+
+    #[test]
+    fn exact_argv_index_preserves_denials_and_first_template_order() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/ok.txt"), "ok").unwrap();
+        fs::write(root.path().join("outside.txt"), "outside").unwrap();
+        let mut value = contract(root.path());
+        value["command_templates"] = json!([{
+            "argv": ["cat", "src/ok.txt"], "effects": ["read"],
+            "targets": [{"operation": "read", "path": "src/ok.txt", "argv_index": 1}]
+        }]);
+        let matcher = JSpaceMatcher::from_value(root.path(), &reseal(value.clone())).unwrap();
+        assert_eq!(matcher.command_template_index.get(&vec!["cat".into(), "src/ok.txt".into()]), Some(&0));
+        assert!(matcher.check_command("bash", "cat src/ok.txt").is_ok());
+        assert_eq!(matcher.check_command("bash", "cat src/missing.txt").unwrap_err().code(),
+                   "JSPACE_COMMAND_DENIED");
+        assert_eq!(matcher.check_command("bash", "cat src/ok.txt; pwd").unwrap_err().code(),
+                   "JSPACE_COMMAND_SYNTAX_UNSAFE");
+        assert_eq!(matcher.check_command("unknown", "cat src/ok.txt").unwrap_err().code(),
+                   "JSPACE_UNKNOWN_TOOL");
+
+        // Duplicate argv is rejected at admission, never silently replaced by the index.
+        let duplicate = value["command_templates"][0].clone();
+        value["command_templates"].as_array_mut().unwrap().push(duplicate);
+        assert_eq!(JSpaceMatcher::from_value(root.path(), &reseal(value)).unwrap_err().code(),
+                   "JSPACE_COMMAND_TEMPLATE_DUPLICATE");
+
+        // The index's first-entry behavior also holds if a legacy matcher contains repeats.
+        let mut repeated = matcher.clone();
+        repeated.command_templates.push(repeated.command_templates[0].clone());
+        repeated.command_templates[1].targets[0].path = "outside.txt".into();
+        assert!(repeated.check_command("bash", "cat src/ok.txt").is_ok());
+        repeated.command_templates[0].targets[0].path = "outside.txt".into();
+        assert_eq!(repeated.check_command("bash", "cat src/ok.txt").unwrap_err().code(),
+                   JSPACE_EXPANSION_REQUIRED);
+        repeated.command_templates[0].targets[0].path = "src/ok.txt".into();
+        repeated.command_templates[0].effects = vec!["network".into()];
+        assert_eq!(repeated.check_command("bash", "cat src/ok.txt").unwrap_err().code(),
+                   "JSPACE_OPERATION_DENIED");
+    }
+
+    #[test]
+    #[ignore = "deterministic opt-in local timing; not a performance gate"]
+    fn bench_exact_argv_index_vs_linear_reference() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let root = tempfile::tempdir().unwrap();
+        for count in [16, 128, 1024] {
+            let mut value = contract(root.path());
+            value["command_templates"] = json!((0..count).map(|n| json!({
+                "argv": ["git", "status", format!("--format-{n}")],
+                "effects": ["read"], "targets": []
+            })).collect::<Vec<_>>());
+            let matcher = JSpaceMatcher::from_value(root.path(), &reseal(value)).unwrap();
+            let argv = vec!["git".to_string(), "status".to_string(), format!("--format-{}", count - 1)];
+            let command = argv.join(" ");
+            let runs = 2000;
+            let start = Instant::now();
+            for _ in 0..runs {
+                black_box(matcher.check_command("bash", black_box(&command)).unwrap());
+            }
+            let indexed = start.elapsed();
+            let start = Instant::now();
+            for _ in 0..runs {
+                let command_type = super::normalize_command_type("bash");
+                matcher.check_operation("command", &command_type).unwrap();
+                let (raw, workdir) = super::shell_command_parts(&command);
+                assert!(workdir.is_none());
+                let parsed = super::parse_shell_argv(&raw).unwrap();
+                let template = matcher.command_templates.iter().find(|template| template.argv == parsed).unwrap();
+                for effect in &template.effects {
+                    matcher.check_operation(effect, &raw).unwrap();
+                }
+                black_box(template);
+            }
+            eprintln!("templates={count} indexed_check={indexed:?} linear_check={:?}", start.elapsed());
+        }
+    }
+
+    fn local_directory_source_read_fixture() -> (tempfile::TempDir, std::path::PathBuf, Value) {
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/new.txt"), "needle\n").unwrap();
+        fs::write(root.join("exact.txt"), "exact\n").unwrap();
+        let executable = |name: &str| {
+            let path = root.join(name);
+            fs::write(&path, name).unwrap();
+            json!({"path": path, "sha256": format!("{:x}", Sha256::digest(name.as_bytes()))})
+        };
+        let mut value = contract(&root);
+        value["dcf_generation"]["context_mode"] = json!("local_workspace_jspace");
+        value["dcf_generation"]["dcf_available"] = json!(false);
+        value["dcf_generation"]["required_domain_bindings"] = json!({});
+        value["read_commands"] =
+            json!({"roots":["src"],"rg":executable("rg"),"cat":executable("cat")});
+        value["source_read"] = json!(true);
+        value["command_templates"] = json!([]);
+        value["allowed_operations"] = json!(["read", "command"]);
+        value["read_scopes"] = json!(["src/**"]);
+        value["write_scopes"] = json!([]);
+        value["declared_targets"] = json!([]);
+        (temp, root, value)
+    }
+
+    #[test]
+    fn local_directory_source_read_accepts_only_existing_cat_authority() {
+        let (_temp, root, value) = local_directory_source_read_fixture();
+        let admitted = JSpaceMatcher::from_value(&root, &reseal(value)).unwrap();
+        assert!(admitted.source_read_enabled());
+        let cat = root.join("cat").display().to_string();
+        for file in ["src/new.txt", "src/discovered-later.txt"] {
+            fs::write(root.join(file), "needle\n").unwrap();
+            assert!(!admitted.read_scopes.matches_exact(file));
+            admitted.check_source_read(std::path::Path::new(file)).unwrap();
+            admitted.check_source_read(&root.join(file)).unwrap();
+            admitted.check_command("bash", &format!("{cat} -- {file}")).unwrap();
+        }
+        assert!(admitted.check_command("bash", "cat src/new.txt").is_err());
+        assert!(admitted.check_command("apply_patch", "").is_err());
+        assert!(admitted.check_path("modify", &root.join("src/new.txt")).is_err());
+    }
+
+    #[test]
+    fn local_directory_source_read_requires_exact_local_generation_markers() {
+        let (_temp, root, mut value) = local_directory_source_read_fixture();
+        value["read_scopes"] = json!(["src/**", "exact.txt"]);
+        for (field, replacement) in [
+            ("context_mode", None),
+            ("context_mode", Some(json!(null))),
+            ("context_mode", Some(json!(false))),
+            ("context_mode", Some(json!("dcf"))),
+            ("dcf_available", None),
+            ("dcf_available", Some(json!(null))),
+            ("dcf_available", Some(json!("false"))),
+            ("dcf_available", Some(json!(0))),
+            ("dcf_available", Some(json!(true))),
+        ] {
+            let mut nonlocal = value.clone();
+            if let Some(replacement) = replacement {
+                nonlocal["dcf_generation"][field] = replacement;
+            } else {
+                nonlocal["dcf_generation"].as_object_mut().unwrap().remove(field);
+            }
+            let admitted = JSpaceMatcher::from_value(&root, &reseal(nonlocal.clone())).unwrap();
+            admitted.check_source_read(&root.join("exact.txt")).unwrap();
+            assert_eq!(
+                admitted.check_source_read(&root.join("src/new.txt")).unwrap_err().code(),
+                JSPACE_EXPANSION_REQUIRED,
+                "{field}"
+            );
+            nonlocal["read_scopes"] = json!(["src/**"]);
+            assert_eq!(
+                JSpaceMatcher::from_value(&root, &reseal(nonlocal)).unwrap_err().code(),
+                "JSPACE_SOURCE_READ_DENIED",
+                "{field}"
+            );
+        }
+        let sealed = reseal(value);
+        for generation in [None, Some(json!(null)), Some(json!([]))] {
+            let mut malformed = sealed.clone();
+            if let Some(generation) = generation {
+                malformed["dcf_generation"] = generation;
+            } else {
+                malformed.as_object_mut().unwrap().remove("dcf_generation");
+            }
+            malformed["content_sha256"] = json!(semantic_sha256(&malformed));
+            assert_eq!(
+                JSpaceMatcher::from_value(&root, &malformed).unwrap_err().code(),
+                "JSPACE_CONTRACT_MALFORMED"
+            );
+        }
+    }
+
+    #[test]
+    fn local_directory_source_read_requires_valid_policy_and_operation_grants() {
+        let (_temp, root, mut value) = local_directory_source_read_fixture();
+        value["read_scopes"] = json!(["src/**", "exact.txt"]);
+        let mut exact_only = value.clone();
+        exact_only.as_object_mut().unwrap().remove("read_commands");
+        let admitted = JSpaceMatcher::from_value(&root, &reseal(exact_only.clone())).unwrap();
+        admitted.check_source_read(&root.join("exact.txt")).unwrap();
+        assert_eq!(
+            admitted.check_source_read(&root.join("src/new.txt")).unwrap_err().code(),
+            JSPACE_EXPANSION_REQUIRED
+        );
+        exact_only["read_scopes"] = json!(["src/**"]);
+        assert_eq!(
+            JSpaceMatcher::from_value(&root, &reseal(exact_only)).unwrap_err().code(),
+            "JSPACE_SOURCE_READ_DENIED"
+        );
+
+        let sealed = reseal(value.clone());
+        for policy in [json!(null), json!({}), {
+            let mut policy = value["read_commands"].clone();
+            policy["cat"]["sha256"] = json!("invalid");
+            policy
+        }, {
+            let mut policy = value["read_commands"].clone();
+            policy["roots"] = json!(["src/*"]);
+            policy
+        }] {
+            let mut malformed = sealed.clone();
+            malformed["read_commands"] = policy;
+            malformed["content_sha256"] = json!(semantic_sha256(&malformed));
+            assert_eq!(
+                JSpaceMatcher::from_value(&root, &malformed).unwrap_err().code(),
+                "JSPACE_READ_COMMAND_DENIED"
+            );
+        }
+        let mut disabled = value.clone();
+        disabled.as_object_mut().unwrap().remove("source_read");
+        let admitted = JSpaceMatcher::from_value(&root, &reseal(disabled)).unwrap();
+        assert!(!admitted.source_read_enabled());
+        assert_eq!(
+            admitted.check_source_read(&root.join("src/new.txt")).unwrap_err().code(),
+            "JSPACE_SOURCE_READ_DENIED"
+        );
+        let mut invalid = sealed;
+        invalid["source_read"] = json!(false);
+        invalid["content_sha256"] = json!(semantic_sha256(&invalid));
+        assert_eq!(
+            JSpaceMatcher::from_value(&root, &invalid).unwrap_err().code(),
+            "JSPACE_SOURCE_READ_GRANT_INVALID"
+        );
+        for operation in ["read", "command"] {
+            let mut denied = value.clone();
+            denied["denied_operations"] = json!([operation]);
+            assert!(JSpaceMatcher::from_value(&root, &reseal(denied)).is_err());
+            let mut absent = value.clone();
+            absent["allowed_operations"] = json!([if operation == "read" { "command" } else { "read" }]);
+            assert!(JSpaceMatcher::from_value(&root, &reseal(absent)).is_err());
+        }
+        let mut unsupported = value;
+        unsupported["schema_version"] = json!("jspace_contract_v3");
+        unsupported["allowed_operations"] = json!(["command"]);
+        unsupported["effect_capabilities"] = json!([{
+            "domain_id": "workspace", "root": root,
+            "read_scopes": ["src/**", "exact.txt"], "write_scopes": [],
+            "allowed_operations": ["read"], "declared_targets": []
+        }]);
+        for field in ["read_scopes", "write_scopes", "declared_targets"] {
+            unsupported.as_object_mut().unwrap().remove(field);
+        }
+        assert!(JSpaceMatcher::from_value(&root, &reseal(unsupported)).is_err());
+    }
+
+    #[test]
+    fn local_directory_source_read_keeps_cat_path_and_file_boundaries() {
+        let (_temp, root, mut value) = local_directory_source_read_fixture();
+        fs::create_dir(root.join("other")).unwrap();
+        fs::write(root.join("other/readable.txt"), "outside policy roots").unwrap();
+        fs::create_dir(root.join("src/nested")).unwrap();
+        fs::write(root.join("src/nested/file"), "nested").unwrap();
+        fs::create_dir(root.join("src/.private")).unwrap();
+        fs::write(root.join("src/.private/file"), "hidden").unwrap();
+        fs::write(root.join("src/.hidden"), "hidden").unwrap();
+        fs::File::create(root.join("src/large")).unwrap().set_len(1024 * 1024 + 1).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("file"), "outside workspace").unwrap();
+        value["read_scopes"] = json!(["src/**", "other/**"]);
+        let admitted = JSpaceMatcher::from_value(&root, &reseal(value)).unwrap();
+        admitted.check_path("read", &root.join("other/readable.txt")).unwrap();
+        admitted.check_source_read(&root.join("src/nested/file")).unwrap();
+        let denied = |target: &std::path::Path| {
+            assert!(admitted.check_source_read(target).is_err(), "{}", target.display());
+            assert!(super::read_commands::check(
+                &admitted,
+                &[root.join("cat").to_str().unwrap().to_owned(), "--".to_owned(), target.to_str().unwrap().to_owned()],
+                &root,
+            ).is_err(), "{}", target.display());
+        };
+        for target in [
+            root.join("other/readable.txt"),
+            outside.path().join("file"),
+            root.join("src/../exact.txt"),
+            root.join("src/.hidden"),
+            root.join("src/.private/file"),
+            root.join("src/nested"),
+            root.join("src/large"),
+            root.join("src/missing"),
+        ] {
+            denied(&target);
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("src/new.txt"), root.join("src/link")).unwrap();
+            std::os::unix::fs::symlink(root.join("src/nested"), root.join("src/link-dir")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), root.join("src/escape")).unwrap();
+            denied(&root.join("src/link"));
+            denied(&root.join("src/link-dir/file"));
+            denied(&root.join("src/escape/file"));
+        }
+    }
+
+    #[test]
+    fn local_directory_source_read_checks_pinned_cat_without_tightening_exact_reads() {
+        let (_temp, root, mut value) = local_directory_source_read_fixture();
+        value["read_scopes"] = json!(["src/**", "exact.txt"]);
+        let admitted = JSpaceMatcher::from_value(&root, &reseal(value)).unwrap();
+        fs::write(root.join("rg"), "changed rg").unwrap();
+        admitted.check_source_read(&root.join("src/new.txt")).unwrap();
+        fs::write(root.join("cat"), "changed cat").unwrap();
+        assert_eq!(
+            admitted.check_source_read(&root.join("src/new.txt")).unwrap_err().code(),
+            "JSPACE_READ_COMMAND_DENIED"
+        );
+        admitted.check_source_read(&root.join("exact.txt")).unwrap();
+    }
+
+    #[test]
+    fn local_directory_source_read_mode_is_bound_to_fresh_admitted_content() {
+        let (_temp, root, mut value) = local_directory_source_read_fixture();
+        value["read_scopes"] = json!(["src/**", "exact.txt"]);
+        let local = reseal(value);
+        let cache = JSpaceAdmissionCache::default();
+        let admitted = cache.admit("directory", &root, Some(&local)).unwrap().unwrap();
+        admitted.check_source_read(&root.join("src/new.txt")).unwrap();
+        let mut nonlocal = local.clone();
+        nonlocal["dcf_generation"]["dcf_available"] = json!(true);
+        assert_eq!(
+            cache.admit("directory", &root, Some(&nonlocal)).unwrap_err().code(),
+            "JSPACE_CONTENT_DIGEST_MISMATCH"
+        );
+        let nonlocal = reseal(nonlocal);
+        assert_eq!(local["authorization_semantic_sha256"], nonlocal["authorization_semantic_sha256"]);
+        assert_ne!(local["content_sha256"], nonlocal["content_sha256"]);
+        let admitted = cache.admit("directory", &root, Some(&nonlocal)).unwrap().unwrap();
+        assert_eq!(
+            admitted.check_source_read(&root.join("src/new.txt")).unwrap_err().code(),
+            JSPACE_EXPANSION_REQUIRED
+        );
+        admitted.check_source_read(&root.join("exact.txt")).unwrap();
     }
 
     #[test]
@@ -2630,7 +4414,8 @@ mod tests {
             fs::write(&path, name).unwrap();
             json!({"path": path, "sha256": format!("{:x}", Sha256::digest(name.as_bytes()))})
         };
-        value["read_commands"] = json!({"roots":["src"],"rg":executable("rg"),"cat":executable("cat")});
+        value["read_commands"] =
+            json!({"roots":["src"],"rg":executable("rg"),"cat":executable("cat")});
         value["command_templates"] = json!([]);
         value["allowed_operations"] = json!(["read", "command"]);
         value["write_scopes"] = json!([]);
@@ -2647,7 +4432,11 @@ mod tests {
             admitted.check_command("bash", &command).unwrap();
         }
         fs::write(root.join("src/discovered-later.txt"), "new").unwrap();
-        assert!(admitted.check_command("bash", &format!("{cat} -- src/discovered-later.txt")).is_ok());
+        assert!(
+            admitted
+                .check_command("bash", &format!("{cat} -- src/discovered-later.txt"))
+                .is_ok()
+        );
         for command in [
             format!("{rg} --no-config --max-filesize=1M --pre evil -- needle src"),
             format!("{rg} --no-config --max-filesize=1M --follow -- needle src"),
@@ -2658,15 +4447,34 @@ mod tests {
             format!("{cat} -- src/.env"),
             "cat src/new.txt".to_string(),
         ] {
-            assert!(admitted.check_command("bash", &command).is_err(), "{command}");
+            assert!(
+                admitted.check_command("bash", &command).is_err(),
+                "{command}"
+            );
         }
-        assert!(admitted.check_path("modify", &root.join("src/new.txt")).is_err());
-        #[cfg(unix)] {
+        assert!(
+            admitted
+                .check_path("modify", &root.join("src/new.txt"))
+                .is_err()
+        );
+        #[cfg(unix)]
+        {
             std::os::unix::fs::symlink(root.join("outside.txt"), root.join("src/link")).unwrap();
-            assert!(admitted.check_command("bash", &format!("{cat} -- src/link")).is_err());
+            assert!(
+                admitted
+                    .check_command("bash", &format!("{cat} -- src/link"))
+                    .is_err()
+            );
         }
         fs::write(root.join("rg"), "changed binary").unwrap();
-        assert!(admitted.check_command("bash", &format!("{rg} --no-config --max-filesize=1M --files -- src")).is_err());
+        assert!(
+            admitted
+                .check_command(
+                    "bash",
+                    &format!("{rg} --no-config --max-filesize=1M --files -- src")
+                )
+                .is_err()
+        );
         let sealed = reseal(value);
         let mut forged = sealed.clone();
         forged["read_commands"]["roots"] = json!(["outside"]);
@@ -3300,6 +5108,44 @@ mod tests {
                 .expect_err("command")
                 .code(),
             "JSPACE_COMMAND_DENIED"
+        );
+    }
+
+    #[test]
+    fn metadata_and_patch_entry_do_not_require_a_shell_grant() {
+        let root = tempfile::tempdir().expect("root");
+        fs::create_dir(root.path().join("src")).expect("src");
+        let mut value = contract(root.path());
+        value["allowed_operations"] = json!(["read", "modify"]);
+        value["denied_operations"] = json!(["command", "create", "delete", "network"]);
+        value["command_templates"] = json!([]);
+        let matcher = JSpaceMatcher::from_value(root.path(), &reseal(value)).expect("matcher");
+
+        matcher
+            .check_command(
+                "task_status",
+                r#"{"task_group":"single file","task_type":["new_build"]}"#,
+            )
+            .expect("internal task status");
+        matcher
+            .check_command("apply_patch", "*** Begin Patch\n*** End Patch")
+            .expect("patch entry; effect paths are checked separately");
+        matcher
+            .check_path("modify", &root.path().join("src/main.rs"))
+            .expect("declared patch target");
+        assert_eq!(
+            matcher
+                .check_path("modify", &root.path().join("src/other.rs"))
+                .expect_err("undeclared patch target")
+                .code(),
+            JSPACE_EXPANSION_REQUIRED
+        );
+        assert_eq!(
+            matcher
+                .check_command("shell_command", "git status --short")
+                .expect_err("shell command remains denied")
+                .code(),
+            "JSPACE_OPERATION_DENIED"
         );
     }
 

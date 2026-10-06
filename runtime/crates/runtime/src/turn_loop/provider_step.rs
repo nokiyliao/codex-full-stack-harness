@@ -13,6 +13,8 @@ pub(crate) fn accumulate_session_from_runtime(
 ) -> Result<(), String> {
     let now = Utc::now();
 
+    crate::provider_flow::responses_continuity::accumulate_reasoning(session, runtime)?;
+
     session.runtime_usage = runtime
         .usage
         .as_ref()
@@ -33,6 +35,20 @@ pub(crate) fn accumulate_session_from_runtime(
             now,
         );
     }
+
+    // Count unobserved calls too, so an early tool completion cannot disappear
+    // from the denominator when another call later reports a tier.
+    session.push_log(
+        serde_json::json!({
+            "type": "runtime_provider_observation",
+            "runtime_id": runtime.runtime_id,
+            "provider_observation": runtime.provider_observation,
+            "reasoning_observation": runtime.output.as_ref().and_then(|output| output.get("responses_continuity_observation")),
+            "timestamp": now.to_rfc3339(),
+        })
+        .to_string(),
+        now,
+    );
 
     if !publish_runtime_text {
         return Ok(());
@@ -79,6 +95,73 @@ mod tests {
     use lifecycle::{RuntimeAggregate, RuntimeProviderConfig, UsageReport};
     use lifecycle::{SessionInput, SessionManagement};
     use std::path::PathBuf;
+
+    #[test]
+    fn provider_observation_is_projected_without_usage() {
+        let now = Utc::now();
+        let mut session = SessionManagement::new(
+            "session-observation".to_string(),
+            "test".to_string(),
+            PathBuf::from("C:/workspace"),
+            false,
+            "coding".to_string(),
+            SessionInput {
+                user_input: "hello".to_string(),
+                file_input: Vec::new(),
+                agent: Some("direct".to_string()),
+                runtime_context: None,
+                planning_mode_override: None,
+            },
+            "hello".to_string(),
+            now,
+        );
+        let mut runtime = RuntimeAggregate::new(
+            "runtime-observation".to_string(),
+            "session-observation".to_string(),
+            "agent".to_string(),
+            RuntimeProviderConfig {
+                base: ProviderConfig {
+                    tura_llm_name: "test".to_string(),
+                    default_model_tier: None,
+                    current_model: None,
+                    stream: true,
+                    temperature: 0.0,
+                    max_tokens: 1024,
+                    tool_choice: ToolChoice::Auto,
+                    time_out_ms: 30_000,
+                },
+                thinking: false,
+                provider_name: "openai".to_string(),
+                model_name: "gpt-6".to_string(),
+                provider_url_name: "openai".to_string(),
+                llm_provider_name: "openai".to_string(),
+            },
+            now,
+        );
+        runtime.mark_called(now).expect("start");
+        runtime
+            .set_output_with_provider_observation(
+                serde_json::json!({}),
+                Some(lifecycle::ProviderObservation {
+                    schema_version: "provider_observation_v1".into(),
+                    source: "provider_response".into(),
+                    response_id: Some("resp-final".into()),
+                    model: None,
+                    service_tier: None,
+                }),
+            )
+            .expect("output");
+        accumulate_session_from_runtime(&mut session, &runtime, false).expect("projection");
+        assert!(runtime.usage.is_none());
+        assert_eq!(session.runtime_usage, serde_json::Value::Null);
+        assert!(
+            session
+                .session_log
+                .iter()
+                .any(|entry| entry.contains("runtime_provider_observation")
+                    && entry.contains("resp-final"))
+        );
+    }
 
     #[test]
     fn assistant_session_log_reuses_runtime_message_ids_and_timestamps() {

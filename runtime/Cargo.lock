@@ -5744,8 +5744,11 @@ dependencies = [
  "futures",
  "image",
  "provider",
+ "rustix",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "toml 0.8.2",
  "tura_path",
@@ -5934,6 +5937,7 @@ dependencies = [
 name = "tura_path"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

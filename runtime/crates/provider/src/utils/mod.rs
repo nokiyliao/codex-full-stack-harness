@@ -22,11 +22,16 @@ pub use xml::{parse_xml_parameter_value, xml_parameters, xml_unescape};
 
 pub fn strip_json_fence(input: &str) -> String {
     let s = input.trim();
-    if let Some(rest) = s.strip_prefix("```json") {
-        return rest.trim().trim_end_matches("```").trim().to_string();
-    }
-    if let Some(rest) = s.strip_prefix("```") {
-        return rest.trim().trim_end_matches("```").trim().to_string();
+    if let Some((opening, rest)) = s.split_once('\n') {
+        let opening = opening.strip_suffix('\r').unwrap_or(opening);
+        if opening == "```json" || opening == "```" {
+            if let Some((body, "```")) = rest.rsplit_once('\n') {
+                let json = body.trim();
+                if serde_json::from_str::<Value>(json).is_ok() {
+                    return json.to_string();
+                }
+            }
+        }
     }
     s.to_string()
 }
@@ -151,11 +156,59 @@ mod tests {
 
     #[test]
     fn strip_json_fence_removes_markdown_wrappers() {
-        assert_eq!(
-            strip_json_fence("```json\n{\"ok\":true}\n```"),
-            "{\"ok\":true}"
-        );
-        assert_eq!(strip_json_fence(" plain "), "plain");
+        for (input, expected) in [
+            ("```json\n{\"ok\":true}\n```", "{\"ok\":true}"),
+            ("```\n[1,2]\n```", "[1,2]"),
+            (
+                " \r\n```json\r\n \t{\"ok\":true}\r\n```\r\n ",
+                "{\"ok\":true}",
+            ),
+            (" \t```\r\n [1,2] \r\n```\r\n ", "[1,2]"),
+            (" plain ", "plain"),
+        ] {
+            assert_eq!(strip_json_fence(input), expected);
+        }
+    }
+
+    #[test]
+    fn strip_json_fence_preserves_custom_handoffs() {
+        let payload = json!({
+            "schema_version": "nokiy_capability_gap_v1",
+            "missing_capabilities": [{
+                "path": "crates/provider/src/utils/mod.rs",
+                "operation": "read",
+                "tool": "source_read"
+            }],
+            "completed_work": [],
+            "remaining_work": ["Read the provider helper."],
+            "unified_diff": null
+        });
+        for explanation in ["", "\nThe caller should receive the complete handoff."] {
+            let handoff = format!("```nokiy_capability_gap_v1\n{payload}\n```{explanation}");
+            assert_eq!(strip_json_fence(&handoff), handoff);
+        }
+    }
+
+    #[test]
+    fn strip_json_fence_preserves_other_envelopes() {
+        for input in [
+            "```json5\n{\"ok\":true}\n```",
+            "```json \n{\"ok\":true}\n```",
+            "```json{\"ok\":true}\n```",
+            "```rust\nlet value = 1;\n```",
+            "```\nordinary text\n```",
+            "```json\n{invalid}\n```",
+            "```\n[1,]\n```",
+            "```json\n{} {}\n```",
+            "```json\n{\"ok\":true}",
+            "```json\n{\"ok\":true}\n``",
+            "```json\n{\"ok\":true}\n````",
+            "```json\n{\"ok\":true}\n``` explanation",
+            "```json\n{\"ok\":true}\n```\nExplanation.",
+            "```json\n{\"ok\":true}\n```\n```\n[]\n```",
+        ] {
+            assert_eq!(strip_json_fence(input), input);
+        }
     }
 
     #[test]

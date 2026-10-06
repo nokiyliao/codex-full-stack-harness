@@ -1,10 +1,12 @@
 use std::sync::MutexGuard;
 
 pub struct SessionDbTestService {
-    _guard: MutexGuard<'static, ()>,
     _env: EnvRestore,
     _root: tempfile::TempDir,
     handle: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    // Fields drop in declaration order: restore the environment and remove the
+    // fixture root before releasing the lock to the next fixture.
+    _guard: MutexGuard<'static, ()>,
 }
 
 impl SessionDbTestService {
@@ -30,13 +32,15 @@ impl SessionDbTestService {
         unsafe {
             std::env::set_var("SESSION_LOG_DB_ROOT", root.path())
         };
+        // Command receipts must use this fixture's directory, not an ambient
+        // database location selected by the default root resolution.
         // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
         #[allow(
             unsafe_code,
             reason = "Rust 2024 process-environment mutation audited at the caller"
         )]
         unsafe {
-            std::env::remove_var("TURA_DB_ROOT")
+            std::env::set_var("TURA_DB_ROOT", &home)
         };
 
         let handle = std::thread::spawn(session_log::service::run_socket_service);

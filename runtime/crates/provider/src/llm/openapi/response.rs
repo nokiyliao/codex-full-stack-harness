@@ -13,7 +13,10 @@ use super::common::{
     insert_opt, message_content_text, normalized_reasoning_effort, normalized_service_tier,
 };
 use crate::metrics::extract_openapi_metrics;
-use crate::streaming::{next_provider_stream_chunk, send_provider_request_first_response};
+use crate::streaming::{
+    ProviderTransportPhase, next_provider_stream_chunk, provider_transport_error,
+    send_provider_request_first_response,
+};
 use crate::tura_llm::{
     CostDetails, ProviderResponse, ProviderStreamEvent, ProviderStreamEventSink, TuraError,
     normalize_response_content,
@@ -29,9 +32,7 @@ pub(crate) async fn codex_oauth_call(
 ) -> Result<ProviderResponse, TuraError> {
     let client = reqwest::Client::builder()
         .build()
-        .map_err(|err| TuraError::Network {
-            message: err.to_string(),
-        })?;
+        .map_err(|err| provider_transport_error(ProviderTransportPhase::ClientBuild, &err))?;
     let payload = build_codex_oauth_payload(model, messages, options);
 
     let mut request = client
@@ -62,9 +63,10 @@ pub(crate) async fn codex_oauth_call(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     if !status.is_success() {
-        let body = resp.text().await.map_err(|err| TuraError::Network {
-            message: err.to_string(),
-        })?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|err| provider_transport_error(ProviderTransportPhase::ResponseBody, &err))?;
         return Err(TuraError::HttpStatus {
             status: status.as_u16(),
             body,
@@ -104,9 +106,7 @@ pub(crate) async fn responses_api_key_call(
     let profile = ResponsesProfile::for_provider(provider);
     let client = reqwest::Client::builder()
         .build()
-        .map_err(|err| TuraError::Network {
-            message: err.to_string(),
-        })?;
+        .map_err(|err| provider_transport_error(ProviderTransportPhase::ClientBuild, &err))?;
     let payload = build_responses_payload(profile, model, messages, options);
 
     let endpoint = format!("{}/responses", base_url.trim_end_matches('/'));
@@ -120,9 +120,10 @@ pub(crate) async fn responses_api_key_call(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     if !status.is_success() {
-        let body = resp.text().await.map_err(|err| TuraError::Network {
-            message: err.to_string(),
-        })?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|err| provider_transport_error(ProviderTransportPhase::ResponseBody, &err))?;
         return Err(TuraError::HttpStatus {
             status: status.as_u16(),
             body,
@@ -226,6 +227,24 @@ fn build_responses_payload(
     let instructions =
         "Follow the user request and Operation Manual, and answer concisely.".to_string();
     for message in messages {
+        if message.get("type").and_then(Value::as_str) == Some("reasoning")
+            && message.get("role").is_none()
+        {
+            if profile.include_encrypted_reasoning
+                && message
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+                && message
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+                && message.get("summary").is_some_and(Value::is_array)
+            {
+                input.push(message.clone());
+            }
+            continue;
+        }
         if matches!(
             message.get("type").and_then(Value::as_str),
             Some("function_call" | "function_call_output")
@@ -351,8 +370,18 @@ async fn parse_codex_response_stream(
     resp: reqwest::Response,
     stream_events: Option<ProviderStreamEventSink>,
 ) -> Result<Value, TuraError> {
-    let mut stream = resp.bytes_stream();
-    let mut pending = String::new();
+    parse_codex_response_chunks(resp.bytes_stream(), stream_events).await
+}
+
+pub(crate) async fn parse_codex_response_chunks<S, B>(
+    mut stream: S,
+    stream_events: Option<ProviderStreamEventSink>,
+) -> Result<Value, TuraError>
+where
+    S: futures_util::Stream<Item = Result<B, reqwest::Error>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let mut pending = Vec::new();
     let mut output_text = String::new();
     let mut completed = None;
     let mut events = Vec::new();
@@ -363,31 +392,30 @@ async fn parse_codex_response_stream(
     while let Some(chunk) =
         next_provider_stream_chunk(&mut stream, saw_output, last_output_at).await?
     {
-        let chunk = chunk.map_err(|err| TuraError::Network {
-            message: err.to_string(),
-        })?;
-        pending.push_str(&String::from_utf8_lossy(&chunk));
+        let chunk = chunk
+            .map_err(|err| provider_transport_error(ProviderTransportPhase::ResponsesSse, &err))?;
+        pending.extend_from_slice(chunk.as_ref());
 
-        while let Some(line_end) = pending.find('\n') {
-            let line = pending[..line_end].trim_end_matches('\r').to_string();
-            pending.drain(..=line_end);
-            if process_codex_sse_line(
-                &line,
+        while let Some(line_end) = pending.iter().position(|byte| *byte == b'\n') {
+            let output_event = process_codex_sse_line(
+                decode_codex_sse_line(&pending[..line_end])?,
                 &mut output_text,
                 &mut completed,
                 &mut events,
                 &mut command_collector,
                 stream_events.as_ref(),
-            )? {
+            )?;
+            pending.drain(..=line_end);
+            if output_event {
                 saw_output = true;
                 last_output_at = Instant::now();
             }
         }
     }
 
-    if !pending.trim().is_empty() {
+    if !pending.is_empty() {
         let _ = process_codex_sse_line(
-            &pending,
+            decode_codex_sse_line(&pending)?,
             &mut output_text,
             &mut completed,
             &mut events,
@@ -396,7 +424,43 @@ async fn parse_codex_response_stream(
         )?;
     }
 
+    // Keep provider failures available to the caller's existing status validator.
+    // Otherwise a snapshot or [DONE] alone is not proof of completed output.
+    let provider_failure = completed
+        .as_ref()
+        .and_then(|response| response.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|status| !matches!(status, "completed" | "in_progress" | "queued"));
+    let valid_completion = completed.as_ref().is_some_and(|response| {
+        response.is_object()
+            && response.get("status").is_none_or(|status| status == "completed")
+            && response.get("error").is_none_or(Value::is_null)
+            && events.iter().any(|event| {
+                event["type"] == "response.completed" && event.get("response") == Some(response)
+            })
+    }) && !events.iter().any(|event| {
+        matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("response.failed" | "response.incomplete" | "error")
+        )
+    });
+    if !provider_failure && !valid_completion {
+        return Err(TuraError::Network {
+            message: "provider stream failure: phase=responses-sse category=protocol cause=missing-completed"
+                .to_string(),
+        });
+    }
+
     Ok(build_codex_stream_root(output_text, completed, events))
+}
+
+fn decode_codex_sse_line(bytes: &[u8]) -> Result<&str, TuraError> {
+    std::str::from_utf8(bytes)
+        .map(|line| line.trim_end_matches('\r'))
+        .map_err(|_| TuraError::Network {
+            message: "provider stream failure: phase=responses-sse category=decode cause=invalid-utf8"
+                .to_string(),
+        })
 }
 
 fn process_codex_sse_line(
@@ -495,11 +559,105 @@ fn build_codex_stream_root(
     events: Vec<Value>,
 ) -> Value {
     let mut root = completed.unwrap_or_else(|| json!({ "output": [] }));
+    if let Some(items) = completed_stream_output(&root, &events) {
+        root["output"] = Value::Array(items);
+        root["stream_output_source"] = json!("completed_output_item_events");
+    }
     if !output_text.is_empty() {
         root["output_text"] = Value::String(output_text);
     }
     root["events"] = Value::Array(events);
     root
+}
+
+fn completed_stream_output(final_response: &Value, events: &[Value]) -> Option<Vec<Value>> {
+    if final_response["status"] != "completed"
+        || final_response.get("error").is_some_and(|e| !e.is_null())
+    {
+        return None;
+    }
+    if let Some(output) = final_response.get("output") {
+        if !output.as_array().is_some_and(Vec::is_empty) {
+            return None;
+        }
+    }
+    let response_id = final_response["id"].as_str().filter(|id| !id.is_empty())?;
+    let mut created = false;
+    let mut finished = false;
+    let mut added = std::collections::BTreeMap::new();
+    let mut done = std::collections::BTreeMap::new();
+    for event in events {
+        if event
+            .get("response")
+            .is_some_and(|r| r["id"] != response_id)
+        {
+            return None;
+        }
+        match event["type"].as_str() {
+            Some("response.created") => {
+                if created || finished || !added.is_empty() {
+                    return None;
+                }
+                created = true;
+            }
+            Some("response.completed") => {
+                if !created || finished || event["response"] != *final_response {
+                    return None;
+                }
+                finished = true;
+            }
+            Some("response.failed" | "response.incomplete" | "error") => return None,
+            Some("response.output_item.added" | "response.output_item.done") => {
+                if !created || finished {
+                    return None;
+                }
+                let index = event["output_index"].as_u64()?;
+                let item = &event["item"];
+                let id = item["id"].as_str().filter(|id| !id.is_empty())?;
+                let kind = item["type"].as_str().filter(|kind| !kind.is_empty())?;
+                let identity = (id.to_owned(), kind.to_owned());
+                if event["type"] == "response.output_item.added" {
+                    if done.contains_key(&index) {
+                        return None;
+                    }
+                    if added
+                        .insert(index, identity.clone())
+                        .is_some_and(|old| old != identity)
+                    {
+                        return None;
+                    }
+                } else {
+                    if added.get(&index) != Some(&identity) {
+                        return None;
+                    }
+                    if done
+                        .insert(index, item.clone())
+                        .is_some_and(|old| old != *item)
+                    {
+                        return None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !created || !finished || done.is_empty() || added.len() != done.len() {
+        return None;
+    }
+    let mut ids = std::collections::HashSet::new();
+    for (expected, (index, item)) in done.iter().enumerate() {
+        let identity = (
+            item["id"].as_str()?.to_owned(),
+            item["type"].as_str()?.to_owned(),
+        );
+        if *index != expected as u64
+            || added.get(index) != Some(&identity)
+            || !ids.insert(identity.0)
+        {
+            return None;
+        }
+    }
+    Some(done.into_values().collect())
 }
 
 fn validate_responses_status(provider: &str, data: &Value) -> Result<(), TuraError> {
@@ -741,6 +899,170 @@ fn dedupe_tool_calls(calls: Vec<Value>) -> Vec<Value> {
         }
     }
     unique
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    use super::*;
+
+    fn completed_item_stream() -> (Value, Vec<Value>, Vec<Value>) {
+        let items = vec![
+            json!({"type":"reasoning", "id":"r1", "summary":[], "encrypted_content":"exact-opaque"}),
+            json!({"type":"function_call", "id":"fc1", "call_id":"c1", "name":"command_run", "arguments":"{}"}),
+        ];
+        let final_response =
+            json!({"id":"resp1", "status":"completed", "model":"model", "output":[]});
+        let mut events = vec![
+            json!({"type":"response.created", "response":{"id":"resp1", "status":"in_progress"}}),
+        ];
+        for (index, item) in items.iter().enumerate() {
+            events.push(json!({"type":"response.output_item.added", "output_index":index, "item":{"id":item["id"], "type":item["type"]}}));
+            events.push(
+                json!({"type":"response.output_item.done", "output_index":index, "item":item}),
+            );
+        }
+        events.push(json!({"type":"response.completed", "response":final_response}));
+        (final_response, events, items)
+    }
+
+    #[test]
+    fn completed_stream_restores_exact_done_items_when_final_snapshot_is_empty() {
+        let (final_response, events, items) = completed_item_stream();
+        let root = build_codex_stream_root(String::new(), Some(final_response), events);
+        assert_eq!(root["output"], json!(items));
+        assert_eq!(root["output"][0]["encrypted_content"], "exact-opaque");
+    }
+
+    #[test]
+    fn completed_stream_keeps_authoritative_snapshot_and_rejects_uncertain_events() {
+        let (mut final_response, events, _) = completed_item_stream();
+        final_response["output"] = json!([{"type":"message", "id":"canonical"}]);
+        assert!(completed_stream_output(&final_response, &events).is_none());
+        let (final_response, events, _) = completed_item_stream();
+        let mut cross_response = events.clone();
+        cross_response[0]["response"]["id"] = json!("other-response");
+        assert!(completed_stream_output(&final_response, &cross_response).is_none());
+        for case in 0..11 {
+            let mut invalid = events.clone();
+            match case {
+                0 => {
+                    invalid.remove(0);
+                }
+                1 => {
+                    invalid.pop();
+                }
+                2 => {
+                    invalid.remove(2);
+                }
+                3 => {
+                    invalid[3]["output_index"] = json!(9);
+                    invalid[4]["output_index"] = json!(9);
+                }
+                4 => {
+                    let mut conflict = invalid[2].clone();
+                    conflict["item"]["encrypted_content"] = json!("changed");
+                    invalid.insert(3, conflict);
+                }
+                5 => {
+                    invalid[3]["item"]["id"] = json!("mismatch");
+                }
+                6 => {
+                    invalid.swap(1, 2);
+                }
+                7 => {
+                    invalid.swap(4, 5);
+                }
+                8 => {
+                    invalid.swap(0, 1);
+                }
+                9 => {
+                    invalid[5]["response"]["model"] = json!("other-model");
+                }
+                _ => {
+                    invalid.insert(3, invalid[1].clone());
+                }
+            }
+            assert!(
+                completed_stream_output(&final_response, &invalid).is_none(),
+                "case {case}"
+            );
+        }
+        let mut partial = final_response.clone();
+        partial["status"] = json!("in_progress");
+        assert!(completed_stream_output(&partial, &events).is_none());
+    }
+
+    #[test]
+    fn completed_stream_duplicate_done_is_idempotent_and_sse_parser_keeps_items() {
+        let (final_response, mut events, items) = completed_item_stream();
+        events.insert(3, events[2].clone());
+        assert_eq!(
+            completed_stream_output(&final_response, &events),
+            Some(items.clone())
+        );
+        let mut output_text = String::new();
+        let mut completed = None;
+        let mut parsed = Vec::new();
+        let mut collector = CodexCommandRunCommandCollector::default();
+        for event in events {
+            process_codex_sse_line(
+                &format!("data: {event}"),
+                &mut output_text,
+                &mut completed,
+                &mut parsed,
+                &mut collector,
+                None,
+            )
+            .unwrap();
+        }
+        let root = build_codex_stream_root(output_text, completed, parsed);
+        assert_eq!(root["output"], json!(items));
+        assert_eq!(root["model"], "model");
+    }
+
+    #[test]
+    fn responses_continuity_builder_keeps_exact_items_and_call_order() {
+        let item = json!({"type":"reasoning", "id":"r1", "summary":[],
+            "encrypted_content":"synthetic-opaque", "status":"completed"});
+        let input = vec![
+            item.clone(),
+            json!({"type":"function_call", "name":"command_run", "call_id":"c1", "arguments":"{}"}),
+            json!({"type":"function_call_output", "call_id":"c1", "output":"ok"}),
+        ];
+        let payload = build_codex_oauth_payload("model", &input, &CallOptions::default());
+        assert_eq!(payload["input"], json!(input));
+        assert_eq!(payload["store"], false);
+    }
+
+    #[test]
+    fn responses_continuity_builder_excludes_plaintext_and_incompatible_provider() {
+        let opaque = json!({"type":"reasoning", "id":"r1", "summary":[], "encrypted_content":"synthetic-opaque"});
+        let plain = json!({"type":"reasoning", "id":"r2", "summary":[{"text":"not opaque"}]});
+        let user = json!({"role":"user", "content":"question"});
+        let payload =
+            build_codex_oauth_payload("model", &[plain, user.clone()], &CallOptions::default());
+        assert_eq!(payload["input"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["input"][0]["role"], "user");
+        let other = build_responses_payload_for_provider(
+            "grok",
+            "model",
+            &[opaque, user],
+            &CallOptions::default(),
+        );
+        assert_eq!(other["input"].as_array().unwrap().len(), 1);
+        assert_eq!(other["input"][0]["role"], "user");
+    }
+
+    #[test]
+    fn responses_continuity_keeps_existing_role_based_system_context() {
+        let message = json!({"role":"system", "type":"reasoning", "content":"existing context"});
+        let payload = build_codex_oauth_payload("model", &[message], &CallOptions::default());
+        assert_eq!(payload["input"][0]["role"], "system");
+        assert_eq!(
+            payload["input"][0]["content"][0]["text"],
+            "existing context"
+        );
+    }
 }
 
 fn tool_call_argument_score(call: &Value) -> usize {

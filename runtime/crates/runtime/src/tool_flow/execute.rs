@@ -19,8 +19,9 @@ use crate::gateway_events::{
 use crate::manas::constants::COMMAND_RUN_TOOL;
 use crate::manas::tool_arguments::normalize_tool_arguments_for_tool;
 use crate::manas::tool_catalog::{
-    command_run_commands_for_agent, extend_command_run_commands_with_capabilities,
-    project_directory_with_tools, startup_task_state_required,
+    authorize_source_read_command, command_run_commands_for_agent,
+    extend_command_run_commands_with_capabilities, project_directory_with_tools,
+    startup_task_state_required,
 };
 
 use super::permission::{permission_denial_for_tool, request_command_run_sandbox_bypass};
@@ -42,6 +43,7 @@ pub(crate) fn execute_tool_calls(
             &mut commands,
             session.session_capabilities.iter().map(String::as_str),
         );
+        authorize_source_read_command(&mut commands, session);
         commands
     });
     let require_startup_task_state = allowed_command_run_commands

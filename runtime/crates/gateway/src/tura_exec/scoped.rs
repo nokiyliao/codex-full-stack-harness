@@ -260,6 +260,39 @@ mod tests {
     }
 
     #[test]
+    fn scoped_binding_accepts_operator_prepared_source_read_pair_offline() {
+        let Some(workspace) = std::env::var_os("TURA_SCOPED_TEST_WORKSPACE") else {
+            return;
+        };
+        let capsule = std::env::var_os("TURA_SCOPED_TEST_CAPSULE")
+            .expect("prepared capsule path is required with the workspace");
+        let jspace = std::env::var_os("TURA_SCOPED_TEST_JSPACE")
+            .expect("prepared J-Space path is required with the workspace");
+        let mut config = CliConfig::parse(vec![
+            "--router-address".into(),
+            "127.0.0.1:12345".into(),
+            "--sandbox".into(),
+            "-a".into(),
+            "direct".into(),
+            "--task-context-capsule".into(),
+            capsule.to_string_lossy().into_owned(),
+            "--jspace-contract".into(),
+            jspace.to_string_lossy().into_owned(),
+        ])
+        .expect("scoped CLI flags");
+        config.cwd = workspace.into();
+        let mut payload = json!({"prompt": "offline admission only"});
+        bind_context(&config, &mut payload).expect("prepared pair admission");
+        let matcher =
+            tura_path::jspace::JSpaceMatcher::from_value(&config.cwd, &payload["jspace_contract"])
+                .expect("prepared J-Space matcher");
+        assert!(matcher.source_read_enabled());
+        matcher
+            .check_source_read(&config.cwd.join("TASK.md"))
+            .expect("exact prepared source_read target");
+    }
+
+    #[test]
     fn scoped_binding_rejects_tampering_before_router_or_session_contact() {
         let directory = tempfile::tempdir().unwrap();
         let mut config = CliConfig::parse(args()).unwrap();

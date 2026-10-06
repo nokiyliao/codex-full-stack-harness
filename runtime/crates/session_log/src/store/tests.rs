@@ -548,6 +548,175 @@ fn context_only_entry(sequence: u64, raw_record: &str) -> SessionDeltaEntry {
     }
 }
 
+fn execution_evidence_store_fixture() -> (tempfile::TempDir, super::SessionLogStore) {
+    let root = tempfile::tempdir().expect("evidence fixture root");
+    let workspace = root.path().join("workspace").to_string_lossy().to_string();
+    let store = super::SessionLogStore::open(root.path().join("db")).expect("canonical evidence store");
+    store.create_session(CreateSessionRequest {
+        command_id:"create:evidence-history".to_string(), session_id:"evidence-history".to_string(),
+        creation_command:lifecycle::SessionCommand::CreateSession { task_plan:TaskPlan::default() },
+        copy_context:false, workspace:workspace.clone(), session_directory:workspace,
+        name:"execution evidence fixture".to_string(), created_at:1000, model:None, agent:None,
+        session_type:"coding".to_string(), kill_processes_on_start:false, validator_enabled:false,
+        force_planning:false, model_variant:None, model_acceleration_enabled:false,
+        disable_permission_restrictions:false, use_last_tool_call_response:false,
+        auto_session_name:false, initial_task_plan_patch:None,
+    }).expect("create canonical session");
+    (root, store)
+}
+
+fn append_execution_fixture(
+    store: &super::SessionLogStore, start: u64, management_sequence: u64, retained: u64, records: &[String],
+) -> PersistSessionDeltaRequest {
+    let previous = store.get_session(GetSessionRequest { session_id:"evidence-history".to_string() })
+        .expect("get fixture session").expect("fixture session").into_management().expect("management");
+    let next = previous.persistence_view(retained);
+    let request = PersistSessionDeltaRequest { session_id:"evidence-history".to_string(), management_sequence,
+        management_delta:SessionManagement::persistence_delta(Some(&previous), &next),
+        retained_from_sequence:retained,
+        entries:records.iter().enumerate().map(|(offset, raw)| context_only_entry(start + offset as u64, raw)).collect() };
+    store.persist_session_delta(request.clone()).expect("append canonical execution fixture");
+    request
+}
+
+fn execution_fixture_read(snapshot: Option<session_log_contract::ExecutionEvidenceSnapshot>, from: u64, summary: bool) -> session_log_contract::ReadExecutionEvidenceRequest {
+    session_log_contract::ReadExecutionEvidenceRequest { session_id:"evidence-history".to_string(), snapshot,
+        from_sequence:from, max_records:17, max_bytes:1024, include_summary:summary }
+}
+
+#[test]
+fn execution_evidence_pages_keep_prefix_usage_and_provider_facts_through_two_compactions_and_retry() {
+    let (_root, store) = execution_evidence_store_fixture();
+    let command = json!({"type":"tool_result", "tool_name":"command_run", "input":{"commands":[]},
+        "output":{"results":[{"command_type":"shell_command", "success":true,
+            "output":{"stdout":"EARLY_EXECUTION_COMMAND"}}]}}).to_string();
+    let observation = |id: &str, tier: &str| json!({"type":"runtime_provider_observation", "runtime_id":id,
+        "provider_observation":{"schema_version":"provider_observation_v1", "source":"provider_response",
+            "response_id":format!("response-{id}"), "model":"observed-model", "service_tier":tier}}).to_string();
+    let usage = |id: &str, input: u64, output: u64| json!({"type":"runtime_usage", "runtime_id":id,
+        "usage":{"input_tokens":input, "output_tokens":output, "total_tokens":input + output}}).to_string();
+    let prefix = vec![command.clone(), observation("a", "priority"), usage("a", 7, 3),
+        json!({"type":"context_compaction","content":"first checkpoint"}).to_string()];
+    let retry = append_execution_fixture(&store, 0, 0, 0, &prefix);
+    assert_eq!(store.persist_session_delta(retry).expect("idempotent replay"), (4, 1));
+    let middle = vec![json!({"type":"tool_result", "tool_name":"command_run",
+        "output":{"results":[{"command_type":"apply_patch", "success":true,
+            "changes":[{"path":"early.rs","kind":"update"}]}]}}).to_string(),
+        usage("b", 13, 5), observation("b", "default"),
+        json!({"type":"context_compaction","content":"second checkpoint"}).to_string()];
+    append_execution_fixture(&store, 4, 1, 3, &middle);
+    let padding = (0..257).map(|index| json!({"type":"fixture","content":format!("padding-{index}")}).to_string()).collect::<Vec<_>>();
+    append_execution_fixture(&store, 8, 2, 7, &padding);
+    let context = store.read_context_slice(ReadContextSliceRequest { session_id:"evidence-history".to_string(), max_estimated_tokens:u64::MAX }).expect("retained prompt window");
+    assert_eq!(context.retained_from_sequence, 7);
+    assert!(context.records.iter().all(|record| record.sequence >= 7));
+    assert!(!context.records.iter().any(|record| record.raw_record == command));
+    let head = store.read_execution_evidence(execution_fixture_read(None, 0, true)).expect("complete evidence head");
+    assert_eq!(head.records[0].raw_record, command);
+    assert_eq!(head.snapshot.next_sequence, 265);
+    assert_eq!(head.snapshot.next_management_sequence, 3);
+    let summary = head.summary.as_ref().expect("all-history summary");
+    assert_eq!(summary.usage["input_tokens"], 20);
+    assert_eq!(summary.usage["total_tokens"], 28);
+    assert_eq!(summary.usage["coverage"]["known_runtime_count"], 2);
+    assert_eq!(summary.usage["coverage"]["status"], "complete");
+    assert_eq!(summary.provider_observation["model"]["value"], "observed-model");
+    assert!(summary.provider_observation["service_tier"]["value"].is_null());
+    assert_eq!(summary.provider_observation["service_tier"]["distinct_values"], json!(["default", "priority"]));
+    let mut next = 0;
+    let mut pages = 0;
+    while next < head.snapshot.next_sequence {
+        let request = execution_fixture_read(Some(head.snapshot.clone()), next, false);
+        let page = store.read_execution_evidence(request.clone()).expect("monotonic bounded evidence page");
+        page.validate(&request).expect("public page invariants");
+        assert!(page.records.len() <= 17);
+        assert!(page.records.iter().map(|record| record.raw_record.len()).sum::<usize>() <= 1024);
+        assert!(page.next_sequence > next);
+        next = page.next_sequence;
+        pages += 1;
+    }
+    assert!(pages > 2);
+    assert_eq!(next, 265);
+    assert!(store.read_execution_evidence(execution_fixture_read(Some(head.snapshot.clone()), next, false)).expect("terminal page").records.is_empty());
+    let mut visited = 0;
+    session_log_contract::visit_execution_evidence(&head.snapshot,
+        |request| store.read_execution_evidence(request).map_err(|error| error.to_string()),
+        |record| { assert_eq!(record.sequence, visited); visited += 1; Ok(()) }).expect("resumed canonical traversal");
+    assert_eq!(visited, 265);
+}
+
+#[test]
+fn execution_evidence_summary_has_exact_distinct_counts_with_bounded_display_and_runtime_state() {
+    let (_root, store) = execution_evidence_store_fixture();
+    let records = (0..40).flat_map(|index| {
+        let id = format!("runtime-{index:02}");
+        [json!({"type":"runtime_usage","runtime_id":id,
+            "usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}).to_string(),
+         json!({"type":"runtime_provider_observation","runtime_id":id,
+            "provider_observation":{"schema_version":"provider_observation_v1","source":"provider_response",
+                "response_id":format!("response-{index}"), "model":format!(" model-{index:02} \n"),
+                "service_tier":"default"}}).to_string()]
+    }).collect::<Vec<_>>();
+    append_execution_fixture(&store, 0, 0, 0, &records);
+    let summary = store.read_execution_evidence(execution_fixture_read(None, 80, true)).expect("bounded grouped summary").summary.expect("summary");
+    assert_eq!(summary.usage["total_tokens"], 120);
+    assert_eq!(summary.provider_observation["runtime_count"], 40);
+    assert_eq!(summary.provider_observation["model"]["observed_count"], 40);
+    assert_eq!(summary.provider_observation["model"]["distinct_count"], 40);
+    assert_eq!(summary.provider_observation["model"]["distinct_values"].as_array().expect("bounded values").len(), 8);
+    assert_eq!(summary.provider_observation["model"]["distinct_values"][0], "model-00");
+    assert_eq!(summary.provider_observation["service_tier"]["value"], "default");
+}
+
+#[test]
+fn execution_evidence_fails_closed_on_absent_gapped_wrong_identity_or_drifted_history() {
+    for case in 0..4 {
+        let (_root, store) = execution_evidence_store_fixture();
+        let records = (0..3).map(|index| json!({"content":format!("fixture-{index}")}).to_string()).collect::<Vec<_>>();
+        append_execution_fixture(&store, 0, 0, 0, &records);
+        let snapshot = store.read_execution_evidence(execution_fixture_read(None, 3, false)).expect("pin evidence snapshot").snapshot;
+        if case == 3 {
+            append_execution_fixture(&store, 3, 1, 0, &[]);
+        } else {
+            let path = store.workspace_db_path_for_session("evidence-history").expect("locate DB").expect("workspace DB");
+            store.with_workspace_connection(&path, |conn| {
+                match case {
+                    0 => { conn.execute("DELETE FROM session_context_records WHERE session_id = ?1 AND sequence = 0", params!["evidence-history"])?; }
+                    1 => { conn.execute("DELETE FROM session_context_records WHERE session_id = ?1 AND sequence = 1", params!["evidence-history"])?; }
+                    _ => { conn.execute("UPDATE session_context_records SET record_json = ?2 WHERE session_id = ?1 AND sequence = 0",
+                        params!["evidence-history", json!({"session_id":"wrong-session"}).to_string()])?; }
+                }
+                Ok(())
+            }).expect("inject isolated fixture corruption");
+        }
+        assert!(store.read_execution_evidence(execution_fixture_read(Some(snapshot), 0, true)).is_err(), "case {case} must not return a tail");
+    }
+    let (_root, store) = execution_evidence_store_fixture();
+    let mut missing = execution_fixture_read(None, 0, false);
+    missing.session_id = "absent-session".to_string();
+    assert!(store.read_execution_evidence(missing).is_err());
+}
+
+#[test]
+fn execution_evidence_does_not_double_count_duplicate_usage_or_load_oversized_records() {
+    for total in [3, 4] {
+        let (_root, store) = execution_evidence_store_fixture();
+        let records = [3, total].map(|total| json!({"type":"runtime_usage","runtime_id":"same-runtime",
+            "usage":{"input_tokens":1,"output_tokens":2,"total_tokens":total}}).to_string());
+        append_execution_fixture(&store, 0, 0, 0, &records);
+        assert!(store.read_execution_evidence(execution_fixture_read(None, 2, true)).is_err());
+    }
+    let (_root, store) = execution_evidence_store_fixture();
+    append_execution_fixture(&store, 0, 0, 0, &[json!({"content":"fixture"}).to_string()]);
+    let path = store.workspace_db_path_for_session("evidence-history").expect("locate DB").expect("workspace DB");
+    store.with_workspace_connection(&path, |conn| {
+        let oversized = json!({"content":"x".repeat(session_log_contract::EXECUTION_EVIDENCE_PAGE_BYTES as usize + 1)}).to_string();
+        conn.execute("UPDATE session_context_records SET record_json = ?2 WHERE session_id = ?1 AND sequence = 0", params!["evidence-history", oversized])?;
+        Ok(())
+    }).expect("isolated oversized-record fixture");
+    assert!(store.read_execution_evidence(execution_fixture_read(None, 0, false)).is_err());
+}
+
 fn projected_context_entry(sequence: u64, raw_record: &str, record: Value) -> SessionDeltaEntry {
     SessionDeltaEntry {
         context: SessionContextRecord {

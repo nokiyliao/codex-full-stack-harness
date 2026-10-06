@@ -55,6 +55,15 @@ thread and cannot differ from it. `action.json` supplies the current mission,
 bounded context summary, operations, read/write scopes and exact command
 templates. It is not permission to exceed the parent's lease or sandbox.
 
+Opt in with `"terminal_delivery": "evidence_only"` in `action.json` (v3 Direct
+or Balanced only), not in the draft or native-host configuration. Omission or
+`"assistant_reply"` preserves the old wire request and hash. An eligible runtime
+can skip the final summary turn: the caller validates its persisted terminal
+marker and returns compact evidence, never relabeled planning prose. Opt-in
+readback includes requested/observed delivery and `terminal_evidence`; a runtime
+without a marker falls back to `assistant_reply`. Parent acceptance, usage,
+command evidence and cleanup remain required; this is not a general cost claim.
+
 `prepare` invokes the workspace's `.venv/bin/python scripts/ops/dcf.py jspace
 compile`, consumes the canonical inline result without rewriting its semantics,
 and runs the existing full-core preflight. It publishes `request.json` last and

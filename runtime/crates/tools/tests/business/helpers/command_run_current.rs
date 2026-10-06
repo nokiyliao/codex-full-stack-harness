@@ -49,13 +49,17 @@ pub(crate) fn restore_env_var(name: &str, value: Option<OsString>) {
 }
 
 pub(crate) fn temp_workspace(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
+    temp_workspace_in(&std::env::temp_dir(), name)
+}
+
+pub(crate) fn temp_workspace_in(temp_root: &Path, name: &str) -> PathBuf {
+    let path = temp_root.join(format!(
         "tura-command-run-current-flow-{name}-{}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).expect("create temp workspace");
-    path
+    fs::canonicalize(&path).expect("canonicalize temp workspace")
 }
 
 pub(crate) fn single_quoted_powershell_path(path: &Path) -> String {

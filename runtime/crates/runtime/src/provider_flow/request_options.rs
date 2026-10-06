@@ -21,6 +21,10 @@ pub(crate) fn normalize_provider_messages(
     let mut normalized = Vec::new();
 
     for message in messages {
+        if crate::provider_flow::responses_continuity::is_opaque_reasoning(&message) {
+            normalized.push(message);
+            continue;
+        }
         if matches!(
             message.get("type").and_then(serde_json::Value::as_str),
             Some("function_call" | "function_call_output")
@@ -392,6 +396,17 @@ fn provider_base_url(settings: &tura_llm_rust::Settings, provider: &str) -> Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn responses_continuity_normalization_keeps_opaque_items_exact() {
+        let item = serde_json::json!({"type":"reasoning", "id":"r1", "summary":[],
+            "encrypted_content":"synthetic-opaque", "status":"completed"});
+        let messages = super::normalize_provider_messages(vec![
+            item.clone(),
+            serde_json::json!({"type":"function_call_output", "call_id":"c1", "output":"ok"}),
+        ]);
+        assert_eq!(messages[0], item);
+        assert_eq!(messages[1]["call_id"], "c1");
+    }
     use super::{
         normalize_provider_messages, prompt_cache_key, session_model_override_route,
         session_reasoning_effort, session_service_tier, stream_options,

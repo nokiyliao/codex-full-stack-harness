@@ -5,8 +5,12 @@ pub(super) fn admitted(directory: &Path, unrestricted: bool) -> Result<bool, Str
     let Some(root) = std::env::var_os("NOKIY_ABLATION_READONLY_ROOT") else {
         return Ok(false);
     };
-    let root = Path::new(&root).canonicalize().map_err(|_| "NOKIY_ABLATION_ROOT_INVALID")?;
-    let current = directory.canonicalize().map_err(|_| "NOKIY_ABLATION_ROOT_INVALID")?;
+    let root = Path::new(&root)
+        .canonicalize()
+        .map_err(|_| "NOKIY_ABLATION_ROOT_INVALID")?;
+    let current = directory
+        .canonicalize()
+        .map_err(|_| "NOKIY_ABLATION_ROOT_INVALID")?;
     validate(
         root == current,
         unrestricted,
@@ -17,7 +21,12 @@ pub(super) fn admitted(directory: &Path, unrestricted: bool) -> Result<bool, Str
     Ok(true)
 }
 
-fn validate(same_root: bool, unrestricted: bool, command_sandbox: bool, readonly: bool) -> Result<(), String> {
+fn validate(
+    same_root: bool,
+    unrestricted: bool,
+    command_sandbox: bool,
+    readonly: bool,
+) -> Result<(), String> {
     if !same_root || unrestricted || !command_sandbox || !readonly {
         return Err("NOKIY_ABLATION_READONLY_SANDBOX_REQUIRED".into());
     }
@@ -27,7 +36,8 @@ fn validate(same_root: bool, unrestricted: bool, command_sandbox: bool, readonly
 fn write_denied(path: &Path) -> bool {
     // Open without create/truncate/write: no source bytes change even if allowed.
     // Missing files and other errors must not be mistaken for enforced read-only.
-    path.is_file() && matches!(std::fs::OpenOptions::new().write(true).open(path),
+    path.is_file()
+        && matches!(std::fs::OpenOptions::new().write(true).open(path),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
@@ -38,8 +48,12 @@ mod tests {
     #[test]
     fn every_boundary_is_required() {
         assert!(validate(true, false, true, true).is_ok());
-        for args in [(false, false, true, true), (true, true, true, true),
-                     (true, false, false, true), (true, false, true, false)] {
+        for args in [
+            (false, false, true, true),
+            (true, true, true, true),
+            (true, false, false, true),
+            (true, false, true, false),
+        ] {
             assert!(validate(args.0, args.1, args.2, args.3).is_err());
         }
     }

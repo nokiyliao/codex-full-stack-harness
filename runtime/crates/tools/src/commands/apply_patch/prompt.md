@@ -2,47 +2,43 @@ Use `apply_patch` for focused file edits. The `command_line` value is the raw pa
 
 Rules:
 - Keep each `apply_patch` `command_line` focused on one file or one code block.
-- When editing different files or separate code blocks, put multiple `apply_patch` commands in the same `command_run` batch, usually with the same `step`, instead of making one oversized patch.
+- Put focused patches in one `command_run` batch. Different files may share a `step`; patches to the same file must use later ordered steps or one combined patch.
 - Use separate `apply_patch` commands for unrelated files even if the edits are small; batching keeps the turn efficient while keeping each patch easy to review and recover.
 
 Example: update two files in one batch with multiple focused patches.
 
 ```json
 {
-  "requests": {
-    "commands": [
+  "commands": [
       {
-        "command": "apply_patch",
+        "command_type": "apply_patch",
         "step": 1,
         "command_line": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn label() -> &'static str {\n-    \"old\"\n-}\n+pub fn label() -> &'static str {\n+    \"new\"\n+}\n*** End Patch\n"
       },
       {
-        "command": "apply_patch",
+        "command_type": "apply_patch",
         "step": 1,
         "command_line": "*** Begin Patch\n*** Update File: README.md\n@@\n-Old label\n+New label\n*** End Patch\n"
       }
-    ]
-  }
+  ]
 }
 ```
 
-Example: change two separate code blocks in the same file as two `apply_patch` commands in one batch.
+Example: change two separate code blocks in the same file as two ordered `apply_patch` commands in one batch.
 
 ```json
 {
-  "requests": {
-    "commands": [
+  "commands": [
       {
-        "command": "apply_patch",
+        "command_type": "apply_patch",
         "step": 1,
         "command_line": "*** Begin Patch\n*** Update File: src/config.rs\n@@\n-pub const RETRIES: usize = 2;\n+pub const RETRIES: usize = 3;\n*** End Patch\n"
       },
       {
-        "command": "apply_patch",
-        "step": 1,
+        "command_type": "apply_patch",
+        "step": 2,
         "command_line": "*** Begin Patch\n*** Update File: src/config.rs\n@@\n-pub const TIMEOUT_MS: u64 = 1000;\n+pub const TIMEOUT_MS: u64 = 1500;\n*** End Patch\n"
       }
-    ]
-  }
+  ]
 }
 ```

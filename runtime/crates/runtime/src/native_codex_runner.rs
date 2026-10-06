@@ -48,16 +48,26 @@ impl NativeCodexProviderProfile {
     pub fn semantic_sha256(&self) -> Result<String, String> {
         if self.model.is_empty()
             || self.model.len() > 128
-            || !self.model.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+            || !self
+                .model
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
         {
             return Err("NATIVE_CODEX_PROVIDER_MODEL_INVALID".into());
         }
-        if !matches!(self.reasoning_effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max" | "ultra") {
+        if !matches!(
+            self.reasoning_effort.as_str(),
+            "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+        ) {
             return Err("NATIVE_CODEX_PROVIDER_EFFORT_INVALID".into());
         }
         if let Some(provider) = &self.model_provider {
-            if provider.is_empty() || provider.len() > 128
-                || !provider.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c)) {
+            if provider.is_empty()
+                || provider.len() > 128
+                || !provider
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+            {
                 return Err("NATIVE_CODEX_MODEL_PROVIDER_INVALID".into());
             }
         }
@@ -149,11 +159,7 @@ impl NativeCodexContext {
 
         let provider_input = format!(
             "[TURA_IMMUTABLE_INSTRUCTION_PREFIX_V1]\nexecution_profile_sha256={}\nbalanced_prompt_sha256={}\n{}\n[TASK_CONTEXT_CAPSULE_V1]\n{}\n\n[CURRENT_TASK_DELTA_V1]\n{}",
-            self.execution_profile_sha256,
-            prompt_sha256,
-            prompt,
-            capsule_presentation,
-            delta_json,
+            self.execution_profile_sha256, prompt_sha256, prompt, capsule_presentation, delta_json,
         );
         if provider_input.len() > MAX_COMPILED_PROVIDER_INPUT_BYTES {
             return Err("NATIVE_CODEX_PROVIDER_INPUT_TOO_LARGE".to_string());
@@ -248,9 +254,9 @@ impl NativeCodexRunner {
     ) -> Result<NativeCodexTerminalEnvelope, String> {
         let provider_input = request.validated_provider_input()?;
         let deadline = tokio::time::Instant::now() + request.timeout;
-        let inherited_mcp = native_mcp_server_names(
-            &request.codex_executable, &request.workspace, deadline,
-        ).await?;
+        let inherited_mcp =
+            native_mcp_server_names(&request.codex_executable, &request.workspace, deadline)
+                .await?;
         let mut command = Command::new(&request.codex_executable);
         command
             .arg("exec")
@@ -281,8 +287,13 @@ impl NativeCodexRunner {
             .arg("-C")
             .arg(&request.workspace)
             .arg("-m")
-            .arg(request.context.provider_profile.as_ref()
-                .map_or(TURA_PROFILE_MODEL, |profile| profile.model.as_str()))
+            .arg(
+                request
+                    .context
+                    .provider_profile
+                    .as_ref()
+                    .map_or(TURA_PROFILE_MODEL, |profile| profile.model.as_str()),
+            )
             .arg("-s")
             .arg(request.sandbox.as_str())
             .arg("-c")
@@ -302,24 +313,45 @@ impl NativeCodexRunner {
             .arg("-c")
             .arg(format!(
                 "model_reasoning_effort={}",
-                toml_string(request.context.provider_profile.as_ref()
-                    .map_or(TURA_PROFILE_REASONING_EFFORT, |profile| profile.reasoning_effort.as_str()))
+                toml_string(
+                    request
+                        .context
+                        .provider_profile
+                        .as_ref()
+                        .map_or(TURA_PROFILE_REASONING_EFFORT, |profile| profile
+                            .reasoning_effort
+                            .as_str())
+                )
             ))
             .arg("-c")
             .arg(format!(
                 "service_tier={}",
-                toml_string(request.context.provider_profile.as_ref()
-                    .map_or(ModelServiceTier::Priority, |profile| profile.service_tier).as_str())
+                toml_string(
+                    request
+                        .context
+                        .provider_profile
+                        .as_ref()
+                        .map_or(ModelServiceTier::Priority, |profile| profile.service_tier)
+                        .as_str()
+                )
             ));
 
         // Native merges MCP tables; an empty table does not remove inherited
         // servers. Disable the effective catalog without discarding user rules.
         for name in inherited_mcp {
-            command.arg("-c").arg(format!("mcp_servers.{name}.enabled=false"));
+            command
+                .arg("-c")
+                .arg(format!("mcp_servers.{name}.enabled=false"));
         }
-        if let Some(provider) = request.context.provider_profile.as_ref()
-            .and_then(|profile| profile.model_provider.as_ref()) {
-            command.arg("-c").arg(format!("model_provider={}", toml_string(provider)));
+        if let Some(provider) = request
+            .context
+            .provider_profile
+            .as_ref()
+            .and_then(|profile| profile.model_provider.as_ref())
+        {
+            command
+                .arg("-c")
+                .arg(format!("model_provider={}", toml_string(provider)));
         }
 
         if let Some(command_graph) = &request.command_graph {
@@ -483,46 +515,83 @@ impl NativeCodexRunner {
 }
 
 async fn native_mcp_server_names(
-    executable: &Path, workspace: &Path, execution_deadline: tokio::time::Instant,
+    executable: &Path,
+    workspace: &Path,
+    execution_deadline: tokio::time::Instant,
 ) -> Result<BTreeSet<String>, String> {
     let mut child = Command::new(executable)
         .args(["mcp", "list", "--json"])
         // Plugin-owned servers disappear with these execution features off.
         // Discovering them first would create transport-less disable overrides.
-        .args(["--disable", "apps", "--disable", "plugins", "--disable", "remote_plugin",
-               "--disable", "skill_mcp_dependency_install"])
+        .args([
+            "--disable",
+            "apps",
+            "--disable",
+            "plugins",
+            "--disable",
+            "remote_plugin",
+            "--disable",
+            "skill_mcp_dependency_install",
+        ])
         .current_dir(workspace)
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .kill_on_drop(true).spawn()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|_| "NATIVE_CODEX_MCP_CATALOG_SPAWN_FAILED".to_string())?;
-    let stdout = child.stdout.take().ok_or("NATIVE_CODEX_MCP_CATALOG_STDOUT_MISSING")?;
-    let stderr = child.stderr.take().ok_or("NATIVE_CODEX_MCP_CATALOG_STDERR_MISSING")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("NATIVE_CODEX_MCP_CATALOG_STDOUT_MISSING")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("NATIVE_CODEX_MCP_CATALOG_STDERR_MISSING")?;
     let deadline = execution_deadline.min(tokio::time::Instant::now() + Duration::from_secs(5));
     let result = tokio::time::timeout_at(deadline, async {
         tokio::try_join!(
-            read_bounded(stdout, 1024 * 1024), read_bounded(stderr, MAX_STDERR_BYTES),
-            async { child.wait().await.map_err(|_| "NATIVE_CODEX_MCP_CATALOG_WAIT_FAILED".to_string()) },
+            read_bounded(stdout, 1024 * 1024),
+            read_bounded(stderr, MAX_STDERR_BYTES),
+            async {
+                child
+                    .wait()
+                    .await
+                    .map_err(|_| "NATIVE_CODEX_MCP_CATALOG_WAIT_FAILED".to_string())
+            },
         )
-    }).await;
+    })
+    .await;
     let (stdout, _, status) = match result {
         Ok(Ok(output)) => output,
-        Ok(Err(error)) => { stop_and_reap_native_child(&mut child).await?; return Err(error); }
+        Ok(Err(error)) => {
+            stop_and_reap_native_child(&mut child).await?;
+            return Err(error);
+        }
         Err(_) => {
             stop_and_reap_native_child(&mut child).await?;
             return Err("NATIVE_CODEX_MCP_CATALOG_TIMEOUT".into());
         }
     };
-    if !status.success() { return Err("NATIVE_CODEX_MCP_CATALOG_FAILED".into()); }
+    if !status.success() {
+        return Err("NATIVE_CODEX_MCP_CATALOG_FAILED".into());
+    }
     // Only names are retained. Native transport configuration never enters the
     // prompt, terminal receipt or logs.
     let rows: Vec<Value> = serde_json::from_slice(&stdout)
         .map_err(|_| "NATIVE_CODEX_MCP_CATALOG_INVALID".to_string())?;
     let mut names = BTreeSet::new();
     for row in rows {
-        let name = row.get("name").and_then(Value::as_str)
+        let name = row
+            .get("name")
+            .and_then(Value::as_str)
             .ok_or("NATIVE_CODEX_MCP_CATALOG_INVALID")?;
-        if name.is_empty() || name.len() > 256
-            || !name.bytes().all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)) {
+        if name.is_empty()
+            || name.len() > 256
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+        {
             return Err("NATIVE_CODEX_MCP_NAME_UNSUPPORTED".into());
         }
         // An inherited same-name server may carry conflicting transport/env

@@ -1,0 +1,543 @@
+name: CI
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "outreach/**"
+  push:
+    branches:
+      - main
+      - "fix/**"
+      - "release/**"
+      - "staging/runtime_session_refactor"
+    tags:
+      - "release*"
+      - "release-v*"
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "outreach/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Quality Smell Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Node setup
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/tui/package-lock.json
+      - name: Install TUI dependencies
+        run: npm ci --prefix apps/tui
+      - name: Cache quality binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/typos
+          key: ${{ runner.os }}-quality-bins-cargo-audit-deny-0.19.8-typos
+      - name: Install quality binaries
+        run: |
+          command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
+          cargo-deny --version 2>/dev/null | grep -q ' 0\.19\.8$' || cargo install cargo-deny --version 0.19.8 --locked --force
+          command -v typos >/dev/null 2>&1 || cargo install typos-cli --locked
+      - name: Run quality smell gate
+        shell: bash
+        run: |
+          set +e
+          mkdir -p .ci-results
+          sh scripts/check-backend-quality.sh 2>&1 | tee .ci-results/quality-smell-gate.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            tail_output="$(tail -n 60 .ci-results/quality-smell-gate.log)"
+            tail_output="${tail_output//'%'/'%25'}"
+            tail_output="${tail_output//$'\r'/'%0D'}"
+            tail_output="${tail_output//$'\n'/'%0A'}"
+            echo "::error title=Quality smell gate failure::$tail_output"
+          fi
+          exit "$status"
+      - name: Upload quality smell gate failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-smell-gate-failure-log
+          path: .ci-results/quality-smell-gate.log
+          if-no-files-found: error
+
+  crate-tests:
+    name: Crate ${{ matrix.crate }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - tura_workspace
+          - router
+          - router_contract
+          - agents
+          - personas
+          - lifecycle
+          - session_log
+          - session_log_contract
+          - tura_path
+          - tools
+          - provider
+          - runtime
+          - runtime_contract
+          - read_media
+          - web_discover
+          - gateway
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: crate-${{ matrix.crate }}
+          cache-on-failure: true
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config
+      - name: Run crate clippy and tests
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          mkdir -p .ci-results
+          sh xtask/scripts/run-ci-crate-tests.sh \
+            --crate "${{ matrix.crate }}" \
+            --jobs 1 \
+            --timeout-seconds 600 2>&1 | tee ".ci-results/crate-${{ matrix.crate }}.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            failure_summary="$(tail -n 220 ".ci-results/crate-${{ matrix.crate }}.log")"
+            failure_summary="${failure_summary//'%'/'%25'}"
+            failure_summary="${failure_summary//$'\r'/'%0D'}"
+            failure_summary="${failure_summary//$'\n'/'%0A'}"
+            echo "::error title=Crate ${{ matrix.crate }} failure::$failure_summary"
+          fi
+          exit "$status"
+      - name: Upload crate failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crate-${{ matrix.crate }}-failure-logs
+          path: |
+            .ci-results/crate-${{ matrix.crate }}.log
+            target/test-logs/ci-crates/${{ matrix.crate }}.*.txt
+          if-no-files-found: error
+
+  backend-business:
+    name: Backend Business
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: quality
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: backend-business
+          cache-on-failure: true
+      - name: uv setup
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: commands/read_media/requirements.txt
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config
+      - name: Install read_media Python dependencies
+        run: sh commands/read_media/install.sh
+      - name: Run backend business tests
+        shell: bash
+        run: |
+          set +e
+          mkdir -p .ci-results
+          sh xtask/scripts/run-backend-business-tests.sh --jobs 4 --timeout-seconds 300 2>&1 |
+            tee .ci-results/backend-business.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            failure_summary="$(sed -n '/^Failed backend business tests:/,$p' .ci-results/backend-business.log)"
+            failure_summary="${failure_summary//'%'/'%25'}"
+            failure_summary="${failure_summary//$'\r'/'%0D'}"
+            failure_summary="${failure_summary//$'\n'/'%0A'}"
+            echo "::error title=Backend business test failure::$failure_summary"
+          fi
+          exit "$status"
+      - name: Upload backend business failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-business-failure-log
+          path: .ci-results/backend-business.log
+          if-no-files-found: error
+      - name: Run Runtime Session equivalence gate
+        shell: pwsh
+        run: |
+          & ./tests/equivalence/runtime_session/run.ps1 -Mode gate -Repo $PWD
+      - name: Upload Phase 0 Runtime Session evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase0-runtime-session-evidence
+          path: |
+            tests/equivalence/runtime_session/reference/*.json
+            target/runtime-session-equivalence/*.json
+            target/runtime-session-equivalence/*.stderr.log
+            tests/equivalence/runtime_session/baseline.json
+            tests/equivalence/runtime_session/core-e2e.json
+            tests/equivalence/runtime_session/*-evidence.json
+            tests/equivalence/runtime_session/failure-injection.json
+          if-no-files-found: warn
+
+  backend-e2e:
+    name: Backend Full Chain E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: quality
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: backend-e2e
+          cache-on-failure: true
+      - name: Node setup
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config
+      - name: Run backend full-chain E2E tests
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          mkdir -p .ci-results
+          sh xtask/scripts/run-backend-e2e-tests.sh --timeout-seconds 300 2>&1 |
+            tee .ci-results/backend-e2e.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            tail_output="$(tail -n 100 .ci-results/backend-e2e.log)"
+            tail_output="${tail_output//'%'/'%25'}"
+            tail_output="${tail_output//$'\r'/'%0D'}"
+            tail_output="${tail_output//$'\n'/'%0A'}"
+            echo "::error title=Backend E2E failure::$tail_output"
+          fi
+          exit "$status"
+      - name: Upload backend E2E diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-e2e-diagnostics
+          path: |
+            .ci-results/backend-e2e.log
+            target/full-chain-e2e-stress/**/summary.json
+            target/full-chain-e2e-stress/**/logs/**
+          if-no-files-found: warn
+
+  tui-tests:
+    name: TUI Unit And E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: quality
+    steps:
+      - uses: actions/checkout@v4
+      - name: Node setup
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/tui/package-lock.json
+      - name: Install TUI dependencies
+        run: npm ci --prefix apps/tui
+      - name: Install TUI Playwright browser
+        working-directory: apps/tui
+        run: npx playwright install --with-deps chromium
+      - name: Run TUI unit tests
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          npm --prefix apps/tui run test:unit 2>&1 | tee tui-unit.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            failure_summary="$(awk '
+              /^not ok [0-9]+ - / { capture = 1 }
+              capture { print }
+              capture && /^  \.\.\.$/ { exit }
+            ' tui-unit.log)"
+            if [ -z "$failure_summary" ]; then
+              failure_summary="$(tail -n 120 tui-unit.log)"
+            fi
+            failure_summary="${failure_summary//'%'/'%25'}"
+            failure_summary="${failure_summary//$'\r'/'%0D'}"
+            failure_summary="${failure_summary//$'\n'/'%0A'}"
+            echo "::error title=TUI unit test failure::$failure_summary"
+          fi
+          exit "$status"
+      - name: Run TUI e2e tests
+        shell: bash
+        run: |
+          set +e
+          npm --prefix apps/tui run test:e2e 2>&1 | tee tui-e2e.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            tail_output="$(tail -n 80 tui-e2e.log)"
+            tail_output="${tail_output//'%'/'%25'}"
+            tail_output="${tail_output//$'\r'/'%0D'}"
+            tail_output="${tail_output//$'\n'/'%0A'}"
+            echo "::error title=TUI E2E failure::$tail_output"
+          fi
+          exit "$status"
+      - name: Upload TUI failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-failure-logs
+          path: |
+            tui-unit.log
+            tui-e2e.log
+          if-no-files-found: warn
+
+  gui-tests:
+    name: GUI Check Unit And E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: quality
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bun setup
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install GUI dependencies
+        working-directory: apps/gui
+        run: bun install --frozen-lockfile
+      - name: Install TUI dependencies for shared-session E2E
+        run: npm ci --prefix apps/tui
+      - name: Install GUI E2E dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --quiet playwright==1.52.0
+          python -m playwright install --with-deps chromium
+      - name: Run GUI checks
+        id: gui_check
+        working-directory: apps/gui
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          mkdir -p ../../.ci-results
+          bun run check 2>&1 | tee ../../.ci-results/gui-check.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            tail_output="$(tail -n 80 ../../.ci-results/gui-check.log)"
+            tail_output="${tail_output//'%'/'%25'}"
+            tail_output="${tail_output//$'\r'/'%0D'}"
+            tail_output="${tail_output//$'\n'/'%0A'}"
+            echo "::error title=GUI check failure::$tail_output"
+          fi
+          exit "$status"
+      - name: Upload GUI check failure log
+        if: failure() && steps.gui_check.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-check-failure-log
+          path: .ci-results/gui-check.log
+          if-no-files-found: error
+      - name: Run GUI unit tests
+        working-directory: apps/gui
+        run: bun run test:unit
+      - name: Run GUI E2E tests
+        id: gui_e2e
+        working-directory: apps/gui
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          mkdir -p ../../.ci-results
+          bun run test:e2e 2>&1 | tee ../../.ci-results/gui-e2e.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            tail_output="$(tail -n 80 ../../.ci-results/gui-e2e.log)"
+            tail_output="${tail_output//'%'/'%25'}"
+            tail_output="${tail_output//$'\r'/'%0D'}"
+            tail_output="${tail_output//$'\n'/'%0A'}"
+            echo "::error title=GUI E2E failure::$tail_output"
+          fi
+          exit "$status"
+      - name: Upload GUI E2E failure log
+        if: failure() && steps.gui_e2e.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-e2e-failure-log
+          path: .ci-results/gui-e2e.log
+          if-no-files-found: error
+
+  install-script-tests:
+    name: Install Scripts ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    needs: quality
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: ubuntu-latest
+            runner: ubuntu-latest
+            log: .ci-results/install-ubuntu-latest.log
+          - label: macos-latest
+            runner: macos-latest
+            log: .ci-results/install-macos-latest.log
+          - label: windows-2022
+            runner: windows-2022
+            log: .ci-results/install-windows-2022.log
+    steps:
+      - uses: actions/checkout@v4
+      - name: Node setup
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run install script tests (Windows)
+        if: runner.os == 'Windows'
+        id: install_windows
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Path .ci-results -Force | Out-Null
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\tests\scripts\test-install.ps1 -SkipApps *>&1 | Tee-Object -FilePath "${{ matrix.log }}"
+          $exitCode = $LASTEXITCODE
+          "exit_code=$exitCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($exitCode -ne 0) { exit $exitCode }
+      - name: Run install script tests (Linux/macOS)
+        if: runner.os != 'Windows'
+        id: install_posix
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p .ci-results
+          sh scripts/tests/scripts/test-install.sh --skip-apps 2>&1 | tee "${{ matrix.log }}"
+          exit_code=${PIPESTATUS[0]}
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
+          exit "$exit_code"
+      - name: Upload install script logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-script-${{ matrix.label }}-logs
+          path: ${{ matrix.log }}
+          if-no-files-found: warn
+      - name: Fail if install script tests failed
+        if: steps.install_windows.outcome == 'failure' || steps.install_posix.outcome == 'failure'
+        shell: pwsh
+        run: exit 1
+
+  ci-complete:
+    name: CI Complete
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - crate-tests
+      - backend-business
+      - backend-e2e
+      - tui-tests
+      - gui-tests
+      - install-script-tests
+    steps:
+      - run: echo "CI flow passed"
+
+  release-dry-run:
+    name: Release Dry Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: startsWith(github.ref, 'refs/tags/release')
+    needs: ci-complete
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-dry-run
+          cache-on-failure: true
+      - name: Node setup
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/tui/package-lock.json
+      - name: Bun setup
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Cache command Python environments
+        uses: actions/cache@v4
+        with:
+          path: |
+            commands/read_media/.venv
+            commands/web_discover/.venv
+          key: ${{ runner.os }}-command-venv-${{ hashFiles('commands/*/requirements.txt', 'commands/*/pyproject.toml') }}
+      - name: Install dependencies
+        run: sh scripts/install.sh --environment-only
+      - name: Build release artifacts without publishing
+        run: sh scripts/run-release-dry-run.sh --skip-install --skip-ci --jobs 4

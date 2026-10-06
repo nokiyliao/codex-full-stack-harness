@@ -30,6 +30,10 @@ pub(crate) const MOCK_PROVIDER_STREAM_TIMEOUT_MS: &str = "1000";
 pub(crate) const MOCK_MULTI_COMMAND_STREAM_TIMEOUT_MS: &str = "10000";
 pub(crate) const MOCK_OPENAI_TOKEN_EXPIRES: &str = "4102444800000";
 
+// Synthetic fixture data to force compaction, not a usage/cost measurement.
+pub(crate) const MOCK_COMPACTION_INPUT_TOKENS: u64 = 10_000_000;
+pub(crate) const MOCK_COMPACTION_REPLY: &str = "Offline no-tool compaction fixture completed.";
+
 pub(crate) fn mock_command_run_router_addr() -> String {
     if let Some(addr) = MOCK_ROUTER_ADDR.get() {
         return addr.clone();
@@ -108,7 +112,7 @@ pub(crate) async fn mock_command_run_router_response(raw: &str) -> Value {
             "error": "session_directory missing"
         });
     };
-    let output = code_tools::command_run::execute_async_value(
+    let mut output = code_tools::command_run::execute_async_value(
         payload
             .get("arguments")
             .cloned()
@@ -116,6 +120,28 @@ pub(crate) async fn mock_command_run_router_response(raw: &str) -> Value {
         PathBuf::from(session_directory),
     )
     .await;
+    // Fault injection is restricted to this fixture's verification commands.
+    // Real command execution still happens; no production router is changed.
+    if let Some(commands) = payload.pointer("/arguments/commands").and_then(Value::as_array) {
+        for (index, command) in commands.iter().enumerate() {
+            let line = command["command_line"].as_str().unwrap_or_default();
+            if let Some(result) = output.get_mut("results").and_then(Value::as_array_mut)
+                .and_then(|results| results.get_mut(index)).and_then(Value::as_object_mut)
+            {
+                if line.contains("NOKIY_FIXTURE_UNKNOWN_OUTCOME") {
+                    if let Some(output) = result.get_mut("output").and_then(Value::as_object_mut) {
+                        output.insert("outcome".to_string(), json!("unknown"));
+                    }
+                } else if line.contains("NOKIY_FIXTURE_UNRESOLVED_EFFECT") {
+                    if let Some(output) = result.get_mut("output").and_then(Value::as_object_mut) {
+                        let receipt = output.entry("terminal_receipt".to_string())
+                            .or_insert_with(|| json!({}));
+                        receipt["reconcile_required"] = json!(true);
+                    }
+                }
+            }
+        }
+    }
     json!({
         "request_id": request_id,
         "ok": true,
@@ -144,9 +170,43 @@ pub(crate) enum MockMode {
     TaskStatusOnlyThenFinal,
     TaskStatusDoneWithShortVisibleReply,
     TaskStatusDoneWithLongVisibleReply,
+    NoToolVisibleReplyWithSyntheticCompactionUsage,
+    TerminalEvidence(TerminalEvidenceScenario),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TerminalEvidenceScenario {
+    Done,
+    Question,
+    FailedCommand,
+    UnknownOutcome,
+    UnresolvedEffect,
+    PendingCompact,
+    AutoCompact,
+    ForeignMarker,
+    MissingTerminalStatus,
+    UnsafeTerminalBatch,
+    Ordered(OrderedEvidenceScenario),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OrderedEvidenceScenario {
+    SeparateDone,
+    Done,
+    FailedCheck,
+    TimedOutCheck,
+    UnknownOutcome,
+    UnresolvedEffect,
+    SameStep,
+    DoneBeforeCheck,
+    ReversedSteps,
 }
 
 impl MockProvider {
+    pub(crate) fn start_terminal_evidence(scenario: TerminalEvidenceScenario) -> Self {
+        Self::start_with_mode(MockMode::TerminalEvidence(scenario), None)
+    }
+
     pub(crate) fn start_command_run() -> Self {
         Self::start_with_mode(MockMode::CommandRun, None)
     }
@@ -184,6 +244,10 @@ impl MockProvider {
 
     pub(crate) fn start_task_status_done_with_long_visible_reply() -> Self {
         Self::start_with_mode(MockMode::TaskStatusDoneWithLongVisibleReply, None)
+    }
+
+    pub(crate) fn start_no_tool_visible_reply_with_synthetic_compaction_usage() -> Self {
+        Self::start_with_mode(MockMode::NoToolVisibleReplyWithSyntheticCompactionUsage, None)
     }
 
     fn start_with_mode(mode: MockMode, workspace: Option<PathBuf>) -> Self {
@@ -252,7 +316,7 @@ pub(crate) fn handle_provider_connection(
         .push(request);
     let stream = reader.get_mut();
     match mode {
-        MockMode::CommandRun => {
+        MockMode::CommandRun | MockMode::TerminalEvidence(_) => {
             write_command_run_responses(stream, &response);
         }
         MockMode::CodexApplyPatchOnly => {
@@ -295,11 +359,37 @@ pub(crate) fn handle_provider_connection(
         MockMode::TaskStatusDoneWithLongVisibleReply => {
             write_command_run_responses(stream, &response);
         }
+        MockMode::NoToolVisibleReplyWithSyntheticCompactionUsage => {
+            if index == 0 {
+                write_command_run_responses(stream, &response);
+            } else {
+                let body = json!({
+                    "error": {
+                        "message": "Unexpected additional provider request in no-tool compaction fixture",
+                        "type": "invalid_request_error",
+                        "code": "unexpected_no_tool_compaction_request"
+                    }
+                })
+                .to_string();
+                eprintln!(
+                    "no-tool compaction fixture received unexpected provider request #{}",
+                    index + 1
+                );
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.flush();
+            }
+        }
     }
 }
 
 pub(crate) fn provider_response(index: usize, mode: MockMode) -> Value {
     match mode {
+        MockMode::TerminalEvidence(scenario) => terminal_evidence_response(index, scenario),
         MockMode::CommandRun => command_run_provider_response(index),
         MockMode::CodexApplyPatchOnly => assistant_response("Apply-only repair completed."),
         MockMode::CodexStreamingProbe => assistant_response("streaming probe completed."),
@@ -316,6 +406,15 @@ pub(crate) fn provider_response(index: usize, mode: MockMode) -> Value {
         }
         MockMode::TaskStatusDoneWithLongVisibleReply => {
             task_status_done_with_long_visible_reply_response(index)
+        }
+        MockMode::NoToolVisibleReplyWithSyntheticCompactionUsage => {
+            let mut response = assistant_response(MOCK_COMPACTION_REPLY);
+            response["usage"] = json!({
+                "prompt_tokens": MOCK_COMPACTION_INPUT_TOKENS,
+                "completion_tokens": 1,
+                "total_tokens": MOCK_COMPACTION_INPUT_TOKENS + 1
+            });
+            response
         }
     }
 }
@@ -695,7 +794,11 @@ pub(crate) fn write_command_run_responses(stream: &mut TcpStream, response: &Val
                 "response": {
                     "id": "resp_cmd_run",
                     "output": output_items,
-                    "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                    "usage": {
+                        "input_tokens": response.pointer("/usage/prompt_tokens").and_then(Value::as_u64).unwrap_or(1),
+                        "output_tokens": response.pointer("/usage/completion_tokens").and_then(Value::as_u64).unwrap_or(1),
+                        "total_tokens": response.pointer("/usage/total_tokens").and_then(Value::as_u64).unwrap_or(2)
+                    }
                 }
             }),
         );
@@ -710,10 +813,23 @@ pub(crate) fn write_command_run_responses(stream: &mut TcpStream, response: &Val
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    write_command_run_final_text(stream, &content);
+    let input_tokens = response
+        .pointer("/usage/prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let output_tokens = response
+        .pointer("/usage/completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    write_command_run_final_text(stream, &content, input_tokens, output_tokens);
 }
 
-pub(crate) fn write_command_run_final_text(stream: &mut TcpStream, content: &str) {
+pub(crate) fn write_command_run_final_text(
+    stream: &mut TcpStream,
+    content: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) {
     write_codex_sse(
         stream,
         json!({
@@ -736,7 +852,11 @@ pub(crate) fn write_command_run_final_text(stream: &mut TcpStream, content: &str
                         "text": content
                     }]
                 }],
-                "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens.saturating_add(output_tokens)
+                }
             }
         }),
     );
@@ -809,8 +929,8 @@ pub(crate) fn command_run_provider_response(index: usize) -> Value {
             "command_run",
             json!({
                 "commands": [
-                    { "command": "shell_command", "command_line": json!({"command":"pwd","timeout_ms":MOCK_COMMAND_TIMEOUT_MS}).to_string(), "step": 1 },
-                    { "command": "shell_command", "command_line": json!({"command":"echo 2","timeout_ms":MOCK_COMMAND_TIMEOUT_MS}).to_string(), "step": 1 }
+                    { "command_type": "zsh", "command_line": "pwd", "timeout_ms": MOCK_COMMAND_TIMEOUT_MS, "step": 1 },
+                    { "command_type": "zsh", "command_line": "echo 2", "timeout_ms": MOCK_COMMAND_TIMEOUT_MS, "step": 1 }
                 ],
                 "step_summary": "Call the command_run console tool as requested."
             }),
@@ -822,7 +942,7 @@ pub(crate) fn command_run_provider_response(index: usize) -> Value {
                 "commands": [
                     {
                         "step": 1,
-                        "command": "task_status",
+                        "command_type": "task_status",
                         "command_line": json!({
                             "task_group": "runtime command run",
                             "task_type": ["debug"]
@@ -839,13 +959,14 @@ pub(crate) fn command_run_provider_response(index: usize) -> Value {
                 "commands": [
                     {
                         "step": 1,
-                        "command": "apply_patch",
+                        "command_type": "apply_patch",
                         "command_line": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn process_manas_internal(input: &str) -> String {\n-    format!(\"processed {input}\")\n+pub fn process_manas_internal(input: &str) -> String {\n+    format!(\"processed verified {input}\")\n }\n*** End Patch"
                     },
                     {
                         "step": 2,
-                        "command": "shell_command",
-                        "command_line": json!({"command":"cat src/lib.rs","timeout_ms":MOCK_COMMAND_TIMEOUT_MS}).to_string()
+                        "command_type": "zsh",
+                        "command_line": "cat src/lib.rs",
+                        "timeout_ms": MOCK_COMMAND_TIMEOUT_MS
                     }
                 ],
                 "step_summary": "Patch src/lib.rs and verify the edited content."
@@ -989,6 +1110,136 @@ pub(crate) fn task_status_done_with_short_visible_reply_response(index: usize) -
     }
 }
 
+pub(crate) const TERMINAL_EVIDENCE_FINAL_REPLY: &str = "Terminal evidence fixture final assistant reply.";
+pub(crate) const TERMINAL_EVIDENCE_PROGRESS_REPLY: &str = "Offline fixture: the actual patch and verification will follow.";
+
+fn terminal_evidence_response(index: usize, scenario: TerminalEvidenceScenario) -> Value {
+    if let TerminalEvidenceScenario::Ordered(ordered) = scenario {
+        return ordered_evidence_response(index, ordered);
+    }
+    match index {
+        // Use the existing actual task-status, patch, and verification loop.
+        0 => tool_response_with_content("call_terminal_evidence_start", "command_run", json!({"commands":[{
+            "step":1, "command_type":"task_status", "command_line":json!({
+                "task_group":"runtime command run", "task_type":["debug"], "status":"doing"
+            }).to_string()
+        }]}), TERMINAL_EVIDENCE_PROGRESS_REPLY),
+        1 => {
+            let mut response = command_run_provider_response(2);
+            let mut arguments: Value = serde_json::from_str(
+                response.pointer("/choices/0/message/tool_calls/0/function/arguments")
+                    .and_then(Value::as_str).expect("fixture arguments"),
+            ).expect("fixture command JSON");
+            let verify = &mut arguments["commands"][1];
+            verify["command_type"] = json!("shell_command");
+            verify["command_line"] = json!(match scenario {
+                TerminalEvidenceScenario::FailedCommand => "exit 7".to_string(),
+                TerminalEvidenceScenario::UnknownOutcome =>
+                    "echo NOKIY_FIXTURE_UNKNOWN_OUTCOME".to_string(),
+                TerminalEvidenceScenario::UnresolvedEffect =>
+                    "echo NOKIY_FIXTURE_UNRESOLVED_EFFECT".to_string(),
+                _ if cfg!(windows) => "Get-Content src/lib.rs".to_string(),
+                _ => "cat src/lib.rs".to_string(),
+            });
+            response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+                json!(arguments.to_string());
+            response
+        }
+        2 => {
+            if matches!(scenario, TerminalEvidenceScenario::MissingTerminalStatus) {
+                return tool_response("call_terminal_evidence_no_status", "command_run", json!({"commands":[{
+                    "step":1, "command_type":"shell_command",
+                    "command_line":if cfg!(windows) { "Get-Content src/lib.rs" } else { "cat src/lib.rs" }
+                }]}));
+            }
+            let mut status = json!({"status":match scenario {
+                TerminalEvidenceScenario::Question => "question",
+                _ => "done",
+            }});
+            if matches!(scenario, TerminalEvidenceScenario::PendingCompact) {
+                status["compact_context"] = json!("Offline fixture checkpoint; patch and verification already executed. Continue without replaying effects.");
+            }
+            let commands = if matches!(scenario, TerminalEvidenceScenario::UnsafeTerminalBatch) {
+                json!([
+                    {"step":1, "command_type":"shell_command", "command_line":"echo NOKIY_FIXTURE_UNKNOWN_OUTCOME"},
+                    {"step":2, "command_type":"task_status", "command_line":status.to_string()}
+                ])
+            } else {
+                json!([{"step":1, "command_type":"task_status", "command_line":status.to_string()}])
+            };
+            let mut response = tool_response("call_terminal_evidence_status", "command_run", json!({"commands":commands}));
+            if matches!(scenario, TerminalEvidenceScenario::AutoCompact) {
+                response["usage"] = json!({"prompt_tokens":MOCK_COMPACTION_INPUT_TOKENS,
+                    "completion_tokens":1, "total_tokens":MOCK_COMPACTION_INPUT_TOKENS + 1});
+            }
+            response
+        }
+        _ => assistant_response(TERMINAL_EVIDENCE_FINAL_REPLY),
+    }
+}
+
+fn ordered_evidence_response(index: usize, scenario: OrderedEvidenceScenario) -> Value {
+    match index {
+        0 => terminal_evidence_response(0, TerminalEvidenceScenario::Done),
+        1 => {
+            // Reuse the real patch/router loop. The check has a predetermined
+            // pass/fail predicate, not stdout that needs another model review.
+            let mut response = command_run_provider_response(2);
+            let mut arguments: Value = serde_json::from_str(
+                response.pointer("/choices/0/message/tool_calls/0/function/arguments")
+                    .and_then(Value::as_str).expect("fixture arguments"),
+            ).expect("fixture command JSON");
+            let check = if cfg!(windows) {
+                "if ((Get-Content src/lib.rs) -ccontains '    format!(\"processed verified {input}\")') { exit 0 } else { exit 7 }"
+            } else {
+                "grep -Fqx '    format!(\"processed verified {input}\")' src/lib.rs"
+            };
+            let verify = &mut arguments["commands"][1];
+            verify["command_type"] = json!("shell_command");
+            verify["command_line"] = json!(match scenario {
+                OrderedEvidenceScenario::FailedCheck => "exit 7".to_string(),
+                OrderedEvidenceScenario::TimedOutCheck if cfg!(windows) =>
+                    "Start-Sleep -Seconds 30".to_string(),
+                OrderedEvidenceScenario::TimedOutCheck => "sleep 30".to_string(),
+                OrderedEvidenceScenario::UnknownOutcome =>
+                    format!("echo NOKIY_FIXTURE_UNKNOWN_OUTCOME; {check}"),
+                OrderedEvidenceScenario::UnresolvedEffect =>
+                    format!("echo NOKIY_FIXTURE_UNRESOLVED_EFFECT; {check}"),
+                _ => check.to_string(),
+            });
+            if matches!(scenario, OrderedEvidenceScenario::TimedOutCheck) {
+                verify["timeout_ms"] = json!(100);
+            }
+            let commands = arguments["commands"].as_array_mut().expect("fixture commands");
+            let mut done = json!({"step":3,
+                "command_type":"task_status", "command_line":json!({"status":"done"}).to_string()});
+            match scenario {
+                OrderedEvidenceScenario::SeparateDone => {}
+                OrderedEvidenceScenario::SameStep => {
+                    done["step"] = json!(2);
+                    commands.push(done);
+                }
+                OrderedEvidenceScenario::DoneBeforeCheck => {
+                    done["step"] = json!(2);
+                    commands[1]["step"] = json!(3);
+                    commands.insert(1, done);
+                }
+                OrderedEvidenceScenario::ReversedSteps => {
+                    done["step"] = json!(1);
+                    commands.push(done);
+                }
+                _ => commands.push(done),
+            }
+            response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+                json!(arguments.to_string());
+            response
+        }
+        2 if matches!(scenario, OrderedEvidenceScenario::SeparateDone) =>
+            terminal_evidence_response(2, TerminalEvidenceScenario::Done),
+        _ => assistant_response(TERMINAL_EVIDENCE_FINAL_REPLY),
+    }
+}
+
 pub(crate) fn assistant_response(content: &str) -> Value {
     json!({
         "id": "chatcmpl-final",
@@ -1092,7 +1343,7 @@ pub fn call_process(value: &str) -> String {
 }
 "#,
     );
-    root
+    std::fs::canonicalize(&root).expect("test workspace root should be canonicalized")
 }
 
 pub(crate) fn write_fixture(path: &Path, content: &str) {
@@ -1129,7 +1380,7 @@ pub(crate) fn write_llm_config(workspace: &Path, addr: SocketAddr) -> PathBuf {
     path
 }
 
-pub(crate) fn write_codex_llm_config(workspace: &Path) -> PathBuf {
+pub(crate) fn write_codex_llm_config(workspace: &Path, addr: SocketAddr) -> PathBuf {
     let mut routes = serde_json::Map::new();
     for route in ROUTES {
         routes.insert(
@@ -1146,7 +1397,7 @@ pub(crate) fn write_codex_llm_config(workspace: &Path) -> PathBuf {
     }
     let config = json!({
         "provider_base_url": {
-            "openai": "https://api.openai.com/v1"
+            "openai": format!("http://{}", addr)
         },
         "routes": routes
     });

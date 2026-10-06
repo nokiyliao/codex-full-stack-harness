@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use super::cli::CliConfig;
 use super::env::normalize_model;
 use super::output::{
-    aggregate_runtime_usage, emit_jsonl, turn_completed_event, write_last_message,
-    write_turn_log_stderr, write_jsonl,
+    aggregate_provider_observations, aggregate_runtime_usage, emit_jsonl, turn_completed_event,
+    write_jsonl, write_last_message, write_turn_log_stderr,
 };
 use super::session::{ensure_cli_session, final_text_from_session_db};
 
@@ -56,9 +56,11 @@ pub(crate) fn run_via_router(
     if config.task_context_capsule.is_some() {
         // Set only after scoped Direct/Balanced validation; never inherit this
         // selector from the caller environment as a global routing override.
-        let binding = payload["jspace_contract"].get("content_sha256")
+        let binding = payload["jspace_contract"]
+            .get("content_sha256")
             .or_else(|| payload["jspace_contract"].get("semantic_sha256"))
-            .cloned().ok_or("TASKCORE_JSPACE_BINDING_MISSING")?;
+            .cloned()
+            .ok_or("TASKCORE_JSPACE_BINDING_MISSING")?;
         if !payload["worker_env"].is_object() {
             payload["worker_env"] = json!({});
         }
@@ -76,11 +78,12 @@ pub(crate) fn run_via_router(
         .map_err(|err| format!("failed to set router response timeout: {err}"))?;
     ensure_cli_session(config, session_id)?;
     let request_id = format!("exec-{}", uuid::Uuid::new_v4());
+    let runtime_id = format!("runtime-{}", uuid::Uuid::new_v4());
     let request = json!({
         "request_id": request_id,
         "kind": "call",
         "method": "execution.enqueue_turn",
-        "payload": { "runtime_id": format!("runtime-{}", uuid::Uuid::new_v4()), "session_id": session_id, "payload": payload },
+        "payload": { "runtime_id": runtime_id, "session_id": session_id, "payload": payload },
     });
 
     let mut writer = stream
@@ -100,13 +103,21 @@ pub(crate) fn run_via_router(
             .to_string());
     }
 
+    let session_log = router_session_log(&response);
+    if config.json && config.task_context_capsule.is_some() && session_log.is_some() {
+        // The scoped caller disables Gateway callbacks; replay persisted results.
+        // SAFETY: this synchronous thin CLI has finished reading its Router
+        // socket and runs no embedded runtime or provider threads.
+        #[allow(unsafe_code, reason = "single-threaded scoped CLI output selection")]
+        unsafe { std::env::remove_var("TURA_CLI_LIVE_JSONL") };
+    }
+
     // The worker persisted the session to the single owner; render from there.
     let text =
         router_final_text(&response).unwrap_or_else(|| final_text_from_session_db(session_id));
     if let Some(path) = config.last_message_path.as_ref() {
         write_last_message(path, &text)?;
     }
-    let session_log = router_session_log(&response);
     if config.log
         && let Some(session_log) = session_log.as_ref()
     {
@@ -119,12 +130,6 @@ pub(crate) fn run_via_router(
         if config.task_context_capsule.is_some()
             && let Some(log) = session_log.as_deref()
         {
-            // The scoped caller disables Gateway callbacks. Render actual
-            // persisted tool results rather than treating final prose as proof.
-            // SAFETY: this synchronous thin CLI has finished reading its Router
-            // socket and runs no embedded runtime or provider threads.
-            #[allow(unsafe_code, reason = "single-threaded scoped CLI output selection")]
-            unsafe { std::env::remove_var("TURA_CLI_LIVE_JSONL") };
             return write_jsonl(log, session_id, config, false).map(|()| 0);
         }
         let usage = session_log
@@ -136,6 +141,7 @@ pub(crate) fn run_via_router(
             config,
             session_id,
             usage,
+            aggregate_provider_observations(session_log.as_deref().unwrap_or(&[])),
             "completed",
             None,
         ))?;

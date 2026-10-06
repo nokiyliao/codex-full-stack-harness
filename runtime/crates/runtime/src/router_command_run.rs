@@ -3,6 +3,7 @@
 //! The runtime owns turn orchestration and checkpoints. The router owns the
 //! child process tree created by shell/tool commands.
 
+use code_tools::command_run::CommandRunTerminalStatusGuard;
 use router_contract::{IpcRequest, IpcResponse};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -221,6 +222,8 @@ pub struct RouterCommandRunExecutor {
     active_step: Option<u64>,
     output_bindings: code_tools::command_run::CommandRunOutputBindings,
     pending_binding_results: Vec<Value>,
+    terminal_status_guard: CommandRunTerminalStatusGuard,
+    pending_done: Option<Value>,
     halted: bool,
 }
 
@@ -262,6 +265,8 @@ impl RouterCommandRunExecutor {
             active_step: None,
             output_bindings: code_tools::command_run::CommandRunOutputBindings::default(),
             pending_binding_results: Vec::new(),
+            terminal_status_guard: CommandRunTerminalStatusGuard::default(),
+            pending_done: None,
             halted: false,
         }
     }
@@ -270,16 +275,47 @@ impl RouterCommandRunExecutor {
         if self.halted {
             return Vec::new();
         }
+        let mut finished = Vec::new();
+        if let Some(done) = self.pending_done.take() {
+            let result = terminal_status_failure_result(
+                &done,
+                CommandRunTerminalStatusGuard::ORDER_ERROR,
+            );
+            self.accept_results(std::slice::from_ref(&result));
+            finished.push(result);
+        }
         let step = command_step(&command);
+        let forward_step = !self.active_step.is_some_and(|active| step < active);
         if self.active_step.is_some_and(|active| active != step) {
             self.publish_pending_bindings();
         }
         self.active_step = Some(step);
         if let Err(error) = resolve_router_command_bindings(&mut command, &self.output_bindings) {
             let result = command_failure_result(&command, &error);
-            self.pending_binding_results.push(result.clone());
-            return vec![result];
+            self.accept_results(std::slice::from_ref(&result));
+            finished.push(result);
+            return finished;
         }
+        let (declared_step, terminal_done) =
+            CommandRunTerminalStatusGuard::command_metadata(&command);
+        let ordered_step = declared_step.filter(|declared| *declared == step && forward_step);
+        if terminal_done {
+            if let Some(error) = self.terminal_status_guard.done_error(ordered_step, true) {
+                let result = terminal_status_failure_result(&command, error);
+                self.accept_results(std::slice::from_ref(&result));
+                finished.push(result);
+            } else {
+                // Defer only the terminal marker; subsequent work invalidates it.
+                self.pending_done = Some(command);
+            }
+            return finished;
+        }
+        self.terminal_status_guard.observe_step(ordered_step);
+        finished.extend(self.run_command(command).await);
+        finished
+    }
+
+    async fn run_command(&mut self, command: Value) -> Vec<Value> {
         let command_metadata = command.clone();
         let mut result = execute_command_value_results(
             command,
@@ -295,13 +331,21 @@ impl RouterCommandRunExecutor {
             self.halted = true;
             self.ctx.cancellation.cancel();
         }
-        self.pending_binding_results
-            .extend(result.results.iter().cloned());
+        self.accept_results(&result.results);
         result.results
     }
 
-    pub async fn finish(self) -> Vec<Value> {
-        Vec::new()
+    pub async fn finish(mut self) -> Vec<Value> {
+        let Some(command) = self.pending_done.take() else {
+            return Vec::new();
+        };
+        if let Some(error) = self
+            .terminal_status_guard
+            .done_error(Some(command_step(&command)), true)
+        {
+            return vec![terminal_status_failure_result(&command, error)];
+        }
+        self.run_command(command).await
     }
 
     pub fn is_halted(&self) -> bool {
@@ -310,6 +354,19 @@ impl RouterCommandRunExecutor {
 
     pub fn event_context(&self) -> code_tools::runtime::tool::ToolContext {
         self.ctx.child()
+    }
+
+    fn accept_results(&mut self, results: &[Value]) {
+        if results.is_empty() {
+            self.terminal_status_guard.observe_result(None);
+        }
+        for result in results {
+            self.terminal_status_guard
+                .observe_result(result.get("success").and_then(Value::as_bool));
+            self.terminal_status_guard
+                .observe_step(result.get("step").and_then(Value::as_u64));
+        }
+        self.pending_binding_results.extend_from_slice(results);
     }
 
     fn publish_pending_bindings(&mut self) {
@@ -480,6 +537,12 @@ fn command_failure_result(command: &Value, error: &str) -> Value {
     result
 }
 
+fn terminal_status_failure_result(command: &Value, error: &str) -> Value {
+    let mut result = command_failure_result(command, error);
+    result["command_type"] = Value::String("task_status".to_string());
+    result
+}
+
 pub fn command_run_error_payload(error: String) -> Value {
     json!({
         "ok": false,
@@ -585,6 +648,106 @@ mod tests {
         }));
         assert!(executor.is_halted());
         assert!(executor.finish().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn router_streamed_terminal_status_fences_binding_failure_without_halting() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut executor = terminal_executor(workspace.path());
+        let failure = executor.push_command_value(json!({
+            "command_type": "source_read", "command_line":
+                concat!("#@#", "${missing.path}", "#@#$"), "step": 1
+        })).await;
+        assert_eq!(failure.len(), 1);
+        assert_eq!(failure[0]["success"], false);
+        let blocked = executor.push_command_value(terminal_done(2)).await;
+        assert_eq!(blocked.len(), 1);
+        assert_terminal_blocked(&blocked[0], "TERMINAL_STATUS_PRIOR_RESULT");
+        assert!(!executor.is_halted());
+        let recovery = executor.push_command_value(json!({
+            "command_type": "source_read", "command_line":
+                concat!("#@#", "${still_missing.path}", "#@#$"), "step": 3
+        })).await;
+        assert_eq!(recovery.len(), 1, "ordinary work must still be processed");
+        assert!(executor.finish().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn router_streamed_terminal_status_remembers_router_parse_and_unknown_results() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let router_error = command_run_error_payload("router unavailable".to_string());
+        for results in [
+            vec![],
+            router_error["results"].as_array().unwrap().clone(),
+            vec![json!({"step": 1, "command_type": "command_run", "success": false, "error": "parse failed"})],
+            vec![json!({"step": 1, "command_type": "source_read", "output": {}})],
+            vec![json!({"step": 1, "command_type": "focused_verifier", "success": null})],
+        ] {
+            let mut executor = terminal_executor(workspace.path());
+            executor.accept_results(&results);
+            executor.publish_pending_bindings(); // Draining must not forget the failure fence.
+            let blocked = executor.push_command_value(terminal_done(2)).await;
+            assert_eq!(blocked.len(), 1);
+            assert_terminal_blocked(&blocked[0], "TERMINAL_STATUS_PRIOR_RESULT");
+            assert!(!executor.is_halted());
+            assert!(executor.finish().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn router_streamed_terminal_status_defers_and_rejects_shared_or_nonfinal_steps() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        for next_step in [2, 3] {
+            let mut executor = terminal_executor(workspace.path());
+            executor.active_step = Some(1);
+            executor.accept_results(&[json!({
+                "step": 1, "command_type": "source_read", "success": true, "output": {}
+            })]);
+            assert!(executor.push_command_value(terminal_done(2)).await.is_empty());
+            assert!(executor.pending_done.is_some(), "done waits for end-of-batch proof");
+            let results = executor.push_command_value(json!({
+                "command_type": "source_read", "command_line":
+                    concat!("#@#", "${missing.path}", "#@#$"), "step": next_step
+            })).await;
+            assert_eq!(results.len(), 2, "later work must still be processed: {results:?}");
+            assert_terminal_blocked(&results[0], "TERMINAL_STATUS_BATCH_ORDER");
+            assert!(!executor.is_halted());
+            assert!(executor.finish().await.is_empty());
+        }
+        for done_step in [None, Some(1)] {
+            let mut executor = terminal_executor(workspace.path());
+            executor.accept_results(&[json!({"step": 1, "success": true})]);
+            let mut done = terminal_done(2);
+            done["step"] = json!(done_step);
+            let results = executor.push_command_value(done).await;
+            assert_eq!(results.len(), 1);
+            assert_terminal_blocked(&results[0], "TERMINAL_STATUS_BATCH_ORDER");
+        }
+        let mut fresh = terminal_executor(workspace.path());
+        assert!(fresh.push_command_value(terminal_done(1)).await.is_empty());
+        // Exercise the final recheck without a router/provider call.
+        fresh.accept_results(&[]);
+        let results = fresh.finish().await;
+        assert_eq!(results.len(), 1);
+        assert_terminal_blocked(&results[0], "TERMINAL_STATUS_PRIOR_RESULT");
+    }
+
+    fn terminal_executor(workspace: &std::path::Path) -> RouterCommandRunExecutor {
+        RouterCommandRunExecutor::new_with_allowed(
+            workspace.to_path_buf(), None, "session-1".to_string(), "runtime-1".to_string(),
+        )
+    }
+
+    fn terminal_done(step: u64) -> serde_json::Value {
+        json!({"command_type": "task_status", "command_line": "done", "id": "terminal", "step": step})
+    }
+
+    fn assert_terminal_blocked(result: &serde_json::Value, prefix: &str) {
+        assert_eq!(result["command_type"], "task_status", "{result}");
+        assert_eq!(result["success"], false, "{result}");
+        assert_eq!(result["id"], "terminal", "{result}");
+        assert!(result.get("output").is_none(), "{result}");
+        assert!(result["error"].as_str().is_some_and(|error| error.starts_with(prefix)), "{result}");
     }
 
     #[test]

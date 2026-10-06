@@ -20,6 +20,7 @@ import subprocess
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,15 +33,16 @@ LEGACY_REQUEST_SCHEMA_VERSION = "tura_embedded_request_v1"
 TERMINAL_SCHEMA_VERSION = "tura_embedded_terminal_v1"
 PREFLIGHT_SCHEMA_VERSION = "tura_embedded_preflight_v1"
 FAILURE_SCHEMA_VERSION = "tura_embedded_failure_v1"
-DEFAULT_MODEL = "gpt-6-astra"
-DEFAULT_REASONING_EFFORT = "high"
+DEFAULT_MODEL = "gpt-6.1-sol"
+DEFAULT_REASONING_EFFORT = "max"
 DEFAULT_SERVICE_TIER = "default"
 SERVICE_TIERS = {"default", "priority", "ultrafast"}
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_CONTEXT_BYTES = 512 * 1024
 MAX_PROMPT_BYTES = 64 * 1024
-MAX_TERMINAL_BYTES = 16 * 1024
 MAX_RESULT_BYTES = 8 * 1024
+# JSON escaping can expand each preview byte sixfold; keep metadata headroom.
+MAX_TERMINAL_BYTES = 16 * 1024 + 6 * MAX_RESULT_BYTES
 MAX_TRAJECTORY_BYTES = 64 * 1024 * 1024
 REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
 AUTHORITY_EFFECTS = {"none", "workspace"}
@@ -60,6 +62,8 @@ REQUIRED_RUNTIME_ARTIFACTS = {
 }
 NATIVE_COMMANDS = ("apply_patch", "bash", "shell_command", "zsh")
 NATIVE_TERMINAL_SCHEMA = "tura_native_codex_terminal_envelope_v2"
+NATIVE_ONCE_V3 = "tura_native_codex_worker_request_v3"
+NATIVE_ONCE_V4 = "tura_native_codex_worker_request_v4"
 REQUEST_KEYS = {
     "allow_provider_network",
     "artifact_root",
@@ -90,9 +94,10 @@ FILE_IDENTITY_KEYS = {"path", "sha256"}
 class EmbeddedNokiyError(RuntimeError):
     """Typed fail-closed boundary for one embedded runtime request."""
 
-    def __init__(self, code: str, detail: str) -> None:
+    def __init__(self, code: str, detail: str, *, issues: object = None) -> None:
         self.code = code
         self.detail = detail
+        self.issues = issues
         super().__init__(f"{code}: {detail}")
 
 
@@ -135,18 +140,25 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_json(path: Path, *, limit: int, code: str) -> dict[str, Any]:
+def _load_json_snapshot(path: Path, *, limit: int, code: str) -> tuple[dict[str, Any], bytes]:
     try:
         metadata = path.lstat()
     except FileNotFoundError as error:
         raise EmbeddedNokiyError(code, f"missing file: {path}") from error
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
         raise EmbeddedNokiyError(code, f"not a plain file: {path}")
-    if metadata.st_size > limit:
-        raise EmbeddedNokiyError(code, f"file exceeds {limit} bytes: {path}")
     try:
+        with os.fdopen(os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise EmbeddedNokiyError(code, f"not a plain file: {path}")
+            if opened.st_size > limit:
+                raise EmbeddedNokiyError(code, f"file exceeds {limit} bytes: {path}")
+            raw = stream.read(limit + 1)
+        if len(raw) > limit:
+            raise EmbeddedNokiyError(code, f"file exceeds {limit} bytes: {path}")
         value = json.loads(
-            path.read_text(encoding="utf-8"),
+            raw.decode("utf-8"),
             object_pairs_hook=_unique_object,
             parse_constant=_invalid_constant,
         )
@@ -154,7 +166,11 @@ def _load_json(path: Path, *, limit: int, code: str) -> dict[str, Any]:
         raise EmbeddedNokiyError(code, f"invalid JSON: {path}") from error
     if not isinstance(value, dict):
         raise EmbeddedNokiyError(code, f"JSON root must be an object: {path}")
-    return value
+    return value, raw
+
+
+def _load_json(path: Path, *, limit: int, code: str) -> dict[str, Any]:
+    return _load_json_snapshot(path, limit=limit, code=code)[0]
 
 
 def _require_sha256(name: str, value: object) -> str:
@@ -226,6 +242,34 @@ class FileIdentity:
         return {"path": str(self.path), "sha256": self.sha256}
 
 
+def _normalize_initial_task_state(
+    value: object, *, code: str = "NOKIY_EMBEDDED_REQUEST_INVALID"
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"task_group", "task_type"}:
+        raise EmbeddedNokiyError(code, "initial_task_state requires exactly task_group and task_type")
+
+    def text(raw: object, name: str, limit: int) -> str:
+        if not isinstance(raw, str) or re.search(r"[\x00-\x1f\x7f-\x9f]", raw):
+            raise EmbeddedNokiyError(code, f"initial_task_state.{name} must be a string without control characters")
+        normalized = raw.strip()
+        try:
+            size = len(normalized.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise EmbeddedNokiyError(code, f"initial_task_state.{name} must be UTF-8") from error
+        if not normalized or size > limit:
+            raise EmbeddedNokiyError(code, f"initial_task_state.{name} must be nonempty and at most {limit} UTF-8 bytes")
+        return normalized
+
+    group = text(value["task_group"], "task_group", 256)
+    types = value["task_type"]
+    if not isinstance(types, list) or not 1 <= len(types) <= 8:
+        raise EmbeddedNokiyError(code, "initial_task_state.task_type must be a list of 1..8 strings")
+    normalized_types = [text(item, "task_type", 128) for item in types]
+    if len(set(normalized_types)) != len(normalized_types):
+        raise EmbeddedNokiyError(code, "initial_task_state.task_type must be unique after trimming")
+    return {"task_group": group, "task_type": normalized_types}
+
+
 @dataclass(frozen=True, slots=True)
 class EmbeddedNokiyRequest:
     runtime_image: FileIdentity
@@ -240,9 +284,9 @@ class EmbeddedNokiyRequest:
     require_tool_call: bool
     native_thread_id: str | None
     persistence_mode: str
-    timeout_seconds: int
+    timeout_seconds: int | None
     max_context_age_seconds: int
-    max_trajectory_bytes: int
+    max_trajectory_bytes: int | None
     max_result_bytes: int
     model_acceleration: bool
     allow_provider_network: bool
@@ -251,6 +295,9 @@ class EmbeddedNokiyRequest:
     model_provider: str | None = None
     service_tier: str | None = None
     execution_profile: str | None = None
+    model_selection: dict[str, str] | None = None
+    terminal_delivery: str = "assistant_reply"
+    initial_task_state: dict[str, Any] | None = None
     request_id: str = field(init=False)
     request_sha256: str = field(init=False)
 
@@ -294,6 +341,12 @@ class EmbeddedNokiyRequest:
             value["service_tier"] = self.service_tier
         if self.execution_profile is not None:
             value["execution_profile"] = self.execution_profile
+        if self.model_selection is not None:
+            value["model_selection"] = self.model_selection
+        if self.terminal_delivery == "evidence_only":
+            value["terminal_delivery"] = self.terminal_delivery
+        if self.initial_task_state is not None:
+            value["initial_task_state"] = self.initial_task_state
         if include_identity:
             value.update(
                 {"request_id": self.request_id, "request_sha256": self.request_sha256}
@@ -307,6 +360,7 @@ class RuntimeIdentity:
     runtime_root: Path
     artifacts: Mapping[str, FileIdentity]
     build_identity: str
+    native_once_request_schema: str = NATIVE_ONCE_V3
 
 
 def decode_request(value: Mapping[str, Any]) -> EmbeddedNokiyRequest:
@@ -327,7 +381,8 @@ def decode_request(value: Mapping[str, Any]) -> EmbeddedNokiyRequest:
         raise EmbeddedNokiyError(
             "NOKIY_EMBEDDED_REQUEST_INVALID", "unsupported schema_version"
         )
-    optional_keys = {"model_provider", "service_tier", "execution_profile"} if schema_version == REQUEST_SCHEMA_VERSION else set()
+    optional_keys = {"model_provider", "service_tier", "execution_profile", "model_selection",
+                     "terminal_delivery", "initial_task_state"} if schema_version == REQUEST_SCHEMA_VERSION else set()
     if not expected_keys <= set(value) or set(value) - expected_keys - optional_keys:
         raise EmbeddedNokiyError(
             "NOKIY_EMBEDDED_REQUEST_INVALID",
@@ -341,6 +396,24 @@ def decode_request(value: Mapping[str, Any]) -> EmbeddedNokiyRequest:
         not isinstance(execution_profile, str) or execution_profile not in {"direct", "balanced"}
     ):
         raise EmbeddedNokiyError("NOKIY_EMBEDDED_REQUEST_INVALID", "execution_profile must be direct or balanced")
+    terminal_delivery = value.get("terminal_delivery", "assistant_reply")
+    if "terminal_delivery" in value and (
+        not isinstance(terminal_delivery, str)
+        or terminal_delivery not in {"assistant_reply", "evidence_only"}
+        or schema_version != REQUEST_SCHEMA_VERSION
+        or execution_profile not in {"direct", "balanced"}
+    ):
+        raise EmbeddedNokiyError(
+            "NOKIY_EMBEDDED_REQUEST_INVALID",
+            "terminal_delivery must be assistant_reply or evidence_only on v3 direct/balanced",
+        )
+    initial_task_state = None
+    if "initial_task_state" in value:
+        if schema_version != REQUEST_SCHEMA_VERSION or execution_profile not in {"direct", "balanced"}:
+            raise EmbeddedNokiyError(
+                "NOKIY_EMBEDDED_REQUEST_INVALID", "initial_task_state requires v3 direct/balanced"
+            )
+        initial_task_state = _normalize_initial_task_state(value["initial_task_state"])
     if not isinstance(prompt, str) or not prompt.strip():
         raise EmbeddedNokiyError(
             "NOKIY_EMBEDDED_REQUEST_INVALID", "prompt must be non-empty"
@@ -372,15 +445,31 @@ def decode_request(value: Mapping[str, Any]) -> EmbeddedNokiyRequest:
             "NOKIY_EMBEDDED_REQUEST_INVALID", "unsupported reasoning_effort"
         )
     timeout = value.get("timeout_seconds")
+    if timeout is None:
+        if schema_version != REQUEST_SCHEMA_VERSION or execution_profile is None:
+            raise EmbeddedNokiyError(
+                "NOKIY_EMBEDDED_REQUEST_INVALID", "timeout_seconds=null requires full_core"
+            )
+    elif type(timeout) is not int or not 10 <= timeout <= 900:
+        raise EmbeddedNokiyError(
+            "NOKIY_EMBEDDED_REQUEST_INVALID", "timeout_seconds must be an integer in [10, 900]"
+        )
     context_age = value.get("max_context_age_seconds")
     trajectory_limit = value.get("max_trajectory_bytes")
     result_limit = value.get("max_result_bytes")
+    if trajectory_limit is None and (
+        schema_version != REQUEST_SCHEMA_VERSION or execution_profile is None
+    ):
+        raise EmbeddedNokiyError(
+            "NOKIY_EMBEDDED_REQUEST_INVALID", "max_trajectory_bytes=null requires v3 full_core"
+        )
     for name, candidate, low, high in (
-        ("timeout_seconds", timeout, 10, 900),
         ("max_context_age_seconds", context_age, 1, 7 * 24 * 60 * 60),
         ("max_trajectory_bytes", trajectory_limit, 1024, MAX_TRAJECTORY_BYTES),
         ("max_result_bytes", result_limit, 256, MAX_RESULT_BYTES),
     ):
+        if name == "max_trajectory_bytes" and candidate is None:
+            continue
         if type(candidate) is not int or not low <= candidate <= high:
             raise EmbeddedNokiyError(
                 "NOKIY_EMBEDDED_REQUEST_INVALID",
@@ -418,6 +507,9 @@ def decode_request(value: Mapping[str, Any]) -> EmbeddedNokiyRequest:
                 "NOKIY_EMBEDDED_REQUEST_INVALID",
                 "v3 requires persistence_mode=native_codex_thread_only",
             )
+    if "model_selection" in value:
+        from .model_topology import validate_request_marker
+        validate_request_marker(value["model_selection"], model, reasoning, execution_profile)
     return EmbeddedNokiyRequest(
         runtime_image=FileIdentity.decode(value["runtime_image"], name="runtime_image"),
         codex=FileIdentity.decode(value["codex"], name="codex"),
@@ -448,6 +540,9 @@ def decode_request(value: Mapping[str, Any]) -> EmbeddedNokiyRequest:
         model_provider=model_provider,
         service_tier=service_tier,
         execution_profile=execution_profile,
+        model_selection=value.get("model_selection"),
+        terminal_delivery=terminal_delivery,
+        initial_task_state=initial_task_state,
     )
 
 
@@ -508,6 +603,13 @@ def verify_runtime_image(identity: FileIdentity, *, required_artifacts: set[str]
         raise EmbeddedNokiyError(
             "NOKIY_EMBEDDED_RUNTIME_IMAGE_INVALID", "runtime image is not frozen"
         )
+    # An absent declaration preserves the existing Rust native-once v3 contract.
+    # Only an explicit, byte-exact image declaration opts into v4 state_root.
+    native_once_schema = image.get("native_once_request_schema_version", NATIVE_ONCE_V3)
+    if type(native_once_schema) is not str or native_once_schema not in (NATIVE_ONCE_V3, NATIVE_ONCE_V4):
+        raise EmbeddedNokiyError(
+            "NOKIY_EMBEDDED_RUNTIME_IMAGE_INVALID", "unsupported native-once request schema"
+        )
     runtime_root = _plain_path(
         image.get("runtime_root"), name="runtime_image.runtime_root", directory=True
     )
@@ -528,7 +630,7 @@ def verify_runtime_image(identity: FileIdentity, *, required_artifacts: set[str]
         raise EmbeddedNokiyError(
             "NOKIY_EMBEDDED_RUNTIME_IMAGE_INVALID", "runtime build identity missing"
         )
-    return RuntimeIdentity(identity.sha256, runtime_root, artifacts, build)
+    return RuntimeIdentity(identity.sha256, runtime_root, artifacts, build, native_once_schema)
 
 
 def _bound_json(identity: FileIdentity, *, code: str) -> dict[str, Any]:
@@ -543,6 +645,78 @@ def _bound_json(identity: FileIdentity, *, code: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise EmbeddedNokiyError(code, "bound input must be an object")
     return value
+
+
+def _check_exact_write_readiness(workspace: Path, jspace: dict[str, Any]) -> None:
+    """Negative OS diagnostic only; J-Space remains the sole authority for writes."""
+    targets = jspace.get("declared_targets")
+    allowed = jspace.get("allowed_operations")
+    denied = jspace.get("denied_operations")
+    if (not isinstance(targets, list) or not isinstance(allowed, list)
+            or not isinstance(denied, list)
+            or any(os.access not in support for support in (
+                os.supports_effective_ids, os.supports_dir_fd, os.supports_follow_symlinks))):
+        return
+    operations = set(item for item in allowed if isinstance(item, str)) - set(
+        item for item in denied if isinstance(item, str))
+    if not operations.intersection({"create", "modify"}):
+        return
+    # This is a bounded negative diagnostic, not complete filesystem clearance.
+    for name in targets[:64]:
+        if not isinstance(name, str) or not name or any(c in name for c in "*?[]{}"):
+            continue
+        raw = Path(name)
+        try:
+            relative = raw.relative_to(workspace) if raw.is_absolute() else raw
+        except ValueError:
+            continue
+        if not relative.parts or any(part in (".", "..") for part in relative.parts):
+            continue
+        current = workspace
+        directory = None
+        try:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            directory = os.open(workspace.anchor, flags)
+            for part in workspace.parts[1:]:
+                child = os.open(part, flags, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            for index, part in enumerate(relative.parts):
+                current = current / part
+                try:
+                    mode = os.stat(part, dir_fd=directory, follow_symlinks=False).st_mode
+                except FileNotFoundError:
+                    if "create" in operations and not os.access(
+                        ".", os.W_OK | os.X_OK, dir_fd=directory,
+                        effective_ids=True, follow_symlinks=False
+                    ):
+                        raise EmbeddedNokiyError(
+                            "NOKIY_EMBEDDED_WRITE_TARGET_UNWRITABLE",
+                            f"{name}: nearest existing parent {current.parent} is not writable/searchable",
+                        )
+                    break  # More missing components need no further OS probes.
+                if stat.S_ISLNK(mode):
+                    break  # Leave symlink/escape handling to existing scope enforcement.
+                if index == len(relative.parts) - 1:
+                    if "modify" in operations and stat.S_ISREG(mode) and not os.access(
+                        part, os.W_OK, dir_fd=directory,
+                        effective_ids=True, follow_symlinks=False
+                    ):
+                        raise EmbeddedNokiyError(
+                            "NOKIY_EMBEDDED_WRITE_TARGET_UNWRITABLE",
+                            f"{name}: existing file is not writable by the current identity",
+                        )
+                elif not stat.S_ISDIR(mode):
+                    break
+                else:
+                    child = os.open(part, flags, dir_fd=directory)
+                    os.close(directory)
+                    directory = child
+        except OSError:
+            continue  # Unknown OS state is not evidence of an unwritable target.
+        finally:
+            if directory is not None:
+                os.close(directory)
 
 
 def _verify_context(request: EmbeddedNokiyRequest) -> tuple[dict[str, str], dict[str, Any], dict[str, Any]]:
@@ -636,6 +810,19 @@ def _verify_context(request: EmbeddedNokiyRequest) -> tuple[dict[str, str], dict
             authorization_payload["command_effect_policy"] = policy
         if "read_commands" in jspace:
             authorization_payload["read_commands"] = jspace["read_commands"]
+        if "source_read" in jspace:
+            if jspace["source_read"] is not True:
+                raise EmbeddedNokiyError(
+                    "NOKIY_EMBEDDED_JSPACE_INVALID", "source_read requires an explicit true opt-in"
+                )
+            authorization_payload["source_read"] = True
+        if "verifier_commands" in jspace or "verifier_artifact_root" in jspace:
+            if "verifier_commands" not in jspace or "verifier_artifact_root" not in jspace:
+                raise EmbeddedNokiyError(
+                    "NOKIY_EMBEDDED_JSPACE_INVALID", "verifier grant requires a bound artifact root"
+                )
+            authorization_payload["verifier_commands"] = jspace["verifier_commands"]
+            authorization_payload["verifier_artifact_root"] = jspace["verifier_artifact_root"]
         expected = _canonical_sha256(authorization_payload)
         content = jspace.get("content_sha256")
         content_expected = _canonical_sha256(
@@ -675,9 +862,12 @@ def _verify_context(request: EmbeddedNokiyRequest) -> tuple[dict[str, str], dict
             raise EmbeddedNokiyError("NOKIY_EMBEDDED_CONTEXT_SCOPE_MISMATCH", "DCF generation bindings differ")
         from .full_stack import verify_action_freshness
         verify_action_freshness(request.workspace, jspace)
+    from .source_excerpt import verify_context_excerpt
+    verify_context_excerpt(request.workspace, context, jspace)
     if local_context:
         from .local_context import verify_context
-        verify_context(request.workspace, context, jspace)
+        verify_context(request.workspace, context, jspace, artifact_root=request.artifact_root)
+    _check_exact_write_readiness(request.workspace, jspace)
     return ({
         "context_semantic_sha256": str(context_semantic),
         "jspace_semantic_sha256": semantic,
@@ -705,6 +895,10 @@ def _verify_native_thread_binding(request: EmbeddedNokiyRequest) -> str | None:
 
 def _native_request(request: EmbeddedNokiyRequest, runtime: RuntimeIdentity,
                     capsule: dict[str, Any], jspace: dict[str, Any]) -> dict[str, Any]:
+    run_root = request.artifact_root / request.request_id
+    if run_root.is_relative_to(request.workspace) or request.workspace.is_relative_to(run_root):
+        raise EmbeddedNokiyError("NOKIY_EMBEDDED_REQUEST_INVALID",
+                                "Native state root must be disjoint from workspace")
     mission = capsule.get("mission")
     if not isinstance(mission, dict) or any(
         not isinstance(mission.get(key), str) or not mission[key].strip()
@@ -728,9 +922,10 @@ def _native_request(request: EmbeddedNokiyRequest, runtime: RuntimeIdentity,
              "current_predicate": mission["current_predicate"], "instruction": request.prompt}
     delta["semantic_sha256"] = _canonical_sha256(delta)
     wire = {
-        "schema_version": "tura_native_codex_worker_request_v3", "provider_profile": profile,
+        "schema_version": runtime.native_once_request_schema, "provider_profile": profile,
         "codex_executable": str(request.codex.path), "codex_executable_sha256": request.codex.sha256,
-        "workspace": str(request.workspace), "session_id": f"once-{request.request_sha256}",
+        "workspace": str(request.workspace),
+        "session_id": f"once-{request.request_sha256}",
         "task_id": mission["task_id"], "execution_id": request.request_id,
         # This labels the disposable execution lifetime. It is NOT a replacement
         # for the outer task harness's writer lease or a grant of authority.
@@ -747,6 +942,8 @@ def _native_request(request: EmbeddedNokiyRequest, runtime: RuntimeIdentity,
             "allowed_commands": list(NATIVE_COMMANDS), "jspace_contract": jspace,
         },
     }
+    if runtime.native_once_request_schema == NATIVE_ONCE_V4:
+        wire["state_root"] = str(run_root)
     wire["execution_binding_sha256"] = _canonical_sha256(wire)
     if len(_canonical_bytes(wire)) > 2 * 1024 * 1024:
         raise EmbeddedNokiyError("NOKIY_EMBEDDED_REQUEST_INVALID", "Native input exceeds byte budget")
@@ -754,6 +951,10 @@ def _native_request(request: EmbeddedNokiyRequest, runtime: RuntimeIdentity,
 
 
 def _prepare(request: EmbeddedNokiyRequest) -> tuple[dict[str, Any], RuntimeIdentity, dict[str, Any]]:
+    if request.timeout_seconds is None:
+        raise EmbeddedNokiyError("NOKIY_EMBEDDED_REQUEST_INVALID", "native_once requires a finite timeout_seconds")
+    if request.max_trajectory_bytes is None:
+        raise EmbeddedNokiyError("NOKIY_EMBEDDED_REQUEST_INVALID", "native_once requires a finite max_trajectory_bytes")
     if request.schema_version != REQUEST_SCHEMA_VERSION:
         raise EmbeddedNokiyError("NOKIY_EMBEDDED_LEGACY_REQUEST_READBACK_ONLY",
                                 "old requests remain readable; new execution requires the Native caller binding")
@@ -867,9 +1068,10 @@ def _record(path: Path) -> dict[str, Any]:
     }
 
 
-def _write_create_only(path: Path, value: Mapping[str, Any]) -> None:
+def _write_create_only(path: Path, value: Mapping[str, Any], *, dir_fd: int | None = None) -> None:
     encoded = _canonical_bytes(value).decode("utf-8") + "\n"
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=dir_fd)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             descriptor = -1
@@ -895,29 +1097,39 @@ def _bounded_preview(text: str, limit: int) -> tuple[str, bool]:
     return head + marker + tail, True
 
 
+_active_cancellation: ContextVar[list[int] | None] = ContextVar("active_nokiy_cancellation", default=None)
+
+
 @contextmanager
 def _cancellation_signals():
-    cancelled: list[int] = []
+    cancelled = _active_cancellation.get()
+    owns_scope = cancelled is None
+    if owns_scope:
+        cancelled = []
+        token = _active_cancellation.set(cancelled)
     previous = {}
 
     def cancel(signum, _frame):
         cancelled.append(signum)
 
-    # The CLI owns signal forwarding. Library calls on other threads leave
-    # process-wide signal ownership with their host.
-    if threading.current_thread() is threading.main_thread():
-        for signum in (signal.SIGTERM, signal.SIGINT):
-            previous[signum] = signal.signal(signum, cancel)
     try:
+        # Only the outer main-thread scope owns process-wide handlers. A batch
+        # copies its invocation context into workers; single runs still own it here.
+        if owns_scope and threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous[signum] = signal.signal(signum, cancel)
         yield cancelled
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
+        if owns_scope:
+            _active_cancellation.reset(token)
 
 
 def _run_process(
     command: list[str], *, cwd: Path, env: Mapping[str, str], stdin_path: Path,
-    stdout_path: Path, stderr_path: Path, timeout: int, output_limit: int,
+    stdout_path: Path, stderr_path: Path, timeout: int | None, output_limit: int,
+    pass_fds: tuple[int, ...] = (), on_spawn=None,
 ) -> tuple[int, float, str | None, dict[str, Any]]:
     started = time.monotonic()
     failure: str | None = None
@@ -925,13 +1137,16 @@ def _run_process(
         if cancelled:
             raise EmbeddedNokiyError("NOKIY_EMBEDDED_CANCELLED", "cancelled before spawn")
         process = subprocess.Popen(command, cwd=cwd, env=dict(env), stdin=source,
-                                   stdout=stdout, stderr=stderr, start_new_session=True)
+                                   stdout=stdout, stderr=stderr, start_new_session=True,
+                                   pass_fds=pass_fds)
         try:
+            if on_spawn is not None:
+                on_spawn()
             while process.poll() is None:
                 if cancelled:
                     failure = "NOKIY_EMBEDDED_CANCELLED"
                     break
-                if time.monotonic() - started >= timeout:
+                if timeout is not None and time.monotonic() - started >= timeout:
                     failure = "NOKIY_EMBEDDED_RUNTIME_TIMEOUT"
                     break
                 if stdout_path.stat().st_size > output_limit:
@@ -994,6 +1209,10 @@ def execute(request: EmbeddedNokiyRequest) -> dict[str, Any]:
     if request.execution_profile is not None:
         from .full_core import execute_full_core
         return execute_full_core(request)
+    if request.timeout_seconds is None:
+        raise EmbeddedNokiyError("NOKIY_EMBEDDED_REQUEST_INVALID", "native_once requires a finite timeout_seconds")
+    if request.max_trajectory_bytes is None:
+        raise EmbeddedNokiyError("NOKIY_EMBEDDED_REQUEST_INVALID", "native_once requires a finite max_trajectory_bytes")
     _verify_native_thread_binding(request)
     run_root = request.artifact_root / request.request_id
     receipt_path = run_root / "terminal.json"
@@ -1129,8 +1348,32 @@ def read_terminal(artifact_root: Path, request_id: str) -> dict[str, Any]:
     return receipt
 
 
+# Keep this static preparation vocabulary in sync with nokiy-native-host.py.
+_ACTION_ISSUE_PAIRS = {
+    ("action.read_scopes", "input_missing"),
+    ("action.command_templates", "invalid_shape"),
+    ("action.command_templates", "unsupported_command"),
+    ("action.command_templates", "invalid_bindings"),
+}
+
+
+def _safe_action_issues(value: object) -> list[dict[str, str]] | None:
+    if type(value) is not list or not 1 <= len(value) <= 8:
+        return None
+    issues = []
+    for issue in value:
+        if type(issue) is not dict or len(issue) != 2 or set(issue) != {"path", "reason"}:
+            return None
+        path, reason = issue["path"], issue["reason"]
+        if (type(path) is not str or type(reason) is not str
+                or (path, reason) not in _ACTION_ISSUE_PAIRS):
+            return None
+        issues.append({"path": path, "reason": reason})
+    return issues
+
+
 def _failure(error: EmbeddedNokiyError) -> dict[str, Any]:
-    return {
+    failure = {
         "schema_version": FAILURE_SCHEMA_VERSION,
         "status": "BLOCKED_PREEXECUTION",
         "first_typed_blocker": error.code,
@@ -1139,6 +1382,11 @@ def _failure(error: EmbeddedNokiyError) -> dict[str, Any]:
         "native_codex_control_plane_mutation_count": 0,
         "fallback_used": False,
     }
+    issues = (_safe_action_issues(error.issues)
+              if error.code == "NOKIY_LOCAL_CONTEXT_INVALID" else None)
+    if issues is not None:
+        failure["issues"] = issues
+    return failure
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1154,12 +1402,24 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--action", required=True, help="Bounded DCF action JSON, including mission")
     prepare.add_argument("--surface-id", help="Required for DCF workspaces; omit for local context")
     prepare.add_argument("--output-dir", required=True, help="New absolute preparation directory")
+    prepare.add_argument("--topology-model", choices=("nokiy", "nokiy-direct"),
+                         help="Bind worker selection; does not activate a native root topology")
+    prepare.add_argument("--worker-family", choices=("luna", "sol", "astra"),
+                         help="Nokiy worker family, at max; requires topology-model")
     for name in ("preflight", "run"):
         command = commands.add_parser(name)
         command.add_argument("--request", required=True)
+        if name == "run":
+            command.add_argument("--summary", action="store_true", help="Compact return; original terminal remains available")
     read = commands.add_parser("read-result")
     read.add_argument("--artifact-root", required=True)
     read.add_argument("--request-id", required=True)
+    read.add_argument("--summary", action="store_true", help="Compact return; original terminal remains available")
+    for name in ("run-batch", "read-batch"):
+        batch = commands.add_parser(name, help="Coordinate exact Ultra requests within host capacity")
+        batch.add_argument("--plan", required=True)
+        batch.add_argument("--plan-sha256", required=True)
+        batch.add_argument("--summary", action="store_true", help="Bounded native output; raw results remain in read-result")
     for name in ("check-deployment", "deploy"):
         deploy = commands.add_parser(name, help="Execute exact parent-admitted deployment commands without a model")
         deploy.add_argument("--plan", required=True)
@@ -1182,16 +1442,46 @@ def main(argv: list[str] | None = None) -> int:
         elif arguments.command == "prepare":
             from .full_stack import prepare_request
             result = prepare_request(Path(arguments.request), Path(arguments.action),
-                                     arguments.surface_id, Path(arguments.output_dir))
+                                     arguments.surface_id, Path(arguments.output_dir),
+                                     topology_model=arguments.topology_model,
+                                     worker_family=arguments.worker_family)
         elif arguments.command == "read-result":
             result = read_terminal(Path(arguments.artifact_root), arguments.request_id)
+        elif arguments.command in {"run-batch", "read-batch"}:
+            from . import batch
+            result = (batch.run_batch if arguments.command == "run-batch" else batch.read_batch)(
+                Path(arguments.plan), arguments.plan_sha256)
+            if arguments.summary:
+                result = batch.summarize(result)
         else:
-            request = load_request(Path(arguments.request))
+            from .model_topology import load_prepared_request
+            request, _ = load_prepared_request(Path(arguments.request))
+            run = request.artifact_root / request.request_id
+            new_run = arguments.command == "run" and not (run.exists() or run.is_symlink())
             result = (
                 preflight(request)
                 if arguments.command == "preflight"
                 else execute(request)
             )
+        if arguments.command in {"run", "read-result"}:
+            from .result_inspection import project_terminal, retain_inspection_summary, summarize_terminal
+            artifact_root = request.artifact_root if arguments.command == "run" else Path(arguments.artifact_root)
+            request_id = request.request_id if arguments.command == "run" else arguments.request_id
+            result = project_terminal(
+                result,
+                artifact_root,
+                request_id,
+                request_thread_id=request.native_thread_id if arguments.command == "run" else None,
+                require_request_binding=arguments.command == "run",
+            )
+            if arguments.command == "run" and new_run:
+                result = retain_inspection_summary(result, artifact_root, request_id,
+                                                    expected_thread_id=request.native_thread_id)
+            else:
+                result = {**result, "inspection_summary": None,
+                          "inspection_summary_omission": "READ_ONLY_RECOVERY"}
+            if arguments.summary:
+                result = summarize_terminal(result, artifact_root, request_id)
     except (OSError, ValueError) as error:
         print(json.dumps(_failure(EmbeddedNokiyError("NOKIY_EMBEDDED_INPUT_ERROR", str(error))),
                          ensure_ascii=True, sort_keys=True))

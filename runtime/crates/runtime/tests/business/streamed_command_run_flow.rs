@@ -428,6 +428,7 @@ async fn streamed_command_batch_runs_same_step_macro_commands_without_result_cro
 async fn streamed_command_batches_repeated_workspaces_do_not_cross_talk() {
     let batch_count = 5;
     let mut completed = Vec::new();
+    let mut receipt_roots = std::collections::BTreeSet::new();
 
     for index in 0..batch_count {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -459,13 +460,32 @@ async fn streamed_command_batches_repeated_workspaces_do_not_cross_talk() {
             text_at(&workspace.path().join(&second_file)).contains(&format!("{marker}-second"))
         );
         let entries = workspace_entries(workspace.path());
+        let mut expected_entries = vec![".tura".to_string(), first_file.clone(), second_file.clone()];
+        expected_entries.sort();
         assert_eq!(
-            entries.len(),
-            2,
-            "repeated stream batch workspace should only contain its own artifacts"
+            entries,
+            expected_entries,
+            "repeated stream batch workspace should contain only its own artifacts and receipt root"
         );
         assert!(entries.iter().any(|name| name == &first_file));
         assert!(entries.iter().any(|name| name == &second_file));
+        let state_root = workspace.path().join(".tura");
+        assert_eq!(workspace_entries(&state_root), vec!["run"]);
+        let run_root = state_root.join("run");
+        assert_eq!(workspace_entries(&run_root), vec!["command_receipts"]);
+        let receipt_root = run_root.join("command_receipts");
+        assert!(receipt_root.is_dir(), "owned receipt directory must exist");
+        let store = code_tools::runtime::tool::ToolContext::new(workspace.path().to_path_buf())
+            .bound_receipt_store()
+            .expect("workspace receipt store should retain its binding");
+        let receipt_path = store
+            .display_path("workspace-isolation.json")
+            .expect("receipt display identity");
+        assert_eq!(receipt_path.parent(), Some(receipt_root.as_path()));
+        assert!(
+            receipt_roots.insert(receipt_root.canonicalize().expect("canonical receipt root")),
+            "repeated workspaces must not share a receipt root"
+        );
         completed.push((index, output));
     }
     assert_eq!(completed.len(), batch_count);
@@ -510,15 +530,15 @@ async fn streamed_command_batches_concurrent_workspaces_remain_isolated_inner() 
                 "step": 1,
                 "command": "task_status",
                 "command_line": json!({
-                    "status": "done",
+                    "status": "question",
                     "task_group": format!("{marker}-first")
                 }).to_string()
             }),
             json!({
-                "step": 1,
+                "step": 2,
                 "command": "task_status",
                 "command_line": json!({
-                    "status": "question",
+                    "status": "done",
                     "task_group": format!("{marker}-second")
                 }).to_string()
             }),
@@ -545,7 +565,7 @@ async fn streamed_command_batches_concurrent_workspaces_remain_isolated_inner() 
             .expect("command_run output should contain results");
         assert_eq!(results.len(), 2);
         assert_eq!(results[0]["step"], 1);
-        assert_eq!(results[1]["step"], 1);
+        assert_eq!(results[1]["step"], 2);
         assert!(
             results.iter().all(|result| {
                 result["command_type"] == "task_status" && result["success"] == true
@@ -560,14 +580,21 @@ async fn streamed_command_batches_concurrent_workspaces_remain_isolated_inner() 
             results[1]["output"]["task_status"]["task_group"],
             format!("{marker}-second")
         );
-        assert_eq!(results[0]["output"]["task_status"]["status"], "done");
-        assert_eq!(results[1]["output"]["task_status"]["status"], "question");
+        assert_eq!(results[0]["output"]["task_status"]["status"], "question");
+        assert_eq!(results[1]["output"]["task_status"]["status"], "done");
 
         let entries = workspace_entries(workspace);
-        assert!(
-            entries.is_empty(),
-            "planning-only concurrent batches should not create workspace artifacts"
+        assert_eq!(
+            entries,
+            vec![".tura"],
+            "planning-only concurrent batches should contain only their owned receipt root"
         );
+        let state_root = workspace.join(".tura");
+        assert_eq!(workspace_entries(&state_root), vec!["run"]);
+        let run_root = state_root.join("run");
+        assert_eq!(workspace_entries(&run_root), vec!["command_receipts"]);
+        let receipt_root = run_root.join("command_receipts");
+        assert!(receipt_root.is_dir(), "owned receipt directory must exist");
         let serialized = output.to_string();
         assert!(serialized.contains("task_status"));
         for other in 0..workspaces.len() {

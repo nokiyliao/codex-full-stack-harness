@@ -131,25 +131,41 @@ fn extract_apply_patch_body_from_value(value: &Value) -> Option<String> {
     }
 }
 
+pub(crate) fn patch_marker_range(text: &str, marker: &str) -> Option<std::ops::Range<usize>> {
+    let mut start = 0;
+    for physical in text.split_inclusive('\n') {
+        let line = physical
+            .strip_suffix("\r\n")
+            .or_else(|| physical.strip_suffix('\n'))
+            .unwrap_or(physical);
+        if line == marker {
+            return Some(start..start + line.len());
+        }
+        start += physical.len();
+    }
+    None
+}
+
 fn extract_apply_patch_body(text: &str) -> Option<String> {
-    let end_marker = "*** End Patch";
-    if let Some(begin) = text.find("*** Begin Patch") {
-        let end = text[begin..].find(end_marker)? + begin + end_marker.len();
-        return Some(text[begin..end].trim().to_string());
+    if let Some(begin) = patch_marker_range(text, "*** Begin Patch") {
+        let patch = &text[begin.start..];
+        let end = patch_marker_range(patch, "*** End Patch")?;
+        return Some(patch[..end.end].to_string());
     }
     normalize_apply_patch_body_without_begin(text)
 }
 
 fn normalize_apply_patch_body_without_begin(text: &str) -> Option<String> {
-    let body = strip_apply_patch_command_line(text.trim());
+    let body = strip_apply_patch_command_line(text.trim_start());
     if !starts_with_patch_hunk(body) {
         return None;
     }
     let end_marker = "*** End Patch";
-    let body = if let Some(end) = body.find(end_marker) {
-        body[..end + end_marker.len()].trim().to_string()
+    let body = if let Some(end) = patch_marker_range(body, end_marker) {
+        body[..end.end].to_string()
     } else {
-        format!("{}\n{end_marker}", body.trim_end())
+        let separator = if body.ends_with('\n') { "" } else { "\n" };
+        format!("{body}{separator}{end_marker}")
     };
     Some(format!("*** Begin Patch\n{body}"))
 }
@@ -174,6 +190,71 @@ fn starts_with_patch_hunk(text: &str) -> bool {
             || body.starts_with("*** Delete File: ")
             || body.starts_with("*** Update File: ")
     )
+}
+
+#[cfg(test)]
+mod physical_marker_tests {
+    use super::*;
+
+    const BODY: &str = concat!(
+        "*** Update File: x\n@@\n",
+        "-let s = \"*** End Patch\";\n",
+        "+let s = \"\\n*** Begin Patch\\n*** End Patch\";\n",
+        " *** End Patch\n+*** End Patch\n-*** End Patch\n+tail\n",
+    );
+
+    fn check(input: &str, expected: &str) {
+        assert_eq!(extract_apply_patch_body(input).as_deref(), Some(expected));
+        let command = crate::command_run::normalize_command_value_for_execution(
+            serde_json::json!({"command_type": "apply_patch", "command_line": input, "step": 1}),
+            0,
+        )
+        .unwrap();
+        assert_eq!(command["command_line"].as_str(), Some(expected));
+    }
+
+    #[test]
+    fn physical_lines() {
+        for nl in ["\n", "\r\n"] {
+            let body = BODY.replace('\n', nl);
+            for marker in ["*** Begin Patch", "*** End Patch"] {
+                assert!(patch_marker_range(&body, marker).is_none());
+            }
+            let prefix = format!("\u{e9}{nl}{body}");
+            let text = format!("{prefix}*** End Patch{nl}*** End Patch");
+            assert_eq!(
+                patch_marker_range(&text, "*** End Patch"),
+                Some(prefix.len()..prefix.len() + "*** End Patch".len())
+            );
+            let patch = format!("*** Begin Patch{nl}{body}*** End Patch");
+            check(
+                &format!("apply_patch <<'PATCH'{nl}{patch}{nl}PATCH{nl}*** End Patch"),
+                &patch,
+            );
+            assert_eq!(
+                normalize_apply_patch_text(&serde_json::json!({"patch": &patch}).to_string()),
+                patch
+            );
+            check(
+                &format!("apply_patch\n{body}*** End Patch\nPATCH"),
+                &format!("*** Begin Patch\n{body}*** End Patch"),
+            );
+        }
+        let expected = format!("*** Begin Patch\n{BODY}*** End Patch");
+        check(BODY, &expected);
+        check(BODY.trim_end(), &expected);
+    }
+
+    #[test]
+    fn incomplete_or_impostor_boundaries() {
+        for suffix in [" suffix", " ", "\r"] {
+            let patch = format!("*** Begin Patch\n{BODY}*** End Patch{suffix}");
+            assert!(extract_apply_patch_body(&patch).is_none());
+        }
+        assert!(extract_apply_patch_body(&format!("*** Begin Patch\n{BODY}")).is_none());
+        assert!(extract_apply_patch_body("*** Begin Patch suffix\n*** End Patch").is_none());
+        assert!(parse_patch("*** Begin Patch\n*** Add File: x\n+x\n*** End Patch suffix").is_err());
+    }
 }
 
 pub fn execute(patch_text: &str, session_dir: &Path) -> CommandResponse {
@@ -423,7 +504,7 @@ fn parse_patch(patch_text: &str) -> Result<Vec<PatchChange>, String> {
                 change.hunks.push(hunk_lines);
             }
             hunk = Some(Vec::new());
-        } else if line.starts_with("*** End Patch") {
+        } else if line == "*** End Patch" {
             finish_change(&mut changes, &mut current, &mut hunk);
             ended = true;
             break;

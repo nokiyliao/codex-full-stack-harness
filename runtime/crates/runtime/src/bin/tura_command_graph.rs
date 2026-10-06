@@ -151,7 +151,11 @@ async fn serve() -> Result<(), String> {
     Ok(())
 }
 
-async fn call_tool(context: &CommandGraphContext, params: Option<&Value>, rpc_id: &Value) -> Result<Value, String> {
+async fn call_tool(
+    context: &CommandGraphContext,
+    params: Option<&Value>,
+    rpc_id: &Value,
+) -> Result<Value, String> {
     let params = params.ok_or_else(|| "TURA_COMMAND_GRAPH_PARAMS_REQUIRED".to_string())?;
     if params.get("name").and_then(Value::as_str) != Some(TOOL_NAME) {
         return Err("TURA_COMMAND_GRAPH_TOOL_NAME_INVALID".to_string());
@@ -298,9 +302,12 @@ mod tests {
 
     fn context() -> CommandGraphContext {
         CommandGraphContext {
-            session_id: "session".into(), task_id: "task".into(),
-            execution_id: "execution".into(), lease_id: "lease".into(),
-            workspace: PathBuf::from("/tmp"), allowed_commands: BTreeSet::new(),
+            session_id: "session".into(),
+            task_id: "task".into(),
+            execution_id: "execution".into(),
+            lease_id: "lease".into(),
+            workspace: PathBuf::from("/tmp"),
+            allowed_commands: BTreeSet::new(),
             jspace_contract: json!({}),
         }
     }
@@ -308,10 +315,14 @@ mod tests {
     #[test]
     fn repeated_content_is_a_new_call_but_retransmission_keeps_identity() {
         let c = context();
-        let args = json!({"commands":[{"command_type":"shell_command","command_line":"cat input.txt"}]});
+        let args =
+            json!({"commands":[{"command_type":"shell_command","command_line":"cat input.txt"}]});
         let first = c.bind_arguments(args.clone(), &json!(1)).unwrap();
         assert_eq!(first, c.bind_arguments(args.clone(), &json!(1)).unwrap());
-        assert_ne!(first["execution_id"], c.bind_arguments(args, &json!(2)).unwrap()["execution_id"]);
+        assert_ne!(
+            first["execution_id"],
+            c.bind_arguments(args, &json!(2)).unwrap()["execution_id"]
+        );
     }
 
     #[test]
@@ -320,9 +331,17 @@ mod tests {
         let args = json!({"execution_id":"effect-1","commands":[]});
         let first = c.bind_arguments(args.clone(), &json!(1)).unwrap();
         assert_eq!(first, c.bind_arguments(args, &json!(2)).unwrap());
-        let changed = c.bind_arguments(json!({"execution_id":"effect-1","commands":[{}]}), &json!(3)).unwrap();
+        let changed = c
+            .bind_arguments(
+                json!({"execution_id":"effect-1","commands":[{}]}),
+                &json!(3),
+            )
+            .unwrap();
         assert_eq!(first["execution_id"], changed["execution_id"]);
-        assert!(c.bind_arguments(json!({"execution_id":false}), &json!(1)).is_err());
+        assert!(
+            c.bind_arguments(json!({"execution_id":false}), &json!(1))
+                .is_err()
+        );
         assert!(c.bind_arguments(json!({}), &Value::Null).is_err());
     }
 
@@ -330,8 +349,10 @@ mod tests {
     fn tool_schema_does_not_advertise_fresh_effect_calls_as_idempotent() {
         let tools = tools_list().unwrap();
         assert_eq!(tools["tools"][0]["annotations"]["idempotentHint"], false);
-        let description = tools["tools"][0]["inputSchema"]["properties"]["execution_id"]["description"]
-            .as_str().unwrap();
+        let description =
+            tools["tools"][0]["inputSchema"]["properties"]["execution_id"]["description"]
+                .as_str()
+                .unwrap();
         assert!(description.contains("retransmission"));
         assert!(description.contains("new read/test after an edit"));
     }

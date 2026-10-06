@@ -13,9 +13,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tura_llm_rust::official_codex_app_server::{
     CodexAppServerExecutable, CodexCommandRunCommandObservation, CodexCommandRunEffectObservation,
     CodexExecutionLedger, CodexObservedCommandAccess, CodexObservedToolEffectState,
-    CodexReadOnlyCommandObservation, CodexReadOnlyEffectObservation, OfficialCodexServerRequest,
-    OfficialCodexServerRequestFuture, OfficialCodexServerRequestHandler, OfficialCodexTurnRequest,
-    canonical_thread_revision_sha256, load_thread_association, run_official_codex_turn,
+    CodexReadOnlyCommandObservation, CodexReadOnlyDispatchPhase, CodexReadOnlyEffectObservation,
+    OfficialCodexServerRequest, OfficialCodexServerRequestFuture,
+    OfficialCodexServerRequestHandler, OfficialCodexTurnRequest, canonical_thread_revision_sha256,
+    load_thread_association, run_official_codex_turn,
 };
 
 const UNCLAIMED_READ_ONLY_COMMAND_LINE: &str = r#"rg -n -A18 -B6 "struct TurnRequestContext|TurnRequestContext \{" crates/provider/src/official_codex_app_server.rs"#;
@@ -68,6 +69,13 @@ fn verify_read_only_artifact_absent_for_test(path: &Path) -> Result<(), String> 
     }
 }
 
+fn canonical_tempdir() -> tempfile::TempDir {
+    let temp_root = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+    tempfile::Builder::new()
+        .tempdir_in(temp_root)
+        .expect("canonical tempdir")
+}
+
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
     if args.iter().any(|arg| arg == "app-server") {
@@ -96,7 +104,7 @@ fn main() {
 }
 
 async fn run_active_stream_missing_readback_deadline() {
-    let root = tempfile::tempdir().expect("missing readback deadline tempdir");
+    let root = canonical_tempdir();
     let session_directory = root.path().join("missing-readback-session");
     fs::create_dir_all(&session_directory).expect("missing readback session directory");
     let capture = root.path().join("active-stream-missing-readback.jsonl");
@@ -124,7 +132,7 @@ async fn run_active_stream_missing_readback_deadline() {
 }
 
 async fn run_active_stream_interrupted_effect_recovery() {
-    let root = tempfile::tempdir().expect("active stream recovery tempdir");
+    let root = canonical_tempdir();
     let session_directory = root.path().join("active-stream-session");
     fs::create_dir_all(&session_directory).expect("active stream session directory");
     let execution_count_path = root.path().join("active-stream-execution-count");
@@ -198,7 +206,7 @@ async fn run_active_stream_interrupted_effect_recovery() {
 }
 
 async fn run_authoritative_wait_readback() {
-    let root = tempfile::tempdir().expect("authoritative wait readback tempdir");
+    let root = canonical_tempdir();
 
     let completed_directory = root.path().join("completed-session");
     fs::create_dir_all(&completed_directory).expect("completed readback session directory");
@@ -256,7 +264,7 @@ async fn run_authoritative_wait_readback() {
 }
 
 async fn run_commander_target_convergence() {
-    let root = tempfile::tempdir().expect("commander target tempdir");
+    let root = canonical_tempdir();
     let session_directory = root.path().join("session");
     fs::create_dir_all(&session_directory).expect("commander target session directory");
     let pre_turns = vec![
@@ -458,7 +466,7 @@ async fn run_commander_target_convergence() {
 }
 
 async fn run_commander_idle_start() {
-    let root = tempfile::tempdir().expect("idle Commander tempdir");
+    let root = canonical_tempdir();
     let session_directory = root.path().join("session");
     fs::create_dir_all(&session_directory).expect("idle Commander session directory");
     let pre_turns = vec![
@@ -507,7 +515,7 @@ async fn run_commander_idle_start() {
 }
 
 async fn run_commander_prepared_delivery_reconciliation() {
-    let root = tempfile::tempdir().expect("Commander delivery recovery tempdir");
+    let root = canonical_tempdir();
     let session_directory = root.path().join("session");
     fs::create_dir_all(&session_directory).expect("Commander recovery session directory");
     let pre_turns = vec![
@@ -626,7 +634,7 @@ fn response_binding(
 }
 
 async fn run_hostile_flow() {
-    let root = tempfile::tempdir().expect("tempdir");
+    let root = canonical_tempdir();
     let session_directory = root.path().join("session");
     fs::create_dir_all(&session_directory).expect("session directory");
     let auth_path = root.path().join("home").join(".codex").join("auth.json");
@@ -910,7 +918,7 @@ async fn assert_changed_mission_rejected(
 }
 
 async fn run_interrupted_effect_recovery() {
-    let root = tempfile::tempdir().expect("recovery tempdir");
+    let root = canonical_tempdir();
 
     let external_directory = root.path().join("external-interrupted-session");
     fs::create_dir_all(&external_directory).expect("external interrupted session directory");
@@ -1300,6 +1308,10 @@ async fn run_interrupted_effect_recovery() {
         unclaimed_observation.commands[0].claim_identity,
         UNCLAIMED_READ_ONLY_CLAIM_IDENTITY
     );
+    assert_eq!(
+        unclaimed_observation.dispatch_phase,
+        Some(CodexReadOnlyDispatchPhase::MayHaveDispatched)
+    );
     assert!(unclaimed_effect.command_receipts.is_empty());
     let unclaimed_receipt_directory = unclaimed_directory.join(".tura/run/command_receipts");
     verify_read_only_artifact_absent_for_test(&unclaimed_receipt_directory)
@@ -1312,7 +1324,7 @@ async fn run_interrupted_effect_recovery() {
     )
     .expect("unrelated receipt write");
 
-    let unclaimed_recovered = run_official_codex_turn(
+    let unclaimed_error = run_official_codex_turn(
         effect_request(
             &unclaimed_directory,
             &root.path().join("unclaimed-effect-recover.jsonl"),
@@ -1321,21 +1333,16 @@ async fn run_interrupted_effect_recovery() {
         Some(&mut unclaimed_handler),
     )
     .await
-    .expect("unclaimed read-only observation must recover as terminal zero-mutation");
-    assert_eq!(
-        unclaimed_recovered.content,
-        Value::String("recovered after provider loss".to_string())
+    .expect_err("post-dispatch interruption cannot infer zero effect from missing receipts");
+    assert!(
+        unclaimed_error
+            .to_string()
+            .contains("OFFICIAL_CODEX_INTERRUPTED_RECOVERY_UNCERTAIN_EFFECT")
     );
     assert_eq!(
         execution_count(&unclaimed_count),
         1,
         "unclaimed read-only command was replayed"
-    );
-    assert!(
-        unclaimed_recovered
-            .association
-            .observed_tool_effects
-            .is_empty()
     );
 
     for (case_name, receipt_suffix) in [("claim", ".claim.json"), ("terminal", ".json")] {
@@ -1800,6 +1807,7 @@ impl OfficialCodexServerRequestHandler for ReceiptHandler {
                 binding_id,
                 claim_identity,
             }],
+            dispatch_phase: None,
         }))
     }
 
@@ -2021,14 +2029,10 @@ impl OfficialCodexServerRequestHandler for ReceiptHandler {
                     "success": true
                 }));
             }
-            let receipt_path = if self.observe_read_only {
-                receipt_directory.join(format!(
-                    "{}.json",
-                    encode_read_only_receipt_identity_for_test(UNCLAIMED_READ_ONLY_CLAIM_IDENTITY)
-                ))
-            } else {
-                receipt_directory.join("effect-command.json")
-            };
+            let receipt_path = receipt_directory.join(format!(
+                "{}.json",
+                encode_read_only_receipt_identity_for_test(UNCLAIMED_READ_ONLY_CLAIM_IDENTITY)
+            ));
             let receipt = json!({
                 "schema_version": "tura_command_terminal_receipt_v1",
                 "call_id": "runtime-official-1:call-original:step:1:index:0",

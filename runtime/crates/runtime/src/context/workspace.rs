@@ -4,6 +4,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use lifecycle::SessionManagement;
+
 use super::ContextualUserFragment;
 
 const MAX_DEPTH: usize = 3;
@@ -20,6 +22,29 @@ pub(crate) struct WorkspaceSnapshot {
     entries: Vec<WorkspaceSnapshotEntry>,
     recent_files: Vec<WorkspaceSnapshotEntry>,
     omitted_recent_files: usize,
+}
+
+pub(crate) fn workspace_snapshot_for_session(session: &SessionManagement) -> String {
+    let scoped_jspace = session.jspace_contract.as_ref().is_some_and(|contract| {
+        contract
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            == Some("jspace_contract_v2")
+            && contract
+                .get("allowed_operations")
+                .and_then(serde_json::Value::as_array)
+                .is_some()
+            && contract
+                .get("read_scopes")
+                .and_then(serde_json::Value::as_array)
+                .is_some()
+    });
+    if scoped_jspace {
+        return "<WORKSPACE_SNAPSHOT>\nInventory omitted; inspect only paths admitted by the active J-Space contract.\n</WORKSPACE_SNAPSHOT>".to_string();
+    }
+    WorkspaceSnapshot::from_cwd(&session.session_directory)
+        .map(|snapshot| snapshot.render())
+        .unwrap_or_else(|| "<WORKSPACE_SNAPSHOT>\n\n</WORKSPACE_SNAPSHOT>".to_string())
 }
 
 #[derive(Clone)]
@@ -307,9 +332,44 @@ fn format_entry_line(entry: &WorkspaceSnapshotEntry) -> String {
 mod tests {
     use std::fs;
 
+    use lifecycle::{SessionInput, SessionManagement};
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn jspace_session_omits_unadmitted_workspace_inventory() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("unadmitted.rs"), "secret").expect("write file");
+        let now = chrono::Utc::now();
+        let mut session = SessionManagement::new(
+            "scoped-workspace".to_string(),
+            "scoped workspace".to_string(),
+            temp.path().to_path_buf(),
+            false,
+            "coding".to_string(),
+            SessionInput {
+                user_input: "read admitted.txt".to_string(),
+                file_input: Vec::new(),
+                agent: None,
+                runtime_context: None,
+                planning_mode_override: None,
+            },
+            "read admitted.txt".to_string(),
+            now,
+        );
+        session.jspace_contract = Some(serde_json::json!({
+            "schema_version": "jspace_contract_v2",
+            "allowed_operations": ["command", "read"],
+            "read_scopes": ["admitted.txt"],
+        }));
+
+        let snapshot = workspace_snapshot_for_session(&session);
+        assert!(snapshot.contains("<WORKSPACE_SNAPSHOT>"));
+        assert!(snapshot.contains("active J-Space contract"));
+        assert!(!snapshot.contains("unadmitted.rs"));
+        assert!(snapshot.len() < 200);
+    }
 
     #[test]
     fn workspace_snapshot_includes_depth_limited_file_metadata() {

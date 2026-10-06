@@ -616,6 +616,7 @@ fn finish_native_runtime(
                 .unwrap_or_else(|error| json!({"terminal_encode_error": error.to_string()}));
             if let Err(error) = runtime.execute(RuntimeCommand::CaptureOutput {
                 output: terminal_value.clone(),
+                provider_observation: None,
             }) {
                 return native_worker_error(
                     session_id,
@@ -873,9 +874,44 @@ fn response_from_mano_result(
     result: ManoProcessResult,
     return_log: bool,
 ) -> Value {
+    response_from_mano_result_with_evidence(session_id, result, return_log, |session_id, next| {
+        crate::session_log_client::SessionLogClient::discover()
+            .map_err(|error| error.to_string())?
+            .execution_evidence_snapshot(session_id, next)
+    })
+}
+
+fn response_from_mano_result_with_evidence(
+    session_id: &str,
+    result: ManoProcessResult,
+    return_log: bool,
+    read_snapshot: impl FnOnce(&str, u64) -> Result<session_log_contract::ExecutionEvidenceSnapshot, String>,
+) -> Value {
     let final_text = final_assistant_text(&result.session.session_log).unwrap_or_default();
-    let message_count = result.session.session_log.len();
+    let Some(message_count) = result.session.session_log_retention.omitted_entries
+        .checked_add(result.session.session_log.len() as u64) else {
+        return json!({"ok":false, "session_id":session_id, "error":"execution evidence sequence overflow"});
+    };
     let turn_started_at_ms = result.session.session_started_at.timestamp_millis();
+    if result.session.session_id != session_id {
+        return json!({"ok":false, "session_id":session_id, "error":"runtime execution evidence session identity mismatch"});
+    }
+    let evidence = if return_log && result.session.session_log_retention.omitted_entries > 0 {
+        match read_snapshot(session_id, message_count).and_then(|snapshot| {
+            snapshot.validate()?;
+            if snapshot.session_id != session_id || snapshot.next_sequence != message_count {
+                return Err("runtime execution evidence session/sequence mismatch".to_string());
+            }
+            serde_json::to_string(&session_log_contract::ExecutionEvidenceReference::new(snapshot, turn_started_at_ms))
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(reference) => Some(reference),
+            Err(error) => return json!({"ok":false, "session_id":session_id,
+                "session_state":result.session.state, "message_count":message_count,
+                "turn_started_at_ms":turn_started_at_ms, "final_text":final_text,
+                "error":format!("execution evidence unavailable: {error}"), "provider_error":result.final_error}),
+        }
+    } else { None };
     if result.session.state == SessionState::Failed {
         let error = result
             .final_error
@@ -896,24 +932,42 @@ fn response_from_mano_result(
             "final_text": final_text,
             "error": error,
         });
-        if return_log {
+        if let Some(reference) = evidence {
+            response["session_log"] = json!([reference]);
+        } else if return_log {
             response["session_log"] = json!(result.session.session_log);
         }
         return response;
     }
     if final_text.trim().is_empty() {
-        let mut response = json!({
-            "ok": false,
-            "session_id": session_id,
-            "session_state": result.session.state,
-            "message_count": message_count,
-            "turn_started_at_ms": turn_started_at_ms,
-            "error": "runtime completed without a final assistant message",
-        });
-        if return_log {
-            response["session_log"] = json!(result.session.session_log);
+        // Evidence-only delivery must carry proof, not just an empty successful reply.
+        // A pinned history reference alone is not proof of a terminal marker/binding.
+        let delivery = if result.session.state == SessionState::Completed && return_log {
+            validated_retained_terminal_delivery(session_id, &result.session.session_log)
+        } else {
+            Ok(false)
+        };
+        let error = match delivery {
+            Ok(true) => None,
+            Ok(false) => Some("runtime completed without a final assistant message".to_string()),
+            Err(error) => Some(format!("execution evidence unavailable: {error}")),
+        };
+        if let Some(error) = error {
+            let mut response = json!({
+                "ok": false,
+                "session_id": session_id,
+                "session_state": result.session.state,
+                "message_count": message_count,
+                "turn_started_at_ms": turn_started_at_ms,
+                "error": error,
+            });
+            if let Some(reference) = evidence {
+                response["session_log"] = json!([reference]);
+            } else if return_log {
+                response["session_log"] = json!(result.session.session_log);
+            }
+            return response;
         }
-        return response;
     }
     let mut response = json!({
         "ok": true,
@@ -923,10 +977,30 @@ fn response_from_mano_result(
         "turn_started_at_ms": turn_started_at_ms,
         "final_text": final_text,
     });
-    if return_log {
+    if let Some(reference) = evidence {
+        // Preserve the existing string-record transport, but carry a typed,
+        // bounded output reference, not a misleading retained prompt tail.
+        response["session_log"] = json!([reference]);
+    } else if return_log {
         response["session_log"] = json!(result.session.session_log);
     }
     response
+}
+
+fn validated_retained_terminal_delivery(
+    session_id: &str,
+    session_log: &[SessionLogEntry],
+) -> Result<bool, String> {
+    let mut projection = runtime_contract::TerminalEvidenceProjection::default();
+    for entry in session_log {
+        // Use the existing string-record transport to preserve the exact raw JSON;
+        // serializing a parsed marker instead would hide duplicate fields.
+        let record = serde_json::to_value(entry).map_err(|error| error.to_string())?;
+        let raw = record.as_str().ok_or_else(|| "execution evidence record is not a string".to_string())?;
+        let value = serde_json::from_str(raw).map_err(|error| format!("malformed execution evidence record: {error}"))?;
+        projection.observe(&value, session_id, raw)?;
+    }
+    Ok(projection.finish()?.is_some())
 }
 
 fn final_assistant_text(session_log: &[SessionLogEntry]) -> Option<String> {
@@ -1193,6 +1267,45 @@ mod tests {
     }
 
     #[test]
+    fn blocked_marker_separates_completed_delivery_from_runtime_failure() {
+        for state in [SessionState::Completed, SessionState::Failed] {
+            let mut session = test_session("blocked-response");
+            session.transition(SessionState::Running, Utc::now()).unwrap();
+            session.push_log(json!({"role":"assistant", "content":"Previously published progress."}).to_string(), Utc::now());
+            let marker = json!({"type":"nokiy.terminal_evidence", "schema_version":"nokiy_terminal_evidence_v1",
+                "session_id":"blocked-response", "runtime_id":"blocked-runtime", "terminal_status":"blocked",
+                "delivery_mode":"evidence_only", "parent_acceptance_required":true, "final_summary_turn_executed":false});
+            let failure = json!({"type":"tool_result", "runtime_id":"past-runtime", "tool_name":"command_run", "success":false,
+                "output":{"results":[{"command_type":"shell_command", "success":false,
+                    "output":{"exit_code":7, "stderr":"specific command blocker"}}]}}).to_string();
+            session.push_log(failure.clone(), Utc::now());
+            for record in [json!({"type":"runtime_usage", "runtime_id":"blocked-runtime"}),
+                json!({"type":"tool_result", "runtime_id":"blocked-runtime", "tool_name":"command_run", "success":true,
+                    "output":{"results":[{"command_type":"task_status", "success":true,
+                        "output":{"task_status":{"status":"done"}}}]}}), marker.clone()] {
+                session.push_log(record.to_string(), Utc::now());
+            }
+            session.transition(state, Utc::now()).unwrap();
+            let failed = state == SessionState::Failed;
+            let reply = response_from_mano_result("blocked-response", ManoProcessResult {
+                session, agents:Vec::new(), final_error:failed.then(|| "original runtime failure".to_string()),
+            }, true);
+            assert_eq!(reply["ok"], !failed, "ok describes runtime delivery, not task acceptance");
+            assert_eq!(reply["session_state"], if failed { "failed" } else { "completed" });
+            if failed { assert_eq!(reply["error"], "original runtime failure"); }
+            else { assert!(reply.get("error").is_none()); }
+            let mut projection = runtime_contract::TerminalEvidenceProjection::default();
+            let log = reply["session_log"].as_array().unwrap();
+            assert!(log.iter().any(|raw| raw.as_str() == Some(failure.as_str())));
+            for raw in log {
+                let raw = raw.as_str().unwrap();
+                projection.observe(&serde_json::from_str(raw).unwrap(), "blocked-response", raw).unwrap();
+            }
+            assert_eq!(projection.finish().unwrap(), Some(marker));
+        }
+    }
+
+    #[test]
     fn response_from_mano_result_includes_session_log_only_when_requested() {
         let mut session = test_session("log-response-session");
         session
@@ -1228,6 +1341,294 @@ mod tests {
         assert!(without_log.get("session_log").is_none());
         assert_eq!(with_log["session_log"].as_array().expect("log").len(), 1);
         assert!(with_log["turn_started_at_ms"].as_i64().is_some());
+    }
+
+    #[test]
+    fn compacted_worker_response_uses_pinned_history_for_completed_and_failed_sessions() {
+        for state in [SessionState::Completed, SessionState::Failed] {
+            let mut session = test_session("compacted-response");
+            session.transition(SessionState::Running, Utc::now()).expect("running");
+            session.push_log(json!({"role":"assistant","content":"terminal"}).to_string(), Utc::now());
+            session.session_log_retention.omitted_entries = 2000;
+            session.transition(state, Utc::now()).expect("terminal");
+            let reply = super::response_from_mano_result_with_evidence("compacted-response",
+                ManoProcessResult { session, agents:Vec::new(), final_error:Some("provider fixture failure".to_string()) },
+                true, |session_id, next| {
+                    assert_eq!(next, 2001);
+                    Ok(session_log_contract::ExecutionEvidenceSnapshot { session_id:session_id.to_string(),
+                        next_sequence:next, next_management_sequence:3, retained_from_sequence:1999 })
+                });
+            assert_eq!(reply["message_count"], 2001);
+            assert_eq!(reply["ok"], state != SessionState::Failed);
+            let records = reply["session_log"].as_array().expect("output reference");
+            assert_eq!(records.len(), 1);
+            let reference: session_log_contract::ExecutionEvidenceReference = serde_json::from_str(records[0].as_str().expect("string record")).expect("typed reference");
+            assert_eq!(reference.snapshot.next_sequence, 2001);
+            assert_eq!(reference.snapshot.session_id, "compacted-response");
+            if state == SessionState::Failed { assert_eq!(reply["error"], "provider fixture failure"); }
+        }
+    }
+
+    #[test]
+    fn compacted_worker_response_never_substitutes_a_tail_for_missing_or_wrong_evidence() {
+        for case in 0..3 {
+            let mut session = test_session("missing-history");
+            session.push_log(json!({"role":"assistant","content":"retained tail"}).to_string(), Utc::now());
+            session.session_log_retention.omitted_entries = 50;
+            let reply = super::response_from_mano_result_with_evidence("missing-history",
+                ManoProcessResult { session, agents:Vec::new(), final_error:None }, true, |_, next| {
+                    if case == 0 { return Err("history is absent".to_string()); }
+                    Ok(session_log_contract::ExecutionEvidenceSnapshot {
+                        session_id:if case == 1 { "other" } else { "missing-history" }.to_string(),
+                        next_sequence:if case == 2 { next - 1 } else { next },
+                        next_management_sequence:3, retained_from_sequence:50,
+                    })
+                });
+            assert_eq!(reply["ok"], false);
+            assert!(reply.get("session_log").is_none());
+            assert!(reply["error"].as_str().expect("error").contains("execution evidence"));
+        }
+        let mut session = test_session("compacted-empty-terminal");
+        session.session_log_retention.omitted_entries = 50;
+        let reply = super::response_from_mano_result_with_evidence("compacted-empty-terminal",
+            ManoProcessResult { session, agents:Vec::new(), final_error:None }, true, |session_id, next| {
+                Ok(session_log_contract::ExecutionEvidenceSnapshot { session_id:session_id.to_string(),
+                    next_sequence:next, next_management_sequence:3, retained_from_sequence:50 })
+            });
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "runtime completed without a final assistant message");
+        assert_eq!(reply["session_log"].as_array().expect("reference").len(), 1);
+    }
+
+    #[test]
+    fn completed_evidence_only_response_delivers_done_and_blocked_without_prose() {
+        for status in ["done", "blocked"] {
+            let records: Vec<String> = terminal_delivery_records("terminal-response", status)
+                .iter().map(Value::to_string).collect();
+            for return_log in [true, false] {
+                let result = evidence_only_result("terminal-response", records.iter().cloned(), SessionState::Completed);
+                let reply = response_from_mano_result_with_evidence("terminal-response", result, return_log,
+                    |_, _| panic!("uncompacted response must not read history"));
+                assert_eq!(reply["ok"], return_log, "delivery requires returning evidence, not parent acceptance");
+                if return_log {
+                    assert_eq!(reply["session_state"], "completed");
+                    assert_eq!(reply["final_text"], "");
+                    assert_eq!(reply["session_log"], json!(records));
+                    assert!(reply.get("error").is_none());
+                } else {
+                    assert_eq!(reply["error"], "runtime completed without a final assistant message");
+                    assert!(reply.get("session_log").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_evidence_only_response_preserves_provider_error_before_marker_validation() {
+        for malformed in [false, true] {
+            for omitted in [0, 50] {
+                for provider_error in [Some("original provider failure"), Some(" \t "), None] {
+                    let mut records: Vec<String> = terminal_delivery_records("failed-terminal", "done")
+                        .iter().map(Value::to_string).collect();
+                    if malformed { records.push("{".to_string()); }
+                    let mut result = evidence_only_result("failed-terminal", records, SessionState::Failed);
+                    result.session.session_log_retention.omitted_entries = omitted;
+                    result.final_error = provider_error.map(str::to_string);
+                    let reply = response_from_mano_result_with_evidence("failed-terminal", result, true,
+                        |session_id, next| {
+                            assert_eq!(omitted, 50);
+                            Ok(session_log_contract::ExecutionEvidenceSnapshot {
+                                session_id:session_id.to_string(), next_sequence:next,
+                                next_management_sequence:3, retained_from_sequence:50,
+                            })
+                        });
+                    assert_eq!(reply["ok"], false);
+                    assert_eq!(reply["session_state"], "failed");
+                    assert_eq!(reply["final_text"], "");
+                    assert_eq!(reply["error"], if provider_error == Some("original provider failure") {
+                        "original provider failure"
+                    } else { "runtime session failed without a final provider error" });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_only_response_rejects_nonterminal_sessions_even_with_bound_marker() {
+        for state in [test_session("nonterminal-response").state, SessionState::Running] {
+            let records = terminal_delivery_records("nonterminal-response", "done");
+            let result = evidence_only_result("nonterminal-response", records.iter().map(Value::to_string), state);
+            let reply = response_from_mano_result_with_evidence("nonterminal-response", result, true,
+                |_, _| panic!("uncompacted response must not read history"));
+            assert_eq!(reply["ok"], false);
+            assert_eq!(reply["error"], "runtime completed without a final assistant message");
+        }
+    }
+
+    #[test]
+    fn evidence_only_response_rejects_foreign_or_malformed_marker_fields() {
+        for (field, value) in [
+            ("type", json!("other")),
+            ("schema_version", json!("other")),
+            ("session_id", json!("other-session")),
+            ("runtime_id", json!("other-runtime")),
+            ("runtime_id", json!("")),
+            ("runtime_id", json!(" terminal-runtime ")),
+            ("terminal_status", json!("failed")),
+            ("terminal_status", Value::Null),
+            ("delivery_mode", json!("prose")),
+            ("parent_acceptance_required", json!(false)),
+            ("parent_acceptance_required", json!("true")),
+            ("final_summary_turn_executed", json!(true)),
+        ] {
+            let mut records = terminal_delivery_records("invalid-terminal", "done");
+            records[2][field] = value;
+            let result = evidence_only_result("invalid-terminal", records.iter().map(Value::to_string), SessionState::Completed);
+            let reply = response_from_mano_result_with_evidence("invalid-terminal", result, true,
+                |_, _| panic!("uncompacted response must not read history"));
+            assert_eq!(reply["ok"], false, "invalid marker field: {field}");
+            assert!(reply["error"].as_str().unwrap().contains("execution evidence"));
+        }
+    }
+
+    #[test]
+    fn evidence_only_response_rejects_missing_duplicate_unbound_or_continued_records() {
+        for case in ["empty", "missing marker", "missing usage", "missing done", "missing field",
+            "duplicate marker", "duplicate field", "malformed JSON", "failed command", "failed terminal result",
+            "unfinished command", "revoked done", "superseded runtime", "assistant continuation",
+            "tool continuation", "usage continuation", "provider continuation", "stream continuation"] {
+            let mut records = terminal_delivery_records("invalid-terminal", "done");
+            match case {
+                "empty" => records.clear(),
+                "missing marker" => { records.pop(); }
+                "missing usage" => { records.remove(0); }
+                "missing done" => { records.remove(1); }
+                "missing field" => { records[2].as_object_mut().unwrap().remove("terminal_status"); }
+                "duplicate marker" => records.push(records[2].clone()),
+                "failed command" => records[1]["success"] = json!(false),
+                "failed terminal result" => records[1]["output"]["results"][0]["success"] = json!(false),
+                "unfinished command" => records[1]["output"]["results"][0]["output"]["task_status"]["status"] = json!("doing"),
+                "revoked done" => {
+                    let mut failed = records[1].clone();
+                    failed["success"] = json!(false);
+                    records.insert(2, failed);
+                }
+                "superseded runtime" => records.insert(2, json!({"type":"runtime_provider_observation", "runtime_id":"other-runtime"})),
+                "assistant continuation" => records.push(json!({"role":"assistant", "content":""})),
+                "tool continuation" => records.push(json!({"type":"tool_result"})),
+                "usage continuation" => records.push(json!({"type":"runtime_usage", "runtime_id":"terminal-runtime"})),
+                "provider continuation" => records.push(json!({"type":"runtime_provider_observation", "runtime_id":"terminal-runtime"})),
+                "stream continuation" => records.push(json!({"type":"streamed_command_event"})),
+                "duplicate field" | "malformed JSON" => {}
+                _ => unreachable!(),
+            }
+            let mut raw: Vec<String> = records.iter().map(Value::to_string).collect();
+            if case == "duplicate field" {
+                raw[2] = format!("{{\"session_id\":\"invalid-terminal\",{}", &raw[2][1..]);
+            } else if case == "malformed JSON" {
+                raw[2] = "{".to_string();
+            }
+            let result = evidence_only_result("invalid-terminal", raw, SessionState::Completed);
+            let reply = response_from_mano_result_with_evidence("invalid-terminal", result, true,
+                |_, _| panic!("uncompacted response must not read history"));
+            assert_eq!(reply["ok"], false, "invalid terminal records: {case}");
+            assert!(reply["error"].as_str().is_some_and(|error| !error.is_empty()));
+        }
+    }
+
+    #[test]
+    fn compacted_evidence_only_response_requires_retained_binding_and_returns_pinned_history() {
+        for status in ["done", "blocked"] {
+            for retained in [vec![0, 1, 2], vec![1, 2], vec![0, 2], vec![0, 1], vec![2], Vec::new()] {
+                let records = terminal_delivery_records("compacted-terminal", status);
+                let mut result = evidence_only_result("compacted-terminal",
+                    retained.iter().map(|&index| records[index].to_string()), SessionState::Completed);
+                result.session.session_log_retention.omitted_entries = 50;
+                let expected_next = 50 + retained.len() as u64;
+                let reply = response_from_mano_result_with_evidence("compacted-terminal", result, true,
+                    |session_id, next| {
+                        assert_eq!(session_id, "compacted-terminal");
+                        assert_eq!(next, expected_next);
+                        Ok(session_log_contract::ExecutionEvidenceSnapshot {
+                            session_id:session_id.to_string(), next_sequence:next,
+                            next_management_sequence:3, retained_from_sequence:50,
+                        })
+                    });
+                assert_eq!(reply["ok"], retained.len() == 3, "omitted history cannot supply missing retained proof");
+                assert_eq!(reply["message_count"], expected_next);
+                if retained.len() == 3 {
+                    assert_eq!(reply["final_text"], "");
+                    assert!(reply.get("error").is_none());
+                }
+                let log = reply["session_log"].as_array().unwrap();
+                assert_eq!(log.len(), 1);
+                let reference: session_log_contract::ExecutionEvidenceReference =
+                    serde_json::from_str(log[0].as_str().unwrap()).unwrap();
+                assert_eq!(reference.snapshot.session_id, "compacted-terminal");
+                assert_eq!(reference.snapshot.next_sequence, expected_next);
+                assert_eq!(reference.snapshot.retained_from_sequence, 50);
+            }
+        }
+    }
+
+    #[test]
+    fn compacted_evidence_only_response_rejects_missing_foreign_or_invalid_snapshot() {
+        for case in 0..4 {
+            let records = terminal_delivery_records("compacted-terminal", "done");
+            let mut result = evidence_only_result("compacted-terminal", records.iter().map(Value::to_string), SessionState::Completed);
+            result.session.session_log_retention.omitted_entries = 50;
+            let reply = response_from_mano_result_with_evidence("compacted-terminal", result, true,
+                |_, next| {
+                    if case == 0 { return Err("history is absent".to_string()); }
+                    Ok(session_log_contract::ExecutionEvidenceSnapshot {
+                        session_id:if case == 1 { "other-session" } else { "compacted-terminal" }.to_string(),
+                        next_sequence:if case == 2 { next - 1 } else { next },
+                        next_management_sequence:3, retained_from_sequence:if case == 3 { next + 1 } else { 50 },
+                    })
+                });
+            assert_eq!(reply["ok"], false);
+            assert!(reply.get("session_log").is_none());
+            assert!(reply["error"].as_str().unwrap().contains("execution evidence"));
+        }
+    }
+
+    #[test]
+    fn assistant_reply_keeps_existing_semantics_without_terminal_validation() {
+        for return_log in [true, false] {
+            let result = evidence_only_result("assistant-response",
+                ["{".to_string(), json!({"role":"assistant", "content":" visible "}).to_string()], SessionState::Completed);
+            let reply = response_from_mano_result_with_evidence("assistant-response", result, return_log,
+                |_, _| panic!("uncompacted response must not read history"));
+            assert_eq!(reply["ok"], true);
+            assert_eq!(reply["final_text"], "visible");
+            assert_eq!(reply.get("session_log").is_some(), return_log);
+        }
+    }
+
+    fn terminal_delivery_records(session_id: &str, status: &str) -> Vec<Value> {
+        vec![
+            json!({"type":"runtime_usage", "runtime_id":"terminal-runtime"}),
+            json!({"type":"tool_result", "runtime_id":"terminal-runtime", "tool_name":"command_run", "success":true,
+                "output":{"results":[{"command_type":"task_status", "success":true,
+                    "output":{"task_status":{"status":"done"}}}]}}),
+            json!({"type":"nokiy.terminal_evidence", "schema_version":"nokiy_terminal_evidence_v1",
+                "session_id":session_id, "runtime_id":"terminal-runtime", "terminal_status":status,
+                "delivery_mode":"evidence_only", "parent_acceptance_required":true, "final_summary_turn_executed":false}),
+        ]
+    }
+
+    fn evidence_only_result(
+        session_id: &str,
+        records: impl IntoIterator<Item = String>,
+        state: SessionState,
+    ) -> ManoProcessResult {
+        let mut session = test_session(session_id);
+        if state != session.state {
+            session.transition(SessionState::Running, Utc::now()).unwrap();
+        }
+        for record in records { session.push_log(record, Utc::now()); }
+        if state != session.state { session.transition(state, Utc::now()).unwrap(); }
+        ManoProcessResult { session, agents:Vec::new(), final_error:None }
     }
 
     fn test_session(session_id: &str) -> SessionManagement {

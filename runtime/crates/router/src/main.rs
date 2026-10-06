@@ -7,6 +7,7 @@ mod daemon;
 mod front_lifecycle;
 mod ipc_handlers;
 mod native_once;
+mod parent_verifier;
 mod process_info;
 mod runtime_dispatch;
 mod runtime_utils;
@@ -20,6 +21,7 @@ pub(crate) use runtime_dispatch::dispatch_run_agent_with_runtime_slot;
 
 fn main() -> anyhow::Result<()> {
     tura_path::process_hardening::harden_current_process("router");
+    parent_verifier::initialize()?;
     let command = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "serve".to_string());

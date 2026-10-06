@@ -2,7 +2,48 @@
 
 use chrono::{DateTime, Utc};
 
-use lifecycle::UsageReport;
+use lifecycle::{ProviderObservation, UsageReport};
+
+/// Only the top-level final Responses object is evidence; never search embedded events.
+pub(crate) fn provider_observation(raw: &serde_json::Value) -> ProviderObservation {
+    fn field(raw: &serde_json::Value, key: &str) -> Option<String> {
+        raw.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| {
+                !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+            })
+            .map(str::to_owned)
+    }
+    ProviderObservation {
+        schema_version: "provider_observation_v1".to_string(),
+        source: "provider_response".to_string(),
+        response_id: field(raw, "id"),
+        model: field(raw, "model"),
+        service_tier: field(raw, "service_tier"),
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::provider_observation;
+    use serde_json::json;
+
+    #[test]
+    fn final_response_only_and_missing_fields_are_unknown() {
+        let raw = json!({"id":"resp-final", "model":"gpt-6", "service_tier":"default",
+            "events":[{"response":{"id":"resp-old", "service_tier":"priority"}}]});
+        let observed = provider_observation(&raw);
+        assert_eq!(observed.response_id.as_deref(), Some("resp-final"));
+        assert_eq!(observed.service_tier.as_deref(), Some("default"));
+        assert_eq!(observed.model.as_deref(), Some("gpt-6"));
+        let invalid = provider_observation(&json!({"id":" ", "model":42,
+            "service_tier":"x".repeat(257), "events":[{"response":{"service_tier":"priority"}}]}));
+        assert_eq!(invalid.response_id, None);
+        assert_eq!(invalid.model, None);
+        assert_eq!(invalid.service_tier, None);
+    }
+}
 
 pub(crate) fn usage_report_from_metrics(
     metrics: Option<tura_llm_rust::CallMetrics>,

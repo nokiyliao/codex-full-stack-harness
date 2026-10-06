@@ -934,6 +934,8 @@ impl ExecutionService {
                 request.session_id, status, body
             );
         }
+        // This point is reached only after durable terminal receipt, command
+        // idle, and terminal slot reclamation. Delivery never settles effects.
         require_successful_runtime_dispatch(status, &body)?;
         if let Some(record) = continuation.as_ref() {
             let store = lifecycle_store(&record.commander_session_id)?;
@@ -5897,6 +5899,27 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn runtime_dispatch_failure_is_not_rescued_by_a_blocked_marker() {
+        let marker = json!({"type":"nokiy.terminal_evidence", "schema_version":"nokiy_terminal_evidence_v1",
+            "session_id":"blocked-session", "runtime_id":"blocked-runtime", "terminal_status":"blocked",
+            "delivery_mode":"evidence_only", "parent_acceptance_required":true, "final_summary_turn_executed":false});
+        let records = [json!({"type":"runtime_usage", "runtime_id":"blocked-runtime"}).to_string(),
+            json!({"type":"tool_result", "runtime_id":"blocked-runtime", "tool_name":"command_run", "success":true,
+                "output":{"results":[{"command_type":"task_status", "success":true,
+                    "output":{"task_status":{"status":"done"}}}]}}).to_string(), marker.to_string()];
+        let body = json!({"ok":false, "session_id":"blocked-session", "result":{"ok":false,
+            "session_id":"blocked-session", "session_state":"failed", "error":"original failure",
+            "message_count":records.len(), "session_log":records}});
+        for status in [500, 502, 503] {
+            assert_eq!(require_successful_runtime_dispatch(status, &body).unwrap_err().to_string(),
+                "original failure");
+        }
+        require_successful_runtime_dispatch(200, &json!({"ok":true})).unwrap();
+        assert_eq!(body["result"]["session_state"], "failed");
+        assert_eq!(body["result"]["error"], "original failure");
+    }
+
     fn ready_set_contract() -> TaskSchedulingContractV1 {
         let mut contract = TaskSchedulingContractV1 {
             schema_version: lifecycle::TASK_SCHEDULING_CONTRACT_SCHEMA_VERSION.to_string(),
@@ -6326,7 +6349,7 @@ mod tests {
                 json!({
                     "session_id": "nested-session",
                     "runtime_id": "runtime-nested-session",
-                    "session_directory": workspace.path().display().to_string(),
+                    "session_directory": workspace.path().canonicalize().expect("canonical workspace").display().to_string(),
                     "arguments": {
                         "commands": [{
                             "command": "task_status",
@@ -7074,7 +7097,7 @@ mod tests {
         let request = json!({
             "session_id": "command-session",
             "runtime_id": "runtime-command-session",
-            "session_directory": workspace.path().display().to_string(),
+            "session_directory": workspace.path().canonicalize().expect("canonical workspace").display().to_string(),
             "arguments": {
                 "commands": [{
                     "command": "shell_command",

@@ -1,5 +1,25 @@
 use super::helpers::*;
 
+#[cfg(unix)]
+#[test]
+fn temp_workspace_returns_physical_path_with_symlinked_temp_ancestor() {
+    let fixture = temp_workspace("symlinked-temp-ancestor");
+    let physical_temp = fixture.join("physical-temp");
+    let linked_temp = fixture.join("linked-temp");
+    fs::create_dir(&physical_temp).expect("create physical temp root");
+    std::os::unix::fs::symlink(&physical_temp, &linked_temp).expect("symlink temp root");
+
+    let workspace = temp_workspace_in(&linked_temp, "physical-path");
+
+    assert_eq!(
+        workspace,
+        fs::canonicalize(&workspace).expect("resolve workspace physical path"),
+        "fixture must return a physical path despite a symlinked temp ancestor"
+    );
+    assert_eq!(workspace.parent(), Some(physical_temp.as_path()));
+    fs::remove_dir_all(&fixture).expect("remove symlinked temp fixture");
+}
+
 #[test]
 fn pass_shell_command_output_matches_current_structured_code_mode() {
     let _guard = env_lock_blocking();
@@ -22,7 +42,10 @@ fn pass_shell_command_output_matches_current_structured_code_mode() {
     );
 
     let shell_output = &output["results"][0]["output"];
-    assert_eq!(shell_output["exit_code"], 0);
+    assert_eq!(
+        shell_output["exit_code"], 0,
+        "complete command_run output: {output:#}"
+    );
     assert!(
         shell_output["stdout"]
             .as_str()

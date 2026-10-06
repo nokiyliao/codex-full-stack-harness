@@ -1,0 +1,21 @@
+{
+  "schema_version": "nokiy_model_topology_v1",
+  "default_worker_family": "sol",
+  "worker_families": {
+    "luna": {"model": "gpt-6-luna", "reasoning_effort": "max"},
+    "sol": {"model": "gpt-6.1-sol", "reasoning_effort": "max"},
+    "astra": {"model": "gpt-6-astra", "reasoning_effort": "max"}
+  },
+  "modes": {
+    "nokiy": {"display_name": "Nokiy", "commander": null, "root_executor": "nokiy"},
+    "nokiy-direct": {
+      "display_name": "Nokiy Ultra",
+      "commander": {"model": "gpt-6-astra", "reasoning_effort": "ultra"},
+      "root_executor": "native_codex"
+    }
+  },
+  "worker_execution_profile": "direct",
+  "worker_delegation_allowed": false,
+  "selection_is_authorization": false,
+  "provider_observation_required_for_attestation": true
+}

@@ -1,3 +1,5 @@
+> Superseded for the current tree by [Nokiy v157](nokiy-v157.md). This page records the 2026-09-22 v9 publication boundary.
+
 # Nokiy v9 publication boundary
 
 One aggregate version identifies a composition, not a single executable.

@@ -3,13 +3,11 @@ pub const TASK_STATUS: &str = "Reminder: task_status only updates internal task 
 
 pub const STARTUP_TASK_STATE_GATE: &str = "The current session state has no task_type. Before any apply_patch command or write-producing shell command, define task_type based on the current context and the user's request, and include task_group in the same update. You may do non-writing work such as searches, file reads, or tests in the same command_run batch as that task_status update.";
 
-pub fn task_status_prompt(require_startup_task_state: bool) -> String {
+const CONDITIONAL_TASK_STATE_GUIDANCE: &str = "If task_type is unset, initialize task_type and task_group in the same task_status update before any apply_patch or write-producing shell command. Non-writing reads, searches, and tests may share a command_run batch with that update.";
+
+pub fn task_status_prompt(_require_startup_task_state: bool) -> String {
     let catalog = super::runtime_prompt_manual::task_type_catalog_for_prompt();
-    let task_status = if require_startup_task_state {
-        format!("{STARTUP_TASK_STATE_GATE} {TASK_STATUS}")
-    } else {
-        TASK_STATUS.to_string()
-    };
+    let task_status = format!("{CONDITIONAL_TASK_STATE_GUIDANCE} {TASK_STATUS}");
     if catalog.trim().is_empty() {
         return task_status;
     }
@@ -19,7 +17,7 @@ pub fn task_status_prompt(require_startup_task_state: bool) -> String {
     )
 }
 
-pub fn task_status_schema(require_startup_task_state: bool) -> String {
+pub fn task_status_schema(_require_startup_task_state: bool) -> String {
     let Ok(mut schema) =
         serde_json::from_str::<serde_json::Value>(code_tools::commands::task_status::SCHEMA)
     else {
@@ -34,13 +32,8 @@ pub fn task_status_schema(require_startup_task_state: bool) -> String {
     }
     let catalog = super::runtime_prompt_manual::task_type_catalog_for_schema_description();
     if let Some(task_type) = schema.pointer_mut("/properties/task_type") {
-        let startup = if require_startup_task_state {
-            format!(" {STARTUP_TASK_STATE_GATE}")
-        } else {
-            String::new()
-        };
         task_type["description"] = serde_json::Value::String(format!(
-            "Complete set of prompt and Operation Manual types needed by the current task.{startup} Update task_type as soon as the task type is identified, keep it paired with task_group, and include multiple ids when multiple manuals apply. Available task types: {catalog}",
+            "Complete set of prompt and Operation Manual types needed by the current task. {CONDITIONAL_TASK_STATE_GUIDANCE} Update task_type as soon as the task type is identified, keep it paired with task_group, and include multiple ids when multiple manuals apply. Available task types: {catalog}",
             catalog = catalog.trim()
         ));
     }

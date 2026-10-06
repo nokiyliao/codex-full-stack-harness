@@ -150,7 +150,7 @@ if 'model_provider' in config:
 wire_input=sys.stdin.read()
 delta=json.loads(wire_input.split('[CURRENT_TASK_DELTA_V1]\n',1)[1])
 mode=delta['instruction']
-expected=('gpt-6-astra','high','default')
+expected=('gpt-6-sol','max','default') if mode == 'DEFAULT_PROFILE' else ('gpt-6-astra','high','default')
 assert (sys.argv[sys.argv.index('-m')+1],json.loads(config['model_reasoning_effort']),json.loads(config['service_tier'])) == expected
 with pathlib.Path(__file__+'.runs').open('a') as log: log.write(os.environ['NOKIY_NATIVE_EXECUTION_ID']+'\n')
 pathlib.Path(__file__+'.home').write_text(os.environ['CODEX_HOME'])
@@ -251,8 +251,8 @@ emit({'type':'turn.completed','usage':{'input_tokens':120,'output_tokens':7,'cac
             value.pop(key)
         path.write_text(json.dumps(value))
         result = self.check_result(load_request(path))
-        self.assertEqual(result["model_route"], "native_codex/gpt-6-astra")
-        self.assertEqual(result["reasoning_effort"], "high")
+        self.assertEqual(result["model_route"], "native_codex/gpt-6-sol")
+        self.assertEqual(result["reasoning_effort"], "max")
         self.assertEqual(result["requested_service_tier"], "default")
         self.assertIsNone(result["observed_service_tier"])
         self.assertEqual(result["tool_loop"]["successful_count"], 1)

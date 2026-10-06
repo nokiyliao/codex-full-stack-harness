@@ -10,9 +10,9 @@ use lifecycle::SessionState;
 
 mod task_context_v1;
 pub use task_context_v1::{
+    PRESENTATION_VERSION as TASK_CONTEXT_PRESENTATION_VERSION,
     canonical_json as task_context_canonical_json_v1,
     semantic_sha256 as task_context_semantic_sha256_v1,
-    PRESENTATION_VERSION as TASK_CONTEXT_PRESENTATION_VERSION,
 };
 
 pub const WORKER_KIND_CALL: &str = "call";
@@ -31,6 +31,97 @@ pub const MAXIMUM_NATIVE_CODEX_TASK_DELTA_BYTES: usize = 256 * 1024;
 pub const SESSION_SERVICE_TIER_ENV: &str = "TURA_SESSION_SERVICE_TIER";
 pub const NATIVE_CODEX_TERMINAL_ENVELOPE_SCHEMA_VERSION: &str =
     "tura_native_codex_terminal_envelope_v2";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalEvidenceRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: String,
+    session_id: String,
+    runtime_id: String,
+    terminal_status: String,
+    delivery_mode: String,
+    parent_acceptance_required: bool,
+    final_summary_turn_executed: bool,
+}
+
+/// Validates persisted terminal delivery evidence, not successful task outcomes.
+#[derive(Default)]
+pub struct TerminalEvidenceProjection {
+    marker: Option<(TerminalEvidenceRecord, Value)>,
+    runtime_ids: BTreeSet<String>,
+    done_runtime_ids: BTreeSet<String>,
+    last_runtime_id: Option<String>,
+}
+
+impl TerminalEvidenceProjection {
+    pub fn observe(&mut self, value: &Value, session_id: &str, raw: &str) -> Result<(), String> {
+        let kind = value.get("type").and_then(Value::as_str);
+        if kind == Some("nokiy.terminal_evidence")
+            || value["schema_version"] == "nokiy_terminal_evidence_v1"
+        {
+            if self.marker.is_some() {
+                return Err("duplicate terminal evidence marker".to_string());
+            }
+            // Value parsing alone would hide duplicate JSON fields.
+            let record: TerminalEvidenceRecord = serde_json::from_str(raw)
+                .map_err(|error| format!("malformed terminal evidence: {error}"))?;
+            if record.kind != "nokiy.terminal_evidence"
+                || record.schema_version != "nokiy_terminal_evidence_v1"
+                || record.session_id != session_id
+                || record.runtime_id.trim().is_empty()
+                || record.runtime_id.trim() != record.runtime_id
+                || !matches!(record.terminal_status.as_str(), "done" | "blocked")
+                || record.delivery_mode != "evidence_only"
+                || !record.parent_acceptance_required
+                || record.final_summary_turn_executed
+            {
+                return Err("invalid or foreign terminal evidence marker".to_string());
+            }
+            self.marker = Some((record, value.clone()));
+            return Ok(());
+        }
+        if self.marker.is_some()
+            && (matches!(kind, Some("runtime_usage" | "runtime_provider_observation" | "tool_result" | "streamed_command_event"))
+                || value["role"] == "assistant")
+        {
+            return Err("execution continued after terminal evidence marker".to_string());
+        }
+        if let Some(runtime_id) = value.get("runtime_id").and_then(Value::as_str) {
+            if matches!(kind, Some("runtime_usage" | "runtime_provider_observation")) {
+                self.runtime_ids.insert(runtime_id.to_string());
+                self.last_runtime_id = Some(runtime_id.to_string());
+            }
+            if kind == Some("tool_result") && value["tool_name"] == "command_run" {
+                let terminal = value["output"]["results"].as_array().and_then(|results| results.last());
+                if value["success"] == true && terminal.is_some_and(|result| {
+                    result["command_type"] == "task_status" && result["success"] == true
+                        && result.pointer("/output/task_status/status").and_then(Value::as_str) == Some("done")
+                }) {
+                    self.done_runtime_ids.insert(runtime_id.to_string());
+                } else {
+                    self.done_runtime_ids.remove(runtime_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns only the exact validated marker; absence is never inferred proof.
+    pub fn finish(self) -> Result<Option<Value>, String> {
+        let Some((record, value)) = self.marker else {
+            return Ok(None);
+        };
+        if !self.runtime_ids.contains(&record.runtime_id)
+            || !self.done_runtime_ids.contains(&record.runtime_id)
+            || self.last_runtime_id.as_deref() != Some(record.runtime_id.as_str())
+        {
+            return Err("terminal evidence runtime is not bound to persisted done evidence".to_string());
+        }
+        Ok(Some(value))
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -340,7 +431,11 @@ impl CommanderConvergenceProof {
 #[serde(deny_unknown_fields)]
 pub struct TaskContextMission {
     pub mission_id: String,
-    #[serde(default, deserialize_with = "task_context_v1::non_null_optional_string", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "task_context_v1::non_null_optional_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub task_id: Option<String>,
     pub mode: String,
     pub current_predicate: String,
@@ -352,7 +447,11 @@ pub struct TaskContextMission {
 pub struct TaskContextEvidenceReference {
     pub id: String,
     pub kind: String,
-    #[serde(default, deserialize_with = "task_context_v1::non_null_optional_string", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "task_context_v1::non_null_optional_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sha256: Option<String>,
 }
 
@@ -935,8 +1034,33 @@ pub struct RuntimeWorkerResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelServiceTier, RunAgentRequest};
+    use super::{ModelServiceTier, RunAgentRequest, TerminalEvidenceProjection};
     use serde_json::json;
+
+    #[test]
+    fn terminal_evidence_contract_separates_blocked_delivery_from_unaccepted_task() {
+        let records = [
+            json!({"type":"runtime_usage", "runtime_id":"runtime-terminal"}),
+            json!({"type":"tool_result", "runtime_id":"runtime-terminal", "tool_name":"command_run", "success":true,
+                "output":{"results":[{"command_type":"task_status", "success":true,
+                    "output":{"task_status":{"status":"done"}}}]}}),
+        ];
+        for status in ["done", "blocked"] {
+            let marker = json!({"type":"nokiy.terminal_evidence", "schema_version":"nokiy_terminal_evidence_v1",
+                "session_id":"session-terminal", "runtime_id":"runtime-terminal", "terminal_status":status,
+                "delivery_mode":"evidence_only", "parent_acceptance_required":true, "final_summary_turn_executed":false});
+            let mut projection = TerminalEvidenceProjection::default();
+            for record in records.iter().chain(std::iter::once(&marker)) {
+                projection.observe(record, "session-terminal", &record.to_string()).unwrap();
+            }
+            assert_eq!(projection.finish().unwrap(), Some(marker));
+        }
+        let mut missing = TerminalEvidenceProjection::default();
+        for record in &records {
+            missing.observe(record, "session-terminal", &record.to_string()).unwrap();
+        }
+        assert_eq!(missing.finish().unwrap(), None, "done tools cannot replace the exact marker");
+    }
 
     #[test]
     fn run_agent_request_preserves_optional_retry_lineage_on_the_wire() {

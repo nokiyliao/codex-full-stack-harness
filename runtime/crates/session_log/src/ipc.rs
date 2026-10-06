@@ -206,6 +206,9 @@ pub(crate) fn execute_command_with_feed(
         SessionLogCommand::ReadContextSlice(payload) => SessionLogResponse::ContextSlice {
             context: store.read_context_slice(payload)?,
         },
+        SessionLogCommand::ReadExecutionEvidence(payload) => SessionLogResponse::ExecutionEvidence {
+            evidence: store.read_execution_evidence(payload)?,
+        },
         SessionLogCommand::ApplyCommandCheckpoint(payload) => {
             store.apply_command_checkpoint(*payload)?;
             SessionLogResponse::Ok

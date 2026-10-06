@@ -122,25 +122,60 @@ class EngineExit:
     failure: str | None
 
 
+# UTF-8 replacement/control characters cost at most six ASCII JSON bytes per
+# retained byte. Reserve room in both 262144-byte envelopes for framing/proof.
+_VERIFIER_DIAGNOSTIC_BYTES = 8192
+
+
+class _DiagnosticCapture:
+    """Bounded head/tail bytes; diagnostic overflow is not an execution failure."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.buffer = bytearray()
+        self.total = 0
+
+    def append(self, chunk: bytes) -> None:
+        self.total += len(chunk)
+        self.buffer.extend(chunk)
+        if len(self.buffer) > self.limit:
+            head = self.limit // 2
+            del self.buffer[head:len(self.buffer) - (self.limit - head)]
+
+    def __bytes__(self) -> bytes:
+        if self.total <= self.limit:
+            return bytes(self.buffer)
+        head = self.limit // 2
+        marker = f"\n[... {self.total - self.limit} diagnostic bytes truncated ...]\n".encode("ascii")
+        return bytes(self.buffer[:head]) + marker + bytes(self.buffer[head:])
+
+
 def supervise(
     argv: list[str], *, cwd: str, env: dict[str, str], input_bytes: bytes,
-    timeout: float, cancelled: threading.Event, max_stdout: int, max_stderr: int,
+    timeout: float | None, cancelled: threading.Event, max_stdout: int, max_stderr: int,
     parent_pid: int, terminate_grace: float = 10, cleanup_timeout: float = 5,
+    pass_fds: tuple[int, ...] = (), diagnostic_output: bool = False,
 ) -> EngineExit:
     """Run one engine within the already applied per-call Seatbelt instance."""
     processes = DarwinProcesses()
     processes.verify_isolation(parent_pid)
-    stdout, stderr = bytearray(), bytearray()
+    stdout, stderr = ((_DiagnosticCapture(max_stdout), _DiagnosticCapture(max_stderr))
+                      if diagnostic_output else (bytearray(), bytearray()))
     failure = cleanup_error = None
     killed: set[tuple[int, int, int, int]] = set()
     no_live_descendants = False
     process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=pass_fds)
+    for fd in pass_fds:
+        os.close(fd)
     terminating_at: float | None = None
-    deadline = time.monotonic() + timeout
+    deadline = None if timeout is None else time.monotonic() + timeout
 
-    def append(buffer: bytearray, chunk: bytes, limit: int) -> None:
+    def append(buffer: bytearray | _DiagnosticCapture, chunk: bytes, limit: int) -> None:
         nonlocal failure
+        if isinstance(buffer, _DiagnosticCapture):
+            buffer.append(chunk)
+            return
         if len(buffer) + len(chunk) > limit:
             failure = failure or "GRAPH_ENGINE_OUTPUT_LIMIT_EFFECT_UNSETTLED"
         buffer.extend(chunk[:max(0, limit - len(buffer))])
@@ -160,7 +195,8 @@ def supervise(
                 now = time.monotonic()
                 if os.getppid() != parent_pid:
                     failure = failure or "GRAPH_SUPERVISOR_CALLER_EXITED"
-                if terminating_at is None and (cancelled.is_set() or now >= deadline or failure):
+                if terminating_at is None and (cancelled.is_set()
+                        or (deadline is not None and now >= deadline) or failure):
                     failure = failure or ("GRAPH_CANCELLED" if cancelled.is_set()
                                           else "GRAPH_ENGINE_DEADLINE")
                     process.send_signal(signal.SIGTERM)
@@ -259,6 +295,8 @@ def _result(data: bytes) -> dict[str, Any] | None:
 
 
 def main() -> int:
+    if sys.argv[1:2] == ["--focused-verifier"]:
+        return focused_verifier_main()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", required=True)
     parser.add_argument("--state-dir", required=True)
@@ -319,6 +357,51 @@ def main() -> int:
     except Exception as exc:
         print(json.dumps({"failure": str(exc), "engine_result": None,
                           "process_scope": {"no_live_descendants": False}}))
+        return 2
+
+
+def focused_verifier_main() -> int:
+    """The same scope supervisor with a caller-bound argv, no graph state."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--focused-verifier", action="store_true", required=True)
+    parser.add_argument("--parent-pid", type=int, required=True)
+    parser.add_argument("--timeout", type=float, required=True)
+    args = parser.parse_args()
+    if not 0 < args.timeout <= 300:
+        parser.error("invalid verifier budget")
+    cancelled = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda _sig, _frame: cancelled.set())
+    try:
+        raw = sys.stdin.buffer.read(65537)
+        if len(raw) > 65536:
+            raise ValueError("VERIFIER_INPUT_LIMIT")
+        request = json.loads(raw, object_pairs_hook=_unique_object, parse_constant=_invalid_constant)
+        if not isinstance(request, dict) or set(request) != {"argv", "cwd"}:
+            raise ValueError("VERIFIER_INPUT_INVALID")
+        argv = request["argv"]
+        if (not isinstance(argv, list) or not 1 <= len(argv) <= 32
+                or any(not isinstance(arg, str) or not arg or len(arg) > 1024 for arg in argv)
+                or not os.path.isabs(argv[0]) or request["cwd"] != os.getcwd()):
+            raise ValueError("VERIFIER_ARGV_INVALID")
+        result = supervise(argv, cwd=request["cwd"], env=dict(os.environ), input_bytes=b"",
+                           timeout=args.timeout, cancelled=cancelled,
+                           max_stdout=_VERIFIER_DIAGNOSTIC_BYTES, max_stderr=_VERIFIER_DIAGNOSTIC_BYTES,
+                           parent_pid=args.parent_pid, terminate_grace=2, diagnostic_output=True)
+        clean = (result.scope.get("engine_reaped") is True
+                 and result.scope.get("no_live_descendants") is True
+                 and not result.scope.get("cleanup_error"))
+        print(json.dumps({"success":result.returncode == 0 and not result.failure and clean,
+                          "exit_code":result.returncode,
+                          "stdout":result.stdout.decode("utf-8", "replace"),
+                          "stderr":result.stderr.decode("utf-8", "replace"),
+                          "process_reaped":result.scope.get("engine_reaped") is True,
+                          "process_group_empty":clean,
+                          "outcome":"known" if clean and not result.failure else "unknown"},
+                         ensure_ascii=True, allow_nan=False))
+        return 0
+    except Exception as error:
+        print(json.dumps({"failure":str(error)}))
         return 2
 
 

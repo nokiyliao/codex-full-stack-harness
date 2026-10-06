@@ -1,16 +1,15 @@
 use runtime::native_codex_runner::{
-    NativeCodexContext, NativeCodexProviderProfile, NativeCodexRunRequest, NativeCodexRunner,
-    NativeCodexSandbox, NATIVE_ONCE_PROMPT_SHA256, TURA_EXECUTION_PROFILE_SHA256,
+    NATIVE_ONCE_PROMPT_SHA256, NativeCodexContext, NativeCodexProviderProfile,
+    NativeCodexRunRequest, NativeCodexRunner, NativeCodexSandbox, TURA_EXECUTION_PROFILE_SHA256,
 };
 use runtime_contract::{ModelServiceTier, NativeCodexTaskDelta, TaskContextCapsule};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
 fn sealed(mut value: Value) -> Value {
-    value["semantic_sha256"] = json!(
-        runtime_contract::task_context_semantic_sha256_v1(&value).unwrap()
-    );
+    value["semantic_sha256"] =
+        json!(runtime_contract::task_context_semantic_sha256_v1(&value).unwrap());
     value
 }
 
@@ -35,34 +34,45 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_token
         "authority":{"authority_effect":"none"},
         "evidence_refs":[], "focused_verifiers":[],
         "jspace_semantic_sha256":"a".repeat(64)
-    }))).unwrap();
+    })))
+    .unwrap();
     let delta = NativeCodexTaskDelta::from_value(sealed(json!({
         "schema_version":"tura_native_codex_task_delta_v1",
         "mission_id":"mission", "task_id":"task",
         "mission_revision_sha256":"c".repeat(64),
         "current_predicate":"fix", "instruction":"Read, patch, test; report evidence."
-    }))).unwrap();
+    })))
+    .unwrap();
     let profile = explicit_profile.then(|| NativeCodexProviderProfile {
-        model: "gpt-6-astra".into(), reasoning_effort: "high".into(),
-        service_tier: ModelServiceTier::Default, model_provider: None,
+        model: "gpt-6-astra".into(),
+        reasoning_effort: "high".into(),
+        service_tier: ModelServiceTier::Default,
+        model_provider: None,
     });
-    let profile_sha = profile.as_ref().map(|p| p.semantic_sha256().unwrap())
+    let profile_sha = profile
+        .as_ref()
+        .map(|p| p.semantic_sha256().unwrap())
         .unwrap_or_else(|| TURA_EXECUTION_PROFILE_SHA256.into());
     NativeCodexRunRequest {
         codex_executable: executable,
         codex_executable_sha256: format!("{:x}", Sha256::digest(script.as_bytes())),
         workspace: root.into(),
-        session_id: "session".into(), task_id: "task".into(),
-        execution_id: "execution".into(), lease_id: "lease".into(),
+        session_id: "session".into(),
+        task_id: "task".into(),
+        execution_id: "execution".into(),
+        lease_id: "lease".into(),
         context: NativeCodexContext {
-            provider_profile: profile, execution_profile_sha256: profile_sha,
+            provider_profile: profile,
+            execution_profile_sha256: profile_sha,
             execution_binding_sha256: "d".repeat(64),
             expected_task_context_capsule_sha256: capsule.semantic_sha256.clone(),
             expected_task_delta_sha256: delta.semantic_sha256.clone(),
             expected_jspace_semantic_sha256: capsule.jspace_semantic_sha256.clone(),
-            task_context_capsule: capsule, task_delta: delta,
+            task_context_capsule: capsule,
+            task_delta: delta,
         },
-        sandbox: NativeCodexSandbox::ReadOnly, timeout: Duration::from_secs(10),
+        sandbox: NativeCodexSandbox::ReadOnly,
+        timeout: Duration::from_secs(10),
         command_graph: None,
     }
 }
@@ -70,7 +80,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_token
 #[tokio::test]
 async fn explicit_profile_compiles_capability_consistent_prompt() {
     let root = tempfile::tempdir().unwrap();
-    NativeCodexRunner::run(request(true, root.path())).await.unwrap();
+    NativeCodexRunner::run(request(true, root.path()))
+        .await
+        .unwrap();
     let input = fs::read_to_string(root.path().join("fake-codex.prompt")).unwrap();
     assert!(input.contains(NATIVE_ONCE_PROMPT_SHA256));
     assert!(input.contains("The only execution tool is tura_command_graph"));
@@ -85,7 +97,9 @@ async fn explicit_profile_compiles_capability_consistent_prompt() {
 #[tokio::test]
 async fn frozen_legacy_prompt_is_not_rewritten() {
     let root = tempfile::tempdir().unwrap();
-    NativeCodexRunner::run(request(false, root.path())).await.unwrap();
+    NativeCodexRunner::run(request(false, root.path()))
+        .await
+        .unwrap();
     let input = fs::read_to_string(root.path().join("fake-codex.prompt")).unwrap();
     assert!(input.contains("include task_status `task_group`"));
     assert!(!input.contains(NATIVE_ONCE_PROMPT_SHA256));
@@ -96,6 +110,10 @@ async fn explicit_profile_rejects_old_prompt_identity() {
     let root = tempfile::tempdir().unwrap();
     let mut req = request(true, root.path());
     req.context.execution_profile_sha256 = TURA_EXECUTION_PROFILE_SHA256.into();
-    assert!(NativeCodexRunner::run(req).await.unwrap_err()
-        .contains("EXECUTION_PROFILE_IDENTITY_MISMATCH"));
+    assert!(
+        NativeCodexRunner::run(req)
+            .await
+            .unwrap_err()
+            .contains("EXECUTION_PROFILE_IDENTITY_MISMATCH")
+    );
 }

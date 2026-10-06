@@ -1,9 +1,11 @@
-# Nokiy v9 - Codex Full Stack Harness
+# Nokiy v157 - Codex Full Stack Harness
 
-This repository now publishes the source of the local **Nokiy execution pipeline**.
-The aggregate release `v9` combines caller v9 (`0.3.21.dev0`) with the previously
-verified v8 Rust runtime artifacts. No binary is renamed or rebuilt just to align
-version numbers. This is a **source snapshot**, not a portable binary release.
+This repository publishes the source of the local **Nokiy execution pipeline**.
+The current aggregate release is `v157` (`nokiy-20261007-v157`, 2026-10-07).
+It supersedes the 2026-09-22 `v9` snapshot. The caller source tree still records
+package version `0.3.21.dev0`; the installed wheel built from that tree is stamped
+`0.3.157.dev0`. No binary is renamed or rebuilt just to align version numbers.
+This is a **source snapshot**, not a portable binary release.
 
 ```text
 Parent Codex task -> Nokiy prepare -> DCF/local context + J-Space
@@ -35,7 +37,7 @@ cargo build --locked --release --bin tura_router --bin tura_runtime --bin tura_s
 Python 3.11+ and the Rust toolchain pinned in `runtime/rust-toolchain.toml` are
 required. Building is not live installation: execution also needs a machine-local
 frozen runtime image, native Codex identity and a scoped prepared request.
-See [v9 boundaries](docs/nokiy-v9.md). Do not copy credentials or reuse another
+See [v157 boundaries](docs/nokiy-v157.md). Do not copy credentials or reuse another
 machine's absolute installation paths. DCF remains an external integration.
 
 Source-to-binary reproducibility and clean-machine runtime installation have not

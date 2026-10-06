@@ -1,6 +1,6 @@
 use runtime::native_codex_runner::{
-    NativeCodexCommandGraph, NativeCodexContext, NativeCodexRunRequest, NativeCodexRunner,
-    NativeCodexSandbox, NativeCodexProviderProfile,
+    NativeCodexCommandGraph, NativeCodexContext, NativeCodexProviderProfile, NativeCodexRunRequest,
+    NativeCodexRunner, NativeCodexSandbox,
 };
 use runtime_contract::{NativeCodexTaskDelta, TaskContextCapsule};
 use serde::Deserialize;
@@ -52,8 +52,8 @@ struct WireRequest {
 impl WireRequest {
     fn into_runner_request(self) -> Result<NativeCodexRunRequest, String> {
         match self.schema_version.as_str() {
-            REQUEST_SCHEMA if self.provider_profile.is_some() => {},
-            LEGACY_REQUEST_SCHEMA if self.provider_profile.is_none() => {},
+            REQUEST_SCHEMA if self.provider_profile.is_some() => {}
+            LEGACY_REQUEST_SCHEMA if self.provider_profile.is_none() => {}
             _ => return Err("NATIVE_CODEX_WORKER_REQUEST_SCHEMA_PROFILE_MISMATCH".to_string()),
         }
         let sandbox = match self.sandbox.as_str() {

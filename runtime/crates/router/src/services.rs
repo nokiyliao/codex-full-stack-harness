@@ -1,5 +1,7 @@
 #[path = "services/command_run.rs"]
 pub mod command_run;
+#[path = "services/focused_verifier.rs"]
+mod focused_verifier;
 #[cfg(unix)]
 #[path = "services/direct_thread_writer.rs"]
 pub mod direct_thread_writer;

@@ -19,6 +19,7 @@ pub(super) fn load_agent_capabilities_with_commands(
         agent,
         allowed_commands,
         startup_task_state_required(session, allowed_commands),
+        session.jspace_contract.as_ref(),
     )
 }
 
@@ -33,6 +34,7 @@ fn load_agent_capabilities_for_task_state(
     agent: &AgentManagement,
     allowed_commands: &BTreeSet<String>,
     require_startup_task_state: bool,
+    jspace_contract: Option<&serde_json::Value>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let Some(command_run_directory) = command_run_capability_directory(agent)? else {
         return Ok(Vec::new());
@@ -49,11 +51,14 @@ fn load_agent_capabilities_for_task_state(
     let interface = serde_json::from_str::<serde_json::Value>(&content)
         .map_err(|e| format!("failed to parse tool interface: {e}"))?;
 
-    Ok(vec![tool_interface_to_provider_schema_with_commands(
-        interface,
-        Some(allowed_commands),
-        require_startup_task_state,
-    )])
+    Ok(vec![
+        tool_interface_to_provider_schema_with_commands_and_jspace(
+            interface,
+            Some(allowed_commands),
+            require_startup_task_state,
+            jspace_contract,
+        ),
+    ])
 }
 
 pub(crate) fn filter_tools_for_turn(
@@ -208,7 +213,7 @@ fn command_run_capability_directory_with_fallback(
 
 #[cfg(test)]
 pub(super) fn tool_interface_to_provider_schema(interface: serde_json::Value) -> serde_json::Value {
-    tool_interface_to_provider_schema_with_commands(interface, None, false)
+    tool_interface_to_provider_schema_with_commands_and_jspace(interface, None, false, None)
 }
 
 pub(crate) fn command_run_commands_for_agent(agent: &AgentManagement) -> BTreeSet<String> {
@@ -244,6 +249,111 @@ pub(crate) fn extend_command_run_commands_with_capabilities<I, S>(
     }
 }
 
+pub(crate) fn authorize_source_read_command(
+    commands: &mut BTreeSet<String>,
+    session: &SessionManagement,
+) {
+    commands.remove("source_read");
+    commands.remove("focused_verifier");
+    if let Some(contract) = session.jspace_contract.as_ref()
+        && let Ok(matcher) =
+            tura_path::jspace::JSpaceMatcher::from_value(&session.session_directory, contract)
+    {
+        if matcher.source_read_enabled() {
+            commands.insert("source_read".to_string());
+        }
+        if !matcher.verifier_commands().is_empty() {
+            commands.insert("focused_verifier".to_string());
+        }
+    }
+}
+
+pub(crate) fn provider_command_run_commands_for_jspace(
+    execution_commands: &BTreeSet<String>,
+    jspace_contract: Option<&serde_json::Value>,
+) -> BTreeSet<String> {
+    let Some(contract) = jspace_contract else {
+        return execution_commands.clone();
+    };
+    let Some(allowed_values) = contract
+        .get("allowed_operations")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return execution_commands.clone();
+    };
+    if allowed_values.iter().any(|value| !value.is_string()) {
+        return execution_commands.clone();
+    }
+    let allowed = allowed_values
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let denied = match contract.get("denied_operations") {
+        None => BTreeSet::new(),
+        Some(value) => {
+            let Some(values) = value.as_array() else {
+                return execution_commands.clone();
+            };
+            if values.iter().any(|value| !value.is_string()) {
+                return execution_commands.clone();
+            }
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<BTreeSet<_>>()
+        }
+    };
+
+    let has_command_templates = contract
+        .get("command_templates")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|commands| !commands.is_empty());
+    let has_read_commands = contract
+        .get("read_commands")
+        .is_some_and(serde_json::Value::is_object);
+    let has_write_scopes = contract
+        .get("write_scopes")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|scopes| !scopes.is_empty());
+
+    let mut visible = execution_commands.clone();
+    let shell_is_admitted = allowed.contains("command")
+        && !denied.contains("command")
+        && (has_command_templates || has_read_commands);
+    if !shell_is_admitted {
+        visible.remove(active_shell_command_name());
+    }
+
+    let patch_is_admitted = has_write_scopes
+        && ["create", "modify"]
+            .into_iter()
+            .any(|operation| allowed.contains(operation) && !denied.contains(operation));
+    if !patch_is_admitted {
+        visible.remove("apply_patch");
+    }
+
+    if !allowed.contains("network") || denied.contains("network") {
+        visible.remove("web_discover");
+    }
+
+    if contract
+        .get("source_read")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        visible.remove("source_read");
+    }
+
+    if contract
+        .get("verifier_commands")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|commands| commands.is_empty())
+    {
+        visible.remove("focused_verifier");
+    }
+    visible
+}
+
 fn default_command_run_commands() -> BTreeSet<String> {
     [
         "apply_patch",
@@ -256,10 +366,25 @@ fn default_command_run_commands() -> BTreeSet<String> {
     .collect::<BTreeSet<_>>()
 }
 
+#[cfg(test)]
 fn tool_interface_to_provider_schema_with_commands(
     interface: serde_json::Value,
     allowed_commands: Option<&BTreeSet<String>>,
     require_startup_task_state: bool,
+) -> serde_json::Value {
+    tool_interface_to_provider_schema_with_commands_and_jspace(
+        interface,
+        allowed_commands,
+        require_startup_task_state,
+        None,
+    )
+}
+
+fn tool_interface_to_provider_schema_with_commands_and_jspace(
+    interface: serde_json::Value,
+    allowed_commands: Option<&BTreeSet<String>>,
+    require_startup_task_state: bool,
+    jspace_contract: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     let name = interface
         .get("name")
@@ -275,6 +400,7 @@ fn tool_interface_to_provider_schema_with_commands(
             &description,
             allowed_commands,
             require_startup_task_state,
+            jspace_contract,
         );
     }
     let mut input_schema = sanitize_provider_schema(
@@ -411,6 +537,7 @@ fn command_run_description_for_active_shell(
     original: &str,
     allowed_commands: Option<&BTreeSet<String>>,
     require_startup_task_state: bool,
+    jspace_contract: Option<&serde_json::Value>,
 ) -> String {
     let active = active_shell_command_name();
     let default_commands;
@@ -431,16 +558,95 @@ fn command_run_description_for_active_shell(
         .replace("Available commands: apply_patch, bash, shell_command.", "")
         .trim_end()
         .to_string();
+    let jspace_shell_guidance = jspace_provider_shell_guidance(jspace_contract);
     let command_lines = command_list_for_description(allowed_commands, active)
         .into_iter()
-        .filter_map(|command| command_run_command_format_line(&command, require_startup_task_state))
+        .filter_map(|command| {
+            if command == active
+                && let Some(guidance) = jspace_shell_guidance.as_deref()
+            {
+                return Some(format!(
+                    "- {active}: Follow the J-Space shell boundary exactly. {guidance} Submit the admitted command as `command_line`; do not probe substitute utilities."
+                ));
+            }
+            command_run_command_format_line(&command, require_startup_task_state)
+        })
         .collect::<Vec<_>>();
+    let jspace_guidance = jspace_shell_guidance
+        .as_deref()
+        .map(|guidance| format!("\nJ-Space shell boundary:\n{guidance}"))
+        .unwrap_or_default();
     format!(
-        "{prefix} Available commands: {}.\nCommand run patterns:\n{}\nCommand line formats:\n{}",
+        "{prefix} Available commands: {}.{jspace_guidance}\nCommand run patterns:\n{}\nCommand line formats:\n{}",
         command_list_for_description(allowed_commands, active).join(", "),
         command_run_usage_patterns(allowed_commands),
         command_lines.join("\n"),
     )
+}
+
+fn jspace_provider_shell_guidance(contract: Option<&serde_json::Value>) -> Option<String> {
+    let contract = contract?;
+    let mut sections = Vec::new();
+
+    if let Some(value) = contract.get("command_templates") {
+        let templates = value.as_array()?;
+        let mut exact_argv = Vec::new();
+        for template in templates {
+            let argv = template.get("argv")?.as_array()?;
+            if argv.is_empty() || argv.iter().any(|item| !item.is_string()) {
+                return None;
+            }
+            exact_argv.push(serde_json::Value::Array(argv.clone()).to_string());
+        }
+        exact_argv.sort();
+        exact_argv.dedup();
+        if !exact_argv.is_empty() {
+            sections.push(format!(
+                "Exact admitted argv: {}. Use these exact argv; do not substitute unlisted shell utilities.",
+                exact_argv.join("; ")
+            ));
+        }
+    }
+
+    if let Some(value) = contract.get("read_commands") {
+        let read_commands = value.as_object()?;
+        let mut utilities = Vec::new();
+        let mut roots = Vec::new();
+        for (name, spec) in read_commands {
+            if name == "roots" {
+                let values = spec.as_array()?;
+                if values.iter().any(|item| !item.is_string()) {
+                    return None;
+                }
+                roots.extend(
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string),
+                );
+            } else {
+                if !spec.is_object() {
+                    return None;
+                }
+                utilities.push(name.clone());
+            }
+        }
+        utilities.sort();
+        utilities.dedup();
+        roots.sort();
+        roots.dedup();
+        if !utilities.is_empty() {
+            sections.push(format!(
+                "Admitted read utilities: {}.",
+                utilities.join(", ")
+            ));
+        }
+        if !roots.is_empty() {
+            sections.push(format!("Admitted read roots: {}.", roots.join(", ")));
+        }
+    }
+
+    (!sections.is_empty()).then(|| sections.join(" "))
 }
 
 pub(crate) fn command_run_command_format_line(
@@ -466,6 +672,13 @@ pub(crate) fn command_run_command_format_line(
             compact_prompt(&command_prompt(&command_id)),
             compact_schema(&command_schema(&command_id)),
         )),
+        "source_read" => Some(format!(
+            "- source_read: Read only an exact J-Space-granted workspace file. Use DCF locators first; for an unknown exact branch, search the relevant file using JSON `path`, `search_terms` (1..16 nonempty literal OR terms, <=2048 bytes total), optional `context_lines` (0..5), and optional `start_line` (default 1). For ranges provide `path`, `start_line`, `end_line` and optional `line_numbers`: true. For JSON projection instead provide named `path`, `json_pointer` (RFC 6901 string; empty selects the whole JSON), and no line/search options. Returns compact selected JSON with projection metadata and the source file SHA, not line coverage; invalid JSON, malformed/missing pointers and oversized selections fail without partial output. All modes accept `expected_sha256`; range/search resume using `next_line` as `start_line` with that hash. {} Read only needed ranges or JSON fields, batch independent file requests in the existing command_run, don't reread file starts; cite printed physical line labels only for line reads, stripping labels from verbatim quotes. No shell or workdir override.",
+            code_tools::commands::source_read::output_limits_description(),
+        )),
+        "focused_verifier" => Some(
+            "- focused_verifier: Run a preauthorized public test in a verifier-only step group. command_line must contain only JSON {\"verifier_index\":0}, selecting a zero-based grant. No argv, cwd/workdir or timeout overrides. Task-specific whole-array restrictions prevail. Only when the task permits a mixed response, fully-known J-Space-admitted apply_patch commands may run at earlier positive steps in the same command_run response, with focused_verifier in its own verifier-only strictly later positive step group after all patches it verifies. No same-step dependent verification, speculative edits, relaxed admission or automatic done. Reverify after relevant mutations or verifier failures, interpret required fresh evidence before completion, and avoid unconditional duplicate retests.".to_string(),
+        ),
         "task_status" => {
             let task_status_schema = task_status::task_status_schema(require_startup_task_state);
             Some(format!(
@@ -539,6 +752,8 @@ fn command_list_for_description(commands: &BTreeSet<String>, active_shell: &str)
         "generate_media",
         "read_media",
         "web_discover",
+        "source_read",
+        "focused_verifier",
         "task_status",
         "planning",
     ];
@@ -569,9 +784,7 @@ fn command_run_usage_patterns_for(
 ) -> String {
     let mut patterns = vec![
         "- Current call schema is mandatory: call `command_run` with a non-empty `commands` array only. Every command object must include `command_type`, `command_line`, and `step`. Historical replay may show `arguments: {}` as a bookkeeping placeholder; never copy that placeholder into a new call.",
-        "- Batch investigation: use early commands for the specific discovery, searches, and file reads needed to understand the failure surface.",
-        "- Keep related path listing, targeted search, and candidate file reads in the same command_run batch; independent commands with no output dependency must share one step.",
-        "- Do not run test/probe invocations before you have read the relevant code and determined the actual CLI command set.",
+        "- Batch related discovery, targeted searches, file reads, edits, and already-known validation in as few calls as practical. Read relevant code before probes. Independent commands with no output dependency share one step; dependent commands use later steps.",
     ];
     patterns.push(if output_bindings_enabled {
         "- Use steps as dependency groups, not command indexes. Commands in the same step must have no output dependency on each other and may run together; later steps may consume earlier-step JSON output through placeholders."
@@ -580,29 +793,35 @@ fn command_run_usage_patterns_for(
     });
     if output_bindings_enabled {
         patterns.push("- Cross-step output variable: wrap a generic binding path as `#@#${<command id or command_type>.<JSON path>}#@#$` inside a later step's input. Give repeated commands unique `id` values. Only previous-step outputs are visible; unresolved, same-step, and future-step references fail before dispatch.");
+        patterns.push("- Example output binding: if step 1 command id `create_file` returns `{\"filename\":\"draft.txt\"}`, a later step may use `#@#${create_file.filename}#@#$` in its input.");
     }
     patterns.extend([
-        "- Code repair loop: after discovery has produced enough facts, use one step for coordinated edits and later steps for already-known tests or focused validation.",
+        "- After discovery produces enough facts, edit coherently and run already-known focused validation in later steps. Inspect failures and change the next command; never retry an unchanged failed command.",
         "- Avoid embedding long generated source code or complex quoting directly in shell command lines; for complex logic, invoke a script/interpreter from the active shell rather than encoding the logic in shell syntax.",
-        "- Verification: run the relevant test or build command after edits in the same command_run only when the verification command is already known.",
-        "- Failure handling: inspect each failed item and change the next command based on that failure instead of retrying the same command.",
-        "- Example investigation batch: independent `rg --files`, targeted `rg -n`, and candidate file reads all use step 1.",
-        "- Example repair batch: step 1 `apply_patch` across related files, step 2 run the known build command and use `apply_patch` to write or modify the testing scripts, step 3 run multiple known test commands in the same step.",
-    ]);
-    if output_bindings_enabled {
-        patterns.push("- Example output binding (all command ids, command types, and group ids are illustrative, not built-ins): step 1 `{\"id\":\"create_file\",\"command_type\":\"create_file\",\"command_line\":\"{\\\"path\\\":\\\"draft.txt\\\"}\",\"step\":1}` returns `{\"filename\":\"draft.txt\"}`; step 2 `{\"id\":\"edit_file\",\"command_type\":\"edit_file\",\"command_line\":\"{\\\"path\\\":\\\"#@#${create_file.filename}#@#$\\\",\\\"text\\\":\\\"updated\\\"}\",\"step\":2}` edits that file; step 3 `{\"id\":\"send_file\",\"command_type\":\"teams_send_file\",\"command_line\":\"{\\\"group_id\\\":\\\"project-team\\\",\\\"file\\\":\\\"#@#${create_file.filename}#@#$\\\"}\",\"step\":3}` sends the edited file to the example Teams group after the edit completes.");
-    }
-    patterns.extend([
-        "- Example frontend batch: step 1 write or reuse the focused frontend test script, step 2 run that script and inspect generated textual outputs.",
-        "- Example long-running database check: step 1 run the finite workload in the foreground with `timeout_ms` comfortably above 60000 and optional `stall_timeout_ms` only when the workload emits progress, step 2 run the known database probe script, step 3 read the script output log such as `logs/db-check.log` and summarize the findings.",
     ]);
     if allowed_commands.contains("task_status") {
         patterns.push("- Context compaction: after a meaningful phase completes, or when context is near the active context limit and feels crowded, put the handoff summary in `task_status.compact_context` after the work it summarizes.");
     }
+    if allowed_commands.contains("task_status")
+        && (allowed_commands.contains("focused_verifier") || allowed_commands.contains("source_read"))
+    {
+        if allowed_commands.contains("focused_verifier") {
+            patterns.push(if allowed_commands.contains("apply_patch") {
+                "- Terminal batching economy: when task instructions permit and all inputs, acceptance conditions, effects, checks and readbacks are fully known with no result-dependent interpretation, prefer admitted apply_patch -> focused_verifier -> task_status done in one command_run response; focused_verifier -> done without edits is also useful."
+            } else {
+                "- Terminal batching economy: when task instructions permit and all inputs, acceptance conditions, effects, checks and readbacks are fully known with no result-dependent interpretation, prefer focused_verifier -> task_status done in one command_run response."
+            });
+            patterns.push("- Put focused_verifier in its own verifier-only strictly later positive step after any mutations it verifies. task_status done must be the sole command in a strictly later final positive step. Required effects, checks and readbacks must pass before done executes, not before proposing; failed, timed-out or unknown prior results fence done until resolved with required fresh verification. Fully-known fail -> repair -> pass recovery may remain in the same request.");
+        }
+        if allowed_commands.contains("source_read") {
+            patterns.push("- Terminal batching economy: mechanical final source_read readbacks with already-known inputs may also share a batch with task_status done alone at a strictly later final step, after required verification has already passed.");
+        }
+        patterns.push("- Keep a separate model round for interpretation, missing evidence, unknown outcomes, or failure correction requiring reasoning. Runtime fences failed/unknown prior results and ambiguous streamed ordering; command success alone is not task completion and never waives task_status completion or Operation Manual rules. No blind replay or fence bypass.");
+    }
     if allowed_commands.contains("read_media") || allowed_commands.contains("generate_media") {
-        patterns.push("- Example media batch: step 1 use `web_discover` or `generate_media` to collect the needed media, docs, or repo artifacts, step 2 use `read_media` or focused reads to verify the resulting media or repo content.");
+        patterns.push("- For media work, collect or generate first, then verify with `read_media` or focused reads in a later step.");
     } else if allowed_commands.contains("web_discover") {
-        patterns.push("- Example web discovery batch: step 1 use `web_discover` to collect the needed web docs or references, step 2 use focused reads or probes to verify the resulting repo content.");
+        patterns.push("- For web discovery, collect references first, then verify resulting repo evidence with focused reads or probes.");
     }
     patterns.join("\n")
 }
@@ -621,8 +840,9 @@ fn current_shell_command_format(shell_prompt: &str) -> String {
         compact_prompt(shell_prompt),
         long_running_service_guidance(),
     );
-    let schema = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The shell script to execute in the user's default shell\"},\"workdir\":{\"type\":\"string\",\"description\":\"The working directory to execute the command in\"},\"timeout_ms\":{\"type\":\"number\",\"description\":\"The wall-clock budget for the command in milliseconds\"},\"stall_timeout_ms\":{\"type\":[\"number\",\"null\"],\"minimum\":1000,\"description\":\"Optional no-output progress watchdog in milliseconds\"}},\"required\":[\"command\"],\"additionalProperties\":false}";
-    format!("{guidance} JSON object string matching this schema: {schema}")
+    format!(
+        "{guidance} `command_line` accepts plain shell text or an escaped JSON object string with required `command` and optional `workdir`, `timeout_ms`, and `stall_timeout_ms`."
+    )
 }
 
 fn long_running_service_guidance() -> &'static str {
@@ -916,6 +1136,135 @@ mod tests {
     }
 
     #[test]
+    fn terminal_batching_economy_respects_allowed_commands_in_both_binding_modes() {
+        let command_names = ["apply_patch", "focused_verifier", "source_read", "task_status"];
+        for output_bindings_enabled in [false, true] {
+            for mask in 0..(1 << command_names.len()) {
+                let commands = command_names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(bit, command)| {
+                        (mask & (1 << bit) != 0).then(|| (*command).to_string())
+                    })
+                    .collect::<BTreeSet<_>>();
+                let description =
+                    command_run_usage_patterns_for(&commands, output_bindings_enabled);
+                let verifier_done =
+                    commands.contains("focused_verifier") && commands.contains("task_status");
+                let readback_done =
+                    commands.contains("source_read") && commands.contains("task_status");
+                assert_eq!(
+                    description.contains(
+                        "prefer admitted apply_patch -> focused_verifier -> task_status done"
+                    ),
+                    verifier_done && commands.contains("apply_patch")
+                );
+                assert_eq!(
+                    description.contains("prefer focused_verifier -> task_status done"),
+                    verifier_done && !commands.contains("apply_patch")
+                );
+                assert_eq!(
+                    description.contains(
+                        "mechanical final source_read readbacks with already-known inputs"
+                    ),
+                    readback_done
+                );
+                assert_eq!(
+                    description.contains("Terminal batching economy"),
+                    verifier_done || readback_done
+                );
+                assert_eq!(
+                    description.contains("Cross-step output variable"),
+                    output_bindings_enabled
+                );
+                assert_eq!(
+                    description.contains("separate model round"),
+                    verifier_done || readback_done
+                );
+                assert!(!description.contains("only mechanical final source_read"));
+                if !commands.contains("apply_patch") {
+                    assert!(!description.contains("apply_patch"));
+                }
+                if readback_done {
+                    assert!(description.contains("after required verification has already passed"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn known_terminal_batching_requires_success_and_fresh_recovery() {
+        for output_bindings_enabled in [false, true] {
+            for with_edits in [false, true] {
+                let mut commands =
+                    BTreeSet::from(["focused_verifier".to_string(), "task_status".to_string()]);
+                if with_edits {
+                    commands.insert("apply_patch".to_string());
+                }
+                let description =
+                    command_run_usage_patterns_for(&commands, output_bindings_enabled);
+                for required in [
+                    "when task instructions permit",
+                    "all inputs, acceptance conditions, effects, checks and readbacks are fully known",
+                    "no result-dependent interpretation",
+                    "verifier-only strictly later positive step",
+                    "sole command in a strictly later final positive step",
+                    "must pass before done executes, not before proposing",
+                    "failed, timed-out or unknown prior results fence done",
+                    "resolved with required fresh verification",
+                    "Fully-known fail -> repair -> pass recovery may remain in the same request",
+                    "separate model round for interpretation, missing evidence, unknown outcomes, or failure correction requiring reasoning",
+                    "ambiguous streamed ordering",
+                    "command success alone is not task completion",
+                    "never waives task_status completion or Operation Manual rules",
+                    "No blind replay or fence bypass",
+                ] {
+                    assert!(
+                        description.contains(required),
+                        "missing guidance: {required}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_read_provider_schema_advertises_mode_limits_and_navigation_rules() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let commands = BTreeSet::from(["source_read".to_string()]);
+        let schema = tool_interface_to_provider_schema_with_commands(
+            command_run_interface(),
+            Some(&commands),
+            false,
+        );
+        let description = schema["function"]["description"]
+            .as_str()
+            .expect("command guidance");
+        assert!(description.contains(&code_tools::commands::source_read::output_limits_description()));
+        for expected in [
+            "Line modes: At most 200 complete lines in both modes.",
+            "Range reads: 12288 text bytes, 16384 receipt-inclusive serialized result bytes.",
+            "Search reads: 6144 text bytes, 8192 receipt-inclusive serialized result bytes.",
+            "JSON projection reads: 12288 text bytes, 16384 receipt-inclusive serialized result bytes.",
+            "Oversized JSON projections fail without partial output.",
+            "Read only an exact J-Space-granted workspace file.",
+            "Use DCF locators first",
+            "`search_terms` (1..16 nonempty literal OR terms, <=2048 bytes total)",
+            "optional `context_lines` (0..5), and optional `start_line` (default 1)",
+            "For ranges provide `path`, `start_line`, `end_line` and optional `line_numbers`: true.",
+            "For JSON projection instead provide named `path`, `json_pointer` (RFC 6901 string; empty selects the whole JSON), and no line/search options.",
+            "Returns compact selected JSON with projection metadata and the source file SHA, not line coverage",
+            "invalid JSON, malformed/missing pointers and oversized selections fail without partial output.",
+            "All modes accept `expected_sha256`; range/search resume using `next_line` as `start_line` with that hash.",
+            "Read only needed ranges or JSON fields, batch independent file requests in the existing command_run, don't reread file starts",
+            "cite printed physical line labels only for line reads, stripping labels from verbatim quotes",
+            "No shell or workdir override.",
+        ] {
+            assert!(description.contains(expected), "missing source_read guidance: {expected}");
+        }
+    }
+
+    #[test]
     fn command_run_schema_injects_task_status_command_and_dynamic_schema() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let commands = default_command_run_commands();
@@ -951,6 +1300,39 @@ mod tests {
                     .collect()
             )
         );
+    }
+
+    #[test]
+    fn provider_tools_are_byte_identical_across_task_type_initialization() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let agent =
+            command_run_agent_with_capabilities(&["command_run", "apply_patch", "task_status"]);
+        let commands = command_run_commands_for_agent(&agent);
+        assert!(commands.contains("task_status"));
+        let before = load_agent_capabilities_for_task_state(&agent, &commands, true, None)
+            .expect("startup provider tools");
+        let after = load_agent_capabilities_for_task_state(&agent, &commands, false, None)
+            .expect("initialized provider tools");
+        assert!(!before.is_empty());
+        assert_eq!(
+            serde_json::to_vec(&before).expect("serialize startup tools"),
+            serde_json::to_vec(&after).expect("serialize initialized tools")
+        );
+
+        let description = before[0]["function"]["description"]
+            .as_str()
+            .expect("provider tool description");
+        assert!(description.contains("If task_type is unset"));
+        assert!(description.contains("before any apply_patch or write-producing shell command"));
+        assert!(
+            description
+                .contains("Non-writing reads, searches, and tests may share a command_run batch")
+        );
+        assert!(description.contains("Available `task_type` values:"));
+        assert!(description.contains("Available task types:"));
+        for id in crate::prompt_style::runtime_prompt_manual::valid_task_type_ids() {
+            assert!(description.contains(id.as_str()), "missing task type {id}");
+        }
     }
 
     #[test]
@@ -1033,6 +1415,7 @@ mod tests {
     #[test]
     fn startup_task_state_is_required_only_when_agent_can_set_it() {
         let empty_session = session_with_task_type(Vec::new());
+        let initialized_session = session_with_task_type(vec!["debug".to_string()]);
         let restricted = command_run_agent_with_capabilities(&["apply_patch"]);
         let capable = command_run_agent_with_capabilities(&["apply_patch", "task_status"]);
 
@@ -1042,6 +1425,10 @@ mod tests {
         ));
         assert!(startup_task_state_required(
             &empty_session,
+            &command_run_commands_for_agent(&capable)
+        ));
+        assert!(!startup_task_state_required(
+            &initialized_session,
             &command_run_commands_for_agent(&capable)
         ));
     }
@@ -1248,6 +1635,518 @@ max_timeout_ms = 2000
     }
 
     #[test]
+    fn jspace_provider_surface_hides_unadmitted_workspace_effects() {
+        let shell = active_shell_command_name().to_string();
+        let execution_commands = BTreeSet::from([
+            "apply_patch".to_string(),
+            shell.clone(),
+            "task_status".to_string(),
+            "web_discover".to_string(),
+        ]);
+        let contract = serde_json::json!({
+            "allowed_operations": ["read", "command"],
+            "denied_operations": ["delete", "network"],
+            "write_scopes": [],
+            "command_templates": [{"argv": ["cat", "src/lib.rs"]}],
+        });
+
+        let visible =
+            provider_command_run_commands_for_jspace(&execution_commands, Some(&contract));
+
+        assert_eq!(visible, BTreeSet::from([shell, "task_status".to_string()]));
+        assert!(execution_commands.contains("apply_patch"));
+        assert!(execution_commands.contains("web_discover"));
+    }
+
+    #[test]
+    fn jspace_provider_surface_keeps_authorized_patch_and_discovery_shell() {
+        let shell = active_shell_command_name().to_string();
+        let execution_commands = BTreeSet::from([
+            "apply_patch".to_string(),
+            shell.clone(),
+            "task_status".to_string(),
+            "web_discover".to_string(),
+        ]);
+        let contract = serde_json::json!({
+            "allowed_operations": ["read", "command", "modify"],
+            "denied_operations": ["delete", "network"],
+            "write_scopes": ["src/lib.rs"],
+            "command_templates": [],
+            "read_commands": {
+                "roots": ["src"],
+                "rg": {"path": "/usr/bin/rg", "sha256": "a"},
+                "cat": {"path": "/bin/cat", "sha256": "b"}
+            }
+        });
+
+        let visible =
+            provider_command_run_commands_for_jspace(&execution_commands, Some(&contract));
+
+        assert_eq!(
+            visible,
+            BTreeSet::from(["apply_patch".to_string(), shell, "task_status".to_string(),])
+        );
+    }
+
+    #[test]
+    fn jspace_provider_surface_keeps_internal_status_with_granted_source_read() {
+        let shell = active_shell_command_name().to_string();
+        let execution_commands = BTreeSet::from([
+            "apply_patch".to_string(),
+            shell,
+            "planning".to_string(),
+            "task_status".to_string(),
+            "source_read".to_string(),
+        ]);
+        let contract = serde_json::json!({
+            "allowed_operations": ["read", "command"],
+            "denied_operations": ["create", "modify", "delete", "network"],
+            "read_scopes": ["src/main.rs"],
+            "write_scopes": [],
+            "command_templates": [],
+            "source_read": true,
+        });
+        let visible =
+            provider_command_run_commands_for_jspace(&execution_commands, Some(&contract));
+        assert_eq!(
+            visible,
+            BTreeSet::from([
+                "planning".to_string(),
+                "source_read".to_string(),
+                "task_status".to_string(),
+            ])
+        );
+        let schema = tool_interface_to_provider_schema_with_commands(
+            command_run_interface(),
+            Some(&visible),
+            false,
+        );
+        assert_command_type_enum(&schema, &["source_read", "task_status", "planning"]);
+        assert!(
+            schema["function"]["description"]
+                .as_str()
+                .expect("description")
+                .contains("exact J-Space-granted workspace file")
+        );
+        assert!(
+            schema["function"]["description"]
+                .as_str()
+                .expect("description")
+                .contains("search_terms")
+        );
+
+        let mut without_grant = contract;
+        without_grant
+            .as_object_mut()
+            .expect("contract")
+            .remove("source_read");
+        let hidden =
+            provider_command_run_commands_for_jspace(&execution_commands, Some(&without_grant));
+        assert!(!hidden.contains("source_read"));
+    }
+
+    #[test]
+    fn focused_verifier_format_describes_ordered_step_groups_and_task_limits() {
+        let guide = command_run_command_format_line("focused_verifier", false)
+            .expect("focused_verifier guide");
+        for expected in [
+            "preauthorized public test in a verifier-only step group",
+            "command_line must contain only JSON {\"verifier_index\":0}",
+            "No argv, cwd/workdir or timeout overrides",
+            "Task-specific whole-array restrictions prevail",
+            "Only when the task permits a mixed response",
+            "fully-known J-Space-admitted apply_patch commands",
+            "earlier positive steps in the same command_run response",
+            "own verifier-only strictly later positive step group after all patches it verifies",
+            "No same-step dependent verification, speculative edits, relaxed admission or automatic done",
+            "Reverify after relevant mutations or verifier failures",
+            "interpret required fresh evidence before completion",
+            "avoid unconditional duplicate retests",
+        ] {
+            assert!(
+                guide.contains(expected),
+                "missing focused_verifier guidance: {expected}"
+            );
+        }
+        assert!(!guide.contains("verifier-only batch"));
+    }
+
+    #[test]
+    fn jspace_provider_surface_shows_focused_verifier_only_with_typed_grant() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let interface = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tools/src/command_run/schema.json"
+        ))
+        .expect("command_run schema should parse");
+        let commands = BTreeSet::from([
+            "apply_patch".to_string(),
+            "focused_verifier".to_string(),
+            "task_status".to_string(),
+        ]);
+        let mut contract = serde_json::json!({
+            "allowed_operations": ["read", "command", "modify"],
+            "denied_operations": ["create", "delete", "network"],
+            "read_scopes": ["src/main.rs"],
+            "write_scopes": ["src/main.rs"],
+            "verifier_commands": [{}]
+        });
+        let visible = provider_command_run_commands_for_jspace(&commands, Some(&contract));
+        let schema = tool_interface_to_provider_schema_with_commands_and_jspace(
+            interface.clone(),
+            Some(&visible),
+            false,
+            Some(&contract),
+        );
+        assert_command_type_enum(&schema, &["apply_patch", "focused_verifier", "task_status"]);
+        let description = schema["function"]["description"]
+            .as_str()
+            .expect("provider description");
+        let guide = command_run_command_format_line("focused_verifier", false)
+            .expect("focused_verifier guide");
+        assert_eq!(
+            description
+                .lines()
+                .find(|line| line.starts_with("- focused_verifier:")),
+            Some(guide.as_str())
+        );
+        assert!(description.contains("- apply_patch:"));
+        assert!(!description.contains("verifier-only batch"));
+        contract
+            .as_object_mut()
+            .expect("contract")
+            .remove("verifier_commands");
+        let hidden = provider_command_run_commands_for_jspace(&commands, Some(&contract));
+        assert!(!hidden.contains("focused_verifier"));
+        let schema = tool_interface_to_provider_schema_with_commands_and_jspace(
+            interface,
+            Some(&hidden),
+            false,
+            Some(&contract),
+        );
+        assert_command_type_enum(&schema, &["apply_patch", "task_status"]);
+        let description = schema["function"]["description"]
+            .as_str()
+            .expect("provider description without verifier grant");
+        assert!(!description.contains("- focused_verifier:"));
+        assert!(!description.contains("verifier_index"));
+    }
+
+    #[tokio::test]
+    async fn source_read_only_schema_commands_match_jspace_and_dispatch() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace_root = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        std::fs::create_dir(workspace_root.join("src")).expect("source directory");
+        let source = workspace_root.join("src/main.rs");
+        std::fs::write(&source, "alpha\nbeta\n").expect("source file");
+        let json_source = workspace_root.join("src/capsule.json");
+        let json_content = serde_json::json!({
+            "answer": {"ok": true},
+            "padding": "x".repeat(13 * 1024)
+        }).to_string();
+        assert!(json_content.len() > 12 * 1024);
+        assert_eq!(json_content.lines().count(), 1);
+        std::fs::write(&json_source, &json_content).expect("single-line JSON fixture");
+        std::fs::write(workspace_root.join("src/denied.json"), r#"{"answer":{"ok":true}}"#)
+            .expect("ungranted JSON fixture");
+        let mut contract = serde_json::json!({
+            "schema_version": "jspace_contract_v2",
+            "repo_root": workspace_root,
+            "dcf_generation": {
+                "repo_root": workspace_root,
+                "generation_id": "source-read-schema-dispatch",
+                "required_domain_bindings": {
+                    "surface-map": {
+                        "required_domains": ["surface"],
+                        "source_fingerprints": {"surface": "surface-a"}
+                    }
+                }
+            },
+            "provenance": {"matched_surface_ids": ["surface"]},
+            "matched_surface_ids": ["surface"],
+            "read_scopes": ["src/main.rs", "src/capsule.json"],
+            "write_scopes": [],
+            "allowed_operations": ["read", "command"],
+            "denied_operations": ["create", "modify", "delete", "network"],
+            "command_templates": [],
+            "focused_verifiers": [],
+            "declared_targets": [],
+            "expansion": {
+                "mode": "exact_target_only",
+                "error_code": "JSPACE_EXPANSION_REQUIRED",
+                "mutation_on_expansion": false
+            },
+            "source_read": true
+        });
+        contract["authorization_semantic_sha256"] = serde_json::json!(
+            tura_path::jspace::authorization_semantic_sha256(&contract)
+                .expect("authorization digest")
+        );
+        contract["content_sha256"] =
+            serde_json::json!(tura_path::jspace::semantic_sha256(&contract));
+        let matcher = tura_path::jspace::JSpaceMatcher::from_value(&workspace_root, &contract)
+            .expect("source-read-only contract");
+
+        let execution_commands = BTreeSet::from([
+            "apply_patch".to_string(),
+            active_shell_command_name().to_string(),
+            "planning".to_string(),
+            "source_read".to_string(),
+            "task_status".to_string(),
+        ]);
+        let visible =
+            provider_command_run_commands_for_jspace(&execution_commands, Some(&contract));
+        let schema = tool_interface_to_provider_schema_with_commands(
+            command_run_interface(),
+            Some(&visible),
+            false,
+        );
+        assert_command_type_enum(&schema, &["source_read", "task_status", "planning"]);
+        matcher.check_source_read(&source).expect("exact read");
+        matcher.check_source_read(&json_source).expect("exact JSON read");
+        let denied_request = code_tools::commands::source_read::parse_command_line(
+            r#"{"path":"src/denied.json","json_pointer":"/answer"}"#,
+        ).expect("valid denied JSON projection request");
+        let denied_target = code_tools::commands::source_read::target_path(
+            &workspace_root, &denied_request,
+        ).expect("existing denied JSON target");
+        matcher.check_source_read(&denied_target)
+            .expect_err("JSON projection must not expand exact read scopes");
+        matcher
+            .check_command("task_status", "done")
+            .expect("internal status");
+        matcher
+            .check_command("planning", "[]")
+            .expect("internal planning");
+        assert_eq!(
+            matcher
+                .check_command("shell_command", "cat src/main.rs")
+                .expect_err("shell without template")
+                .code(),
+            "JSPACE_COMMAND_DENIED"
+        );
+        assert_eq!(
+            matcher
+                .check_command("apply_patch", "")
+                .expect_err("patch without target")
+                .code(),
+            "JSPACE_COMMAND_DENIED"
+        );
+
+        let command_run_result = code_tools::command_run::execute_async_value_with_source_read_admission(
+            serde_json::json!({
+                "execution_id": "schema-dispatch-source-read",
+                "commands": [
+                    {
+                        "command_type": "source_read",
+                        "command_line": serde_json::json!({
+                            "path": "src/main.rs", "start_line": 1, "end_line": 2
+                        }).to_string(),
+                        "step": 1
+                    },
+                    {"command_type": "planning", "command_line": "[{\"task_summary\":\"read\"},{\"task_summary\":\"report\"}]", "step": 2},
+                    {"command_type": "task_status", "command_line": "done", "step": 3}
+                ]
+            }),
+            workspace_root.clone(),
+            Some(visible.clone()),
+            None,
+            false,
+            code_tools::runtime::tool::CancellationToken::new(),
+            Some(std::sync::Arc::new(
+                std::fs::File::open(&workspace_root).expect("workspace directory descriptor")
+            )),
+            None,
+        )
+        .await;
+        let results = command_run_result["results"]
+            .as_array()
+            .expect("dispatch results");
+        assert_eq!(results.len(), 3, "{command_run_result}");
+        assert!(
+            results.iter().all(|result| result["success"] == true),
+            "{command_run_result}"
+        );
+        assert_eq!(results[0]["output"]["stdout"], "alpha\nbeta\n");
+        assert_eq!(
+            results[1]["output"]["steps"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(results[2]["output"]["task_status"]["status"], "done");
+        assert_eq!(
+            std::fs::read_to_string(source).expect("source unchanged"),
+            "alpha\nbeta\n"
+        );
+
+        let json_dispatch_result = code_tools::command_run::execute_async_value_with_source_read_admission(
+            serde_json::json!({
+                "execution_id": "schema-dispatch-json-projection",
+                "commands": [
+                    {
+                        "command_type": "source_read",
+                        "command_line": serde_json::json!({
+                            "path": "src/capsule.json", "json_pointer": "/answer"
+                        }).to_string(),
+                        "step": 1
+                    },
+                    {
+                        "command_type": "source_read",
+                        "command_line": serde_json::json!({
+                            "path": "src/capsule.json",
+                            "search_terms": ["not-present-in-fixture"]
+                        }).to_string(),
+                        "step": 1
+                    }
+                ]
+            }),
+            workspace_root.clone(),
+            Some(visible),
+            None,
+            false,
+            code_tools::runtime::tool::CancellationToken::new(),
+            Some(std::sync::Arc::new(
+                std::fs::File::open(&workspace_root).expect("workspace directory descriptor")
+            )),
+            None,
+        ).await;
+        let json_results = json_dispatch_result["results"].as_array().expect("JSON dispatch results");
+        assert_eq!(json_results.len(), 2, "{json_dispatch_result}");
+        assert!(json_results.iter().all(|result| result["success"] == true), "{json_dispatch_result}");
+        let projection = &json_results[0]["output"];
+        let search = &json_results[1]["output"];
+        assert_eq!(projection["stdout"], r#"{"ok":true}"#);
+        assert_eq!(projection["mode"], "json_projection");
+        assert_eq!(projection["path"], "src/capsule.json");
+        assert_eq!(projection["json_pointer"], "/answer");
+        assert_eq!(projection["file_bytes"], json_content.len());
+        assert_eq!(projection["truncated"], false);
+        assert_eq!(search["stdout"], "");
+        assert_eq!(search["search_matches"], serde_json::json!([]));
+        // The empty search hashes the same complete source without emitting its oversized line.
+        let source_sha = search["source_sha256"].as_str().expect("source SHA");
+        assert_eq!(source_sha.len(), 64);
+        assert!(source_sha.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(projection["source_sha256"], source_sha);
+        for key in [
+            "start_line", "end_line", "requested_end_line", "next_line", "total_lines",
+            "line_numbers", "at_eof", "ends_with_newline", "search_matches", "context_lines",
+        ] {
+            assert!(projection.get(key).is_none(), "no fabricated line metadata: {key}");
+        }
+        assert_eq!(projection["terminal_receipt"]["terminal_state"], "completed");
+        assert_eq!(projection["terminal_receipt"]["exit_code"], 0);
+        let receipt_path = projection["terminal_receipt_path"].as_str().expect("JSON receipt path");
+        let durable: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(receipt_path).expect("durable JSON receipt"),
+        ).expect("JSON terminal receipt");
+        assert_eq!(durable, projection["terminal_receipt"]);
+        assert_eq!(std::fs::read_to_string(json_source).expect("JSON source unchanged"), json_content);
+    }
+
+    #[test]
+    fn malformed_jspace_provider_surface_preserves_existing_commands() {
+        let execution_commands = BTreeSet::from([
+            "apply_patch".to_string(),
+            active_shell_command_name().to_string(),
+            "task_status".to_string(),
+            "web_discover".to_string(),
+        ]);
+        let contract = serde_json::json!({"allowed_operations": "read"});
+
+        assert_eq!(
+            provider_command_run_commands_for_jspace(&execution_commands, Some(&contract)),
+            execution_commands
+        );
+    }
+
+    #[test]
+    fn jspace_provider_description_exposes_exact_command_templates_in_stable_order() {
+        let shell = active_shell_command_name().to_string();
+        let allowed_commands = BTreeSet::from([shell]);
+        let contract = serde_json::json!({
+            "allowed_operations": ["read", "command"],
+            "command_templates": [
+                {"argv": ["cat", "scripts/ops/dcf/task_context.py"]},
+                {"argv": ["cat", "scripts/ops/dcf/jspace.py"]}
+            ],
+            "write_scopes": []
+        });
+
+        let schema = tool_interface_to_provider_schema_with_commands_and_jspace(
+            command_run_interface(),
+            Some(&allowed_commands),
+            false,
+            Some(&contract),
+        );
+        let description = schema["function"]["description"].as_str().unwrap();
+        let jspace_pos = description
+            .find(r#"["cat","scripts/ops/dcf/jspace.py"]"#)
+            .unwrap();
+        let task_context_pos = description
+            .find(r#"["cat","scripts/ops/dcf/task_context.py"]"#)
+            .unwrap();
+
+        assert!(description.contains("J-Space shell boundary:"));
+        assert!(
+            description
+                .contains("Use these exact argv; do not substitute unlisted shell utilities.")
+        );
+        assert!(jspace_pos < task_context_pos);
+        assert!(!description.contains("Use for tests, builds, scripts, package tools"));
+        assert!(!description.contains("sed -n"));
+        assert!(!description.contains("tail -n"));
+    }
+
+    #[test]
+    fn jspace_provider_description_exposes_admitted_read_utilities_and_roots() {
+        let shell = active_shell_command_name().to_string();
+        let allowed_commands = BTreeSet::from([shell]);
+        let contract = serde_json::json!({
+            "allowed_operations": ["read", "command"],
+            "command_templates": [],
+            "read_commands": {
+                "roots": ["src", "tests"],
+                "rg": {"path": "/usr/bin/rg", "sha256": "a"},
+                "cat": {"path": "/bin/cat", "sha256": "b"}
+            }
+        });
+
+        let schema = tool_interface_to_provider_schema_with_commands_and_jspace(
+            command_run_interface(),
+            Some(&allowed_commands),
+            false,
+            Some(&contract),
+        );
+        let description = schema["function"]["description"].as_str().unwrap();
+
+        assert!(description.contains("Admitted read utilities: cat, rg."));
+        assert!(description.contains("Admitted read roots: src, tests."));
+    }
+
+    #[test]
+    fn malformed_jspace_shell_projection_falls_back_to_generic_shell_guidance() {
+        let shell = active_shell_command_name().to_string();
+        let allowed_commands = BTreeSet::from([shell]);
+        let contract = serde_json::json!({
+            "allowed_operations": ["read", "command"],
+            "command_templates": [{"argv": "cat src/lib.rs"}]
+        });
+
+        let schema = tool_interface_to_provider_schema_with_commands_and_jspace(
+            command_run_interface(),
+            Some(&allowed_commands),
+            false,
+            Some(&contract),
+        );
+        let description = schema["function"]["description"].as_str().unwrap();
+
+        assert!(!description.contains("J-Space shell boundary:"));
+        assert!(description.contains("Use for tests, builds, scripts, package tools"));
+    }
+
+    #[test]
     fn provider_schema_preserves_additional_properties_recursively() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
@@ -1350,11 +2249,18 @@ max_timeout_ms = 2000
         assert_eq!(schema["function"]["strict"], true);
         assert_eq!(
             parameters["required"],
-            serde_json::json!(["commands", "timeout_ms"])
+            serde_json::json!(["commands", "execution_id", "stall_timeout_ms", "timeout_ms"])
         );
         assert_eq!(
             parameters["properties"]["commands"]["items"]["required"],
-            serde_json::json!(["command_type", "command_line", "id", "step", "timeout_ms"])
+            serde_json::json!([
+                "command_type",
+                "command_line",
+                "id",
+                "stall_timeout_ms",
+                "step",
+                "timeout_ms"
+            ])
         );
         assert!(parameters["properties"].get("sandbox").is_none());
         assert!(parameters["properties"].get("task_status").is_none());
@@ -1370,7 +2276,19 @@ max_timeout_ms = 2000
             serde_json::json!(["number", "null"])
         );
         assert_eq!(
+            parameters["properties"]["stall_timeout_ms"]["type"],
+            serde_json::json!(["number", "null"])
+        );
+        assert_eq!(
+            parameters["properties"]["execution_id"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert_eq!(
             parameters["properties"]["commands"]["items"]["properties"]["timeout_ms"]["type"],
+            serde_json::json!(["number", "null"])
+        );
+        assert_eq!(
+            parameters["properties"]["commands"]["items"]["properties"]["stall_timeout_ms"]["type"],
             serde_json::json!(["number", "null"])
         );
         // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.

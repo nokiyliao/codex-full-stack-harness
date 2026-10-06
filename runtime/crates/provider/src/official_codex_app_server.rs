@@ -18,6 +18,7 @@ use tokio::io::{
 };
 use tokio::process::Command;
 use tokio_tungstenite::tungstenite::Message;
+use tura_path::command_receipts::ReceiptStore;
 
 const ASSOCIATION_FILE: &str = "official-codex-app-server-association.json";
 const ASSOCIATION_DIRECTORY: &str = "official_codex_associations";
@@ -96,12 +97,21 @@ pub struct CodexReadOnlyCommandObservation {
     pub claim_identity: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexReadOnlyDispatchPhase {
+    NotDispatched,
+    MayHaveDispatched,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CodexReadOnlyEffectObservation {
     pub original_runtime_id: String,
     pub tool_call_id: String,
     pub execution_id: String,
     pub commands: Vec<CodexReadOnlyCommandObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_phase: Option<CodexReadOnlyDispatchPhase>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -2517,6 +2527,21 @@ async fn handle_server_request(
         ToolEffectDisposition::Execute(effect_index) => effect_index,
         ToolEffectDisposition::Replay(_) => unreachable!(),
     };
+    if let (Some(effect_index), Some(context)) = (effect_index, turn_context.as_deref_mut()) {
+        if let Some(observation) = context.execution_ledger.effects[effect_index]
+            .read_only_observation
+            .as_mut()
+        {
+            if observation.dispatch_phase != Some(CodexReadOnlyDispatchPhase::NotDispatched) {
+                return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: "read-only effect omitted its pre-dispatch ledger barrier".to_string(),
+                });
+            }
+            observation.dispatch_phase = Some(CodexReadOnlyDispatchPhase::MayHaveDispatched);
+            persist_execution_ledger(request_handler, context.execution_ledger, effect_index)?;
+        }
+    }
     let handled = match request_handler.as_deref_mut() {
         Some(handler) => {
             handler
@@ -2719,6 +2744,10 @@ fn prepare_tool_effect(
     }
 
     let effect_index = context.execution_ledger.effects.len();
+    let read_only_observation = read_only_observation.map(|mut observation| {
+        observation.dispatch_phase = Some(CodexReadOnlyDispatchPhase::NotDispatched);
+        observation
+    });
     context
         .execution_ledger
         .effects
@@ -2919,42 +2948,46 @@ fn encode_command_receipt_identity(identity: &str) -> String {
     }
 }
 
-fn read_only_recovery_artifact_exists(
+fn open_command_receipt_store(
+    session_directory: &Path,
     effect_index: usize,
-    path: &Path,
-) -> Result<bool, OfficialCodexAppServerError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(OfficialCodexAppServerError::UncertainToolEffect {
+) -> Result<ReceiptStore, OfficialCodexAppServerError> {
+    ReceiptStore::open_existing(session_directory).map_err(|error| {
+        OfficialCodexAppServerError::UncertainToolEffect {
             effect_index,
-            reason: format!(
-                "read-only recovery artifact state is unavailable at {}: {error}",
-                path.display()
-            ),
-        }),
-    }
+            reason: format!("command receipt store is unavailable: {error}"),
+        }
+    })
+}
+
+fn receipt_artifact_exists(
+    store: &ReceiptStore,
+    effect_index: usize,
+    name: &str,
+) -> Result<bool, OfficialCodexAppServerError> {
+    store
+        .read_optional(name)
+        .map(|bytes| bytes.is_some())
+        .map_err(|error| OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: format!("command receipt artifact {name} is unavailable: {error}"),
+        })
 }
 
 fn synthesize_completed_read_only_command(
-    session_directory: &Path,
+    store: &ReceiptStore,
     effect_index: usize,
     command: &CodexReadOnlyCommandObservation,
 ) -> Result<Value, OfficialCodexAppServerError> {
-    let receipt_directory = session_directory
-        .join(".tura")
-        .join("run")
-        .join("command_receipts");
-    let receipt_path = receipt_directory.join(format!(
+    let receipt_name = format!(
         "{}.json",
         encode_command_receipt_identity(&command.claim_identity)
-    ));
-    let bytes = std::fs::read(&receipt_path).map_err(|error| {
+    );
+    let bytes = store.read(&receipt_name).map_err(|error| {
         OfficialCodexAppServerError::UncertainToolEffect {
             effect_index,
             reason: format!(
-                "completed read-only terminal receipt is unavailable at {}: {error}",
-                receipt_path.display()
+                "completed read-only terminal receipt {receipt_name} is unavailable: {error}"
             ),
         }
     })?;
@@ -2971,12 +3004,10 @@ fn synthesize_completed_read_only_command(
         });
     }
     validate_terminal_receipt(effect_index, &receipt, true)?;
-    let absolute_path = std::fs::canonicalize(&receipt_path).map_err(|error| {
+    let absolute_path = store.display_path(&receipt_name).map_err(|error| {
         OfficialCodexAppServerError::UncertainToolEffect {
             effect_index,
-            reason: format!(
-                "completed read-only terminal receipt cannot be canonicalized: {error}"
-            ),
+            reason: format!("completed read-only terminal receipt path is invalid: {error}"),
         }
     })?;
     Ok(json!({
@@ -2993,27 +3024,27 @@ fn synthesize_completed_read_only_command(
     }))
 }
 
-fn synthesize_reconciled_read_only_response(
+fn synthesize_completed_read_only_response(
     session_directory: &Path,
     effect_index: usize,
     observation: &CodexReadOnlyEffectObservation,
 ) -> Result<Value, OfficialCodexAppServerError> {
     validate_read_only_observation(effect_index, observation)?;
-    let receipt_directory = session_directory
-        .join(".tura")
-        .join("run")
-        .join("command_receipts");
+    let store = open_command_receipt_store(session_directory, effect_index)?;
     let mut results = Vec::with_capacity(observation.commands.len());
     for command in &observation.commands {
         let encoded_identity = encode_command_receipt_identity(&command.claim_identity);
-        let claim_path = receipt_directory.join(format!("{encoded_identity}.claim.json"));
-        let receipt_path = receipt_directory.join(format!("{encoded_identity}.json"));
-        let claim_exists = read_only_recovery_artifact_exists(effect_index, &claim_path)?;
-        let receipt_exists = read_only_recovery_artifact_exists(effect_index, &receipt_path)?;
+        let claim_exists = receipt_artifact_exists(
+            &store,
+            effect_index,
+            &format!("{encoded_identity}.claim.json"),
+        )?;
+        let receipt_exists =
+            receipt_artifact_exists(&store, effect_index, &format!("{encoded_identity}.json"))?;
 
         if receipt_exists {
             results.push(synthesize_completed_read_only_command(
-                session_directory,
+                &store,
                 effect_index,
                 command,
             )?);
@@ -3026,7 +3057,13 @@ fn synthesize_reconciled_read_only_response(
                 ),
             });
         } else {
-            results.push(synthesize_never_claimed_read_only_command(command));
+            return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: format!(
+                    "read-only command {} has no durable terminal receipt",
+                    command.claim_identity
+                ),
+            });
         }
     }
     let output = json!({"results": results});
@@ -3068,14 +3105,20 @@ fn reconcile_never_claimed_read_only_effects(
                 reason: "runtime read-only claim verifier is unavailable".to_string(),
             }
         })?;
-        let (response, command_receipts) = match handler
-            .verify_never_claimed_read_only_effect(&observation)
-        {
-            Ok(()) => (
+        let unclaimed_reason =
+            if observation.dispatch_phase == Some(CodexReadOnlyDispatchPhase::NotDispatched) {
+                handler
+                    .verify_never_claimed_read_only_effect(&observation)
+                    .err()
+            } else {
+                Some("durable pre-dispatch proof is unavailable".to_string())
+            };
+        let (response, command_receipts) = match unclaimed_reason {
+            None => (
                 synthesize_never_claimed_read_only_response(effect_index, &observation)?,
                 Vec::new(),
             ),
-            Err(unclaimed_reason) => {
+            Some(unclaimed_reason) => {
                 handler
                         .verify_completed_read_only_effect(&observation)
                         .map_err(|completed_reason| {
@@ -3086,7 +3129,7 @@ fn reconcile_never_claimed_read_only_effects(
                                 ),
                             }
                         })?;
-                let response = synthesize_reconciled_read_only_response(
+                let response = synthesize_completed_read_only_response(
                     session_directory,
                     effect_index,
                     &observation,
@@ -3209,33 +3252,37 @@ fn reconcile_durable_command_run_effects(
             });
         }
 
-        let receipt_directory = command_receipt_directory(session_directory);
-        let needs_batch_admission = observation.commands.iter().any(|command| {
-            !receipt_directory
-                .join(format!(
-                    "{}.json",
-                    encode_command_receipt_identity(&command.claim_identity)
-                ))
-                .exists()
-        });
+        let store = open_command_receipt_store(session_directory, effect_index)?;
+        let mut needs_batch_admission = false;
+        for command in &observation.commands {
+            let name = format!(
+                "{}.json",
+                encode_command_receipt_identity(&command.claim_identity)
+            );
+            if !receipt_artifact_exists(&store, effect_index, &name)? {
+                needs_batch_admission = true;
+            }
+        }
         let admission = needs_batch_admission
             .then(|| {
                 load_command_run_batch_admission(session_directory, effect_index, &observation)
             })
             .transpose()?;
         let mut results = Vec::with_capacity(observation.commands.len());
-        let mut canonical_paths = HashSet::new();
+        let mut receipt_paths = HashSet::new();
         let mut receipt_digests = HashSet::new();
         for command in &observation.commands {
             let claim_identity = &command.claim_identity;
             let encoded_identity = encode_command_receipt_identity(claim_identity);
-            let claim_path = receipt_directory.join(format!("{encoded_identity}.claim.json"));
-            let receipt_path = receipt_directory.join(format!("{encoded_identity}.json"));
+            let claim_name = format!("{encoded_identity}.claim.json");
+            let receipt_name = format!("{encoded_identity}.json");
             if admission
                 .as_ref()
                 .is_some_and(|admission| !admission.accepted_call_ids.contains(claim_identity))
             {
-                if claim_path.exists() || receipt_path.exists() {
+                if receipt_artifact_exists(&store, effect_index, &claim_name)?
+                    || receipt_artifact_exists(&store, effect_index, &receipt_name)?
+                {
                     return Err(OfficialCodexAppServerError::UncertainToolEffect {
                         effect_index,
                         reason: format!(
@@ -3249,15 +3296,15 @@ fn reconcile_durable_command_run_effects(
                 ));
                 continue;
             }
-            let absolute_path = std::fs::canonicalize(&receipt_path).map_err(|error| {
+            let absolute_path = store.display_path(&receipt_name).map_err(|error| {
                 OfficialCodexAppServerError::UncertainToolEffect {
                     effect_index,
                     reason: format!(
-                        "terminal receipt for command {claim_identity} cannot be canonicalized: {error}"
+                        "terminal receipt path for command {claim_identity} is invalid: {error}"
                     ),
                 }
             })?;
-            if !canonical_paths.insert(absolute_path.clone()) {
+            if !receipt_paths.insert(absolute_path.clone()) {
                 return Err(OfficialCodexAppServerError::UncertainToolEffect {
                     effect_index,
                     reason: format!(
@@ -3266,7 +3313,7 @@ fn reconcile_durable_command_run_effects(
                     ),
                 });
             }
-            let bytes = std::fs::read(&absolute_path).map_err(|error| {
+            let bytes = store.read(&receipt_name).map_err(|error| {
                 OfficialCodexAppServerError::UncertainToolEffect {
                     effect_index,
                     reason: format!(
@@ -3479,14 +3526,17 @@ fn interrupted_recovery_items(
 struct CommandReceiptEvidence {
     references: Vec<CodexCommandReceiptReference>,
     replayable: bool,
+    contains_unclaimed_read_only_synthetic: bool,
 }
 
+#[derive(Debug)]
 struct CommandRunBatchAdmission {
     path: PathBuf,
     value: Value,
     accepted_call_ids: BTreeSet<String>,
 }
 
+#[cfg(test)]
 fn command_receipt_directory(session_directory: &Path) -> PathBuf {
     session_directory
         .join(".tura")
@@ -3500,37 +3550,21 @@ fn load_command_run_batch_admission(
     observation: &CodexCommandRunEffectObservation,
 ) -> Result<CommandRunBatchAdmission, OfficialCodexAppServerError> {
     validate_command_run_observation(effect_index, observation)?;
-    let receipt_directory = command_receipt_directory(session_directory);
-    let marker_path = receipt_directory.join(format!(
+    let store = open_command_receipt_store(session_directory, effect_index)?;
+    let marker_name = format!(
         "{}.batch-admission",
         encode_command_receipt_identity(&observation.execution_id)
-    ));
-    let absolute_path = std::fs::canonicalize(&marker_path).map_err(|error| {
+    );
+    let absolute_path = store.display_path(&marker_name).map_err(|error| {
         OfficialCodexAppServerError::UncertainToolEffect {
             effect_index,
-            reason: format!(
-                "command_run batch admission is unavailable at {}: {error}",
-                marker_path.display()
-            ),
+            reason: format!("command_run batch admission path is invalid: {error}"),
         }
     })?;
-    let absolute_receipt_directory =
-        std::fs::canonicalize(&receipt_directory).map_err(|error| {
-            OfficialCodexAppServerError::UncertainToolEffect {
-                effect_index,
-                reason: format!("command receipt directory is unavailable: {error}"),
-            }
-        })?;
-    if !absolute_path.starts_with(&absolute_receipt_directory) {
-        return Err(OfficialCodexAppServerError::UncertainToolEffect {
-            effect_index,
-            reason: "command_run batch admission escaped the receipt directory".to_string(),
-        });
-    }
-    let bytes = std::fs::read(&absolute_path).map_err(|error| {
+    let bytes = store.read(&marker_name).map_err(|error| {
         OfficialCodexAppServerError::UncertainToolEffect {
             effect_index,
-            reason: format!("command_run batch admission read failed: {error}"),
+            reason: format!("command_run batch admission is unavailable: {error}"),
         }
     })?;
     let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
@@ -3666,7 +3700,7 @@ fn normalize_command_run_response_from_batch_admission(
             effect_index,
             reason: "command_run response did not preserve its planned command count".to_string(),
         })?;
-    let receipt_directory = command_receipt_directory(session_directory);
+    let store = open_command_receipt_store(session_directory, effect_index)?;
     for (result, command) in results.iter_mut().zip(&observation.commands) {
         if result.get("command_type").and_then(Value::as_str) != Some(command.command_type.as_str())
             || command.binding_id.as_ref().is_some_and(|binding_id| {
@@ -3695,12 +3729,11 @@ fn normalize_command_run_response_from_batch_admission(
             continue;
         }
         let encoded_identity = encode_command_receipt_identity(&command.claim_identity);
-        if receipt_directory
-            .join(format!("{encoded_identity}.claim.json"))
-            .exists()
-            || receipt_directory
-                .join(format!("{encoded_identity}.json"))
-                .exists()
+        if receipt_artifact_exists(
+            &store,
+            effect_index,
+            &format!("{encoded_identity}.claim.json"),
+        )? || receipt_artifact_exists(&store, effect_index, &format!("{encoded_identity}.json"))?
         {
             return Err(OfficialCodexAppServerError::UncertainToolEffect {
                 effect_index,
@@ -3748,7 +3781,8 @@ fn extract_command_receipt_references(
         })?;
     let mut references = Vec::with_capacity(results.len());
     let replayable = true;
-    let mut receipt_root = None;
+    let mut contains_unclaimed_read_only_synthetic = false;
+    let mut receipt_store = None;
     for command_result in results {
         let command_succeeded = command_result.get("success").and_then(Value::as_bool);
         let command_succeeded =
@@ -3767,6 +3801,7 @@ fn extract_command_receipt_references(
                 continue;
             }
             if deterministic_zero_effect_unclaimed_read_only(command_result) {
+                contains_unclaimed_read_only_synthetic = true;
                 continue;
             }
             if let Some(reference) =
@@ -3789,30 +3824,35 @@ fn extract_command_receipt_references(
             });
         };
         validate_terminal_receipt(effect_index, receipt, command_succeeded)?;
-        let receipt_root = match receipt_root.as_ref() {
-            Some(path) => path,
-            None => {
-                let session_root = std::fs::canonicalize(session_directory).map_err(|error| {
-                    OfficialCodexAppServerError::UncertainToolEffect {
-                        effect_index,
-                        reason: format!("failed to canonicalize session directory: {error}"),
-                    }
-                })?;
-                let path = std::fs::canonicalize(
-                    session_root
-                        .join(".tura")
-                        .join("run")
-                        .join("command_receipts"),
-                )
-                .map_err(|error| {
-                    OfficialCodexAppServerError::UncertainToolEffect {
-                        effect_index,
-                        reason: format!("command receipt directory is unavailable: {error}"),
-                    }
-                })?;
-                receipt_root.insert(path)
+        let claim_identity = receipt
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: "terminal receipt omitted its exact command identity".to_string(),
+            })?;
+        if command_result
+            .get("command_id")
+            .and_then(Value::as_str)
+            .is_some_and(|command_id| command_id != claim_identity)
+        {
+            return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: "command result and terminal receipt identities differ".to_string(),
+            });
+        }
+        let receipt_name = format!("{}.json", encode_command_receipt_identity(claim_identity));
+        if receipt_store.is_none() {
+            receipt_store = Some(open_command_receipt_store(session_directory, effect_index)?);
+        }
+        let store = receipt_store.as_ref().expect("opened above");
+        let expected_path = store.display_path(&receipt_name).map_err(|error| {
+            OfficialCodexAppServerError::UncertainToolEffect {
+                effect_index,
+                reason: format!("terminal receipt path is invalid: {error}"),
             }
-        };
+        })?;
         let path = output
             .get("terminal_receipt_path")
             .and_then(Value::as_str)
@@ -3822,28 +3862,20 @@ fn extract_command_receipt_references(
                 effect_index,
                 reason: "command result omitted an absolute terminal_receipt_path".to_string(),
             })?;
-        let canonical_path = std::fs::canonicalize(&path).map_err(|error| {
-            OfficialCodexAppServerError::UncertainToolEffect {
-                effect_index,
-                reason: format!(
-                    "terminal receipt is unavailable at {}: {error}",
-                    path.display()
-                ),
-            }
-        })?;
-        if !canonical_path.starts_with(&receipt_root) {
+        if path != expected_path {
             return Err(OfficialCodexAppServerError::UncertainToolEffect {
                 effect_index,
                 reason: format!(
-                    "terminal receipt {} is outside the session receipt directory",
-                    canonical_path.display()
+                    "terminal receipt path {} changed from expected {}",
+                    path.display(),
+                    expected_path.display()
                 ),
             });
         }
-        let bytes = std::fs::read(&canonical_path).map_err(|error| {
+        let bytes = store.read(&receipt_name).map_err(|error| {
             OfficialCodexAppServerError::UncertainToolEffect {
                 effect_index,
-                reason: format!("failed to read terminal receipt: {error}"),
+                reason: format!("terminal receipt is unavailable: {error}"),
             }
         })?;
         let durable_receipt: Value = serde_json::from_slice(&bytes).map_err(|error| {
@@ -3859,13 +3891,14 @@ fn extract_command_receipt_references(
             });
         }
         references.push(CodexCommandReceiptReference {
-            path: canonical_path,
+            path: expected_path,
             sha256: format!("{:x}", Sha256::digest(bytes)),
         });
     }
     Ok(CommandReceiptEvidence {
         references,
         replayable,
+        contains_unclaimed_read_only_synthetic,
     })
 }
 
@@ -3950,10 +3983,17 @@ fn durable_unaccepted_batch_reference(
             effect_index,
             reason: "batch-unaccepted command changed its execution identity".to_string(),
         })?;
-    let expected_path = command_receipt_directory(session_directory).join(format!(
+    let store = open_command_receipt_store(session_directory, effect_index)?;
+    let marker_name = format!(
         "{}.batch-admission",
         encode_command_receipt_identity(execution_id)
-    ));
+    );
+    let expected_path = store.display_path(&marker_name).map_err(|error| {
+        OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: format!("batch admission path is invalid: {error}"),
+        }
+    })?;
     let reported_path = output
         .get("batch_admission_path")
         .and_then(Value::as_str)
@@ -3963,30 +4003,13 @@ fn durable_unaccepted_batch_reference(
             effect_index,
             reason: "batch-unaccepted command omitted an absolute admission path".to_string(),
         })?;
-    let expected_path = std::fs::canonicalize(&expected_path).map_err(|error| {
-        OfficialCodexAppServerError::UncertainToolEffect {
-            effect_index,
-            reason: format!("batch admission cannot be canonicalized: {error}"),
-        }
-    })?;
-    let reported_path = std::fs::canonicalize(&reported_path).map_err(|error| {
-        OfficialCodexAppServerError::UncertainToolEffect {
-            effect_index,
-            reason: format!("reported batch admission cannot be canonicalized: {error}"),
-        }
-    })?;
-    let receipt_root = std::fs::canonicalize(command_receipt_directory(session_directory))
-        .map_err(|error| OfficialCodexAppServerError::UncertainToolEffect {
-            effect_index,
-            reason: format!("command receipt directory is unavailable: {error}"),
-        })?;
-    if expected_path != reported_path || !reported_path.starts_with(&receipt_root) {
+    if expected_path != reported_path {
         return Err(OfficialCodexAppServerError::UncertainToolEffect {
             effect_index,
             reason: "batch-unaccepted command admission path changed".to_string(),
         });
     }
-    let bytes = std::fs::read(&reported_path).map_err(|error| {
+    let bytes = store.read(&marker_name).map_err(|error| {
         OfficialCodexAppServerError::UncertainToolEffect {
             effect_index,
             reason: format!("durable batch admission read failed: {error}"),
@@ -4035,12 +4058,11 @@ fn durable_unaccepted_batch_reference(
         });
     }
     let encoded_identity = encode_command_receipt_identity(command_id);
-    if receipt_root
-        .join(format!("{encoded_identity}.claim.json"))
-        .exists()
-        || receipt_root
-            .join(format!("{encoded_identity}.json"))
-            .exists()
+    if receipt_artifact_exists(
+        &store,
+        effect_index,
+        &format!("{encoded_identity}.claim.json"),
+    )? || receipt_artifact_exists(&store, effect_index, &format!("{encoded_identity}.json"))?
     {
         return Err(OfficialCodexAppServerError::UncertainToolEffect {
             effect_index,
@@ -4124,6 +4146,13 @@ fn validate_reconciled_tool_effect(
     if let Some(observation) = effect.read_only_observation.as_ref() {
         let synthesized = synthesize_never_claimed_read_only_response(effect_index, observation)?;
         if response == &synthesized {
+            if observation.dispatch_phase != Some(CodexReadOnlyDispatchPhase::NotDispatched) {
+                return Err(OfficialCodexAppServerError::UncertainToolEffect {
+                    effect_index,
+                    reason: "synthetic never-claimed response omitted durable pre-dispatch proof"
+                        .to_string(),
+                });
+            }
             if effect.command_receipts.is_empty() {
                 return Ok(());
             }
@@ -4134,6 +4163,20 @@ fn validate_reconciled_tool_effect(
         }
     }
     let evidence = extract_command_receipt_references(session_directory, effect_index, response)?;
+    if evidence.contains_unclaimed_read_only_synthetic
+        && !effect
+            .read_only_observation
+            .as_ref()
+            .is_some_and(|observation| {
+                observation.dispatch_phase == Some(CodexReadOnlyDispatchPhase::NotDispatched)
+            })
+    {
+        return Err(OfficialCodexAppServerError::UncertainToolEffect {
+            effect_index,
+            reason: "synthetic never-claimed command omitted durable pre-dispatch proof"
+                .to_string(),
+        });
+    }
     if !evidence.replayable {
         return Err(OfficialCodexAppServerError::UncertainToolEffect {
             effect_index,
@@ -4830,6 +4873,8 @@ mod interrupted_read_only_reconciliation_tests {
     #[derive(Default)]
     struct IdentityOnlyVerifier {
         handle_calls: usize,
+        allow_unclaimed: bool,
+        never_claimed_checks: usize,
     }
 
     impl OfficialCodexServerRequestHandler for IdentityOnlyVerifier {
@@ -4845,7 +4890,12 @@ mod interrupted_read_only_reconciliation_tests {
             &mut self,
             _observation: &CodexReadOnlyEffectObservation,
         ) -> Result<(), String> {
-            Err("at least one command has a durable claim".to_string())
+            self.never_claimed_checks += 1;
+            if self.allow_unclaimed {
+                Ok(())
+            } else {
+                Err("at least one command has a durable claim".to_string())
+            }
         }
 
         fn verify_completed_read_only_effect(
@@ -4881,7 +4931,17 @@ mod interrupted_read_only_reconciliation_tests {
             tool_call_id: "call-test".to_string(),
             execution_id: "runtime-test:call-test".to_string(),
             commands: vec![read_only_command(0), read_only_command(1)],
+            dispatch_phase: None,
         }
+    }
+
+    #[test]
+    fn legacy_read_only_observation_has_unknown_dispatch_phase() {
+        let legacy = serde_json::to_value(read_only_observation()).expect("legacy observation");
+        assert!(legacy.get("dispatch_phase").is_none());
+        let decoded: CodexReadOnlyEffectObservation =
+            serde_json::from_value(legacy).expect("legacy observation remains readable");
+        assert_eq!(decoded.dispatch_phase, None);
     }
 
     fn execution_ledger(observation: CodexReadOnlyEffectObservation) -> CodexExecutionLedger {
@@ -5200,14 +5260,19 @@ mod interrupted_read_only_reconciliation_tests {
     #[test]
     fn batch_unaccepted_command_replays_from_durable_admission_without_receipt() {
         let root = tempfile::tempdir().expect("tempdir");
+        let session_dir = std::fs::canonicalize(root.path()).expect("canonical session dir");
         let observation = command_run_observation();
-        let (receipt_path, receipt) = write_command_run_batch_fixture(root.path(), &observation);
+        let (receipt_path, receipt) = write_command_run_batch_fixture(&session_dir, &observation);
         let raw = partial_command_run_response(&receipt_path, &receipt);
 
-        let normalized =
-            normalize_command_run_response_from_batch_admission(root.path(), 0, &observation, &raw)
-                .expect("batch admission normalizes the unaccepted command");
-        let evidence = extract_command_receipt_references(root.path(), 0, &normalized)
+        let normalized = normalize_command_run_response_from_batch_admission(
+            &session_dir,
+            0,
+            &observation,
+            &raw,
+        )
+        .expect("batch admission normalizes the unaccepted command");
+        let evidence = extract_command_receipt_references(&session_dir, 0, &normalized)
             .expect("normalized response is independently replayable");
         assert!(evidence.replayable);
         assert_eq!(evidence.references.len(), 2);
@@ -5252,7 +5317,7 @@ mod interrupted_read_only_reconciliation_tests {
         };
         let mut handler = IdentityOnlyVerifier::default();
         let mut request_handler = Some(&mut handler as &mut dyn OfficialCodexServerRequestHandler);
-        reconcile_durable_command_run_effects(root.path(), &mut ledger, &mut request_handler)
+        reconcile_durable_command_run_effects(&session_dir, &mut ledger, &mut request_handler)
             .expect("interrupted command_run reconciles without reexecution");
         assert_eq!(
             ledger.effects[0].state,
@@ -5265,21 +5330,93 @@ mod interrupted_read_only_reconciliation_tests {
     #[test]
     fn batch_accepted_command_without_terminal_receipt_remains_fail_closed() {
         let root = tempfile::tempdir().expect("tempdir");
+        let session_dir = std::fs::canonicalize(root.path()).expect("canonical session dir");
         let observation = command_run_observation();
-        let (receipt_path, receipt) = write_command_run_batch_fixture(root.path(), &observation);
+        let (receipt_path, receipt) = write_command_run_batch_fixture(&session_dir, &observation);
         std::fs::remove_file(&receipt_path).expect("remove accepted receipt");
         let raw = partial_command_run_response(&receipt_path, &receipt);
-        let error =
-            normalize_command_run_response_from_batch_admission(root.path(), 0, &observation, &raw)
-                .and_then(|normalized| {
-                    extract_command_receipt_references(root.path(), 0, &normalized)
-                })
-                .expect_err("accepted command without durable receipt must stay uncertain");
+        let error = normalize_command_run_response_from_batch_admission(
+            &session_dir,
+            0,
+            &observation,
+            &raw,
+        )
+        .and_then(|normalized| extract_command_receipt_references(&session_dir, 0, &normalized))
+        .expect_err("accepted command without durable receipt must stay uncertain");
         assert!(
             error
                 .to_string()
                 .contains("terminal receipt is unavailable")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_terminal_receipt_is_not_replay_evidence() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let session_dir = std::fs::canonicalize(root.path()).expect("canonical session dir");
+        let observation = command_run_observation();
+        let (receipt_path, receipt) = write_command_run_batch_fixture(&session_dir, &observation);
+        let external = session_dir.join("external-receipt.json");
+        std::fs::write(
+            &external,
+            serde_json::to_vec(&receipt).expect("receipt encode"),
+        )
+        .expect("external receipt");
+        std::fs::remove_file(&receipt_path).expect("remove accepted receipt");
+        std::os::unix::fs::symlink(&external, &receipt_path).expect("symlink accepted receipt");
+        let response = partial_command_run_response(&receipt_path, &receipt);
+
+        let error = extract_command_receipt_references(&session_dir, 0, &response)
+            .expect_err("symlink must not supply replay evidence");
+        assert!(
+            error
+                .to_string()
+                .contains("terminal receipt is unavailable")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_batch_admission_is_not_replay_evidence() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let session_dir = std::fs::canonicalize(root.path()).expect("canonical session dir");
+        let observation = command_run_observation();
+        write_command_run_batch_fixture(&session_dir, &observation);
+        let marker_path = command_receipt_directory(&session_dir).join(format!(
+            "{}.batch-admission",
+            encode_command_receipt_identity(&observation.execution_id)
+        ));
+        let external = session_dir.join("external-admission.json");
+        std::fs::copy(&marker_path, &external).expect("copy admission bytes");
+        std::fs::remove_file(&marker_path).expect("remove admission");
+        std::os::unix::fs::symlink(&external, &marker_path).expect("symlink admission");
+
+        let error = load_command_run_batch_admission(&session_dir, 0, &observation)
+            .expect_err("symlink must not supply batch admission");
+        assert!(error.to_string().contains("batch admission is unavailable"));
+    }
+
+    #[test]
+    fn reported_terminal_receipt_path_is_identity_not_read_authority() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let session_dir = std::fs::canonicalize(root.path()).expect("canonical session dir");
+        let observation = command_run_observation();
+        let (receipt_path, receipt) = write_command_run_batch_fixture(&session_dir, &observation);
+        let mut response = partial_command_run_response(&receipt_path, &receipt);
+        let mut output: Value = serde_json::from_str(
+            response["contentItems"][0]["text"]
+                .as_str()
+                .expect("response text"),
+        )
+        .expect("response JSON");
+        output["results"][0]["output"]["terminal_receipt_path"] =
+            json!(session_dir.join("other-receipt.json"));
+        response["contentItems"][0]["text"] = json!(output.to_string());
+
+        let error = extract_command_receipt_references(&session_dir, 0, &response)
+            .expect_err("reported path must match the store identity");
+        assert!(error.to_string().contains("terminal receipt path"));
     }
 
     fn pre_execution_terminal_receipt(call_id: &str) -> Value {
@@ -5408,11 +5545,13 @@ mod interrupted_read_only_reconciliation_tests {
     }
 
     #[test]
-    fn mixed_read_only_batch_reconciles_per_command_without_reexecution() {
+    fn mixed_read_only_batch_after_dispatch_remains_uncertain() {
         let root = tempfile::tempdir().expect("tempdir");
-        let observation = read_only_observation();
+        let session_dir = std::fs::canonicalize(root.path()).expect("canonical session dir");
+        let mut observation = read_only_observation();
+        observation.dispatch_phase = Some(CodexReadOnlyDispatchPhase::MayHaveDispatched);
         let completed_command = &observation.commands[1];
-        let receipt_directory = receipt_directory(root.path());
+        let receipt_directory = receipt_directory(&session_dir);
         std::fs::create_dir_all(&receipt_directory).expect("receipt directory");
         let encoded = encode_command_receipt_identity(&completed_command.claim_identity);
         std::fs::write(
@@ -5435,45 +5574,41 @@ mod interrupted_read_only_reconciliation_tests {
         .expect("terminal receipt write");
 
         let mut execution_ledger = execution_ledger(observation);
-        let mut handler = IdentityOnlyVerifier::default();
-        {
+        let mut handler = IdentityOnlyVerifier {
+            allow_unclaimed: true,
+            ..Default::default()
+        };
+        let error = {
             let mut request_handler =
                 Some(&mut handler as &mut dyn OfficialCodexServerRequestHandler);
             reconcile_never_claimed_read_only_effects(
-                root.path(),
+                &session_dir,
                 &mut execution_ledger,
                 &mut request_handler,
             )
-            .expect("mixed read-only reconciliation");
-        }
+            .expect_err("missing terminal receipt cannot become a synthetic zero-effect result")
+        };
 
         assert_eq!(handler.handle_calls, 0, "recovery replayed the tool call");
+        assert_eq!(handler.never_claimed_checks, 0);
+        assert!(
+            error
+                .to_string()
+                .contains("has no durable terminal receipt")
+        );
         let effect = &execution_ledger.effects[0];
-        assert_eq!(effect.state, CodexObservedToolEffectState::Reconciled);
-        assert_eq!(effect.command_receipts.len(), 1);
-        validate_reconciled_tool_effect(root.path(), 0, effect)
-            .expect("mixed response must remain independently replayable");
-        let response = effect.response.as_ref().expect("reconciled response");
-        let text = response["contentItems"][0]["text"]
-            .as_str()
-            .expect("response text");
-        let output: Value = serde_json::from_str(text).expect("response JSON");
-        assert_eq!(
-            output["results"][0]["output"]["terminal_state"],
-            "not_started"
-        );
-        assert_eq!(
-            output["results"][1]["output"]["delivery_state"],
-            "reconstructed_from_durable_terminal_receipt"
-        );
+        assert_eq!(effect.state, CodexObservedToolEffectState::Observed);
+        assert!(effect.response.is_none());
     }
 
     #[test]
     fn claimed_read_only_command_without_terminal_receipt_fails_closed() {
         let root = tempfile::tempdir().expect("tempdir");
-        let observation = read_only_observation();
+        let session_dir = std::fs::canonicalize(root.path()).expect("canonical session dir");
+        let mut observation = read_only_observation();
+        observation.dispatch_phase = Some(CodexReadOnlyDispatchPhase::MayHaveDispatched);
         let claimed_command = &observation.commands[0];
-        let receipt_directory = receipt_directory(root.path());
+        let receipt_directory = receipt_directory(&session_dir);
         std::fs::create_dir_all(&receipt_directory).expect("receipt directory");
         let encoded = encode_command_receipt_identity(&claimed_command.claim_identity);
         std::fs::write(
@@ -5488,7 +5623,7 @@ mod interrupted_read_only_reconciliation_tests {
             let mut request_handler =
                 Some(&mut handler as &mut dyn OfficialCodexServerRequestHandler);
             reconcile_never_claimed_read_only_effects(
-                root.path(),
+                &session_dir,
                 &mut execution_ledger,
                 &mut request_handler,
             )
@@ -5508,5 +5643,261 @@ mod interrupted_read_only_reconciliation_tests {
             execution_ledger.effects[0].state,
             CodexObservedToolEffectState::Observed
         );
+    }
+
+    #[derive(Default)]
+    struct DispatchBarrierHandler {
+        persisted_phases: Vec<Option<CodexReadOnlyDispatchPhase>>,
+        handled_after_barrier: bool,
+    }
+
+    impl OfficialCodexServerRequestHandler for DispatchBarrierHandler {
+        fn observe_read_only_effect(
+            &mut self,
+            _request: &OfficialCodexServerRequest,
+        ) -> Result<Option<CodexReadOnlyEffectObservation>, String> {
+            Ok(Some(read_only_observation()))
+        }
+
+        fn persist_execution_ledger(
+            &mut self,
+            ledger: &CodexExecutionLedger,
+        ) -> Result<(), String> {
+            self.persisted_phases.push(
+                ledger.effects[0]
+                    .read_only_observation
+                    .as_ref()
+                    .and_then(|observation| observation.dispatch_phase),
+            );
+            Ok(())
+        }
+
+        fn handle<'a>(
+            &'a mut self,
+            _request: OfficialCodexServerRequest,
+        ) -> OfficialCodexServerRequestFuture<'a> {
+            self.handled_after_barrier = self.persisted_phases.last()
+                == Some(&Some(CodexReadOnlyDispatchPhase::MayHaveDispatched));
+            Box::pin(async { Err("simulated interruption after dispatch".to_string()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_dispatch_phase_is_persisted_before_handler_entry() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut ledger = execution_ledger(read_only_observation());
+        ledger.effects.clear();
+        let mut handler = DispatchBarrierHandler::default();
+        let mut request_handler = Some(&mut handler as &mut dyn OfficialCodexServerRequestHandler);
+        let mut writer: ProtocolWriter = Box::pin(tokio::io::sink());
+        let mut context = TurnRequestContext {
+            session_directory: root.path(),
+            runtime_id: "runtime-test",
+            execution_ledger: &mut ledger,
+        };
+
+        handle_server_request(
+            &json!({
+                "id": "call-test",
+                "method": "item/tool/call",
+                "params": {"tool": "command_run", "callId": "call-test"}
+            }),
+            &mut writer,
+            &mut request_handler,
+            Some(&mut context),
+        )
+        .await
+        .expect_err("simulated post-dispatch interruption");
+
+        assert_eq!(
+            handler.persisted_phases,
+            vec![
+                Some(CodexReadOnlyDispatchPhase::NotDispatched),
+                Some(CodexReadOnlyDispatchPhase::MayHaveDispatched),
+            ]
+        );
+        assert!(handler.handled_after_barrier);
+        assert_eq!(
+            ledger.effects[0]
+                .read_only_observation
+                .as_ref()
+                .and_then(|observation| observation.dispatch_phase),
+            Some(CodexReadOnlyDispatchPhase::MayHaveDispatched)
+        );
+    }
+
+    #[test]
+    fn pre_dispatch_crash_recovers_with_missing_or_empty_receipt_subtree() {
+        for create_empty_subtree in [false, true] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let session_dir = root.path().canonicalize().expect("canonical session dir");
+            if create_empty_subtree {
+                std::fs::create_dir_all(receipt_directory(&session_dir))
+                    .expect("empty receipt subtree");
+            }
+            let mut observation = read_only_observation();
+            observation.dispatch_phase = Some(CodexReadOnlyDispatchPhase::NotDispatched);
+            let mut ledger = execution_ledger(observation);
+            let mut handler = IdentityOnlyVerifier {
+                allow_unclaimed: true,
+                ..Default::default()
+            };
+            {
+                let mut request_handler =
+                    Some(&mut handler as &mut dyn OfficialCodexServerRequestHandler);
+                reconcile_never_claimed_read_only_effects(
+                    &session_dir,
+                    &mut ledger,
+                    &mut request_handler,
+                )
+                .expect("durable pre-dispatch observation is recoverable");
+            }
+            assert_eq!(handler.never_claimed_checks, 1);
+            assert_eq!(handler.handle_calls, 0);
+            validate_reconciled_tool_effect(&session_dir, 0, &ledger.effects[0])
+                .expect("synthetic result retains pre-dispatch proof");
+        }
+    }
+
+    #[test]
+    fn missing_empty_or_replaced_receipts_cannot_zero_post_dispatch_or_legacy_effects() {
+        for phase in [None, Some(CodexReadOnlyDispatchPhase::MayHaveDispatched)] {
+            for state in ["missing", "empty", "replaced"] {
+                let root = tempfile::tempdir().expect("tempdir");
+                let session_dir = root.path().canonicalize().expect("canonical session dir");
+                let receipts = receipt_directory(&session_dir);
+                if state != "missing" {
+                    std::fs::create_dir_all(&receipts).expect("receipt subtree");
+                }
+                if state == "replaced" {
+                    std::fs::rename(&receipts, receipts.with_file_name("old-command-receipts"))
+                        .expect("move original receipt subtree");
+                    std::fs::create_dir(&receipts).expect("replacement receipt subtree");
+                }
+                let mut observation = read_only_observation();
+                observation.dispatch_phase = phase;
+                let mut ledger = execution_ledger(observation);
+                let mut handler = IdentityOnlyVerifier {
+                    allow_unclaimed: true,
+                    ..Default::default()
+                };
+                let error = {
+                    let mut request_handler =
+                        Some(&mut handler as &mut dyn OfficialCodexServerRequestHandler);
+                    reconcile_never_claimed_read_only_effects(
+                        &session_dir,
+                        &mut ledger,
+                        &mut request_handler,
+                    )
+                    .expect_err("post-dispatch or legacy effect cannot infer zero mutation")
+                };
+                assert!(error.to_string().contains("receipt"), "{error}");
+                assert_eq!(handler.never_claimed_checks, 0);
+                assert_eq!(handler.handle_calls, 0);
+                assert_eq!(
+                    ledger.effects[0].state,
+                    CodexObservedToolEffectState::Observed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn post_dispatch_and_legacy_effects_recover_from_complete_terminal_receipts() {
+        for phase in [None, Some(CodexReadOnlyDispatchPhase::MayHaveDispatched)] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let session_dir = root.path().canonicalize().expect("canonical session dir");
+            let mut observation = read_only_observation();
+            observation.dispatch_phase = phase;
+            let receipts = receipt_directory(&session_dir);
+            std::fs::create_dir_all(&receipts).expect("receipt subtree");
+            for command in &observation.commands {
+                let encoded = encode_command_receipt_identity(&command.claim_identity);
+                std::fs::write(
+                    receipts.join(format!("{encoded}.json")),
+                    serde_json::to_vec(&completed_terminal_receipt(&command.claim_identity))
+                        .expect("receipt encode"),
+                )
+                .expect("receipt write");
+            }
+            let mut ledger = execution_ledger(observation);
+            let mut handler = IdentityOnlyVerifier {
+                allow_unclaimed: true,
+                ..Default::default()
+            };
+            {
+                let mut request_handler =
+                    Some(&mut handler as &mut dyn OfficialCodexServerRequestHandler);
+                reconcile_never_claimed_read_only_effects(
+                    &session_dir,
+                    &mut ledger,
+                    &mut request_handler,
+                )
+                .expect("complete terminal receipts are recoverable");
+            }
+            assert_eq!(handler.never_claimed_checks, 0);
+            assert_eq!(ledger.effects[0].command_receipts.len(), 2);
+            validate_reconciled_tool_effect(&session_dir, 0, &ledger.effects[0])
+                .expect("completed receipts remain replayable");
+        }
+    }
+
+    #[test]
+    fn old_reconciled_synthetic_response_without_predispatch_proof_is_rejected() {
+        for phase in [None, Some(CodexReadOnlyDispatchPhase::MayHaveDispatched)] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let mut observation = read_only_observation();
+            observation.dispatch_phase = phase;
+            let response = synthesize_never_claimed_read_only_response(0, &observation)
+                .expect("legacy synthetic shape");
+            let mut ledger = execution_ledger(observation);
+            let effect = &mut ledger.effects[0];
+            effect.state = CodexObservedToolEffectState::Reconciled;
+            effect.response = Some(response);
+            let error = validate_reconciled_tool_effect(root.path(), 0, effect)
+                .expect_err("synthetic response without durable barrier must not replay");
+            assert!(error.to_string().contains("pre-dispatch proof"));
+        }
+    }
+
+    #[test]
+    fn old_mixed_reconciled_synthetic_response_without_predispatch_proof_is_rejected() {
+        for phase in [None, Some(CodexReadOnlyDispatchPhase::MayHaveDispatched)] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let session_dir = root.path().canonicalize().expect("canonical session dir");
+            let mut observation = read_only_observation();
+            observation.dispatch_phase = phase;
+            let completed = &observation.commands[1];
+            let receipts = receipt_directory(&session_dir);
+            std::fs::create_dir_all(&receipts).expect("receipt subtree");
+            let encoded = encode_command_receipt_identity(&completed.claim_identity);
+            std::fs::write(
+                receipts.join(format!("{encoded}.json")),
+                serde_json::to_vec(&completed_terminal_receipt(&completed.claim_identity))
+                    .expect("receipt encode"),
+            )
+            .expect("receipt write");
+            let store = open_command_receipt_store(&session_dir, 0).expect("receipt store");
+            let output = json!({"results": [
+                synthesize_never_claimed_read_only_command(&observation.commands[0]),
+                synthesize_completed_read_only_command(&store, 0, completed)
+                    .expect("completed command")
+            ]});
+            let response = json!({
+                "contentItems": [{"type": "inputText", "text": output.to_string()}],
+                "success": true
+            });
+            let evidence = extract_command_receipt_references(&session_dir, 0, &response)
+                .expect("legacy mixed response shape");
+            assert!(evidence.contains_unclaimed_read_only_synthetic);
+            let mut ledger = execution_ledger(observation);
+            let effect = &mut ledger.effects[0];
+            effect.state = CodexObservedToolEffectState::Reconciled;
+            effect.response = Some(response);
+            effect.command_receipts = evidence.references;
+            let error = validate_reconciled_tool_effect(&session_dir, 0, effect)
+                .expect_err("mixed synthetic response without barrier must not replay");
+            assert!(error.to_string().contains("pre-dispatch proof"));
+        }
     }
 }

@@ -16,9 +16,10 @@ use super::agent_prompts::{active_persona_display_name, load_agent_system_prompt
 use super::constants::{COMMAND_RUN_TOOL, PLANNING_TOOL};
 use super::prompt_messages::messages_for_turn_with_context_limit;
 use super::tool_catalog::{
-    command_run_commands_for_agent, extend_command_run_commands_with_capabilities,
-    filter_tools_for_turn, load_agent_capabilities_with_commands, planning_tool_disabled,
-    startup_task_state_required, tool_schema_name,
+    authorize_source_read_command, command_run_commands_for_agent,
+    extend_command_run_commands_with_capabilities, filter_tools_for_turn,
+    load_agent_capabilities_with_commands, planning_tool_disabled,
+    provider_command_run_commands_for_jspace, startup_task_state_required, tool_schema_name,
 };
 
 const FORCE_COMPACT_CONTEXT_TOKEN_CAP: u64 = 260_000;
@@ -55,13 +56,16 @@ pub(crate) fn execute_turn(
         &mut agent_commands,
         session.session_capabilities.iter().map(String::as_str),
     );
-    let planning_enabled = agent_commands.contains(PLANNING_TOOL);
+    authorize_source_read_command(&mut agent_commands, session);
+    let provider_commands =
+        provider_command_run_commands_for_jspace(&agent_commands, session.jspace_contract.as_ref());
+    let planning_enabled = provider_commands.contains(PLANNING_TOOL);
     let disable_tool_invocation = is_final_turn || force_no_tools;
-    let require_startup_task_state = startup_task_state_required(session, &agent_commands);
+    let require_startup_task_state = startup_task_state_required(session, &provider_commands);
     let tools = if let Some(retry_input) = retry_provider_input.as_ref() {
         retry_input.tools.clone()
     } else {
-        let mut tools = load_agent_capabilities_with_commands(agent, session, &agent_commands)?;
+        let mut tools = load_agent_capabilities_with_commands(agent, session, &provider_commands)?;
         if planning_tool_disabled() {
             tools.retain(|tool| tool_schema_name(tool) != Some(PLANNING_TOOL));
         }

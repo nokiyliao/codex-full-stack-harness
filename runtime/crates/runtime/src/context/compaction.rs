@@ -10,10 +10,10 @@ use super::char_budget::{
 };
 use super::text_truncate::environment_context_message;
 use super::tool_results::{
-    immutable_tool_result_context_messages, strip_context_reporting_fields,
-    tool_result_context_cache,
+    command_run_cached_context_messages_are_valid, immutable_tool_result_context_messages,
+    strip_context_reporting_fields, tool_result_context_cache,
 };
-use super::{ContextualUserFragment, WorkspaceSnapshot};
+use super::workspace_snapshot_for_session;
 
 const MAX_INHERITED_COMPACT_SUMMARIES: usize = 2;
 const INHERITED_COMPACT_CONTEXT_MARKER: &str = "[inherited_compact_context]";
@@ -122,9 +122,7 @@ fn compact_session_context_with_options(
     );
     let retained_from_index = compact_retained_log_start(&session.session_log);
     let compact_entry_index = session.session_log.len();
-    let workspace_snapshot = WorkspaceSnapshot::from_cwd(&session.session_directory)
-        .map(|snapshot| snapshot.render())
-        .unwrap_or_else(|| "<WORKSPACE_SNAPSHOT>\n\n</WORKSPACE_SNAPSHOT>".to_string());
+    let workspace_snapshot = workspace_snapshot_for_session(session);
     let environment_context = environment_context_message(&session.session_directory);
     let compact_record = serde_json::json!({
             "type": "context_compaction",
@@ -591,6 +589,8 @@ fn compact_tool_result_context_messages(value: &serde_json::Value) -> Vec<serde_
     if let Some(messages) = value
         .get("context_messages")
         .and_then(serde_json::Value::as_array)
+        && (value.get("tool_name").and_then(serde_json::Value::as_str) != Some("command_run")
+            || command_run_cached_context_messages_are_valid(messages))
     {
         return messages
             .iter()
@@ -636,4 +636,164 @@ fn compact_section(content: &str, start_marker: &str, end_marker: Option<&str>) 
         .and_then(|marker| tail.find(marker))
         .unwrap_or(tail.len());
     Some(tail[..end].trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compact_session_context, compact_tool_result_context_messages};
+    use crate::context::build_messages_from_session;
+    use chrono::Utc;
+    use lifecycle::{SessionInput, SessionManagement};
+    use serde_json::{Value, json};
+
+    fn recorded_command_run() -> Value {
+        json!({
+            "type": "tool_result",
+            "tool_name": "command_run",
+            "provider_metadata": { "id": "call_compact_cache" },
+            "input": {
+                "commands": [{
+                    "step": 1,
+                    "command_type": "shell_command",
+                    "command_line": "echo recorded"
+                }]
+            },
+            "output": {
+                "results": [{
+                    "step": 1,
+                    "command_type": "shell_command",
+                    "command_line": "echo recorded",
+                    "success": true,
+                    "output": { "exit_code": 0, "stdout": "recorded\n", "stderr": "" }
+                }]
+            },
+            "success": true,
+            "error": null
+        })
+    }
+
+    fn cached_pair(arguments: &str, output: Value) -> Value {
+        let mut record = recorded_command_run();
+        record["context_messages"] = json!([
+            {
+                "type": "function_call",
+                "call_id": "call_compact_cache",
+                "name": "command_run",
+                "arguments": arguments
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_compact_cache",
+                "output": output
+            }
+        ]);
+        record
+    }
+
+    fn assert_rebuilt_command_pair(messages: &[Value]) {
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["type"], "function_call");
+        assert_eq!(messages[1]["type"], "function_call_output");
+        assert_eq!(messages[0]["call_id"], messages[1]["call_id"]);
+        assert_eq!(messages[0]["call_id"], "call_compact_cache");
+        let arguments: Value = serde_json::from_str(messages[0]["arguments"].as_str().unwrap())
+            .expect("recorded arguments");
+        assert_eq!(arguments["commands"][0]["command_line"], "echo recorded");
+        let output: Value = serde_json::from_str(messages[1]["output"].as_str().unwrap())
+            .expect("recorded output");
+        assert_eq!(output["results"][0]["output"]["stdout"], "recorded\n");
+        for field in ["step", "command_type", "command_line"] {
+            assert!(output["results"][0].get(field).is_none(), "{field} leaked");
+        }
+    }
+
+    #[test]
+    fn compact_rebuilds_command_run_cache_with_empty_arguments() {
+        let record = cached_pair("{}", json!("stale output"));
+        assert_rebuilt_command_pair(&compact_tool_result_context_messages(&record));
+    }
+
+    #[test]
+    fn compact_rebuilds_command_run_cache_with_output_command_identity() {
+        let record = cached_pair(
+            r#"{"commands":[{"command_type":"shell_command","command_line":"echo stale"}]}"#,
+            json!(r#"{"results":[{"command_type":"shell_command","command_line":"echo stale"}]}"#),
+        );
+        assert_rebuilt_command_pair(&compact_tool_result_context_messages(&record));
+    }
+
+    #[test]
+    fn compact_preserves_valid_command_run_cache_and_strips_reporting_fields() {
+        let mut record = cached_pair(
+            r#"{"commands":[{"command_type":"shell_command","command_line":"echo cached"}]}"#,
+            json!(r#"{"results":[{"output":"cached output"}]}"#),
+        );
+        record["context_messages"][0]["timestamp"] = json!("audit only");
+        let expected = vec![
+            json!({
+                "type": "function_call",
+                "call_id": "call_compact_cache",
+                "name": "command_run",
+                "arguments": r#"{"commands":[{"command_type":"shell_command","command_line":"echo cached"}]}"#
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_compact_cache",
+                "output": r#"{"results":[{"output":"cached output"}]}"#
+            }),
+        ];
+        assert_eq!(compact_tool_result_context_messages(&record), expected);
+    }
+
+    #[test]
+    fn compact_preserves_absent_cache_and_non_command_context() {
+        let record = recorded_command_run();
+        assert_rebuilt_command_pair(&compact_tool_result_context_messages(&record));
+
+        let non_command = json!({
+            "type": "tool_result",
+            "tool_name": "read_file",
+            "context_messages": [{"role": "user", "content": "cached as-is", "timestamp": "audit"}]
+        });
+        assert_eq!(
+            compact_tool_result_context_messages(&non_command),
+            vec![json!({"role": "user", "content": "cached as-is"})]
+        );
+    }
+
+    #[test]
+    fn compact_boundary_rebuilds_stale_pre_checkpoint_command_run() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let now = Utc::now();
+        let mut session = SessionManagement::new(
+            "sess-compact-cache".to_string(),
+            "test".to_string(),
+            root.path().to_path_buf(),
+            false,
+            "coding".to_string(),
+            SessionInput {
+                user_input: "inspect".to_string(),
+                file_input: vec![],
+                agent: None,
+                runtime_context: None,
+                planning_mode_override: None,
+            },
+            "inspect".to_string(),
+            now,
+        );
+        session.push_log(cached_pair("{}", json!("stale output")).to_string(), now);
+        compact_session_context(&mut session, "handoff after command")
+            .expect("compact checkpoint");
+        let messages = build_messages_from_session(&session);
+        let compact_index = messages.iter().position(|message| {
+            message.get("content").and_then(Value::as_str)
+                .is_some_and(|content| content.contains("handoff after command"))
+        }).expect("compact content");
+        let call_index = messages.iter().position(|message| {
+            message.get("type").and_then(Value::as_str) == Some("function_call")
+                && message.get("call_id").and_then(Value::as_str) == Some("call_compact_cache")
+        }).expect("pre-checkpoint command call");
+        assert_eq!(call_index, compact_index + 1);
+        assert_rebuilt_command_pair(&messages[call_index..call_index + 2]);
+    }
 }

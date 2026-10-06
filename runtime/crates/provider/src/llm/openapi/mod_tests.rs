@@ -224,7 +224,35 @@ fn provider_payload_keeps_max_reasoning_for_gpt_5_6_family() {
 }
 
 #[test]
-fn provider_payload_maps_max_reasoning_to_xhigh_for_non_gpt_5_6_models() {
+fn provider_payload_keeps_max_reasoning_for_supported_gpt_6_models() {
+    let messages = vec![json!({"role": "user", "content": "ping"})];
+    let options = CallOptions {
+        reasoning_effort: Some("max".to_string()),
+        ..CallOptions::default()
+    };
+    for model in ["gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"] {
+        let chat = build_chat_payload("openai", model, &messages, &options);
+        let codex = build_codex_oauth_payload(model, &messages, &options);
+        assert_eq!(chat["reasoning_effort"], "max", "chat {model}");
+        assert_eq!(codex["reasoning"]["effort"], "max", "codex {model}");
+        assert_eq!(codex["include"], json!(["reasoning.encrypted_content"]));
+    }
+}
+
+#[test]
+fn provider_payload_keeps_explicit_ultra_reasoning_for_gpt_6() {
+    let options = CallOptions {
+        reasoning_effort: Some("ultra".to_string()),
+        ..CallOptions::default()
+    };
+    let messages = vec![json!({"role": "user", "content": "ping"})];
+    for model in ["gpt-6-astra", "gpt-6.1-sol"] {
+        assert_eq!(build_codex_oauth_payload(model, &messages, &options)["reasoning"]["effort"], "ultra");
+    }
+}
+
+#[test]
+fn provider_payload_maps_max_reasoning_to_xhigh_for_legacy_unsupported_models() {
     let messages = vec![json!({"role": "user", "content": "ping"})];
     let options = CallOptions {
         reasoning_effort: Some("max".to_string()),
@@ -597,6 +625,15 @@ fn metrics_read_minimax_anthropic_cache_usage_fields() {
 
 #[tokio::test]
 async fn codex_oauth_call_sends_responses_reasoning_and_acceleration() {
+    assert_codex_oauth_request("gpt-5.1-codex", "high").await;
+}
+
+#[tokio::test]
+async fn codex_oauth_call_sends_gpt_6_1_max_without_downgrade() {
+    assert_codex_oauth_request("gpt-6.1-sol", "max").await;
+}
+
+async fn assert_codex_oauth_request(model: &str, effort: &str) {
     let _env_guard = codex_endpoint_env_lock().await;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("local addr");
@@ -671,13 +708,13 @@ async fn codex_oauth_call_sends_responses_reasoning_and_acceleration() {
 
     let messages = vec![json!({"role": "user", "content": "ping"})];
     let options = CallOptions {
-        reasoning_effort: Some("high".to_string()),
+        reasoning_effort: Some(effort.to_string()),
         service_tier: Some("priority".to_string()),
         ..CallOptions::default()
     };
 
     let result =
-        super::codex_oauth_call("gpt-5.1-codex", "test-token", &messages, &options, None).await;
+        super::codex_oauth_call(model, "test-token", &messages, &options, None).await;
 
     match previous_endpoint {
         // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
@@ -738,7 +775,9 @@ async fn codex_oauth_call_sends_responses_reasoning_and_acceleration() {
     );
     let body: serde_json::Value = serde_json::from_str(body_text).expect("json body");
     assert!(body.get("reasoning_effort").is_none());
-    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["reasoning"]["effort"], effort);
+    assert_eq!(body["model"], model);
+    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(body["service_tier"], "priority");
     assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
     assert_eq!(body["input"][0]["content"][0]["text"], "ping");
@@ -902,6 +941,79 @@ fn codex_oauth_payload_passes_prompt_cache_key_only() {
 
     assert_eq!(payload["prompt_cache_key"], "turaosv2:test:abc");
     assert!(payload.get("prompt_cache_retention").is_none());
+}
+
+#[test]
+fn gpt_6_codex_payload_keeps_supported_cache_key_without_rewriting_tool_outputs() {
+    let messages = vec![
+        json!({"role": "system", "content": "stable instructions"}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "one"}),
+        json!({"type": "function_call_output", "call_id": "call_2", "output": "two"}),
+        json!({"type": "function_call_output", "call_id": "call_3", "output": "three"}),
+    ];
+    let options = CallOptions {
+        prompt_cache_key: Some("turaosv2:test:gpt6".to_string()),
+        ..CallOptions::default()
+    };
+
+    let payload = build_codex_oauth_payload("gpt-6-astra", &messages, &options);
+
+    assert_eq!(payload["prompt_cache_key"], "turaosv2:test:gpt6");
+    assert!(payload.get("prompt_cache_options").is_none());
+    assert_eq!(payload["input"][1]["output"], "one");
+    assert_eq!(payload["input"][2]["output"], "two");
+    assert_eq!(payload["input"][3]["output"], "three");
+}
+
+#[test]
+fn gpt_6_responses_payload_keeps_tool_output_shape_before_later_user_message() {
+    let messages = vec![
+        json!({"role": "system", "content": "stable instructions"}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "tool result"}),
+        json!({"role": "assistant", "content": "progress"}),
+        json!({"role": "user", "content": "follow-up"}),
+    ];
+    let options = CallOptions {
+        prompt_cache_key: Some("turaosv2:test:gpt6-followup".to_string()),
+        ..CallOptions::default()
+    };
+
+    let payload = build_codex_oauth_payload("gpt-6-astra", &messages, &options);
+
+    assert_eq!(payload["input"][1]["output"], "tool result");
+    assert!(!payload.to_string().contains("prompt_cache_breakpoint"));
+}
+
+#[test]
+fn provider_qualified_gpt_6_codex_model_keeps_supported_cache_key() {
+    let messages = vec![json!({"role": "user", "content": "ping"})];
+    let options = CallOptions {
+        prompt_cache_key: Some("turaosv2:test:qualified-gpt6".to_string()),
+        ..CallOptions::default()
+    };
+
+    let payload = build_codex_oauth_payload("codex/gpt-6-astra", &messages, &options);
+
+    assert_eq!(payload["prompt_cache_key"], "turaosv2:test:qualified-gpt6");
+    assert!(payload.get("prompt_cache_options").is_none());
+}
+
+#[test]
+fn pre_gpt_5_6_responses_payload_keeps_legacy_tool_output_shape() {
+    let messages = vec![
+        json!({"role": "system", "content": "stable instructions"}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "one"}),
+    ];
+    let options = CallOptions {
+        prompt_cache_key: Some("turaosv2:test:legacy".to_string()),
+        ..CallOptions::default()
+    };
+
+    let payload = build_codex_oauth_payload("gpt-5.5", &messages, &options);
+
+    assert_eq!(payload["prompt_cache_key"], "turaosv2:test:legacy");
+    assert!(payload.get("prompt_cache_options").is_none());
+    assert_eq!(payload["input"][1]["output"], "one");
 }
 
 #[test]
@@ -1427,6 +1539,429 @@ fn minimax_xml_streaming_tool_call_supports_complete_command_run() {
 
     assert_eq!(name, "command_run");
     assert_eq!(arguments["commands"][0]["command"], "npm");
+}
+
+// Loopback-only HTTP fixtures exercise actual reqwest errors without a model or
+// upstream service. Consume the full request before closing a truncated body.
+fn responses_transport_fixture(
+    status: u16,
+    body: &str,
+    missing_bytes: usize,
+) -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind offline fixture");
+    let addr = listener.local_addr().expect("fixture addr");
+    let response = format!(
+        "HTTP/1.1 {status} Fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nSet-Cookie: COOKIE_SENTINEL\r\nConnection: close\r\n\r\n{body}",
+        body.len() + missing_bytes,
+    );
+    let join = std::thread::spawn(move || {
+        use std::io::BufRead;
+
+        let (mut stream, _) = listener.accept().expect("fixture request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("fixture read bound");
+        let mut reader = std::io::BufReader::new(&mut stream);
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).expect("request header") > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse::<usize>().expect("request length");
+            }
+        }
+        let mut request_body = vec![0; content_length];
+        reader.read_exact(&mut request_body).expect("request body");
+        drop(reader);
+        stream.write_all(response.as_bytes()).expect("fixture body");
+    });
+    (format!("http://{addr}/URL_SENTINEL"), join)
+}
+
+fn assert_safe_transport_message(error: crate::tura_llm::TuraError) -> String {
+    let crate::tura_llm::TuraError::Network { message } = error else {
+        panic!("expected transport failure");
+    };
+    assert!(message.len() <= 128);
+    assert!(message.contains("cause="));
+    for sensitive in [
+        "URL_SENTINEL",
+        "PROMPT_SENTINEL",
+        "REASONING_SENTINEL",
+        "AUTH_SENTINEL",
+        "COOKIE_SENTINEL",
+        "127.0.0.1",
+        "http://",
+    ] {
+        assert!(!message.contains(sensitive));
+    }
+    message
+}
+
+#[tokio::test]
+async fn response_body_decode_failure_keeps_safe_phase_category_and_cause() {
+    let (endpoint, join) = responses_transport_fixture(
+        200,
+        r#"{"prompt":"PROMPT_SENTINEL","reasoning":"REASONING_SENTINEL","auth":"AUTH_SENTINEL","cookie":"COOKIE_SENTINEL""#,
+        0,
+    );
+    let response = crate::streaming::send_provider_request_first_response(
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("fixture client")
+            .get(&endpoint)
+            .bearer_auth("AUTH_SENTINEL")
+            .header("cookie", "COOKIE_SENTINEL"),
+    )
+    .await
+    .expect("fixture response");
+    let error = crate::streaming::read_provider_response_body(response.json::<serde_json::Value>())
+        .await
+        .expect_err("incomplete JSON should remain a decode failure");
+    join.join().expect("fixture server");
+    assert_eq!(
+        assert_safe_transport_message(error),
+        "provider transport failure: phase=response-body category=decode cause=json-eof"
+    );
+}
+
+#[tokio::test]
+async fn responses_sse_preserves_unicode_at_every_byte_split() {
+    let text = "let text = \"\u{e9}\u{4e2d}\u{1f980} e\u{301}\u{fffd}\";\n";
+    let delta = json!({"type": "response.output_text.delta", "delta": text});
+    let completed = json!({
+        "type": "response.completed",
+        "response": {"status": "completed", "output": []}
+    });
+    let body = format!("data: {delta}\n\ndata: {completed}\n\ndata: [DONE]\n\n");
+    let bytes = body.as_bytes();
+    for split in 0..=bytes.len() {
+        let (tx, rx) = mpsc::channel();
+        let sink: crate::tura_llm::ProviderStreamEventSink = std::sync::Arc::new(move |event| {
+            tx.send(event).expect("stream event receiver");
+        });
+        let chunks = futures_util::stream::iter([
+            Ok::<_, reqwest::Error>(&bytes[..split]),
+            Ok(&bytes[split..]),
+        ]);
+        let root = super::response::parse_codex_response_chunks(chunks, Some(sink))
+            .await
+            .expect("valid split UTF-8 stream");
+        assert_eq!(root["output_text"], text, "split {split}");
+        assert_eq!(root["events"], json!([delta, completed]), "split {split}");
+        let streamed: String = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                crate::tura_llm::ProviderStreamEvent::TextDelta { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, text, "split {split}");
+    }
+}
+
+#[tokio::test]
+async fn responses_sse_bytewise_command_arguments_remain_exact_and_stream_early() {
+    let command = json!({
+        "step": 1,
+        "command_type": "shell_command",
+        "command_line": "printf '\u{e9} \u{4e2d} \u{1f680}\\n'"
+    });
+    let arguments = json!({"commands": [command]}).to_string();
+    let split = arguments.find('\u{4e2d}').expect("Unicode argument");
+    let added = json!({
+        "type": "response.output_item.added",
+        "item": {"id": "fc_unicode", "call_id": "call_unicode",
+            "type": "function_call", "name": "command_run", "arguments": ""}
+    });
+    let first = json!({"type": "response.function_call_arguments.delta",
+        "item_id": "fc_unicode", "delta": &arguments[..split]});
+    let second = json!({"type": "response.function_call_arguments.delta",
+        "item_id": "fc_unicode", "delta": &arguments[split..]});
+    let prefix = format!("data: {added}\n\ndata: {first}\n\ndata: {second}\n\n");
+    let done = json!({"type": "response.function_call_arguments.done",
+        "item_id": "fc_unicode", "arguments": arguments});
+    let item = json!({"id": "fc_unicode", "call_id": "call_unicode",
+        "type": "function_call", "name": "command_run", "arguments": arguments});
+    let item_done = json!({"type": "response.output_item.done", "item": item});
+    let completed = json!({"type": "response.completed",
+        "response": {"status": "completed", "output": [item]}});
+    let body = format!("{prefix}data: {done}\n\ndata: {item_done}\n\ndata: {completed}");
+    let (tx, rx) = mpsc::channel();
+    let sink: crate::tura_llm::ProviderStreamEventSink = std::sync::Arc::new(move |event| {
+        tx.send(event).expect("stream event receiver");
+    });
+    let chunks = futures_util::stream::iter(
+        body.as_bytes().chunks(1).enumerate().map(|(index, chunk)| {
+            if index == prefix.len() {
+                // Check before arguments.done or response.completed is even read.
+                let ready: Vec<_> = rx
+                    .try_iter()
+                    .filter_map(|event| match event {
+                        crate::tura_llm::ProviderStreamEvent::CommandRunCommandReady {
+                            command_index,
+                            command,
+                            ..
+                        } => Some((command_index, command)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(ready.len(), 1);
+                assert_eq!(ready[0].0, 0);
+                assert_eq!(ready[0].1["command_line"], command["command_line"]);
+            }
+            Ok::<_, reqwest::Error>(chunk)
+        }),
+    );
+    let root = super::response::parse_codex_response_chunks(chunks, Some(sink))
+        .await
+        .expect("bytewise command stream");
+    assert_eq!(root["output"][0]["arguments"], arguments);
+    let calls = super::response::complete_codex_tool_calls(&root);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["arguments"]["commands"][0], command);
+    assert!(
+        rx.try_iter()
+            .all(|event| command_index_for_test(&event).is_none())
+    );
+}
+
+#[tokio::test]
+async fn responses_sse_rejects_invalid_and_partial_utf8_even_after_completion() {
+    for line in [
+        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"PROMPT_SENTINEL \xff\"}\n".as_slice(),
+        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"AUTH_SENTINEL \xff\"}".as_slice(),
+        b": REASONING_SENTINEL \xc0\xaf\r\n".as_slice(),
+        b": COOKIE_SENTINEL \xed\xa0\x80\n".as_slice(),
+        b": PROMPT_SENTINEL AUTH_SENTINEL \xf0\x9f".as_slice(),
+        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"COOKIE_SENTINEL \xe2\x82".as_slice(),
+    ] {
+        let mut body = b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n".to_vec();
+        body.extend_from_slice(line);
+        let chunks = futures_util::stream::iter(body.chunks(1).map(Ok::<_, reqwest::Error>));
+        let error = super::response::parse_codex_response_chunks(chunks, None)
+            .await
+            .expect_err("invalid UTF-8 must not become replacement characters or success");
+        assert_eq!(
+            assert_safe_transport_message(error),
+            "provider stream failure: phase=responses-sse category=decode cause=invalid-utf8"
+        );
+    }
+}
+
+#[tokio::test]
+async fn responses_sse_rejects_clean_eof_without_valid_completion() {
+    let delta = json!({"type": "response.output_text.delta",
+        "delta": "PROMPT_SENTINEL REASONING_SENTINEL AUTH_SENTINEL COOKIE_SENTINEL"});
+    let completed = json!({"type": "response.completed",
+        "response": {"status": "completed", "output": []}});
+    let mut bodies = vec![String::new(), format!("data: {delta}")];
+    for event in [
+        json!({"type": "response.created", "response": {"status": "in_progress"}}),
+        json!({"type": "response.in_progress", "response": {"status": "queued"}}),
+        json!({"type": "response.created", "response": {"status": "completed"}}),
+        json!({"type": "response.completed"}),
+        json!({"type": "response.completed", "response": null}),
+        json!({"type": "response.completed", "response": "AUTH_SENTINEL"}),
+        json!({"type": "response.completed", "response": {"status": null}}),
+        json!({"type": "response.completed", "response": {"status": "in_progress"}}),
+        json!({"type": "response.completed", "response": {
+            "status": "completed", "error": {"message": "AUTH_SENTINEL"}}}),
+        json!({"type": "response.failed", "response": {}}),
+        json!({"type": "response.incomplete", "response": {}}),
+        json!({"type": "error", "message": "AUTH_SENTINEL"}),
+    ] {
+        bodies.push(format!("data: {delta}\n\ndata: {event}"));
+    }
+    bodies.push(format!(
+        "data: {completed}\n\ndata: {{\"type\":\"error\",\"message\":\"AUTH_SENTINEL\"}}"
+    ));
+    for body in bodies {
+        for suffix in ["", "\n\ndata: [DONE]\n\n"] {
+            let body = format!("{body}{suffix}");
+            let chunks = futures_util::stream::iter([Ok::<_, reqwest::Error>(body.as_bytes())]);
+            let error = super::response::parse_codex_response_chunks(chunks, None)
+                .await
+                .expect_err("clean EOF is not proof of completion");
+            assert_eq!(
+                assert_safe_transport_message(error),
+                "provider stream failure: phase=responses-sse category=protocol cause=missing-completed"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_sse_accepts_completed_crlf_and_unterminated_lines_with_optional_status() {
+    let text = "\u{e9}\u{4e2d}\u{1f680}";
+    let delta = json!({"type": "response.output_text.delta", "delta": text});
+    for response in [
+        json!({"output": []}),
+        json!({"status": "completed", "output": []}),
+    ] {
+        let completed = json!({"type": "response.completed", "response": response});
+        for ending in ["", "\r", "\n", "\r\n", "\r\n\r\ndata: [DONE]"] {
+            let body = format!(
+                ": heartbeat\r\n\r\ndata: {delta}\r\n\r\ndata: {completed}{ending}"
+            );
+            let chunks = futures_util::stream::iter(
+                body.as_bytes().chunks(1).map(Ok::<_, reqwest::Error>),
+            );
+            let root = super::response::parse_codex_response_chunks(chunks, None)
+                .await
+                .expect("completed stream with compatible line endings and status");
+            assert_eq!(root["output_text"], text);
+            assert_eq!(root["events"], json!([delta, completed]));
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_sse_keeps_provider_failure_snapshot_for_status_validation() {
+    for (event_type, status) in [
+        ("response.failed", "failed"),
+        ("response.incomplete", "incomplete"),
+        ("error", "failed"),
+    ] {
+        let response = json!({"status": status, "output": [],
+            "error": {"code": "fixture_failure"},
+            "incomplete_details": {"reason": "fixture_incomplete"}});
+        let event = json!({"type": event_type, "response": response});
+        let body = format!("data: {event}\n\n");
+        let chunks = futures_util::stream::iter([Ok::<_, reqwest::Error>(body.as_bytes())]);
+        let root = super::response::parse_codex_response_chunks(chunks, None)
+            .await
+            .expect("retain provider failure for existing caller status validation");
+        assert_eq!(root["status"], status);
+        assert_eq!(root["error"], response["error"]);
+        assert_eq!(root["incomplete_details"], response["incomplete_details"]);
+        assert_eq!(root["events"], json!([event]));
+    }
+}
+
+#[tokio::test]
+async fn responses_sse_decode_failure_keeps_safe_phase_category_and_cause() {
+    let (endpoint, join) = responses_transport_fixture(200, "{", 0);
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("fixture client")
+        .get(&endpoint)
+        .send()
+        .await
+        .expect("fixture response");
+    // A real reqwest decode error, injected into an otherwise valid SSE stream;
+    // this is a category regression, not a claim about the historical cause.
+    let decode_error = response
+        .json::<serde_json::Value>()
+        .await
+        .expect_err("incomplete JSON");
+    join.join().expect("fixture server");
+    assert!(decode_error.is_decode());
+    let chunks = futures_util::stream::iter([
+        Ok::<_, reqwest::Error>(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"PROMPT_SENTINEL REASONING_SENTINEL AUTH_SENTINEL COOKIE_SENTINEL\"}\n\n"
+                .as_slice(),
+        ),
+        Err(decode_error),
+    ]);
+    let error = super::response::parse_codex_response_chunks(chunks, None)
+        .await
+        .expect_err("SSE decode failure must not become partial success");
+    assert_eq!(
+        assert_safe_transport_message(error),
+        "provider transport failure: phase=responses-sse category=decode cause=json-eof"
+    );
+}
+
+#[tokio::test]
+async fn responses_truncated_stream_keeps_safe_phase_and_transport_category() {
+    let body = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"PROMPT_SENTINEL REASONING_SENTINEL AUTH_SENTINEL COOKIE_SENTINEL\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (endpoint, join) = responses_transport_fixture(200, body, 1);
+    let result = super::response::responses_api_key_call(
+        "openai",
+        &endpoint,
+        "offline-fixture",
+        "AUTH_SENTINEL",
+        &[json!({"role": "user", "content": "PROMPT_SENTINEL"})],
+        &CallOptions::default(),
+        None,
+    )
+    .await;
+    join.join().expect("fixture server");
+    let message = assert_safe_transport_message(result.err().expect("truncated HTTP body"));
+    // reqwest can expose a wire-body error directly or wrap it as a decode
+    // error. Neither representation establishes the historical upstream cause.
+    assert!(
+        message.starts_with("provider transport failure: phase=responses-sse category=body ")
+            || message.starts_with("provider transport failure: phase=responses-sse category=decode ")
+    );
+}
+
+#[tokio::test]
+async fn responses_valid_sse_and_existing_error_variants_are_preserved() {
+    let body = concat!(
+        ": heartbeat\r\n\r\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\r\n\r\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"output_text\":\"ok\"}}\r\n\r\n",
+        "data: [DONE]",
+    );
+    let (endpoint, join) = responses_transport_fixture(200, body, 0);
+    let result = super::response::responses_api_key_call(
+        "openai",
+        &endpoint,
+        "offline-fixture",
+        "fixture-key",
+        &[],
+        &CallOptions::default(),
+        None,
+    )
+    .await;
+    join.join().expect("fixture server");
+    let content = result.expect("valid SSE").content;
+    assert_eq!(content, json!("ok"));
+
+    let (endpoint, join) = responses_transport_fixture(200, "data: {", 0);
+    let result = super::response::responses_api_key_call(
+        "openai",
+        &endpoint,
+        "offline-fixture",
+        "fixture-key",
+        &[],
+        &CallOptions::default(),
+        None,
+    )
+    .await;
+    join.join().expect("fixture server");
+    assert!(matches!(result, Err(crate::tura_llm::TuraError::Json(_))));
+
+    let (endpoint, join) = responses_transport_fixture(401, "fixture auth rejection", 0);
+    let result = super::response::responses_api_key_call(
+        "openai",
+        &endpoint,
+        "offline-fixture",
+        "fixture-key",
+        &[],
+        &CallOptions::default(),
+        None,
+    )
+    .await;
+    join.join().expect("fixture server");
+    assert!(matches!(
+        result,
+        Err(crate::tura_llm::TuraError::HttpStatus { status: 401, body })
+            if body == "fixture auth rejection"
+    ));
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {

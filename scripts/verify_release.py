@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def verify(root: Path) -> int:
-    manifest = json.loads((root / "releases/v9.json").read_text())
+    manifest = json.loads((root / "releases/v157.json").read_text())
     count = 0
     for component, entry in manifest["components"].items():
         for name, expected in entry["files"].items():
@@ -19,4 +19,4 @@ def verify(root: Path) -> int:
 
 
 if __name__ == "__main__":
-    print(f"Verified {verify(Path(__file__).resolve().parents[1])} source files for Nokiy v9")
+    print(f"Verified {verify(Path(__file__).resolve().parents[1])} source files for Nokiy v157")

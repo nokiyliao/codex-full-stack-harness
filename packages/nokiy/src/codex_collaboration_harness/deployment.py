@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from . import embedded_nokiy as caller
+from . import task_closeout as closeout
 
 SCHEMA = "nokiy_deployment_plan_v1"
 TERMINAL = "nokiy_deployment_terminal_v1"
@@ -41,7 +42,7 @@ def save(path: Path, value: dict[str, Any]) -> None:
 
 
 def absolute(value: Any, *, directory: bool = False) -> Path:
-    if not isinstance(value, str) or not Path(value).is_absolute():
+    if not isinstance(value, str) or not Path(value).is_absolute() or ".." in Path(value).parts:
         fail("ABSOLUTE_PATH_REQUIRED")
     path = Path(value)
     if path.resolve(strict=True) != path or (directory and not path.is_dir()):
@@ -63,13 +64,41 @@ def identity(value: Any) -> Path:
     return path
 
 
+def validate_command(spec: Any) -> None:
+    if not isinstance(spec, dict) or set(spec) != {"argv", "files", "timeout_seconds"}:
+        fail("COMMAND_INVALID")
+    argv = spec["argv"]
+    if not isinstance(argv, list) or not 1 <= len(argv) <= 64 or any(not isinstance(a, str) or not a or "\0" in a for a in argv):
+        fail("ARGV_INVALID")
+    if type(spec["timeout_seconds"]) is not int or not 1 <= spec["timeout_seconds"] <= 3600:
+        fail("TIMEOUT_INVALID")
+    if not isinstance(spec["files"], list) or not 1 <= len(spec["files"]) <= 64:
+        fail("IDENTITIES_REQUIRED")
+    # Admit an executable entrypoint or a pinned script, not inline shell/code.
+    paths = {f.get("path") for f in spec["files"] if isinstance(f, dict)}
+    if argv[0] not in paths or any(a in {"-c", "-m", "-e", "--eval", "--command"} for a in argv[1:]):
+        fail("PINNED_ENTRYPOINT_REQUIRED")
+    if Path(argv[0]).name.startswith(("python", "node", "ruby", "perl", "bash", "zsh", "sh")):
+        operands = [a for a in argv[1:] if not a.startswith("-")]
+        if not operands or operands[0] not in paths:
+            fail("PINNED_SCRIPT_REQUIRED")
+
+
+def static_commands(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    specs = list(plan["commands"].values())
+    if "task_closeout" in plan:
+        specs.append(plan["task_closeout"]["command"])
+    return specs
+
+
 def load(path: Path, approved: str) -> tuple[dict[str, Any], str]:
     plan = document(path)
     digest = caller._canonical_sha256(plan)
     if digest != approved:
         fail("APPROVAL_DIGEST_MISMATCH")
-    if set(plan) != {"schema_version", "action_id", "native_thread_id", "workspace",
-                     "artifact_root", "target", "release", "expires_at", "authorization_ref", "commands"}:
+    required = {"schema_version", "action_id", "native_thread_id", "workspace",
+                "artifact_root", "target", "release", "expires_at", "authorization_ref", "commands"}
+    if set(plan) not in (required, required | {"task_closeout"}):
         fail("PLAN_FIELDS_INVALID")
     if plan["schema_version"] != SCHEMA or not isinstance(plan["action_id"], str) or not ID.fullmatch(plan["action_id"]):
         fail("PLAN_ID_INVALID")
@@ -86,23 +115,10 @@ def load(path: Path, approved: str) -> tuple[dict[str, Any], str]:
     if type(plan["expires_at"]) not in (int, float):
         fail("EXPIRY_REQUIRED")
     for spec in plan["commands"].values():
-        if not isinstance(spec, dict) or set(spec) != {"argv", "files", "timeout_seconds"}:
-            fail("COMMAND_INVALID")
-        argv = spec["argv"]
-        if not isinstance(argv, list) or not 1 <= len(argv) <= 64 or any(not isinstance(a, str) or not a or "\0" in a for a in argv):
-            fail("ARGV_INVALID")
-        if type(spec["timeout_seconds"]) is not int or not 1 <= spec["timeout_seconds"] <= 3600:
-            fail("TIMEOUT_INVALID")
-        if not isinstance(spec["files"], list) or not 1 <= len(spec["files"]) <= 64:
-            fail("IDENTITIES_REQUIRED")
-        # Admit an executable entrypoint or a pinned script, not inline shell/code.
-        paths = {f.get("path") for f in spec["files"] if isinstance(f, dict)}
-        if argv[0] not in paths or any(a in {"-c", "-m", "-e", "--eval", "--command"} for a in argv[1:]):
-            fail("PINNED_ENTRYPOINT_REQUIRED")
-        if Path(argv[0]).name.startswith(("python", "node", "ruby", "perl", "bash", "zsh", "sh")):
-            operands = [a for a in argv[1:] if not a.startswith("-")]
-            if not operands or operands[0] not in paths:
-                fail("PINNED_SCRIPT_REQUIRED")
+        validate_command(spec)
+    if "task_closeout" in plan:
+        closeout.validate(plan["task_closeout"], thread)
+        validate_command(plan["task_closeout"]["command"])
     return plan, digest
 
 
@@ -110,7 +126,7 @@ def fresh(plan: dict[str, Any]) -> None:
     if time.time() >= plan["expires_at"]:
         fail("AUTHORIZATION_EXPIRED")
     identity(plan["authorization_ref"])
-    for spec in plan["commands"].values():
+    for spec in static_commands(plan):
         for item in spec["files"]:
             identity(item)
         if not os.access(spec["argv"][0], os.X_OK):
@@ -129,7 +145,8 @@ def binding(plan: dict[str, Any], digest: str) -> dict[str, Any]:
             "release": plan["release"], "plan_sha256": digest}
 
 
-def run_stages(plan: dict[str, Any], digest: str, run: Path) -> dict[str, Any]:
+def run_stages(plan: dict[str, Any], digest: str, run: Path,
+               pin: dict[str, Any] | None = None) -> dict[str, Any]:
     cancelled = threading.Event()
     previous_handlers: dict[int, Any] = {}
     if threading.current_thread() is threading.main_thread():
@@ -141,6 +158,8 @@ def run_stages(plan: dict[str, Any], digest: str, run: Path) -> dict[str, Any]:
     try:
         for stage in STAGES:
             fresh(plan)
+            if pin is not None:
+                closeout.lease_identity(plan["task_closeout"], pin, plan["native_thread_id"])
             if cancelled.is_set():
                 fail("CANCELLED")
             spec = plan["commands"][stage]
@@ -178,6 +197,8 @@ def run_stages(plan: dict[str, Any], digest: str, run: Path) -> dict[str, Any]:
                                 {"verified": True, "healthy": True, "observed_release": plan["release"]})
                 if not isinstance(attestation, dict) or any(type(attestation.get(k)) is not type(v) or attestation.get(k) != v for k, v in expected.items()):
                     fail(stage.upper() + "_ATTESTATION_MISMATCH")
+        if cancelled.is_set():
+            fail("CANCELLED")
     except Exception as error:
         blocker = blocker or getattr(error, "code", "NOKIY_DEPLOYMENT_STAGE_ERROR")
     finally:
@@ -185,6 +206,41 @@ def run_stages(plan: dict[str, Any], digest: str, run: Path) -> dict[str, Any]:
             signal.signal(sig, handler)
     return {"stages": rows, "apply_attempted": attempted, "first_typed_blocker": blocker,
             "cleanup_pass": bool(rows) and all(clean(row["scope"]) for row in rows)}
+
+
+def run_closeout(plan: dict[str, Any], digest: str, run: Path, pin: dict[str, Any]) -> dict[str, Any]:
+    spec = plan["task_closeout"]
+    result: dict[str, Any] = {"status": "BLOCKED", "receipt_path": spec["completion_path"],
+                              "receipt_sha256": None, "first_typed_blocker": None}
+    try:
+        # A verified deployment alone is not a completed task. Do not re-run an uncertain finish.
+        fresh(plan)
+        closeout.lease_identity(spec, pin, plan["native_thread_id"])
+        completion = Path(spec["completion_path"])
+        if completion.exists() or completion.is_symlink():
+            fail("CLOSEOUT_RECEIPT_ALREADY_EXISTS")
+        save(run / "closeout.started.json", binding(plan, digest))
+        env = dict(os.environ)
+        env.update(NOKIY_DEPLOYMENT_PLAN_SHA256=digest, NOKIY_DEPLOYMENT_ACTION_ID=plan["action_id"])
+        returncode, wall_time, failure, cleanup = caller._run_process(
+            spec["command"]["argv"], cwd=Path(plan["workspace"]), env=env,
+            stdin_path=Path(os.devnull), stdout_path=run / "closeout.stdout",
+            stderr_path=run / "closeout.stderr", timeout=spec["command"]["timeout_seconds"],
+            output_limit=LIMIT,
+        )
+        result.update(returncode=returncode, wall_time_seconds=wall_time, failure=failure,
+                      cleanup=cleanup)
+        if failure or returncode != 0 or not clean(cleanup):
+            fail("CLOSEOUT_COMMAND_FAILED")
+        result["receipt_sha256"] = closeout.receipt(spec, pin, plan["native_thread_id"])
+        result["status"] = "VERIFIED"
+    except Exception as error:
+        result["first_typed_blocker"] = getattr(error, "code", "NOKIY_DEPLOYMENT_CLOSEOUT_ERROR")
+    try:
+        save(run / "closeout.result.json", result)
+    except OSError:
+        result.update(status="BLOCKED", first_typed_blocker="NOKIY_DEPLOYMENT_CLOSEOUT_RESULT_NOT_DURABLE")
+    return result
 
 
 def read_result(root: Path, action_id: str) -> dict[str, Any]:
@@ -214,6 +270,10 @@ def execute(path: Path, approved: str, *, check_only: bool = False) -> dict[str,
             return read_result(Path(plan["artifact_root"]), plan["action_id"])
         fail("UNCERTAIN_PRIOR_ATTEMPT")
     fresh(plan)
+    pin = None
+    if "task_closeout" in plan:
+        pin = closeout.paths(plan["task_closeout"])
+        closeout.lease_identity(plan["task_closeout"], pin, plan["native_thread_id"])
     if check_only:
         return {"status": "READY", **binding(plan, digest), "execution_started": False,
                 "domain_admission_checked": False}
@@ -223,27 +283,50 @@ def execute(path: Path, approved: str, *, check_only: bool = False) -> dict[str,
         fail("UNCERTAIN_PRIOR_ATTEMPT")
     sync_directory(run.parent)
     save(run / "plan.json", plan)
+    if pin is not None:
+        save(run / "closeout.paths.json", pin)
     result: dict[str, Any] = {}
     blocker = None
+    lease_result = None
+    stages_started = False
     try:
-        result = run_stages(plan, digest, run)
+        if pin is not None:
+            closeout.lease_identity(plan["task_closeout"], pin, plan["native_thread_id"])
+        stages_started = True
+        result = run_stages(plan, digest, run, pin)
         save(run / "supervision.json", result)
         blocker = result.get("first_typed_blocker")
         if not result.get("cleanup_pass"):
             blocker = blocker or "NOKIY_DEPLOYMENT_SUPERVISION_FAILED"
         if [r.get("stage") for r in result.get("stages", [])] != list(STAGES):
             blocker = blocker or "NOKIY_DEPLOYMENT_INCOMPLETE"
+        if not blocker and pin is not None:
+            lease_result = run_closeout(plan, digest, run, pin)
+            blocker = lease_result["first_typed_blocker"]
     except Exception as error:
         blocker = blocker or getattr(error, "code", "NOKIY_DEPLOYMENT_SUPERVISION_LOST")
     attempted = (run / "apply.started.json").exists()
     # Missing supervision may hide an effect: never advertise it as pre-execution.
     terminal = {"schema_version": TERMINAL, **binding(plan, digest), "native_thread_id": plan["native_thread_id"],
-        "status": "VERIFIED" if not blocker else "EFFECT_UNCERTAIN" if attempted or not result else "BLOCKED_BEFORE_APPLY",
+        "status": "CLOSEOUT_BLOCKED" if lease_result and blocker else
+                  "VERIFIED" if not blocker else "EFFECT_UNCERTAIN" if attempted or (stages_started and not result) else "BLOCKED_BEFORE_APPLY",
         "first_typed_blocker": blocker, "apply_attempted": attempted,
-        "cleanup_pass": result.get("cleanup_pass", False), "stages": result.get("stages", []),
+        "deployment_verified": len(result.get("stages", [])) == len(STAGES) and
+                               result.get("first_typed_blocker") is None and result.get("cleanup_pass") is True
+                               and (not blocker or lease_result is not None),
+        "cleanup_pass": result.get("cleanup_pass", False) and
+                        (lease_result is None or "cleanup" not in lease_result or clean(lease_result["cleanup"])),
+        "stages": result.get("stages", []),
         "execution_model": "exact_parent_admitted_commands_direct", "provider_execution_started": False,
         "execution_boundary": "parent_task_environment_no_added_seatbelt",
         "mission_acceptance": "parent_owned", "automatic_retry": False}
+    if pin is not None:
+        terminal["lease_closeout"] = lease_result or {
+            "status": "NOT_ATTEMPTED", "receipt_path": plan["task_closeout"]["completion_path"],
+            "receipt_sha256": None, "first_typed_blocker": blocker}
+        terminal["lease_closeout"]["evidence_scope"] = "historical_at_execution_not_current_readback"
+        terminal["lease_evidence"] = {"active_lease": plan["task_closeout"]["active_lease"],
+                                      "paths": pin}
     try:
         save(run / "terminal.json", terminal)
     except OSError:

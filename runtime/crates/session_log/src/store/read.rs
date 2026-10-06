@@ -12,6 +12,9 @@ use session_log_contract::{
     ContextSlice, GetSessionRequest, ListRuntimeLocationsRequest, ListSessionRecordsRequest,
     ListSessionsRequest, Page, ReadContextSliceRequest, RuntimeLocation, SessionContextRecord,
     SessionRecord, SessionSnapshot, SessionSummary, WorkspaceSummary,
+    EXECUTION_EVIDENCE_PAGE_BYTES, ExecutionEvidencePage, ExecutionEvidenceSnapshot,
+    ExecutionEvidenceSummary, ReadExecutionEvidenceRequest, RuntimeEvidenceState,
+    RuntimeEvidenceTotals, SortedObservedEvidence, observed_evidence_field,
 };
 use std::path::Path;
 
@@ -146,6 +149,77 @@ impl SessionLogStore {
         })
     }
 
+    pub fn read_execution_evidence(&self, request: ReadExecutionEvidenceRequest) -> Result<ExecutionEvidencePage> {
+        request.validate().map_err(anyhow::Error::msg)?;
+        let path = self.workspace_db_path_for_session(&request.session_id)?
+            .ok_or_else(|| anyhow::anyhow!("session {} execution evidence is absent", request.session_id))?;
+        self.with_workspace_connection(&path, |conn| {
+            // Historical grouping may spill to SQLite's bounded file-backed
+            // sorter; it must not accumulate the task trajectory in RAM.
+            if request.include_summary { conn.pragma_update(None, "temp_store", "FILE")?; }
+            // All metadata, preflight, summary and page rows share one SQLite read snapshot.
+            let transaction = conn.unchecked_transaction()?;
+            let snapshot = transaction.query_row(
+                "SELECT session_id, next_context_sequence, next_management_sequence, retained_from_sequence
+                 FROM sessions WHERE session_id = ?1", params![request.session_id], |row| {
+                    Ok(ExecutionEvidenceSnapshot { session_id: row.get(0)?, next_sequence: row.get(1)?,
+                        next_management_sequence: row.get(2)?, retained_from_sequence: row.get(3)? })
+                })?;
+            snapshot.validate().map_err(anyhow::Error::msg)?;
+            if snapshot.session_id != request.session_id
+                || request.snapshot.as_ref().is_some_and(|expected| expected != &snapshot)
+                || request.from_sequence > snapshot.next_sequence {
+                anyhow::bail!("session {} execution evidence snapshot/cursor drift", request.session_id);
+            }
+            if request.snapshot.is_none() || request.include_summary
+                || request.from_sequence == snapshot.next_sequence {
+                let (count, first, last, oversized, malformed) = transaction.query_row(
+                    "SELECT COUNT(*), MIN(sequence), MAX(sequence),
+                     COALESCE(MAX(length(CAST(record_json AS BLOB))), 0),
+                     COALESCE(SUM(NOT json_valid(record_json)), 0)
+                     FROM session_context_records WHERE session_id = ?1",
+                    params![request.session_id], |row| Ok((row.get::<_, u64>(0)?,
+                        row.get::<_, Option<u64>>(1)?, row.get::<_, Option<u64>>(2)?,
+                        row.get::<_, u64>(3)?, row.get::<_, u64>(4)?)))?;
+                if count != snapshot.next_sequence
+                    || (count > 0 && (first != Some(0) || last != Some(count - 1))) {
+                    anyhow::bail!("session {} execution evidence contains an absent prefix or sequence gap", request.session_id);
+                }
+                if oversized > EXECUTION_EVIDENCE_PAGE_BYTES || malformed != 0 {
+                    anyhow::bail!("session {} execution evidence is malformed or exceeds the bounded record size", request.session_id);
+                }
+            }
+            let summary = if request.include_summary {
+                Some(execution_evidence_summary(&transaction, &request.session_id)?)
+            } else { None };
+            let mut statement = transaction.prepare(
+                "SELECT sequence, length(CAST(record_json AS BLOB)), record_json
+                 FROM session_context_records WHERE session_id = ?1 AND sequence >= ?2 AND sequence < ?3
+                 ORDER BY sequence LIMIT ?4")?;
+            let mut rows = statement.query(params![request.session_id, request.from_sequence,
+                snapshot.next_sequence, request.max_records])?;
+            let mut records = Vec::new();
+            let mut bytes = 0_u64;
+            let mut next_sequence = request.from_sequence;
+            while let Some(row) = rows.next()? {
+                let sequence: u64 = row.get(0)?;
+                let size: u64 = row.get(1)?;
+                if sequence != next_sequence { anyhow::bail!("execution evidence sequence gap at {next_sequence}"); }
+                if size > request.max_bytes { anyhow::bail!("execution evidence record {sequence} exceeds page byte bound"); }
+                if bytes + size > request.max_bytes { break; }
+                records.push(SessionContextRecord { sequence, raw_record: row.get(2)? });
+                bytes += size;
+                next_sequence += 1;
+            }
+            let page = ExecutionEvidencePage { snapshot, next_sequence, records, summary };
+            page.validate(&request).map_err(anyhow::Error::msg)?;
+            drop(rows);
+            drop(statement);
+            transaction.commit()?;
+            Ok(page)
+        })
+    }
+
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceSummary>> {
         self.with_index_connection(|conn| {
             let mut stmt = conn.prepare(
@@ -168,6 +242,81 @@ impl SessionLogStore {
         })
     }
 
+}
+
+fn execution_evidence_summary(conn: &rusqlite::Connection, session_id: &str) -> Result<ExecutionEvidenceSummary> {
+    let mut totals = RuntimeEvidenceTotals::default();
+    visit_runtime_evidence_groups(conn, session_id, "runtime_id", |bound, state| {
+        // An idempotent persistence replay has no duplicate sequence. A second
+        // usage fact for the same runtime is not another billable/provider call.
+        if bound && state.usage_records > 1 { anyhow::bail!("duplicate execution usage evidence for one runtime"); }
+        totals.add(bound, state);
+        Ok(())
+    })?;
+    let mut models = SortedObservedEvidence::default();
+    let mut tiers = SortedObservedEvidence::default();
+    visit_runtime_evidence_groups(conn, session_id, "model", |bound, state| {
+        if bound && !state.observation_conflict {
+            models.add(state.observation.as_ref().and_then(|value| value.1.as_deref())).map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    })?;
+    visit_runtime_evidence_groups(conn, session_id, "service_tier", |bound, state| {
+        if bound && !state.observation_conflict {
+            tiers.add(state.observation.as_ref().and_then(|value| value.2.as_deref())).map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    })?;
+    Ok(ExecutionEvidenceSummary { usage: totals.usage(), provider_observation:
+        totals.provider_summary(models.summary(totals.runtime_count), tiers.summary(totals.runtime_count)) })
+}
+
+fn visit_runtime_evidence_groups(
+    conn: &rusqlite::Connection, session_id: &str, order: &str,
+    mut visit: impl FnMut(bool, &RuntimeEvidenceState) -> Result<()>,
+) -> Result<()> {
+    let order = match order { "runtime_id" => "g.runtime_id", "model" => "g.model, g.runtime_id",
+        "service_tier" => "g.service_tier, g.runtime_id", _ => anyhow::bail!("invalid evidence grouping order") };
+    // SQLite sorts/groups the existing canonical records; no duplicate ledger,
+    // history-sized Vec, per-runtime map, or prompt restoration is introduced.
+    let sql = format!("WITH evidence AS (
+        SELECT sequence, record_json,
+          COALESCE(CASE WHEN json_type(record_json, '$.runtime_id') = 'text'
+            THEN trim(json_extract(record_json, '$.runtime_id'), ?2) END, '') AS runtime_id,
+          CASE WHEN json_extract(record_json, '$.type') = 'runtime_provider_observation'
+            THEN trim(json_extract(record_json, '$.provider_observation.model'), ?2) END AS model,
+          CASE WHEN json_extract(record_json, '$.type') = 'runtime_provider_observation'
+            THEN trim(json_extract(record_json, '$.provider_observation.service_tier'), ?2) END AS service_tier
+        FROM session_context_records WHERE session_id = ?1
+          AND json_extract(record_json, '$.type') IN ('runtime_usage', 'runtime_provider_observation')
+      ), runtime_groups AS (
+        SELECT runtime_id, MIN(model) AS model, MIN(service_tier) AS service_tier
+        FROM evidence GROUP BY runtime_id
+      ) SELECT e.record_json FROM runtime_groups g JOIN evidence e ON e.runtime_id = g.runtime_id
+        ORDER BY {order}, e.sequence");
+    let mut statement = conn.prepare(&sql)?;
+    let mut rows = statement.query(params![session_id, RUST_TRIM_WHITESPACE])?;
+    let mut current: Option<Option<String>> = None;
+    let mut state = RuntimeEvidenceState::default();
+    while let Some(row) = rows.next()? {
+        let raw: String = row.get(0)?;
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        if value.get("session_id").is_some_and(|id| id.as_str() != Some(session_id)) {
+            anyhow::bail!("runtime execution evidence has wrong session identity");
+        }
+        let id = observed_evidence_field(&value, "runtime_id");
+        if current.as_ref().is_some_and(|previous| previous != &id) {
+            visit(current.as_ref().is_some_and(|id| id.is_some()), &state)?;
+            state = RuntimeEvidenceState::default();
+        }
+        current = Some(id);
+        state.add(&value);
+    }
+    if let Some(id) = current { visit(id.is_some(), &state)?; }
+    Ok(())
+}
+
+impl SessionLogStore {
     pub fn list_sessions(
         &self,
         request: ListSessionsRequest,

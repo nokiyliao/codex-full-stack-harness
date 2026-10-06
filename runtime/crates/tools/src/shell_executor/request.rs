@@ -94,10 +94,10 @@ fn normalize_shell_command_text(command: &str) -> String {
     }
 }
 pub(super) fn embedded_apply_patch_text(command: &str) -> Option<String> {
-    let begin = command.find("*** Begin Patch")?;
+    use crate::commands::apply_patch::patch_marker_range;
+    let begin = patch_marker_range(command, "*** Begin Patch")?.start;
     let after_begin = &command[begin..];
-    let end_relative = after_begin.find("*** End Patch")?;
-    let end = begin + end_relative + "*** End Patch".len();
+    let end = begin + patch_marker_range(after_begin, "*** End Patch")?.end;
     let patch = &command[begin..end];
     if command[..begin].contains("cat ")
         || command[..begin].contains("Get-Content")
@@ -107,6 +107,29 @@ pub(super) fn embedded_apply_patch_text(command: &str) -> Option<String> {
         return None;
     }
     Some(patch.trim().to_string())
+}
+
+#[cfg(test)]
+mod patch_boundary_regression {
+    #[test]
+    fn shell_preserves_literal_markers_and_read_exclusions() {
+        for nl in ["\n", "\r\n"] {
+            let patch = format!(
+                "*** Begin Patch{nl}*** Add File: x{nl}+*** End Patch{nl}+tail{nl}*** End Patch"
+            );
+            let wrapped = format!("apply_patch <<'PATCH'{nl}{patch}{nl}PATCH");
+            assert_eq!(
+                super::embedded_apply_patch_text(&wrapped),
+                Some(patch.clone())
+            );
+            for prefix in ["cat ", "rg ", "grep ", "Get-Content"] {
+                assert!(
+                    super::embedded_apply_patch_text(&format!("{prefix}{nl}{patch}")).is_none()
+                );
+            }
+            assert!(super::embedded_apply_patch_text(&format!("{patch} suffix")).is_none());
+        }
+    }
 }
 
 fn parse_shell_request_json(text: &str) -> Option<Value> {

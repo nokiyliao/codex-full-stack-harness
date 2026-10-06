@@ -7,10 +7,10 @@ mod session_management;
 mod session_projection;
 
 pub use runtime::{
-    AgentId, ContextTokenStats, DEFAULT_CONTEXT_TOKEN_LIMIT, ProviderConfig, RuntimeAggregate,
-    RuntimeCallResultStatus, RuntimeCommand, RuntimeError, RuntimeEvent, RuntimeId,
-    RuntimeProjection, RuntimeProviderConfig, RuntimeQuery, RuntimeState, RuntimeTransitionError,
-    ToolCallRecord, ToolChoice, UsageReport,
+    AgentId, ContextTokenStats, DEFAULT_CONTEXT_TOKEN_LIMIT, ProviderConfig, ProviderObservation,
+    RuntimeAggregate, RuntimeCallResultStatus, RuntimeCommand, RuntimeError, RuntimeEvent,
+    RuntimeId, RuntimeProjection, RuntimeProviderConfig, RuntimeQuery, RuntimeState,
+    RuntimeTransitionError, ToolCallRecord, ToolChoice, UsageReport,
 };
 pub use session::{
     ACKNOWLEDGED_CHILD_CALLBACK_IDENTITY_SCHEMA_VERSION, AcknowledgedChildCallbackIdentityV1,

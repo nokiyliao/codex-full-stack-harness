@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use code_tools::runtime::tool::CancellationToken;
+use code_tools::commands::source_read::{SourceReadPreExecutionRejection, SourceReadRejectionKind};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,6 +15,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
+use tura_path::command_receipts::ReceiptStore;
 use tura_path::jspace::{JSpaceAdmissionCache, JSpaceError, JSpaceMatcher};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,16 +143,64 @@ impl CommandRunService {
                 request.jspace_contract.as_ref(),
             )
             .map_err(|error| anyhow!(error.to_string()))?;
-        if let Some(matcher) = jspace_matcher.as_deref()
-            && let Err(error) = validate_jspace_arguments(matcher, &request.arguments)
-        {
+        let source_read_requested = contains_source_read(&request.arguments);
+        if jspace_matcher.is_none() && source_read_requested {
             return Ok(json!({
                 "status": "finished",
                 "owner": "router",
                 "session_id": session_id,
                 "runtime_id": request.runtime_id,
                 "execution_id": request_id.unwrap_or("command-run-legacy"),
-                "result": jspace_error_result(error),
+                "result": jspace_error_result(JSpaceError::new(
+                    "JSPACE_SOURCE_READ_DENIED", "read", "source_read",
+                    "source_read requires an admitted J-Space contract",
+                )),
+            }));
+        }
+        let source_read_root = if source_read_requested
+            && let Some(matcher) = jspace_matcher.as_deref()
+            && matcher.source_read_enabled()
+        {
+            match code_tools::commands::source_read::open_admitted_root(matcher.repo_root()) {
+                Ok(root) => Some(Arc::new(root)),
+                Err(error) => {
+                    return Ok(json!({
+                        "status": "finished",
+                        "owner": "router",
+                        "session_id": session_id,
+                        "runtime_id": request.runtime_id,
+                        "execution_id": request_id.unwrap_or("command-run-legacy"),
+                        "result": jspace_error_result(JSpaceError::new(
+                            "JSPACE_SOURCE_READ_PATH_DENIED", "read", "source_read", error,
+                        )),
+                    }));
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(matcher) = jspace_matcher.as_deref()
+            && let Err(error) = validate_jspace_arguments(matcher, &request.arguments)
+        {
+            let (error, rejection_kind) = match error {
+                JSpacePreflightError::Policy(error) => (error, None),
+                JSpacePreflightError::SourceReadJson(error, kind) => (error, Some(kind)),
+            };
+            let proof = match rejection_kind {
+                Some(kind) => record_source_read_rejection(&request, request_id, kind, error.to_string())?,
+                None => None,
+            };
+            let result = match proof {
+                Some(proof) => json!({"results": [proof.failed_result()]}),
+                None => jspace_error_result(error),
+            };
+            return Ok(json!({
+                "status": "finished",
+                "owner": "router",
+                "session_id": session_id,
+                "runtime_id": request.runtime_id,
+                "execution_id": request_id.unwrap_or("command-run-legacy"),
+                "result": result,
             }));
         }
         let execution_id = request_id
@@ -173,8 +223,28 @@ impl CommandRunService {
         let (batch_execution_id, batch_call_ids) =
             code_tools::command_run::command_run_batch_identity(&arguments)
                 .map_err(|error| anyhow!("COMMAND_RUN_BATCH_IDENTITY_INVALID:{error}"))?;
+        let focused_verifiers = match super::focused_verifier::prepare_batch(
+            &arguments,
+            jspace_matcher.as_deref(),
+            request.allowed_commands.as_ref(),
+            &batch_call_ids,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(json!({
+                    "status":"finished", "owner":"router", "session_id":session_id,
+                    "runtime_id":request.runtime_id, "execution_id":execution_id,
+                    "result":jspace_error_result(JSpaceError::new(
+                        "JSPACE_VERIFIER_DENIED", "command", "focused_verifier", error,
+                    )),
+                }));
+            }
+        };
         let session_directory = request.session_directory;
-        let cleanup_directory = session_directory.clone();
+        let receipt_store = Arc::new(
+            ReceiptStore::open(&session_directory)
+                .map_err(|error| anyhow!("COMMAND_RUN_RECEIPT_STORE_INVALID:{error}"))?,
+        );
         #[cfg(test)]
         let worker_session_directory = session_directory.clone();
         let worker_session_id = session_id.clone();
@@ -182,11 +252,14 @@ impl CommandRunService {
         let worker_call_ids = batch_call_ids.clone();
         let runtime_id = request.runtime_id;
         code_tools::shell_executor::begin_command_run_batch(
-            &session_directory,
+            &receipt_store,
             &batch_execution_id,
             &batch_call_ids,
         )
         .map_err(|error| anyhow!("COMMAND_RUN_BATCH_ADMISSION_FAILED:{error}"))?;
+        let worker_receipt_store = Arc::clone(&receipt_store);
+        let worker_batch_execution_id = batch_execution_id.clone();
+        let cleanup_receipt_store = Arc::clone(&receipt_store);
         let panic_cleanup_quarantine = Arc::clone(&self.panic_cleanup_quarantine);
         #[allow(unused_mut)]
         let mut command_env = request.command_env;
@@ -199,17 +272,35 @@ impl CommandRunService {
             let cancellation = active.cancellation_token();
             let worker_cancellation = cancellation.clone();
             let worker = tokio::spawn(async move {
-                let execution = code_tools::registry::with_command_environment(
-                    command_env,
-                    code_tools::command_run::execute_async_value_with_allowed_lock_scope_sandbox_and_cancellation(
-                        arguments,
-                        session_directory,
-                        request.allowed_commands,
-                        worker_session_id,
-                        request.sandbox,
-                        worker_cancellation,
-                    ),
-                );
+                let execution = async move {
+                    if let Some(commands) = focused_verifiers {
+                        return super::focused_verifier::execute_batch(
+                            commands,
+                            jspace_matcher
+                                .as_deref()
+                                .expect("preflight admitted verifier"),
+                            &session_directory,
+                            &worker_batch_execution_id,
+                            worker_cancellation,
+                            worker_receipt_store,
+                        )
+                        .await;
+                    }
+                    code_tools::registry::with_command_environment(
+                        command_env,
+                        code_tools::command_run::execute_async_value_with_source_read_admission(
+                            arguments,
+                            session_directory,
+                            request.allowed_commands,
+                            worker_session_id,
+                            request.sandbox,
+                            worker_cancellation,
+                            source_read_root,
+                            Some(worker_receipt_store),
+                        ),
+                    )
+                    .await
+                };
                 #[cfg(test)]
                 let output = if panic_after_running_claim {
                     let execution = execution;
@@ -232,7 +323,7 @@ impl CommandRunService {
             match worker.await {
                 Ok(output) => {
                     code_tools::shell_executor::complete_command_run_batch(
-                        &cleanup_directory,
+                        &cleanup_receipt_store,
                         &batch_execution_id,
                         &batch_call_ids,
                     )
@@ -259,7 +350,7 @@ impl CommandRunService {
                             .forget();
                     }
                     match code_tools::shell_executor::terminalize_interrupted_command_run_claims(
-                        &cleanup_directory,
+                        &cleanup_receipt_store,
                         &batch_execution_id,
                         &batch_call_ids,
                     )
@@ -271,7 +362,7 @@ impl CommandRunService {
                         }
                         Err(cleanup_error) => {
                             panic_cleanup_quarantine.lock().push(PendingPanicCleanup {
-                                session_directory: cleanup_directory,
+                                receipt_store: cleanup_receipt_store,
                                 batch_execution_id,
                                 batch_call_ids,
                                 active,
@@ -332,7 +423,7 @@ impl CommandRunService {
         let mut failed = Vec::new();
         for pending_cleanup in pending {
             if code_tools::shell_executor::terminalize_interrupted_command_run_claims(
-                &pending_cleanup.session_directory,
+                &pending_cleanup.receipt_store,
                 &pending_cleanup.batch_execution_id,
                 &pending_cleanup.batch_call_ids,
             )
@@ -402,30 +493,105 @@ impl CommandRunService {
     }
 }
 
+#[derive(Debug)]
+enum JSpacePreflightError {
+    Policy(JSpaceError),
+    SourceReadJson(JSpaceError, SourceReadRejectionKind),
+}
+
+impl From<JSpaceError> for JSpacePreflightError {
+    fn from(error: JSpaceError) -> Self { Self::Policy(error) }
+}
+
+fn record_source_read_rejection(
+    request: &CommandRunRequest, request_id: Option<&str>, kind: SourceReadRejectionKind,
+    error_message: String,
+) -> Result<Option<SourceReadPreExecutionRejection>> {
+    let Some(contract) = request.jspace_contract.as_ref() else { return Ok(None); };
+    let Some(authorization) = code_tools::commands::source_read::source_read_recovery_authorization(contract)
+        else { return Ok(None); };
+    let Some(commands) = request.arguments["commands"].as_array().filter(|commands| commands.len() == 1)
+        else { return Ok(None); };
+    if request.allowed_commands.as_ref().is_some_and(|allowed| !allowed.contains("source_read")) {
+        return Ok(None);
+    }
+    let (Some(session_id), Some(runtime_id)) = (request.session_id.as_deref(), request.runtime_id.as_deref())
+        else { return Ok(None); };
+    // No anonymous/legacy identity and no inference from the malformed JSON.
+    let Some(execution_id) = request_id.map(str::trim).filter(|id| !id.is_empty())
+        .or_else(|| request.arguments["execution_id"].as_str().filter(|id| !id.trim().is_empty()))
+        else { return Ok(None); };
+    let mut arguments = request.arguments.clone();
+    arguments.as_object_mut().expect("commands object")
+        .entry("execution_id").or_insert_with(|| json!(execution_id));
+    let (execution_id, call_ids) = code_tools::command_run::command_run_batch_identity(&arguments)
+        .map_err(|error| anyhow!("COMMAND_RUN_BATCH_IDENTITY_INVALID:{error}"))?;
+    if call_ids.len() != 1 { return Ok(None); }
+    let Some(proof) = SourceReadPreExecutionRejection::new(session_id, runtime_id, &execution_id,
+        &call_ids[0], authorization, &commands[0], kind, error_message) else { return Ok(None); };
+    let store = ReceiptStore::open(&request.session_directory)
+        .map_err(|error| anyhow!("COMMAND_RUN_RECEIPT_STORE_INVALID:{error}"))?;
+    proof.publish(&store).map_err(|error| anyhow!("SOURCE_READ_REJECTION_RECEIPT_INVALID:{error}"))?;
+    Ok(Some(proof))
+}
+
 fn validate_jspace_arguments(
     matcher: &JSpaceMatcher,
     arguments: &Value,
-) -> Result<(), JSpaceError> {
-    let Some(commands) = arguments.get("commands").and_then(Value::as_array) else {
-        return Err(JSpaceError::new(
-            "JSPACE_COMMAND_PAYLOAD_INVALID",
-            "command",
-            "",
-            "command_run arguments must contain a commands array",
-        ));
-    };
+) -> Result<(), JSpacePreflightError> {
+    let commands =
+        code_tools::command_run::command_run_preflight_commands(arguments).map_err(|error| {
+            JSpaceError::new("JSPACE_COMMAND_PAYLOAD_INVALID", "command", "", error)
+        })?;
     for command in commands {
-        let command_type = command
-            .get("command")
-            .or_else(|| command.get("command_type"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let command_line = command
-            .get("command_line")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let command_type = command.command.as_str();
+        let command_line = command.command_line.as_str();
+        let canonical_command = code_tools::commands::canonical_command(command_type);
+        if canonical_command == "focused_verifier" {
+            // Typed payload and exact grants are checked for the whole batch
+            // before receipt admission, not through shell template matching.
+            continue;
+        }
+        if canonical_command == "source_read" {
+            if !matcher.source_read_enabled() {
+                return Err(JSpaceError::new(
+                    "JSPACE_SOURCE_READ_DENIED",
+                    "read",
+                    "source_read",
+                    "source_read is not explicitly granted",
+                ).into());
+            }
+            if command.workdir.is_some() {
+                return Err(JSpaceError::new(
+                    "JSPACE_SOURCE_READ_PATH_DENIED",
+                    "read",
+                    "source_read",
+                    "source_read does not accept a workdir override",
+                ).into());
+            }
+            let request = code_tools::commands::source_read::parse_command_line_typed(command_line)
+                .map_err(|error| {
+                    let policy = JSpaceError::new("JSPACE_SOURCE_READ_INVALID", "read", "source_read", error.to_string());
+                    match error.rejection_kind() {
+                        Some(kind) => JSpacePreflightError::SourceReadJson(policy, kind),
+                        None => JSpacePreflightError::Policy(policy),
+                    }
+                })?;
+            let target =
+                code_tools::commands::source_read::target_path(matcher.repo_root(), &request)
+                    .map_err(|error| {
+                        JSpaceError::new(
+                            "JSPACE_SOURCE_READ_PATH_DENIED",
+                            "read",
+                            request.path(),
+                            error,
+                        )
+                    })?;
+            matcher.check_source_read(&target)?;
+            continue;
+        }
         matcher.check_command(command_type, command_line)?;
-        if code_tools::commands::canonical_command(command_type) == "apply_patch" {
+        if canonical_command == "apply_patch" {
             let changes = code_tools::commands::apply_patch::jspace_changes(command_line)
                 .map_err(|error| JSpaceError::new("JSPACE_PATCH_MALFORMED", "modify", "", error))?;
             for (kind, path, move_path) in changes {
@@ -439,7 +605,7 @@ fn validate_jspace_arguments(
                             "modify",
                             &path,
                             format!("unknown apply_patch change kind {kind}"),
-                        ));
+                        ).into());
                     }
                 };
                 matcher.check_path(operation, Path::new(&path))?;
@@ -447,15 +613,19 @@ fn validate_jspace_arguments(
                     matcher.check_path("create", Path::new(&move_path))?;
                 }
             }
-        } else if let Some(workdir) = command
-            .get("workdir")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
+        } else if let Some(workdir) = command.workdir.as_deref() {
             matcher.ensure_in_root(Path::new(workdir), "command")?;
         }
     }
     Ok(())
+}
+
+fn contains_source_read(arguments: &Value) -> bool {
+    code_tools::command_run::command_run_preflight_commands(arguments).is_ok_and(|commands| {
+        commands.iter().any(|command| {
+            code_tools::commands::canonical_command(&command.command) == "source_read"
+        })
+    })
 }
 
 fn jspace_error_result(error: JSpaceError) -> Value {
@@ -489,7 +659,7 @@ pub(crate) struct ActiveCommandRunGuard {
 
 #[derive(Debug)]
 struct PendingPanicCleanup {
-    session_directory: PathBuf,
+    receipt_store: Arc<ReceiptStore>,
     batch_execution_id: String,
     batch_call_ids: Vec<String>,
     active: ActiveCommandRunGuard,
@@ -573,7 +743,7 @@ impl Default for CommandRunService {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandRunRequest, CommandRunService};
+    use super::{CommandRunRequest, CommandRunService, validate_jspace_arguments};
     use serde_json::{Value, json};
     use std::collections::BTreeSet;
     use std::path::Path;
@@ -583,6 +753,15 @@ mod tests {
     const ACTIVE_FIXTURE_DELAY_MS: u64 = 1200;
     const CONCURRENT_FIXTURE_DELAY_MS: u64 = 3000;
     const READ_ONLY_FIXTURE_TIMEOUT_MS: u64 = 30000;
+
+    fn canonical_tempdir() -> tempfile::TempDir {
+        let temp_root = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary root");
+        tempfile::Builder::new()
+            .tempdir_in(temp_root)
+            .expect("temporary workspace")
+    }
 
     fn jspace_contract(root: &Path) -> Value {
         let mut contract = json!({
@@ -634,9 +813,319 @@ mod tests {
         contract
     }
 
+    #[test]
+    fn prepared_source_read_contract_passes_router_preflight_without_execution() {
+        let Some(workspace) = std::env::var_os("TURA_SCOPED_TEST_WORKSPACE") else {
+            return;
+        };
+        let contract_path = std::env::var_os("TURA_SCOPED_TEST_JSPACE")
+            .expect("prepared J-Space path is required with the workspace");
+        let workspace = std::path::PathBuf::from(workspace);
+        let contract: Value =
+            serde_json::from_slice(&std::fs::read(contract_path).expect("prepared J-Space JSON"))
+                .expect("prepared J-Space object");
+        let matcher = tura_path::jspace::JSpaceMatcher::from_value(&workspace, &contract)
+            .expect("prepared contract admission");
+        validate_jspace_arguments(
+            &matcher,
+            &json!({"commands": [{
+                "command_type": "source_read",
+                "command_line": json!({
+                    "path": "TASK.md", "start_line": 1, "end_line": 1
+                }).to_string()
+            }]}),
+        )
+        .expect("exact source_read router preflight");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn malformed_source_read_has_durable_typed_non_execution_evidence() {
+        use code_tools::commands::source_read::SourceReadPreExecutionRejection;
+        let workspace = canonical_tempdir();
+        std::fs::create_dir(workspace.path().join("src")).expect("source directory");
+        std::fs::write(workspace.path().join("src/main.rs"), "answer\n").expect("source");
+        let mut contract = jspace_contract(workspace.path());
+        contract["read_scopes"] = json!(["src/main.rs"]);
+        contract["source_read"] = json!(true);
+        let contract = reseal_jspace(contract);
+        let service = CommandRunService::new();
+        for (index, line) in [
+            r#"{"path":"src/main.rs","start_line":1,"end_line":ninety}"#,
+            r#"{"path":"src/main.rs","start_line":1,"end_line":"ninety"}"#,
+        ].into_iter().enumerate() {
+            let command = json!({"command_type":"source_read", "command":"source_read", "command_line":line, "step":1});
+            let response = service.execute_with_request_id(json!({
+                "session_id":"rejected-session", "runtime_id":"rejected-runtime",
+                "session_directory":workspace.path(), "jspace_contract":contract,
+                "allowed_commands":["source_read"], "arguments":{"commands":[command]},
+            }), Some(&format!("rejected-read-{index}"))).await.expect("preflight response");
+            let result = &response["result"]["results"][0];
+            assert_eq!(result["success"], false);
+            assert_eq!(result["command_type"], "source_read");
+            assert_eq!(result["jspace_error_code"], "JSPACE_SOURCE_READ_INVALID");
+            let evidence = &result["output"]["pre_execution_rejection"];
+            assert_eq!(evidence["effect_state"], "not_started");
+            assert_eq!(evidence["process_started"], false);
+            assert_eq!(evidence["source_content_read"], false);
+            assert_eq!(evidence["mutation_count"], 0);
+            assert!(result["output"].get("stdout").is_none());
+            assert!(result["output"].get("terminal_receipt").is_none());
+            let proof = SourceReadPreExecutionRejection::parse_bounded(evidence).expect("typed proof");
+            let store = super::ReceiptStore::open_existing(workspace.path()).expect("durable store");
+            assert!(proof.authenticate(&store, "rejected-session", "rejected-runtime",
+                contract["authorization_semantic_sha256"].as_str().unwrap(), &command, result));
+            let names = store.list_names().expect("audit entries");
+            assert_eq!(names.len(), index + 1, "no batch admission, command claim, or execution receipt");
+            assert!(names.contains(&proof.receipt_name()));
+            assert_eq!(service.active_count(), 0);
+        }
+        let corrected = service.execute_with_request_id(json!({
+            "session_id":"rejected-session", "runtime_id":"rejected-runtime",
+            "session_directory":workspace.path(), "jspace_contract":contract,
+            "allowed_commands":["source_read"], "arguments":{"commands":[{
+                "command_type":"source_read", "command_line":r#"{"path":"src/main.rs","start_line":1,"end_line":1}"#,
+                "step":1,
+            }]},
+        }), Some("corrected-read")).await.expect("corrected read");
+        let corrected = &corrected["result"]["results"][0];
+        assert_eq!(corrected["success"], true);
+        assert_eq!(corrected["output"]["stdout"], "answer\n");
+        assert!(corrected["output"].get("pre_execution_rejection").is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn policy_path_stale_and_mixed_failures_never_get_recovery_evidence() {
+        for scenario in 0..10 {
+            let workspace = canonical_tempdir();
+            std::fs::create_dir(workspace.path().join("src")).expect("source directory");
+            std::fs::write(workspace.path().join("src/main.rs"), "answer\n").expect("source");
+            std::fs::write(workspace.path().join("src/other.rs"), "outside\n").expect("outside");
+            let mut contract = jspace_contract(workspace.path());
+            contract["read_scopes"] = json!(["src/main.rs"]);
+            if scenario != 0 { contract["source_read"] = json!(true); }
+            let mut allowed = json!(["source_read"]);
+            let mut command = json!({"command_type":"source_read", "step":1,
+                "command_line":r#"{"path":"src/main.rs","start_line":1,"end_line":ninety}"#});
+            match scenario {
+                1 => allowed = json!(["task_status"]),
+                2 => command["workdir"] = json!(workspace.path()),
+                3 => command["command_line"] = json!(r#"{"path":"../secret","start_line":1,"end_line":1}"#),
+                4 => command["command_line"] = json!(r#"{"path":"src/other.rs","start_line":1,"end_line":1}"#),
+                5 => command["command_line"] = json!(r#"{"path":"src/missing.rs","start_line":1,"end_line":1}"#),
+                6 => command["command_line"] = json!(json!({"path":"src/main.rs", "start_line":1,
+                    "end_line":1, "expected_sha256":"0".repeat(64)}).to_string()),
+                8 => command["command_type"] = json!("unknown_command"),
+                9 => {
+                    std::os::unix::fs::symlink("main.rs", workspace.path().join("src/link.rs")).expect("symlink");
+                    command["command_line"] = json!(r#"{"path":"src/link.rs","start_line":1,"end_line":1}"#);
+                }
+                _ => {}
+            }
+            let mut commands = vec![command];
+            if scenario == 7 {
+                commands.push(json!({"command_type":"apply_patch", "step":2, "command_line":"fixture patch"}));
+            }
+            let response = CommandRunService::new().execute_with_request_id(json!({
+                "session_id":"denied-session", "runtime_id":"denied-runtime", "session_directory":workspace.path(),
+                "jspace_contract":reseal_jspace(contract), "allowed_commands":allowed,
+                "arguments":{"commands":commands},
+            }), Some("denied-read")).await.expect("denied response");
+            assert!(response["result"]["results"].as_array().unwrap().iter().all(|result| result["success"] == false));
+            assert!(!response.to_string().contains("nokiy_source_read_pre_execution_rejection_v1"), "scenario {scenario}");
+        }
+    }
+
+    #[tokio::test]
+    async fn source_read_requires_exact_jspace_scope_and_keeps_a_terminal_receipt() {
+        let workspace = canonical_tempdir();
+        std::fs::create_dir(workspace.path().join("src")).expect("source directory");
+        std::fs::write(workspace.path().join("src/main.rs"), "alpha\nbeta\n").expect("source file");
+        std::fs::write(workspace.path().join("src/other.rs"), "outside\n").expect("other file");
+        let mut contract = jspace_contract(workspace.path());
+        contract["read_scopes"] = json!(["src/main.rs"]);
+        contract["command_templates"] = json!([]);
+        contract["source_read"] = json!(true);
+        let contract = reseal_jspace(contract);
+        let service = CommandRunService::new();
+        let read = |path: &str| {
+            json!({
+                "session_id": "source-read-session",
+                "runtime_id": "source-read-runtime",
+                "session_directory": workspace.path(),
+                "jspace_contract": contract,
+                "arguments": {"commands": [{
+                    "command_type": "source_read",
+                    "command_line": json!({"path": path, "start_line": 1, "end_line": 2}).to_string()
+                }]},
+                "allowed_commands": ["source_read"]
+            })
+        };
+        let accepted = service
+            .execute(read("src/main.rs"))
+            .await
+            .expect("accepted read");
+        let result = &accepted["result"]["results"][0];
+        assert_eq!(result["success"], true, "{accepted}");
+        assert_eq!(result["output"]["stdout"], "alpha\nbeta\n");
+        assert_eq!(
+            result["output"]["terminal_receipt"]["authority_effect"],
+            "none"
+        );
+        assert!(
+            serde_json::to_vec(&result["output"])
+                .expect("result JSON")
+                .len()
+                <= 8192
+        );
+
+        let denied = service
+            .execute(read("src/other.rs"))
+            .await
+            .expect("denied read");
+        assert_eq!(
+            denied["result"]["results"][0]["jspace_error_code"],
+            "JSPACE_EXPANSION_REQUIRED"
+        );
+        let shell = service.execute(json!({
+            "session_id": "source-read-session",
+            "runtime_id": "source-read-runtime",
+            "session_directory": workspace.path(),
+            "jspace_contract": contract,
+            "arguments": {"commands": [{"command_type": "bash", "command_line": "cat src/main.rs"}]},
+            "allowed_commands": ["bash"]
+        })).await.expect("shell denial");
+        assert_eq!(
+            shell["result"]["results"][0]["jspace_error_code"],
+            "JSPACE_COMMAND_DENIED"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_read_without_jspace_is_deterministically_denied() {
+        let workspace = canonical_tempdir();
+        let response = CommandRunService::new().execute(json!({
+            "session_id": "no-jspace-source-read",
+            "session_directory": workspace.path(),
+            "arguments": {"commands": [{
+                "command_type": "source_read",
+                "command_line": json!({"path": "src/main.rs", "start_line": 1, "end_line": 1}).to_string()
+            }]},
+            "allowed_commands": ["source_read"]
+        })).await.expect("denial response");
+        assert_eq!(
+            response["result"]["results"][0]["jspace_error_code"],
+            "JSPACE_SOURCE_READ_DENIED"
+        );
+        assert_eq!(
+            response["result"]["results"][0]["effect_state"],
+            "not_started"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_read_cannot_hide_behind_another_command_field() {
+        let workspace = canonical_tempdir();
+        std::fs::create_dir(workspace.path().join("src")).expect("source directory");
+        std::fs::write(workspace.path().join("src/main.rs"), "allowed\n").expect("allowed file");
+        std::fs::write(workspace.path().join("src/other.rs"), "outside\n").expect("outside file");
+        let hidden_read = json!({"commands": [{
+            "command_type": "source_read",
+            "command": "task_status",
+            "command_line": json!({
+                "path": "src/other.rs", "start_line": 1, "end_line": 1
+            }).to_string()
+        }]});
+        let service = CommandRunService::new();
+        let no_jspace = service
+            .execute(json!({
+                "session_id": "hidden-source-read-no-jspace",
+                "session_directory": workspace.path(),
+                "arguments": hidden_read,
+                "allowed_commands": ["source_read"]
+            }))
+            .await
+            .expect("no-JSpace denial");
+        assert_eq!(
+            no_jspace["result"]["results"][0]["jspace_error_code"],
+            "JSPACE_SOURCE_READ_DENIED"
+        );
+
+        let mut exact = jspace_contract(workspace.path());
+        exact["read_scopes"] = json!(["src/main.rs"]);
+        exact["source_read"] = json!(true);
+        let out_of_scope = service
+            .execute(json!({
+                "session_id": "hidden-source-read-out-of-scope",
+                "session_directory": workspace.path(),
+                "jspace_contract": reseal_jspace(exact),
+                "arguments": hidden_read,
+                "allowed_commands": ["source_read"]
+            }))
+            .await
+            .expect("out-of-scope denial");
+        assert_eq!(
+            out_of_scope["result"]["results"][0]["jspace_error_code"],
+            "JSPACE_EXPANSION_REQUIRED"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_read_grant_keeps_patch_limited_to_its_declared_write_target() {
+        let workspace = canonical_tempdir();
+        std::fs::create_dir(workspace.path().join("src")).expect("source directory");
+        let target = workspace.path().join("src/main.rs");
+        std::fs::write(&target, "before\n").expect("source file");
+        let mut contract = jspace_contract(workspace.path());
+        contract["read_scopes"] = json!(["src/main.rs"]);
+        contract["write_scopes"] = json!(["src/main.rs"]);
+        contract["command_templates"] = json!([]);
+        contract["source_read"] = json!(true);
+        let contract = reseal_jspace(contract);
+        let service = CommandRunService::new();
+        let patch = |command_line: &str| {
+            json!({
+                "session_id": "source-read-with-patch",
+                "session_directory": workspace.path(),
+                "jspace_contract": contract,
+                "arguments": {"commands": [{
+                    "command_type": "apply_patch", "command_line": command_line
+                }]},
+                "allowed_commands": ["apply_patch"]
+            })
+        };
+        let accepted = service
+            .execute(patch(
+                "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-before\n+after\n*** End Patch",
+            ))
+            .await
+            .expect("declared patch");
+        assert_eq!(
+            accepted["result"]["results"][0]["success"], true,
+            "{accepted}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("patched source"),
+            "after\n"
+        );
+
+        let denied = service
+            .execute(patch(
+                "*** Begin Patch\n*** Add File: src/other.rs\n+outside\n*** End Patch",
+            ))
+            .await
+            .expect("out-of-scope patch denial");
+        assert_eq!(
+            denied["result"]["results"][0]["jspace_error_code"],
+            "JSPACE_EXPANSION_REQUIRED"
+        );
+        assert!(!workspace.path().join("src/other.rs").exists());
+    }
+
     #[tokio::test]
     async fn command_run_service_executes_inside_requested_workspace() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         let command_line = json!({
             "status": "done",
             "task_group": "订单清结算微服务"
@@ -671,7 +1160,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_run_service_tracks_active_requests() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         let service = CommandRunService::new();
         assert_eq!(service.active_count(), 0);
 
@@ -708,7 +1197,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_run_service_cancels_only_the_exact_session() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         let service = CommandRunService::new();
         let request = |session_id: &str, label: &str| {
             json!({
@@ -777,7 +1266,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn outer_abort_preserves_router_ownership_until_seven_command_batch_terminalizes() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         let receipt_directory = workspace.path().join(".tura/run/command_receipts");
         let first_gate = workspace.path().join("first-step.fifo");
         let cancellation_gate = workspace.path().join("cancel-step.fifo");
@@ -900,7 +1389,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn worker_panic_reaps_claimed_process_before_releasing_router_guard() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         let receipt_directory = workspace.path().join(".tura/run/command_receipts");
         let late_effect = workspace.path().join("late-effect.txt");
         let service = CommandRunService::new();
@@ -1015,7 +1504,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_request_has_zero_router_admission_and_zero_command_effect() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         let service = CommandRunService::new();
 
         service
@@ -1037,7 +1526,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn same_execution_recovery_does_not_duplicate_command_effect() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         let marker = workspace.path().join("effect.txt");
         let service = CommandRunService::new();
         let request = json!({
@@ -1082,7 +1571,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn out_of_order_completion_returns_deterministic_command_order() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         let service = CommandRunService::new();
         let commands = [300, 0, 150]
             .into_iter()
@@ -1187,7 +1676,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_run_service_handles_read_only_requests_concurrently() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         let service = CommandRunService::new();
         let request = |label: &str| {
             json!({
@@ -1252,7 +1741,7 @@ mod tests {
 
     #[tokio::test]
     async fn jspace_admission_reuses_same_digest_and_rejects_changed_digest() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         let service = CommandRunService::new();
         let contract = jspace_contract(workspace.path());
         let request = |contract: Value| {
@@ -1294,7 +1783,7 @@ mod tests {
 
     #[tokio::test]
     async fn jspace_expansion_is_reported_before_apply_patch_mutation() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         let service = CommandRunService::new();
         let contract = jspace_contract(workspace.path());
         let response = service
@@ -1321,8 +1810,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jspace_patch_without_shell_grant_still_checks_exact_target() {
+        let workspace = canonical_tempdir();
+        let source = workspace.path().join("src/main.rs");
+        std::fs::create_dir(workspace.path().join("src")).expect("source directory");
+        std::fs::write(&source, "old\n").expect("source file");
+        let service = CommandRunService::new();
+        let mut contract = jspace_contract(workspace.path());
+        contract["allowed_operations"] = json!(["read", "modify"]);
+        contract["denied_operations"] = json!([
+            "command",
+            "create",
+            "delete",
+            "network",
+            "install",
+            "system_mutation"
+        ]);
+        contract["command_templates"] = json!([]);
+        let contract = reseal_jspace(contract);
+
+        let request = |command_line: &str| {
+            json!({
+                "session_id": "jspace-no-shell-patch-session",
+                "runtime_id": "jspace-no-shell-patch-runtime",
+                "session_directory": workspace.path().display().to_string(),
+                "jspace_contract": contract,
+                "arguments": {
+                    "commands": [{"command": "apply_patch", "command_line": command_line}]
+                }
+            })
+        };
+        let allowed = service
+            .execute(request(
+                "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch",
+            ))
+            .await
+            .expect("declared patch request");
+        assert_eq!(allowed["result"]["results"][0]["success"], true);
+        assert_eq!(
+            std::fs::read_to_string(&source).expect("updated source"),
+            "new\n"
+        );
+
+        let undeclared = workspace.path().join("src/other.rs");
+        std::fs::write(&undeclared, "old\n").expect("undeclared source file");
+        let denied = service
+            .execute(request("*** Begin Patch\n*** Update File: src/other.rs\n@@\n-old\n+must-not-exist\n*** End Patch"))
+            .await
+            .expect("denial is a command result");
+        assert_eq!(
+            denied["result"]["results"][0]["jspace_error_code"],
+            "JSPACE_EXPANSION_REQUIRED"
+        );
+        assert_eq!(
+            std::fs::read_to_string(undeclared).expect("unchanged source"),
+            "old\n"
+        );
+    }
+
+    #[tokio::test]
     async fn jspace_empty_write_scope_rejects_declared_apply_patch_before_mutation() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         std::fs::create_dir(workspace.path().join("src")).expect("create source directory");
         let service = CommandRunService::new();
         let mut contract = jspace_contract(workspace.path());
@@ -1354,7 +1902,7 @@ mod tests {
 
     #[tokio::test]
     async fn jspace_rejects_shell_suffix_injection_before_execution() {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = canonical_tempdir();
         let service = CommandRunService::new();
         let marker = workspace.path().join("injected.txt");
         let response = service

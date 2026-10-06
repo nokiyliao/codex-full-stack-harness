@@ -12,6 +12,21 @@ use tura_router::registry::persona::UpsertPersonaRequest;
 
 pub(crate) fn run_router_command(command: &str) -> anyhow::Result<()> {
     match command {
+        "command-receipt-capabilities" => {
+            println!("nokiy_command_receipt_binding_v1");
+            Ok(())
+        }
+        "command-receipt-preflight" => {
+            let workspace = std::env::var_os(tura_path::command_receipts::RECEIPT_WORKSPACE_ENV)
+                .ok_or_else(|| anyhow::anyhow!("command receipt workspace binding required"))?;
+            let _store = tura_path::command_receipts::ReceiptStore::open(std::path::Path::new(&workspace))?;
+            Ok(())
+        }
+        "focused-verifier-capabilities" => {
+            println!("nokiy_focused_verifier_parent_v1");
+            Ok(())
+        }
+        "focused-verifier-plan" => crate::parent_verifier::plan(),
         "native-once" => tokio_runtime()?.block_on(crate::native_once::run()),
         "serve" => tokio_runtime()?.block_on(serve_stdio()),
         "serve-socket" => tokio_runtime()?.block_on(serve_socket()),

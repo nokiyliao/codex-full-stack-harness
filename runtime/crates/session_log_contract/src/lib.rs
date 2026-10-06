@@ -9,6 +9,12 @@ pub use checkpoint::{CheckpointType, CommandCheckpoint};
 pub use endpoint::ServiceEndpoint;
 pub use protocol::recovery_terminal_projection_event_id;
 pub use protocol::{
+    EXECUTION_EVIDENCE_PAGE_BYTES, EXECUTION_EVIDENCE_PAGE_RECORDS, EVIDENCE_USAGE_KEYS,
+    ExecutionEvidencePage, ExecutionEvidenceReference, ExecutionEvidenceSnapshot,
+    ExecutionEvidenceSummary, ReadExecutionEvidenceRequest, RuntimeEvidenceState,
+    RuntimeEvidenceTotals, SortedObservedEvidence, observed_evidence_field, visit_execution_evidence,
+};
+pub use protocol::{
     ActivateRuntimeLeaseRequest, AppendSessionFeedEventRequest, CommitRuntimeEventRequest,
     ContextSlice, CreateSessionRequest, DeleteSessionRequest, DeleteWorkspaceRequest,
     ExecuteSessionCommandRequest, GetRuntimeLeaseRequest, GetSessionRequest,

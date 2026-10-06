@@ -737,19 +737,32 @@ fn pass_scrambled_steps_are_repaired_without_accidental_parallel_grouping() {
                 { "step": 3, "command": "task_status", "command_line": json!({ "status": "doing", "task_group": "three" }).to_string() },
                 { "step": 2, "command": "task_status", "command_line": json!({ "status": "doing", "task_group": "two" }).to_string() },
                 { "step": 4, "command": "task_status", "command_line": json!({ "status": "doing", "task_group": "four" }).to_string() },
-                { "step": 1, "command": "task_status", "command_line": json!({ "status": "done", "task_group": "one" }).to_string() }
+                { "step": 1, "command": "task_status", "command_line": json!({ "status": "doing", "task_group": "one" }).to_string() }
             ]
         }),
         &root,
     );
 
-    let results = output["results"].as_array().expect("results");
+    let results = output["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing results: {output:#}"));
+    assert!(
+        results
+            .iter()
+            .all(|result| result["success"].as_bool() == Some(true)),
+        "nonterminal step repair failed: {output:#}"
+    );
     assert_eq!(
         results
             .iter()
-            .map(|result| result["step"].as_u64().expect("step"))
+            .map(|result| {
+                result["step"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("missing step: {result:#}"))
+            })
             .collect::<Vec<_>>(),
-        vec![3, 4, 5, 6]
+        vec![3, 4, 5, 6],
+        "unexpected normalized steps: {output:#}"
     );
     assert_eq!(
         results
@@ -757,11 +770,104 @@ fn pass_scrambled_steps_are_repaired_without_accidental_parallel_grouping() {
             .map(|result| {
                 result["output"]["task_status"]["task_group"]
                     .as_str()
-                    .expect("task group")
+                    .unwrap_or_else(|| panic!("missing task group: {result:#}"))
                     .to_string()
             })
             .collect::<Vec<_>>(),
-        vec!["three", "two", "four", "one"]
+        vec!["three", "two", "four", "one"],
+        "unexpected task groups: {output:#}"
+    );
+}
+
+#[test]
+fn pass_backward_final_done_is_rejected_despite_step_normalization() {
+    let _guard = env_lock_blocking();
+    let root = temp_workspace("backward-final-done");
+
+    let output = command_run::execute(
+        &json!({
+            "commands": [
+                { "step": 3, "command": "task_status", "command_line": json!({ "status": "doing", "task_group": "three" }).to_string() },
+                { "step": 2, "command": "task_status", "command_line": json!({ "status": "doing", "task_group": "two" }).to_string() },
+                { "step": 4, "command": "task_status", "command_line": json!({ "status": "doing", "task_group": "four" }).to_string() },
+                { "step": 1, "command": "task_status", "command_line": json!({ "status": "done", "task_group": "one" }).to_string() }
+            ]
+        }),
+        &root,
+    );
+
+    let results = output["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing results: {output:#}"));
+    assert_eq!(results.len(), 4, "unexpected result count: {output:#}");
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result["step"].as_u64())
+            .collect::<Vec<_>>(),
+        vec![Some(3), Some(4), Some(5), Some(6)],
+        "unexpected normalized steps: {output:#}"
+    );
+    assert!(
+        results[..3]
+            .iter()
+            .all(|result| result["success"].as_bool() == Some(true)),
+        "nonterminal prefix failed: {output:#}"
+    );
+    let terminal = &results[3];
+    assert_eq!(
+        terminal["success"].as_bool(),
+        Some(false),
+        "backward done unexpectedly succeeded: {terminal:#}"
+    );
+    assert!(
+        terminal["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("TERMINAL_STATUS_BATCH_ORDER:")),
+        "unexpected terminal error: {terminal:#}"
+    );
+    assert!(
+        terminal["output"].is_null(),
+        "rejected done emitted a terminal payload: {terminal:#}"
+    );
+}
+
+#[test]
+fn pass_genuinely_later_final_done_succeeds_after_step_normalization() {
+    let _guard = env_lock_blocking();
+    let root = temp_workspace("forward-final-done");
+
+    let output = command_run::execute(
+        &json!({
+            "commands": [
+                { "step": 3, "command": "task_status", "command_line": json!({ "status": "doing", "task_group": "three" }).to_string() },
+                { "step": 2, "command": "task_status", "command_line": json!({ "status": "doing", "task_group": "two" }).to_string() },
+                { "step": 4, "command": "task_status", "command_line": json!({ "status": "doing", "task_group": "four" }).to_string() },
+                { "step": 6, "command": "task_status", "command_line": json!({ "status": "done", "task_group": "six" }).to_string() }
+            ]
+        }),
+        &root,
+    );
+
+    let results = output["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing results: {output:#}"));
+    assert_eq!(results.len(), 4, "unexpected result count: {output:#}");
+    assert!(
+        results
+            .iter()
+            .all(|result| result["success"].as_bool() == Some(true)),
+        "ordered final done failed: {output:#}"
+    );
+    let terminal = &results[3];
+    assert_eq!(
+        terminal["output"]["task_status"]["status"].as_str(),
+        Some("done"),
+        "missing successful terminal payload: {terminal:#}"
+    );
+    assert!(
+        terminal["error"].is_null(),
+        "successful done carried an error: {terminal:#}"
     );
 }
 

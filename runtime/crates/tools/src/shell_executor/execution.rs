@@ -2,8 +2,8 @@ use crate::commands::CommandResponse;
 use crate::runtime::tool::ToolContext;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -11,13 +11,14 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
+use tura_path::command_receipts::ReceiptStore;
 
 use super::process::{
     attach_shell_process_scope, configure_process_scope, configure_tokio_process_scope,
     panic_cleanup_process_scope_empty, process_is_alive, retain_shell_process_scope,
     terminate_process_tree,
 };
-use super::response::failed_async_response;
+use super::response::{failed_async_response, json_like_output};
 
 const EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_EXEC_OUTPUT_DELTAS_PER_CALL: usize = 512;
@@ -221,7 +222,10 @@ pub(super) async fn run_tokio_command_with_timeout(
 ) -> CommandResponse {
     let started = Instant::now();
     let progress = ProgressClock::new();
-    if let Err(error) = reconcile_command_execution_claims(&ctx.session_dir, ctx.current_call_id())
+    if let Err(error) = ctx
+        .bound_receipt_store()
+        .map_err(|error| error.to_string())
+        .and_then(|store| reconcile_command_execution_claims(&store, ctx.current_call_id()))
     {
         return CommandResponse {
             success: false,
@@ -531,7 +535,7 @@ pub(super) async fn run_tokio_command_with_timeout(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn attach_durable_terminal_receipt(
+pub(super) fn attach_durable_terminal_receipt(
     response: &mut CommandResponse,
     ctx: &ToolContext,
     pid: Option<u32>,
@@ -545,8 +549,72 @@ fn attach_durable_terminal_receipt(
     process_reaped: bool,
     process_group_empty: bool,
 ) -> Result<(), String> {
+    let receipt = terminal_receipt_value(
+        response,
+        ctx,
+        pid,
+        started.elapsed().as_millis() as u64,
+        timeout_secs,
+        stall_timeout_secs,
+        terminal_state,
+        failure_class,
+        termination_origin,
+        outcome,
+        process_reaped,
+        process_group_empty,
+    );
+    let receipt_path = if let Some(call_id) = ctx.current_call_id() {
+        let store = ctx
+            .bound_receipt_store()
+            .map_err(|error| error.to_string())?;
+        let name = command_receipt_name(call_id);
+        durable_write_receipt(&store, &name, &receipt)?;
+        Some(receipt_display_path(&store, &name)?)
+    } else {
+        None
+    };
+    let prior_output = std::mem::replace(&mut response.output, Value::Null);
+    let mut output = match prior_output {
+        Value::Object(object) => object,
+        Value::String(message) => {
+            let mut object = serde_json::Map::new();
+            object.insert("message".to_string(), Value::String(message));
+            object
+        }
+        _ => serde_json::Map::new(),
+    };
+    output.insert("terminal_receipt".to_string(), receipt);
+    if let Some(path) = receipt_path {
+        output.insert("terminal_receipt_path".to_string(), Value::String(path));
+    }
+    response.output = Value::Object(output);
+    mark_claim_terminal(
+        ctx,
+        terminal_state,
+        outcome,
+        process_reaped,
+        process_group_empty,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminal_receipt_value(
+    response: &CommandResponse,
+    ctx: &ToolContext,
+    pid: Option<u32>,
+    wall_time_ms: u64,
+    timeout_secs: u64,
+    stall_timeout_secs: Option<u64>,
+    terminal_state: &str,
+    failure_class: &str,
+    termination_origin: &str,
+    outcome: &str,
+    process_reaped: bool,
+    process_group_empty: bool,
+) -> Value {
     let call_id = ctx.current_call_id().unwrap_or("command_run");
-    let receipt = json!({
+    json!({
         "schema_version": "tura_command_terminal_receipt_v1",
         "call_id": call_id,
         "pid": pid,
@@ -554,7 +622,7 @@ fn attach_durable_terminal_receipt(
         "failure_class": failure_class,
         "termination_origin": termination_origin,
         "exit_code": response.exit_code,
-        "wall_time_ms": started.elapsed().as_millis() as u64,
+        "wall_time_ms": wall_time_ms,
         "wall_timeout_ms": timeout_secs.saturating_mul(1000),
         "stall_timeout_ms": stall_timeout_secs.map(|seconds| seconds.saturating_mul(1000)),
         "outcome": outcome,
@@ -570,15 +638,43 @@ fn attach_durable_terminal_receipt(
             || failure_class == "workload_exit_nonzero"
             || !(process_reaped && process_group_empty),
         "replay_semantics": "diagnosed_replay_only_after_no_authoritative_publication_or_idempotent_cas_proof"
-    });
-    let path = ctx
-        .current_call_id()
-        .map(|call_id| command_receipt_path(&ctx.session_dir, call_id));
-    if let Some(path) = path.as_ref() {
-        durable_write_receipt(path, &receipt)?;
-    }
-    let prior_output = std::mem::replace(&mut response.output, Value::Null);
-    let mut output = match prior_output {
+    })
+}
+
+pub(crate) fn preview_in_process_terminal_response(
+    ctx: &ToolContext,
+    response: &CommandResponse,
+    termination_origin: &str,
+) -> Result<Value, String> {
+    let (terminal_state, failure_class) = if response.exit_code == 0 {
+        ("completed", "none")
+    } else {
+        ("failed", "workload_exit_nonzero")
+    };
+    let receipt = terminal_receipt_value(
+        response,
+        ctx,
+        None,
+        u64::MAX,
+        0,
+        None,
+        terminal_state,
+        failure_class,
+        termination_origin,
+        "known",
+        true,
+        true,
+    );
+    let receipt_path = if let Some(call_id) = ctx.current_call_id() {
+        let store = ctx
+            .bound_receipt_store()
+            .map_err(|error| error.to_string())?;
+        let name = command_receipt_name(call_id);
+        Some(receipt_display_path(&store, &name)?)
+    } else {
+        None
+    };
+    let mut output = match response.output.clone() {
         Value::Object(object) => object,
         Value::String(message) => {
             let mut object = serde_json::Map::new();
@@ -588,21 +684,16 @@ fn attach_durable_terminal_receipt(
         _ => serde_json::Map::new(),
     };
     output.insert("terminal_receipt".to_string(), receipt);
-    if let Some(path) = path {
-        output.insert(
-            "terminal_receipt_path".to_string(),
-            Value::String(path.display().to_string()),
-        );
+    if let Some(path) = receipt_path {
+        output.insert("terminal_receipt_path".to_string(), Value::String(path));
     }
-    response.output = Value::Object(output);
-    mark_claim_terminal(
-        ctx,
-        terminal_state,
-        outcome,
-        process_reaped,
-        process_group_empty,
-    )?;
-    Ok(())
+    Ok(json_like_output(
+        response.exit_code,
+        response.stdout.clone(),
+        response.stderr.clone(),
+        Value::Object(output),
+        response.changes.clone(),
+    ))
 }
 
 pub(crate) fn run_in_process_command_with_terminal_receipt<F>(
@@ -614,7 +705,10 @@ where
     F: FnOnce() -> CommandResponse,
 {
     let started = Instant::now();
-    if let Err(error) = reconcile_command_execution_claims(&ctx.session_dir, ctx.current_call_id())
+    if let Err(error) = ctx
+        .bound_receipt_store()
+        .map_err(|error| error.to_string())
+        .and_then(|store| reconcile_command_execution_claims(&store, ctx.current_call_id()))
     {
         return CommandResponse {
             success: false,
@@ -702,7 +796,10 @@ pub(crate) fn terminalize_pre_execution_zero_effect(
     stall_timeout_secs: Option<u64>,
 ) -> CommandResponse {
     let started = Instant::now();
-    if let Err(error) = reconcile_command_execution_claims(&ctx.session_dir, ctx.current_call_id())
+    if let Err(error) = ctx
+        .bound_receipt_store()
+        .map_err(|error| error.to_string())
+        .and_then(|store| reconcile_command_execution_claims(&store, ctx.current_call_id()))
     {
         response.output = json!({
             "error_type": "CommandExecutionReconciliationRequired",
@@ -757,16 +854,26 @@ pub(crate) fn terminalize_pre_execution_zero_effect(
     response
 }
 
+fn command_receipt_name(call_id: &str) -> String {
+    format!("{}.json", safe_call_id(call_id))
+}
+
+fn command_claim_name(call_id: &str) -> String {
+    format!("{}.claim.json", safe_call_id(call_id))
+}
+
+#[cfg(test)]
 fn command_receipt_path(session_dir: &Path, call_id: &str) -> PathBuf {
     session_dir
         .join(".tura/run/command_receipts")
-        .join(format!("{}.json", safe_call_id(call_id)))
+        .join(command_receipt_name(call_id))
 }
 
+#[cfg(test)]
 fn command_claim_path(session_dir: &Path, call_id: &str) -> PathBuf {
     session_dir
         .join(".tura/run/command_receipts")
-        .join(format!("{}.claim.json", safe_call_id(call_id)))
+        .join(command_claim_name(call_id))
 }
 
 fn safe_call_id(call_id: &str) -> String {
@@ -785,21 +892,31 @@ fn safe_call_id(call_id: &str) -> String {
     }
 }
 
-fn claim_command_execution(
+pub(super) fn claim_command_execution(
     ctx: &ToolContext,
     timeout_secs: u64,
     stall_timeout_secs: Option<u64>,
 ) -> Result<(), String> {
+    claim_command_execution_with_scope(ctx, timeout_secs, stall_timeout_secs, false)
+}
+
+pub(super) fn claim_parent_verifier_execution(ctx: &ToolContext, timeout_secs: u64) -> Result<(), String> {
+    if ctx.current_call_id().is_none() { return Err("VERIFIER_CALL_ID_REQUIRED".into()); }
+    claim_command_execution_with_scope(ctx, timeout_secs, None, true)
+}
+
+fn claim_command_execution_with_scope(
+    ctx: &ToolContext, timeout_secs: u64, stall_timeout_secs: Option<u64>, parent_owned: bool,
+) -> Result<(), String> {
     let Some(call_id) = ctx.current_call_id() else {
         return Ok(());
     };
-    let path = command_claim_path(&ctx.session_dir, call_id);
-    let parent = path
-        .parent()
-        .ok_or_else(|| "COMMAND_EXECUTION_CLAIM_PARENT_MISSING".to_string())?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let store = ctx
+        .bound_receipt_store()
+        .map_err(|error| error.to_string())?;
+    let name = command_claim_name(call_id);
     let started_at_unix_ms = unix_time_ms();
-    let claim = serde_json::to_vec_pretty(&json!({
+    let mut claim = json!({
         "schema_version": "tura_command_execution_claim_v1",
         "call_id": call_id,
         "state": "claimed",
@@ -813,22 +930,19 @@ fn claim_command_execution(
         "authority_effect": "none",
         "execution_count": 1,
         "replay_allowed": false
-    }))
-    .map_err(|error| error.to_string())?;
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                format!("COMMAND_EXECUTION_ALREADY_CLAIMED:{}", path.display())
-            } else {
-                error.to_string()
-            }
-        })?;
-    file.write_all(&claim).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
-    sync_receipt_directory(parent)
+    });
+    if parent_owned { claim["process_scope"] = json!("parent_verifier_channel"); }
+    let claim = serde_json::to_vec_pretty(&claim).map_err(|error| error.to_string())?;
+    store.publish_new(&name, &claim).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            store.display_path(&name).map_or_else(
+                |error| error.to_string(),
+                |path| format!("COMMAND_EXECUTION_ALREADY_CLAIMED:{}", path.display()),
+            )
+        } else {
+            error.to_string()
+        }
+    })
 }
 
 fn update_command_claim_running(
@@ -840,9 +954,12 @@ fn update_command_claim_running(
     let Some(call_id) = ctx.current_call_id() else {
         return Ok(());
     };
-    let path = command_claim_path(&ctx.session_dir, call_id);
-    let existing = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let mut claim: Value = serde_json::from_str(&existing).map_err(|error| error.to_string())?;
+    let store = ctx
+        .bound_receipt_store()
+        .map_err(|error| error.to_string())?;
+    let name = command_claim_name(call_id);
+    let existing = store.read(&name).map_err(|error| error.to_string())?;
+    let mut claim: Value = serde_json::from_slice(&existing).map_err(|error| error.to_string())?;
     let object = claim
         .as_object_mut()
         .ok_or_else(|| "COMMAND_EXECUTION_CLAIM_INVALID".to_string())?;
@@ -861,7 +978,7 @@ fn update_command_claim_running(
         "stall_timeout_ms".to_string(),
         stall_timeout_secs.map_or(Value::Null, |seconds| json!(seconds.saturating_mul(1000))),
     );
-    durable_replace_json(&path, &claim)
+    durable_replace_json(&store, &name, &claim)
 }
 
 fn mark_claim_terminal(
@@ -874,9 +991,12 @@ fn mark_claim_terminal(
     let Some(call_id) = ctx.current_call_id() else {
         return Ok(());
     };
-    let path = command_claim_path(&ctx.session_dir, call_id);
-    let existing = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let mut claim: Value = serde_json::from_str(&existing).map_err(|error| error.to_string())?;
+    let store = ctx
+        .bound_receipt_store()
+        .map_err(|error| error.to_string())?;
+    let name = command_claim_name(call_id);
+    let existing = store.read(&name).map_err(|error| error.to_string())?;
+    let mut claim: Value = serde_json::from_slice(&existing).map_err(|error| error.to_string())?;
     let object = claim
         .as_object_mut()
         .ok_or_else(|| "COMMAND_EXECUTION_CLAIM_INVALID".to_string())?;
@@ -894,24 +1014,29 @@ fn mark_claim_terminal(
         "reconcile_required".to_string(),
         json!(outcome == "unknown" || !(process_reaped && process_group_empty)),
     );
-    durable_replace_json(&path, &claim)
+    durable_replace_json(&store, &name, &claim)
 }
 
+fn command_run_batch_name(execution_id: &str) -> String {
+    format!("{}.batch-admission", safe_call_id(execution_id))
+}
+
+#[cfg(test)]
 fn command_run_batch_path(session_dir: &Path, execution_id: &str) -> PathBuf {
     session_dir
         .join(".tura/run/command_receipts")
-        .join(format!("{}.batch-admission", safe_call_id(execution_id)))
+        .join(command_run_batch_name(execution_id))
 }
 
 pub fn begin_command_run_batch(
-    session_dir: &Path,
+    store: &ReceiptStore,
     execution_id: &str,
     call_ids: &[String],
 ) -> Result<(), String> {
     if call_ids.is_empty() || call_ids.iter().collect::<BTreeSet<_>>().len() != call_ids.len() {
         return Err("COMMAND_RUN_BATCH_IDENTITY_INVALID".to_string());
     }
-    let path = command_run_batch_path(session_dir, execution_id);
+    let name = command_run_batch_name(execution_id);
     let admission = json!({
         "schema_version": "tura_command_run_batch_admission_v1",
         "execution_id": execution_id,
@@ -921,22 +1046,34 @@ pub fn begin_command_run_batch(
         "accepted_claim_count": 0,
         "zero_effect_proven": false
     });
-    if path.exists() {
-        let existing: Value = serde_json::from_slice(
-            &fs::read(&path)
-                .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_READ_FAILED:{error}"))?,
-        )
-        .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_INVALID:{error}"))?;
+    let validate_existing = |raw: &[u8]| -> Result<(), String> {
+        let existing: Value = serde_json::from_slice(raw)
+            .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_INVALID:{error}"))?;
         if existing.get("schema_version").and_then(Value::as_str)
             == Some("tura_command_run_batch_admission_v1")
             && existing.get("execution_id").and_then(Value::as_str) == Some(execution_id)
             && existing.get("call_ids") == Some(&json!(call_ids))
         {
-            return Ok(());
+            Ok(())
+        } else {
+            Err("COMMAND_RUN_BATCH_MARKER_CONFLICT".to_string())
         }
-        return Err("COMMAND_RUN_BATCH_MARKER_CONFLICT".to_string());
+    };
+    if let Some(raw) = store
+        .read_optional(&name)
+        .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_READ_FAILED:{error}"))?
+    {
+        return validate_existing(&raw);
     }
-    durable_write_receipt(&path, &admission)
+    match durable_write_receipt(store, &name, &admission) {
+        Err(error) if error.starts_with("COMMAND_TERMINAL_RECEIPT_CONFLICT:") => {
+            let raw = store
+                .read(&name)
+                .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_READ_FAILED:{error}"))?;
+            validate_existing(&raw)
+        }
+        result => result,
+    }
 }
 
 fn command_run_batch_marker_lock() -> &'static Mutex<()> {
@@ -945,19 +1082,24 @@ fn command_run_batch_marker_lock() -> &'static Mutex<()> {
 }
 
 pub fn mark_command_run_batch_call_accepted(
-    session_dir: &Path,
+    store: &ReceiptStore,
     execution_id: &str,
     call_id: &str,
 ) -> Result<(), String> {
-    let path = command_run_batch_path(session_dir, execution_id);
-    if !path.exists() {
+    let name = command_run_batch_name(execution_id);
+    if store
+        .read_optional(&name)
+        .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_READ_FAILED:{error}"))?
+        .is_none()
+    {
         return Ok(());
     }
     let _guard = command_run_batch_marker_lock()
         .lock()
         .map_err(|_| "COMMAND_RUN_BATCH_MARKER_LOCK_POISONED".to_string())?;
     let mut marker: Value = serde_json::from_slice(
-        &fs::read(&path)
+        &store
+            .read(&name)
             .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_READ_FAILED:{error}"))?,
     )
     .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_INVALID:{error}"))?;
@@ -988,27 +1130,28 @@ pub fn mark_command_run_batch_call_accepted(
         return Err("COMMAND_RUN_BATCH_MARKER_CONFLICT".to_string());
     }
     accepted.push(Value::String(call_id.to_string()));
-    durable_replace_json(&path, &marker)
+    durable_replace_json(store, &name, &marker)
 }
 
 pub fn complete_command_run_batch(
-    session_dir: &Path,
+    store: &ReceiptStore,
     execution_id: &str,
     call_ids: &[String],
 ) -> Result<(), String> {
-    update_command_run_batch(session_dir, execution_id, call_ids, "finished", None)
+    update_command_run_batch(store, execution_id, call_ids, "finished", None)
 }
 
 fn update_command_run_batch(
-    session_dir: &Path,
+    store: &ReceiptStore,
     execution_id: &str,
     call_ids: &[String],
     state: &str,
     accepted_claim_count: Option<usize>,
 ) -> Result<(), String> {
-    let path = command_run_batch_path(session_dir, execution_id);
+    let name = command_run_batch_name(execution_id);
     let mut marker: Value = serde_json::from_slice(
-        &fs::read(&path)
+        &store
+            .read(&name)
             .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_READ_FAILED:{error}"))?,
     )
     .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_INVALID:{error}"))?;
@@ -1035,7 +1178,7 @@ fn update_command_run_batch(
         object.insert("zero_effect_proven".to_string(), json!(count == 0));
     }
     object.insert("terminal_at_unix_ms".to_string(), json!(unix_time_ms()));
-    durable_replace_json(&path, &marker)
+    durable_replace_json(store, &name, &marker)
 }
 
 fn terminal_receipt_proves_process_terminal(receipt: &Value, call_id: &str) -> Result<(), String> {
@@ -1082,13 +1225,14 @@ fn claim_state_is_terminal(state: &str) -> bool {
 }
 
 pub async fn terminalize_interrupted_command_run_claims(
-    session_dir: &Path,
+    store: &ReceiptStore,
     execution_id: &str,
     call_ids: &[String],
 ) -> Result<usize, String> {
-    let marker_path = command_run_batch_path(session_dir, execution_id);
+    let marker_name = command_run_batch_name(execution_id);
     let marker: Value = serde_json::from_slice(
-        &fs::read(&marker_path)
+        &store
+            .read(&marker_name)
             .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_READ_FAILED:{error}"))?,
     )
     .map_err(|error| format!("COMMAND_RUN_BATCH_MARKER_INVALID:{error}"))?;
@@ -1114,20 +1258,24 @@ pub async fn terminalize_interrupted_command_run_claims(
         .collect::<Result<BTreeSet<_>, _>>()?;
     let mut claims = Vec::new();
     for call_id in call_ids {
-        let path = command_claim_path(session_dir, call_id);
-        if !path.exists() {
+        let name = command_claim_name(call_id);
+        let Some(raw) = store
+            .read_optional(&name)
+            .map_err(|error| error.to_string())?
+        else {
             continue;
-        }
-        let claim: Value =
-            serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string())?;
+        };
+        let claim: Value = serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
         if claim.get("call_id").and_then(Value::as_str) != Some(call_id) {
             return Err(format!(
                 "COMMAND_EXECUTION_CLAIM_ID_CONFLICT:{}",
-                path.display()
+                store
+                    .display_path(&name)
+                    .map_err(|error| error.to_string())?
+                    .display()
             ));
         }
-        claims.push((path, claim));
+        claims.push((name, claim));
     }
     let claimed_call_ids = claims
         .iter()
@@ -1155,13 +1303,13 @@ pub async fn terminalize_interrupted_command_run_claims(
             .get("call_id")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let receipt_path = command_receipt_path(session_dir, call_id);
-        let receipt_proves_terminal = if receipt_path.exists() {
-            match fs::read(&receipt_path)
+        let receipt_name = command_receipt_name(call_id);
+        let receipt_proves_terminal = if let Some(raw) = store
+            .read_optional(&receipt_name)
+            .map_err(|error| error.to_string())?
+        {
+            match serde_json::from_slice::<Value>(&raw)
                 .map_err(|error| error.to_string())
-                .and_then(|raw| {
-                    serde_json::from_slice::<Value>(&raw).map_err(|error| error.to_string())
-                })
                 .and_then(|receipt| terminal_receipt_proves_process_terminal(&receipt, call_id))
             {
                 Ok(()) => true,
@@ -1173,6 +1321,9 @@ pub async fn terminalize_interrupted_command_run_claims(
         } else {
             false
         };
+        if !receipt_proves_terminal && claim.get("process_scope").and_then(Value::as_str) == Some("parent_verifier_channel") {
+            return Err(format!("COMMAND_RUN_PARENT_VERIFIER_CLEANUP_UNPROVEN:{call_id}"));
+        }
         if !receipt_proves_terminal && let Some(pid) = claim.get("pid").and_then(Value::as_u64) {
             processes.push((call_id.to_string(), pid as u32));
         }
@@ -1208,18 +1359,27 @@ pub async fn terminalize_interrupted_command_run_claims(
         return Err(error);
     }
 
-    for (path, claim) in &mut claims {
+    for (name, claim) in &mut claims {
         let call_id = claim
             .get("call_id")
             .and_then(Value::as_str)
-            .ok_or_else(|| format!("COMMAND_EXECUTION_CLAIM_ID_MISSING:{}", path.display()))?
+            .ok_or_else(|| {
+                format!(
+                    "COMMAND_EXECUTION_CLAIM_ID_MISSING:{}",
+                    store
+                        .display_path(name)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|error| error.to_string())
+                )
+            })?
             .to_string();
-        let receipt_path = command_receipt_path(session_dir, &call_id);
-        let receipt = if receipt_path.exists() {
-            let receipt = serde_json::from_slice::<Value>(
-                &fs::read(&receipt_path).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
+        let receipt_name = command_receipt_name(&call_id);
+        let receipt = if let Some(raw) = store
+            .read_optional(&receipt_name)
+            .map_err(|error| error.to_string())?
+        {
+            let receipt =
+                serde_json::from_slice::<Value>(&raw).map_err(|error| error.to_string())?;
             terminal_receipt_proves_process_terminal(&receipt, &call_id)?;
             let claim_state = claim
                 .get("state")
@@ -1257,12 +1417,18 @@ pub async fn terminalize_interrupted_command_run_claims(
                 "reconcile_required": true,
                 "replay_semantics": "diagnosed_replay_only_after_no_authoritative_publication_or_idempotent_cas_proof"
             });
-            durable_write_receipt(&receipt_path, &receipt)?;
+            durable_write_receipt(store, &receipt_name, &receipt)?;
             receipt
         };
-        let object = claim
-            .as_object_mut()
-            .ok_or_else(|| format!("COMMAND_EXECUTION_CLAIM_INVALID:{}", path.display()))?;
+        let object = claim.as_object_mut().ok_or_else(|| {
+            format!(
+                "COMMAND_EXECUTION_CLAIM_INVALID:{}",
+                store
+                    .display_path(name)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|error| error.to_string())
+            )
+        })?;
         object.insert(
             "state".to_string(),
             receipt
@@ -1292,10 +1458,10 @@ pub async fn terminalize_interrupted_command_run_claims(
                 .cloned()
                 .unwrap_or(json!(true)),
         );
-        durable_replace_json(path, &claim)?;
+        durable_replace_json(store, name, &claim)?;
     }
     update_command_run_batch(
-        session_dir,
+        store,
         execution_id,
         call_ids,
         "panic_terminalized",
@@ -1304,39 +1470,31 @@ pub async fn terminalize_interrupted_command_run_claims(
     Ok(claims.len())
 }
 
-fn reconcile_command_execution_claims(
-    session_dir: &Path,
+pub(super) fn reconcile_command_execution_claims(
+    store: &ReceiptStore,
     current_call_id: Option<&str>,
 ) -> Result<(), String> {
-    let directory = session_dir.join(".tura/run/command_receipts");
-    let entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.to_string()),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json")
-            || !path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(|name| name.ends_with(".claim.json"))
-        {
+    for name in store.list_names().map_err(|error| error.to_string())? {
+        if !name.ends_with(".claim.json") {
             continue;
         }
-        let raw = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-        let claim: Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        let raw = store.read(&name).map_err(|error| error.to_string())?;
+        let claim: Value = serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
         let Some(object) = claim.as_object() else {
             return Err(format!(
                 "COMMAND_EXECUTION_CLAIM_INVALID:{}",
-                path.display()
+                receipt_display_path(store, &name)?
             ));
         };
         let call_id = object
             .get("call_id")
             .and_then(Value::as_str)
-            .ok_or_else(|| format!("COMMAND_EXECUTION_CLAIM_ID_MISSING:{}", path.display()))?;
+            .ok_or_else(|| {
+                format!(
+                    "COMMAND_EXECUTION_CLAIM_ID_MISSING:{}",
+                    receipt_display_path(store, &name).unwrap_or_else(|error| error)
+                )
+            })?;
         let state = object
             .get("state")
             .and_then(Value::as_str)
@@ -1357,7 +1515,7 @@ fn reconcile_command_execution_claims(
         if current_call_id == Some(call_id) {
             return Err(format!(
                 "COMMAND_EXECUTION_ALREADY_CLAIMED:{}",
-                path.display()
+                receipt_display_path(store, &name)?
             ));
         }
         let owner_pid = object
@@ -1378,10 +1536,15 @@ fn reconcile_command_execution_claims(
         if pid.is_some_and(process_is_alive) {
             continue;
         }
-        let receipt_path = command_receipt_path(session_dir, call_id);
-        if !receipt_path.exists() {
+        let receipt_name = command_receipt_name(call_id);
+        if store
+            .read_optional(&receipt_name)
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
             durable_write_receipt(
-                &receipt_path,
+                store,
+                &receipt_name,
                 &json!({
                     "schema_version": "tura_command_terminal_receipt_v1",
                     "call_id": call_id,
@@ -1412,7 +1575,7 @@ fn reconcile_command_execution_claims(
             object.insert("terminal_at_unix_ms".to_string(), json!(unix_time_ms()));
             object.insert("reconcile_required".to_string(), Value::Bool(true));
         }
-        durable_replace_json(&path, &interrupted)?;
+        durable_replace_json(store, &name, &interrupted)?;
     }
     Ok(())
 }
@@ -1424,63 +1587,49 @@ fn unix_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn durable_write_receipt(path: &Path, receipt: &Value) -> Result<(), String> {
+fn receipt_display_path(store: &ReceiptStore, name: &str) -> Result<String, String> {
+    store
+        .display_path(name)
+        .map(|path| path.display().to_string())
+        .map_err(|error| error.to_string())
+}
+
+fn durable_write_receipt(store: &ReceiptStore, name: &str, receipt: &Value) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(receipt).map_err(|error| error.to_string())?;
-    if path.exists() {
-        let existing = fs::read(path).map_err(|error| error.to_string())?;
+    if let Some(existing) = store
+        .read_optional(name)
+        .map_err(|error| error.to_string())?
+    {
         if existing == bytes {
             return Ok(());
         }
         return Err(format!(
             "COMMAND_TERMINAL_RECEIPT_CONFLICT:{}",
-            path.display()
+            receipt_display_path(store, name)?
         ));
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| "COMMAND_TERMINAL_RECEIPT_PARENT_MISSING".to_string())?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp)
-        .map_err(|error| error.to_string())?;
-    file.write_all(&bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
-    fs::rename(&temp, path).map_err(|error| error.to_string())?;
-    sync_receipt_directory(parent)?;
-    Ok(())
+    match store.publish_new(name, &bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = store.read(name).map_err(|error| error.to_string())?;
+            if existing == bytes {
+                Ok(())
+            } else {
+                Err(format!(
+                    "COMMAND_TERMINAL_RECEIPT_CONFLICT:{}",
+                    receipt_display_path(store, name)?
+                ))
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
-fn durable_replace_json(path: &Path, value: &Value) -> Result<(), String> {
+fn durable_replace_json(store: &ReceiptStore, name: &str, value: &Value) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| "COMMAND_JSON_PARENT_MISSING".to_string())?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let temp = path.with_extension(format!("tmp-{}-{}", std::process::id(), unix_time_ms()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp)
-        .map_err(|error| error.to_string())?;
-    file.write_all(&bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
-    fs::rename(&temp, path).map_err(|error| error.to_string())?;
-    sync_receipt_directory(parent)
-}
-
-#[cfg(unix)]
-fn sync_receipt_directory(path: &Path) -> Result<(), String> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
+    store
+        .replace(name, &bytes)
         .map_err(|error| error.to_string())
-}
-
-#[cfg(not(unix))]
-fn sync_receipt_directory(_path: &Path) -> Result<(), String> {
-    Ok(())
 }
 
 fn terminated_unknown_outcome(
@@ -1705,9 +1854,9 @@ mod tests {
     use super::super::response::failed_async_response;
     use super::{
         ProgressClock, SharedOutput, begin_command_run_batch, claim_command_execution,
-        command_claim_path, command_receipt_path, command_run_batch_path, durable_replace_json,
-        durable_write_receipt, mark_command_run_batch_call_accepted, read_stream_with_deltas,
-        reconcile_command_execution_claims, run_command_with_timeout,
+        command_claim_name, command_claim_path, command_receipt_name, command_receipt_path,
+        command_run_batch_path, durable_write_receipt, mark_command_run_batch_call_accepted,
+        read_stream_with_deltas, reconcile_command_execution_claims, run_command_with_timeout,
         run_tokio_command_with_timeout, tail_chars, terminalize_interrupted_command_run_claims,
         terminalize_pre_execution_zero_effect,
     };
@@ -1717,6 +1866,14 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
     use tokio::io::AsyncWriteExt;
+    use tura_path::command_receipts::ReceiptStore;
+
+    fn test_temp_dir(name: String) -> PathBuf {
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join(name)
+    }
 
     fn success_command() -> Command {
         if cfg!(windows) {
@@ -1736,10 +1893,10 @@ mod tests {
     }
 
     fn write_test_claim(workspace: &std::path::Path, call_id: &str, state: &str) {
-        let path = command_claim_path(workspace, call_id);
-        fs::create_dir_all(path.parent().expect("claim parent")).expect("claim directory");
-        durable_replace_json(
-            &path,
+        let store = ReceiptStore::open(workspace).expect("receipt store");
+        durable_write_receipt(
+            &store,
+            &command_claim_name(call_id),
             &json!({
                 "schema_version": "tura_command_execution_claim_v1",
                 "call_id": call_id,
@@ -1756,8 +1913,10 @@ mod tests {
         call_id: &str,
         terminal_state: &str,
     ) {
+        let store = ReceiptStore::open(workspace).expect("receipt store");
         durable_write_receipt(
-            &command_receipt_path(workspace, call_id),
+            &store,
+            &command_receipt_name(call_id),
             &json!({
                 "schema_version": "tura_command_terminal_receipt_v1",
                 "call_id": call_id,
@@ -1773,19 +1932,21 @@ mod tests {
     #[tokio::test]
     async fn panic_cleanup_uses_exact_ids_filters_terminal_claims_and_ignores_unrelated_corruption()
     {
-        let workspace =
-            std::env::temp_dir().join(format!("tura-exact-panic-cleanup-{}", std::process::id()));
+        let workspace = test_temp_dir(format!("tura-exact-panic-cleanup-{}", std::process::id()));
         let _ = fs::remove_dir_all(&workspace);
         fs::create_dir_all(&workspace).expect("workspace");
         let execution_id = "exact-batch";
         let completed_id = execution_id.to_string();
         let running_id = format!("{execution_id}:status_update");
         let call_ids = vec![completed_id.clone(), running_id.clone()];
-        begin_command_run_batch(&workspace, execution_id, &call_ids).expect("batch admission");
-        mark_command_run_batch_call_accepted(&workspace, execution_id, &completed_id)
+        let store = ReceiptStore::open(&workspace).expect("receipt store");
+        begin_command_run_batch(&store, execution_id, &call_ids).expect("batch admission");
+        mark_command_run_batch_call_accepted(&store, execution_id, &completed_id)
             .expect("completed acceptance");
-        mark_command_run_batch_call_accepted(&workspace, execution_id, &running_id)
+        mark_command_run_batch_call_accepted(&store, execution_id, &running_id)
             .expect("running acceptance");
+        begin_command_run_batch(&store, execution_id, &call_ids)
+            .expect("same batch admission stays idempotent after acceptance");
         write_test_claim(&workspace, &completed_id, "completed");
         write_test_terminal_receipt(&workspace, &completed_id, "completed");
         write_test_claim(&workspace, &running_id, "running");
@@ -1796,7 +1957,7 @@ mod tests {
         .expect("unrelated corrupt claim");
 
         assert_eq!(
-            terminalize_interrupted_command_run_claims(&workspace, execution_id, &call_ids,)
+            terminalize_interrupted_command_run_claims(&store, execution_id, &call_ids,)
                 .await
                 .expect("exact batch cleanup"),
             2
@@ -1819,25 +1980,25 @@ mod tests {
 
     #[tokio::test]
     async fn panic_cleanup_zero_claims_needs_and_terminalizes_durable_admission_marker() {
-        let workspace = std::env::temp_dir().join(format!(
+        let workspace = test_temp_dir(format!(
             "tura-zero-claim-panic-cleanup-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&workspace);
         fs::create_dir_all(&workspace).expect("workspace");
+        let store = ReceiptStore::open(&workspace).expect("receipt store");
         let execution_id = "zero-claim-batch";
         let call_ids = vec![execution_id.to_string()];
-        let missing =
-            terminalize_interrupted_command_run_claims(&workspace, execution_id, &call_ids)
-                .await
-                .expect_err("missing admission marker cannot prove zero effect");
+        let missing = terminalize_interrupted_command_run_claims(&store, execution_id, &call_ids)
+            .await
+            .expect_err("missing admission marker cannot prove zero effect");
         assert!(missing.contains("COMMAND_RUN_BATCH_MARKER_READ_FAILED"));
 
-        begin_command_run_batch(&workspace, execution_id, &call_ids).expect("batch admission");
-        mark_command_run_batch_call_accepted(&workspace, execution_id, execution_id)
+        begin_command_run_batch(&store, execution_id, &call_ids).expect("batch admission");
+        mark_command_run_batch_call_accepted(&store, execution_id, execution_id)
             .expect("accepted command");
         let accepted_without_claim =
-            terminalize_interrupted_command_run_claims(&workspace, execution_id, &call_ids)
+            terminalize_interrupted_command_run_claims(&store, execution_id, &call_ids)
                 .await
                 .expect_err("accepted command without claim is ambiguous");
         assert!(
@@ -1846,9 +2007,9 @@ mod tests {
 
         let execution_id = "durable-zero-claim-batch";
         let call_ids = vec![execution_id.to_string()];
-        begin_command_run_batch(&workspace, execution_id, &call_ids).expect("zero batch admission");
+        begin_command_run_batch(&store, execution_id, &call_ids).expect("zero batch admission");
         assert_eq!(
-            terminalize_interrupted_command_run_claims(&workspace, execution_id, &call_ids,)
+            terminalize_interrupted_command_run_claims(&store, execution_id, &call_ids,)
                 .await
                 .expect("durable zero effect"),
             0
@@ -1865,20 +2026,22 @@ mod tests {
 
     #[tokio::test]
     async fn panic_cleanup_rejects_incomplete_existing_terminal_receipt() {
-        let workspace = std::env::temp_dir().join(format!(
+        let workspace = test_temp_dir(format!(
             "tura-incomplete-receipt-panic-cleanup-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&workspace);
         fs::create_dir_all(&workspace).expect("workspace");
+        let store = ReceiptStore::open(&workspace).expect("receipt store");
         let execution_id = "incomplete-receipt-batch";
         let call_ids = vec![execution_id.to_string()];
-        begin_command_run_batch(&workspace, execution_id, &call_ids).expect("batch admission");
-        mark_command_run_batch_call_accepted(&workspace, execution_id, execution_id)
+        begin_command_run_batch(&store, execution_id, &call_ids).expect("batch admission");
+        mark_command_run_batch_call_accepted(&store, execution_id, execution_id)
             .expect("running acceptance");
         write_test_claim(&workspace, execution_id, "running");
         durable_write_receipt(
-            &command_receipt_path(&workspace, execution_id),
+            &store,
+            &command_receipt_name(execution_id),
             &json!({
                 "schema_version": "tura_command_terminal_receipt_v1",
                 "call_id": execution_id,
@@ -1890,7 +2053,7 @@ mod tests {
         )
         .expect("incomplete receipt");
 
-        let error = terminalize_interrupted_command_run_claims(&workspace, execution_id, &call_ids)
+        let error = terminalize_interrupted_command_run_claims(&store, execution_id, &call_ids)
             .await
             .expect_err("incomplete process proof must fail closed");
         assert!(error.contains("COMMAND_TERMINAL_RECEIPT_PROOF_INCOMPLETE"));
@@ -1904,15 +2067,15 @@ mod tests {
 
     #[test]
     fn live_claim_owner_prevents_parallel_startup_from_being_reconciled_as_orphan() {
-        let workspace =
-            std::env::temp_dir().join(format!("tura-live-claim-owner-{}", std::process::id()));
+        let workspace = test_temp_dir(format!("tura-live-claim-owner-{}", std::process::id()));
         let _ = fs::remove_dir_all(&workspace);
         fs::create_dir_all(&workspace).expect("workspace");
+        let store = ReceiptStore::open(&workspace).expect("receipt store");
         let call_id = "runtime:tool-call:parallel-a";
         let context = ToolContext::new(workspace.clone()).with_call_id(call_id.to_string());
 
         claim_command_execution(&context, 30, None).expect("claim command");
-        reconcile_command_execution_claims(&workspace, Some("runtime:tool-call:parallel-b"))
+        reconcile_command_execution_claims(&store, Some("runtime:tool-call:parallel-b"))
             .expect("live sibling claim must remain active");
 
         let claim: Value = serde_json::from_slice(
@@ -1923,6 +2086,49 @@ mod tests {
         assert_eq!(claim["owner_pid"], std::process::id());
         assert!(!command_receipt_path(&workspace, call_id).exists());
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_admission_rejects_symlink_entry_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = temp.path().canonicalize().expect("canonical workspace");
+        let store = ReceiptStore::open(&workspace).expect("receipt store");
+        let target = workspace.join("outside-marker");
+        fs::write(&target, b"outside-unchanged").expect("outside marker");
+        let marker = command_run_batch_path(&workspace, "symlink-batch");
+        symlink(&target, &marker).expect("symlink marker");
+
+        let error = begin_command_run_batch(&store, "symlink-batch", &["call-1".to_string()])
+            .expect_err("symlink entry must fail closed");
+        assert!(!error.is_empty());
+        assert_eq!(
+            fs::read(&target).expect("outside marker"),
+            b"outside-unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_admission_uses_bound_store_after_display_directory_swap() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = temp.path().canonicalize().expect("canonical workspace");
+        let store = ReceiptStore::open(&workspace).expect("receipt store");
+        let receipt_dir = workspace.join(".tura/run/command_receipts");
+        let held_dir = workspace.join(".tura/run/held-receipts");
+        let outside_dir = workspace.join("outside");
+        fs::create_dir(&outside_dir).expect("outside directory");
+        fs::rename(&receipt_dir, &held_dir).expect("move held directory");
+        symlink(&outside_dir, &receipt_dir).expect("replace display path");
+
+        begin_command_run_batch(&store, "bound-batch", &["call-1".to_string()])
+            .expect("fd-bound admission");
+        assert!(held_dir.join("bound-batch.batch-admission").is_file());
+        assert!(!outside_dir.join("bound-batch.batch-admission").exists());
     }
 
     fn failing_command() -> Command {
@@ -2055,7 +2261,7 @@ mod tests {
 
     #[test]
     fn pre_execution_failure_writes_exact_known_zero_effect_receipt() {
-        let workspace = std::env::temp_dir().join(format!(
+        let workspace = test_temp_dir(format!(
             "tura-pre-execution-zero-effect-{}",
             std::process::id()
         ));
@@ -2157,7 +2363,13 @@ mod tests {
 
     #[tokio::test]
     async fn run_tokio_command_with_timeout_honors_pre_cancelled_context() {
-        let context = ToolContext::new(PathBuf::from("workspace"));
+        let workspace = tempfile::tempdir().expect("workspace");
+        let context = ToolContext::new(
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace"),
+        );
         context.cancellation.cancel();
 
         let response =
@@ -2171,7 +2383,13 @@ mod tests {
 
     #[tokio::test]
     async fn run_tokio_command_with_timeout_retains_stdout_on_timeout() {
-        let context = ToolContext::new(PathBuf::from("workspace"));
+        let workspace = tempfile::tempdir().expect("workspace");
+        let context = ToolContext::new(
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace"),
+        );
 
         let response =
             run_tokio_command_with_timeout(tokio_output_then_sleep_command(), 1, None, &context)
@@ -2195,8 +2413,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_longer_than_legacy_fifteen_second_gate_completes_with_receipt() {
-        let workspace =
-            std::env::temp_dir().join(format!("tura-long-command-receipt-{}", std::process::id()));
+        let workspace = test_temp_dir(format!("tura-long-command-receipt-{}", std::process::id()));
         let _ = fs::remove_dir_all(&workspace);
         fs::create_dir_all(&workspace).expect("workspace");
         let context = ToolContext::new(workspace.clone())
@@ -2226,8 +2443,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrapper_timeout_writes_distinct_terminal_receipt_with_process_proof() {
-        let workspace =
-            std::env::temp_dir().join(format!("tura-timeout-receipt-{}", std::process::id()));
+        let workspace = test_temp_dir(format!("tura-timeout-receipt-{}", std::process::id()));
         let _ = fs::remove_dir_all(&workspace);
         fs::create_dir_all(&workspace).expect("workspace");
         let context = ToolContext::new(workspace.clone())

@@ -3,11 +3,13 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use tura_path::command_receipts::ReceiptStore;
 
 #[path = "handler_parse.rs"]
 mod handler_parse;
@@ -45,6 +47,13 @@ struct CommandItem {
     binding_id: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct CommandRunPreflightCommand {
+    pub command: String,
+    pub command_line: String,
+    pub workdir: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct CommandRunItemResult {
     #[serde(skip)]
@@ -74,6 +83,54 @@ struct CommandRunStepOutput {
     results: Vec<CommandRunItemResult>,
     cancelled: bool,
     cancel_reason: Option<String>,
+}
+
+/// Batch-local failure and ordering fence; successful commands do not prove task completion.
+#[derive(Default)]
+pub struct CommandRunTerminalStatusGuard {
+    failed_or_unknown: bool,
+    prior_step: Option<u64>,
+    ambiguous_order: bool,
+}
+
+impl CommandRunTerminalStatusGuard {
+    pub const ORDER_ERROR: &'static str =
+        "TERMINAL_STATUS_BATCH_ORDER: task_status done must be alone in a strictly later final step; streamed done waits for finish and requires explicit ordered steps";
+
+    pub fn observe_result(&mut self, success: Option<bool>) {
+        self.failed_or_unknown |= success != Some(true);
+    }
+
+    pub fn observe_step(&mut self, step: Option<u64>) {
+        match step.filter(|step| *step > 0) {
+            Some(step) => self.prior_step = Some(self.prior_step.unwrap_or(0).max(step)),
+            None => self.ambiguous_order = true,
+        }
+    }
+
+    pub fn done_error(&self, step: Option<u64>, final_command: bool) -> Option<&'static str> {
+        if self.failed_or_unknown {
+            return Some(
+                "TERMINAL_STATUS_PRIOR_RESULT: task_status done blocked by a failed or unknown result in this command_run batch; recover in a new batch",
+            );
+        }
+        if !final_command
+            || self.ambiguous_order
+            || step.is_none_or(|step| {
+                step == 0 || self.prior_step.is_some_and(|prior| step <= prior)
+            })
+        {
+            return Some(Self::ORDER_ERROR);
+        }
+        None
+    }
+
+    /// Reuse the command and task_status parsers, including inline arguments and text forms.
+    pub fn command_metadata(command: &Value) -> (Option<u64>, bool) {
+        parse_command_item(command).map_or((None, false), |item| {
+            (item.step.filter(|step| *step > 0), item.is_terminal_done())
+        })
+    }
 }
 
 pub fn execute(arguments: &Value, session_dir: &Path) -> Value {
@@ -164,6 +221,29 @@ pub async fn execute_async_value_with_allowed_lock_scope_sandbox_and_cancellatio
     sandbox: bool,
     cancellation: CancellationToken,
 ) -> Value {
+    execute_async_value_with_source_read_admission(
+        arguments,
+        session_dir,
+        allowed_commands,
+        lock_scope,
+        sandbox,
+        cancellation,
+        None,
+        None,
+    )
+    .await
+}
+
+pub async fn execute_async_value_with_source_read_admission(
+    arguments: Value,
+    session_dir: PathBuf,
+    allowed_commands: Option<BTreeSet<String>>,
+    lock_scope: Option<String>,
+    sandbox: bool,
+    cancellation: CancellationToken,
+    source_read_root: Option<Arc<File>>,
+    receipt_store: Option<Arc<ReceiptStore>>,
+) -> Value {
     let mut args = match parse_args(&arguments) {
         Ok(args) => args,
         Err(message) => return error_payload(message),
@@ -171,7 +251,13 @@ pub async fn execute_async_value_with_allowed_lock_scope_sandbox_and_cancellatio
     args.allowed_commands = allowed_commands;
     args.sandbox = sandbox;
     let ctx =
-        ToolContext::new_with_lock_scope_and_cancellation(session_dir, lock_scope, cancellation);
+        ToolContext::new_with_lock_scope_and_cancellation(session_dir, lock_scope, cancellation)
+            .with_source_read_root(source_read_root)
+            .with_receipt_store(receipt_store);
+    let ctx = match bind_receipt_store(ctx) {
+        Ok(ctx) => ctx,
+        Err(error) => return error_payload(error),
+    };
     let output = execute_async(args, ctx).await;
     serde_json::to_value(output).unwrap_or_else(|err| error_payload(err.to_string()))
 }
@@ -220,6 +306,7 @@ pub fn normalize_command_value_for_execution(
 pub struct StreamingCommandRunExecutor {
     router: Arc<CommandRouter>,
     ctx: ToolContext,
+    receipt_store_error: Option<String>,
     execution_id: String,
     allowed_commands: Option<BTreeSet<String>>,
     sandbox: bool,
@@ -230,6 +317,8 @@ pub struct StreamingCommandRunExecutor {
     results: Vec<CommandRunItemResult>,
     output_bindings: CommandRunOutputBindings,
     pending_binding_results: Vec<CommandRunItemResult>,
+    terminal_status_guard: CommandRunTerminalStatusGuard,
+    pending_done: Option<CommandItem>,
     halted: bool,
     halt_reason: Option<String>,
 }
@@ -251,9 +340,15 @@ impl StreamingCommandRunExecutor {
         allowed_commands: Option<BTreeSet<String>>,
         lock_scope: Option<String>,
     ) -> Self {
+        let ctx = ToolContext::new_with_lock_scope(session_dir, lock_scope);
+        let (ctx, receipt_store_error) = match bind_receipt_store(ctx.clone()) {
+            Ok(ctx) => (ctx, None),
+            Err(error) => (ctx, Some(error)),
+        };
         Self {
             router: Arc::new(CommandRouter::new()),
-            ctx: ToolContext::new_with_lock_scope(session_dir, lock_scope),
+            ctx,
+            receipt_store_error,
             execution_id: new_execution_id(),
             allowed_commands,
             sandbox: command_run_sandbox_enabled(),
@@ -264,19 +359,43 @@ impl StreamingCommandRunExecutor {
             results: Vec::new(),
             output_bindings: CommandRunOutputBindings::default(),
             pending_binding_results: Vec::new(),
+            terminal_status_guard: CommandRunTerminalStatusGuard::default(),
+            pending_done: None,
             halted: false,
             halt_reason: None,
         }
     }
 
     pub async fn push_command_value(&mut self, command: Value) -> Vec<Value> {
+        // A push cannot prove that it is the final command, even at a higher step.
+        if let Some(done) = self.pending_done.take() {
+            self.accept_result(terminal_status_failure(
+                &done,
+                CommandRunTerminalStatusGuard::ORDER_ERROR,
+            ));
+        }
+        if let Some(error) = self.receipt_store_error.clone() {
+            let step = command
+                .get("step")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .max(1);
+            self.accept_result(CommandRunItemResult::failed(
+                self.next_index,
+                step,
+                "command_run".to_string(),
+                error,
+            ));
+            self.next_index += 1;
+            return self.drain_finished_results();
+        }
         if self.halted {
             return Vec::new();
         }
         let mut command = match parse_single_streamed_command(command, self.next_index) {
             Ok(command) => command,
             Err((step, message)) => {
-                self.results.push(CommandRunItemResult::failed(
+                self.accept_result(CommandRunItemResult::failed(
                     self.next_index,
                     step,
                     "command_run".to_string(),
@@ -290,7 +409,9 @@ impl StreamingCommandRunExecutor {
         self.next_index += 1;
 
         let requested_step = command.effective_step();
+        let declared_step = command.step.filter(|step| *step > 0);
         let step = self.normalize_next_step(requested_step);
+        let ordered_step = declared_step.filter(|declared| *declared == step);
         command.step = Some(step);
         if self.active_step.is_some_and(|current| step != current) {
             self.flush_macro_command_batch().await;
@@ -299,6 +420,7 @@ impl StreamingCommandRunExecutor {
         self.active_step = Some(step);
 
         if let Err(error) = resolve_command_bindings(&mut command, &self.output_bindings) {
+            self.terminal_status_guard.observe_step(ordered_step);
             self.accept_result(CommandRunItemResult::failed(
                 command.index,
                 command.effective_step(),
@@ -307,6 +429,18 @@ impl StreamingCommandRunExecutor {
             ));
             return self.drain_finished_results();
         }
+
+        if command.is_terminal_done() {
+            self.flush_macro_command_batch().await;
+            if let Some(error) = self.terminal_status_guard.done_error(ordered_step, true) {
+                self.terminal_status_guard.observe_step(ordered_step);
+                self.accept_result(terminal_status_failure(&command, error));
+            } else {
+                self.pending_done = Some(command);
+            }
+            return self.drain_finished_results();
+        }
+        self.terminal_status_guard.observe_step(ordered_step);
 
         let macro_command_safe = command
             .is_macro_command_safe(&self.router, &self.ctx.child(), &self.execution_id)
@@ -357,6 +491,26 @@ impl StreamingCommandRunExecutor {
             return self.drain_finished_results();
         }
         self.flush_macro_command_batch().await;
+        if let Some(command) = self.pending_done.take() {
+            let result = if let Some(error) = self
+                .terminal_status_guard
+                .done_error(Some(command.effective_step()), true)
+            {
+                terminal_status_failure(&command, error)
+            } else {
+                run_command_run_item(
+                    &self.router,
+                    command,
+                    self.ctx.child(),
+                    &self.execution_id,
+                    true,
+                    self.allowed_commands.as_ref(),
+                    self.sandbox,
+                )
+                .await
+            };
+            self.accept_result(result);
+        }
         self.drain_finished_results()
     }
 
@@ -402,6 +556,8 @@ impl StreamingCommandRunExecutor {
     }
 
     fn accept_result(&mut self, result: CommandRunItemResult) {
+        self.terminal_status_guard
+            .observe_result(Some(result.success));
         self.pending_binding_results.push(result.clone());
         self.results.push(result);
     }
@@ -472,8 +628,19 @@ async fn execute_async_args_with_lock_scope(
     lock_scope: Option<String>,
 ) -> Value {
     let ctx = ToolContext::new_with_lock_scope(session_dir, lock_scope);
+    let ctx = match bind_receipt_store(ctx) {
+        Ok(ctx) => ctx,
+        Err(error) => return error_payload(error),
+    };
     let output = execute_async(args, ctx).await;
     serde_json::to_value(output).unwrap_or_else(|err| error_payload(err.to_string()))
+}
+
+fn bind_receipt_store(ctx: ToolContext) -> Result<ToolContext, String> {
+    let store = ctx
+        .bound_receipt_store()
+        .map_err(|error| format!("failed to bind command_run receipt store: {error}"))?;
+    Ok(ctx.with_receipt_store(Some(store)))
 }
 
 async fn execute_async(args: CommandRunArgs, ctx: ToolContext) -> CommandRunOutput {
@@ -485,6 +652,12 @@ async fn execute_async(args: CommandRunArgs, ctx: ToolContext) -> CommandRunOutp
         sandbox,
         ..
     } = args;
+    let final_index = commands.len().saturating_sub(1);
+    let final_declared_step = commands.last().map(CommandItem::effective_step).unwrap_or(1);
+    let final_declared_order = commands
+        .iter()
+        .take(final_index)
+        .all(|command| command.effective_step() < final_declared_step);
     normalize_command_steps(&mut commands);
     for command in commands {
         by_step
@@ -498,7 +671,12 @@ async fn execute_async(args: CommandRunArgs, ctx: ToolContext) -> CommandRunOutp
     let mut cancelled = false;
     let mut cancel_reason = None;
     let mut output_bindings = CommandRunOutputBindings::default();
+    let mut terminal_status_guard = CommandRunTerminalStatusGuard::default();
     for mut commands in by_step.into_values() {
+        let step = commands[0].effective_step();
+        let sole_final_command = commands.len() == 1
+            && commands[0].index == final_index
+            && final_declared_order;
         let mut binding_errors = Vec::new();
         commands.retain_mut(|command| {
             if let Err(error) = resolve_command_bindings(command, &output_bindings) {
@@ -508,10 +686,16 @@ async fn execute_async(args: CommandRunArgs, ctx: ToolContext) -> CommandRunOutp
                     command.command.clone(),
                     error,
                 ));
-                false
-            } else {
-                true
+                return false;
             }
+            if command.is_terminal_done()
+                && let Some(error) =
+                    terminal_status_guard.done_error(Some(step), sole_final_command)
+            {
+                binding_errors.push(terminal_status_failure(command, error));
+                return false;
+            }
+            true
         });
         let step_output = run_command_run_step(
             &router,
@@ -525,7 +709,9 @@ async fn execute_async(args: CommandRunArgs, ctx: ToolContext) -> CommandRunOutp
         let mut step_results = binding_errors;
         step_results.extend(step_output.results);
         step_results.sort_by_key(|result| (result.step, result.index));
+        terminal_status_guard.observe_step(Some(step));
         for result in &step_results {
+            terminal_status_guard.observe_result(Some(result.success));
             if result.success
                 && let Some(output) = result.output.as_ref()
             {
@@ -707,11 +893,7 @@ async fn run_command_run_item(
     let canonical_command = crate::commands::canonical_command(&command.command);
     if canonical_command == "task_status" {
         let call_id = command_call_id(execution_id, &command);
-        if let Err(error) = crate::shell_executor::mark_command_run_batch_call_accepted(
-            &ctx.session_dir,
-            execution_id,
-            &call_id,
-        ) {
+        if let Err(error) = mark_batch_call_accepted(&ctx, execution_id, &call_id) {
             return CommandRunItemResult::failed(
                 command.index,
                 command.effective_step(),
@@ -725,11 +907,7 @@ async fn run_command_run_item(
         && allowed_commands.is_some_and(|commands| commands.contains("planning"))
     {
         let call_id = command_call_id(execution_id, &command);
-        if let Err(error) = crate::shell_executor::mark_command_run_batch_call_accepted(
-            &ctx.session_dir,
-            execution_id,
-            &call_id,
-        ) {
+        if let Err(error) = mark_batch_call_accepted(&ctx, execution_id, &call_id) {
             return CommandRunItemResult::failed(
                 command.index,
                 command.effective_step(),
@@ -780,11 +958,7 @@ async fn run_command_run_item(
             message,
         );
     }
-    if let Err(error) = crate::shell_executor::mark_command_run_batch_call_accepted(
-        &ctx.session_dir,
-        execution_id,
-        &call.call_id,
-    ) {
+    if let Err(error) = mark_batch_call_accepted(&ctx, execution_id, &call.call_id) {
         return CommandRunItemResult::failed(
             command.index,
             command.effective_step(),
@@ -809,6 +983,17 @@ async fn run_command_run_item(
             err.to_string(),
         ),
     }
+}
+
+fn mark_batch_call_accepted(
+    ctx: &ToolContext,
+    execution_id: &str,
+    call_id: &str,
+) -> Result<(), String> {
+    let store = ctx
+        .bound_receipt_store()
+        .map_err(|error| error.to_string())?;
+    crate::shell_executor::mark_command_run_batch_call_accepted(&store, execution_id, call_id)
 }
 
 fn command_allowed(command: &str, allowed_commands: Option<&BTreeSet<String>>) -> bool {
@@ -950,6 +1135,18 @@ fn command_run_task_status_result(command: CommandItem) -> CommandRunItemResult 
     }
 }
 
+fn terminal_status_failure(command: &CommandItem, error: &str) -> CommandRunItemResult {
+    CommandRunItemResult {
+        index: command.index,
+        step: command.effective_step(),
+        command_type: "task_status".to_string(),
+        id: command.binding_id.clone(),
+        success: false,
+        output: None,
+        error: Some(error.to_string()),
+    }
+}
+
 fn build_tool_call(
     command_name: &str,
     command: &CommandItem,
@@ -957,6 +1154,9 @@ fn build_tool_call(
 ) -> Result<ToolCall, String> {
     let router = CommandRouter::new();
     let payload = match command_name {
+        "focused_verifier" => {
+            return Err("VERIFIER_JSPACE_GRANT_REQUIRED: use the admitted router path".into());
+        }
         "apply_patch" => ToolPayload::Freeform {
             input: extract_apply_patch_body(&command.command_line)
                 .unwrap_or_else(|| command.command_line.clone()),
@@ -969,6 +1169,12 @@ fn build_tool_call(
         },
         "read_media" => ToolPayload::Function {
             arguments: normalize_json_or_cli_command_arguments(command, "read_media")?,
+        },
+        "source_read" => ToolPayload::Function {
+            arguments: serde_json::to_value(crate::commands::source_read::parse_command_line(
+                &command.command_line,
+            )?)
+            .map_err(|error| format!("SOURCE_READ_ARGUMENTS_INVALID: {error}"))?,
         },
         "web_discover" => ToolPayload::Function {
             arguments: normalize_json_or_cli_command_arguments(command, "web_discover")?,
@@ -1013,6 +1219,20 @@ pub fn command_run_batch_identity(arguments: &Value) -> Result<(String, Vec<Stri
         .map(|command| command_call_id(&args.execution_id, command))
         .collect();
     Ok((args.execution_id, call_ids))
+}
+
+pub fn command_run_preflight_commands(
+    arguments: &Value,
+) -> Result<Vec<CommandRunPreflightCommand>, String> {
+    Ok(parse_args(arguments)?
+        .commands
+        .into_iter()
+        .map(|command| CommandRunPreflightCommand {
+            command: command.command,
+            command_line: command.command_line,
+            workdir: command.workdir,
+        })
+        .collect())
 }
 
 fn normalize_shell_command_arguments(command: &CommandItem) -> Result<Value, String> {
@@ -1118,7 +1338,13 @@ fn parse_args(arguments: &Value) -> Result<CommandRunArgs, String> {
         }
         if !matches!(
             canonical_command.as_str(),
-            "shell_command" | "bash" | "zsh" | "apply_patch" | "planning" | "task_status"
+            "shell_command"
+                | "bash"
+                | "zsh"
+                | "apply_patch"
+                | "planning"
+                | "task_status"
+                | "focused_verifier"
         ) {
             if CommandRouter::new()
                 .resolve_command_tool_name(&canonical_command)
@@ -1377,24 +1603,27 @@ fn normalize_json_command_arguments(
 }
 
 fn extract_apply_patch_body(text: &str) -> Option<String> {
-    let end_marker = "*** End Patch";
-    if let Some(begin) = text.find("*** Begin Patch") {
-        let end = text[begin..].find(end_marker)? + begin + end_marker.len();
-        return Some(text[begin..end].trim().to_string());
+    use crate::commands::apply_patch::patch_marker_range;
+    if let Some(begin) = patch_marker_range(text, "*** Begin Patch") {
+        let patch = &text[begin.start..];
+        let end = patch_marker_range(patch, "*** End Patch")?;
+        return Some(patch[..end.end].to_string());
     }
     normalize_apply_patch_body_without_begin(text)
 }
 
 fn normalize_apply_patch_body_without_begin(text: &str) -> Option<String> {
-    let body = strip_apply_patch_command_line(text.trim());
+    use crate::commands::apply_patch::patch_marker_range;
+    let body = strip_apply_patch_command_line(text.trim_start());
     if !starts_with_patch_hunk(body) {
         return None;
     }
     let end_marker = "*** End Patch";
-    let body = if let Some(end) = body.find(end_marker) {
-        body[..end + end_marker.len()].trim().to_string()
+    let body = if let Some(end) = patch_marker_range(body, end_marker) {
+        body[..end.end].to_string()
     } else {
-        format!("{}\n{end_marker}", body.trim_end())
+        let separator = if body.ends_with('\n') { "" } else { "\n" };
+        format!("{body}{separator}{end_marker}")
     };
     Some(format!("*** Begin Patch\n{body}"))
 }
@@ -1422,6 +1651,17 @@ fn starts_with_patch_hunk(text: &str) -> bool {
 }
 
 impl CommandItem {
+    fn is_terminal_done(&self) -> bool {
+        crate::commands::canonical_command(&self.command) == "task_status"
+            && crate::commands::task_status::normalize_output(
+                self.inline_arguments.as_ref(),
+                &self.command_line,
+            )
+            .is_ok_and(|output| {
+                output.pointer("/task_status/status").and_then(Value::as_str) == Some("done")
+            })
+    }
+
     fn effective_step(&self) -> u64 {
         self.step.unwrap_or((self.index + 1) as u64).max(1)
     }

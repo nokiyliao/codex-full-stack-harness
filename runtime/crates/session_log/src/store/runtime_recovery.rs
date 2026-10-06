@@ -1619,6 +1619,7 @@ mod tests {
                     idempotency_key: format!("{}:output", fixture.runtime_id),
                     event: RuntimeEvent::OutputCaptured {
                         output: output.clone(),
+                        provider_observation: None,
                     },
                 })
                 .expect("commit durable Commander convergence output"),

@@ -27,7 +27,7 @@ use crate::provider_flow::provider_response::apply_provider_response_with_option
 use crate::provider_flow::streamed_command_run::{
     command_run_stream_events_from_provider_content, streamed_command_run_call_id,
 };
-use crate::provider_flow::usage::usage_report_from_metrics;
+use crate::provider_flow::usage::{provider_observation, usage_report_from_metrics};
 use crate::runtime_event_writer::RuntimeEventWriter;
 use lifecycle::RuntimeAggregate;
 
@@ -310,8 +310,20 @@ pub(crate) async fn call_runtime_streaming(
     let finished_at = Utc::now();
     let tool_dispatch_content =
         response_content_for_tool_dispatch(&response.content, &response.raw);
+    let mut final_commands_delivered = true;
     for event in command_run_stream_events_from_provider_content(&tool_dispatch_content) {
-        let _ = final_response_stream_tx.send(event);
+        if final_response_stream_tx.send(event).is_err() {
+            final_commands_delivered = false;
+            break;
+        }
+    }
+    if final_commands_delivered
+        && !command_state.was_cancelled()
+        && !command_state.apply_patch_failed()
+        && !command_state.startup_apply_patch_discarded()
+    {
+        // Failure/timeout/abort exits never set this, even when their senders close.
+        command_state.mark_provider_completed_healthy();
     }
     drop(final_response_stream_tx);
     let joined_command_results = command_task.join().unwrap_or_default();
@@ -367,7 +379,14 @@ pub(crate) async fn call_runtime_streaming(
             runtime_output["provider_content"] = tool_dispatch_content.clone();
         }
     }
-    runtime.set_output(runtime_output)?;
+    runtime.set_output_with_provider_observation(
+        super::responses_continuity::capture_reasoning(
+            runtime_output,
+            &response.raw,
+            &runtime.provider,
+        ),
+        Some(provider_observation(&response.raw)),
+    )?;
     apply_provider_response_with_options(
         runtime,
         &tool_dispatch_content,

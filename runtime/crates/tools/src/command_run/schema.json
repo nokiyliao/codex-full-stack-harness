@@ -10,24 +10,24 @@
         "type": ["number", "null"],
         "minimum": 1,
         "x-tura-optional": true,
-        "description": "Optional default timeout in milliseconds for commands that do not declare their own timeout_ms."
+        "description": "Default timeout in ms for commands without their own timeout_ms."
       },
       "stall_timeout_ms": {
         "type": ["number", "null"],
         "minimum": 1000,
         "x-tura-optional": true,
-        "description": "Optional progress watchdog in milliseconds. It is independent from timeout_ms and expires only after no stdout or stderr activity. Omit for silent workloads that have another liveness signal."
+        "description": "No-output watchdog in ms, independent of timeout_ms. Omit for silent workloads."
       },
       "execution_id": {
         "type": ["string", "null"],
         "x-tura-optional": true,
-        "description": "Stable Router execution identity used to bind claims, terminal receipts, and diagnosed replay."
+        "description": "Stable execution identity for receipts and diagnosed replay."
       },
       "commands": {
         "type": "array",
         "minItems": 1,
         "maxItems": 20,
-        "description": "Executable command-line instructions. During task execution, complete all currently needed steps in one batch; prefer 5 or more commands. For simple, standalone user tasks such as quick information lookups (e.g., checking current time) or single-step queries, 1-2 commands are acceptable when that fully answers the request. Independent read/search/list commands with no output dependency must share one step. A later step may consume an earlier step's JSON output through a command output placeholder.",
+        "description": "Executable instructions. Batch all currently known work; prefer 5 or more commands when useful. For simple standalone tasks, 1-2 commands are acceptable. Independent commands share one step; dependencies use later steps and may bind earlier JSON output.",
         "items": {
           "type": "object",
           "required": ["command_type", "command_line"],
@@ -35,34 +35,34 @@
           "properties": {
             "command_type": {
               "type": "string",
-              "description": "Target internal command name from the available commands list. For namespaced tools use the flattened name shown there exactly."
+              "description": "Command name from the available list; use flattened names exactly."
             },
             "command_line": {
               "type": "string",
-              "description": "String payload for the target command. For JSON-schema commands, pass an escaped JSON object string such as {\"cmd\":\"rg -n query src\"}. For freeform commands such as apply_patch, pass the raw freeform body. For shell-like commands, plain text is also accepted and mapped to that tool's command field."
+              "description": "Command payload string. source_read: prefer JSON [\"path\",1,50,null,true] = [path,start_line,end_line,expected_sha256,line_numbers]; omit trailing optionals. Named range/search objects remain valid. JSON projection: named {\"path\":\"capsule.json\",\"json_pointer\":\"/field\"}, optional expected_sha256, no line/search options. RFC 6901 string; empty pointer selects whole JSON only within the existing range budgets (12288 text bytes, 16384 serialized result bytes including receipts). Returns compact selected JSON, projection metadata and source file SHA, not line coverage or pagination; invalid/missing/oversized selections fail without partial output. Exact granted paths, full SHA pins; range/search next_line pagination, max 200 lines. Other JSON-schema tools: escaped object strings; freeform: raw bodies; shell-like: text."
             },
             "id": {
               "type": ["string", "null"],
               "x-tura-optional": true,
-              "description": "Optional stable output binding name for this command. Later steps may reference this id; otherwise the resolved command_type is used."
+              "description": "Optional output-binding name; otherwise command_type is used."
             },
             "timeout_ms": {
               "type": ["number", "null"],
               "minimum": 1,
               "x-tura-optional": true,
-              "description": "Optional timeout in milliseconds for this command. Overrides the top-level timeout_ms allowance."
+              "description": "Per-command timeout in ms; overrides top-level timeout_ms."
             },
             "stall_timeout_ms": {
               "type": ["number", "null"],
               "minimum": 1000,
               "x-tura-optional": true,
-              "description": "Optional no-output progress watchdog in milliseconds for this command. Overrides the top-level stall_timeout_ms allowance."
+              "description": "Per-command no-output watchdog in ms; overrides top-level stall_timeout_ms."
             },
             "step": {
               "type": "integer",
               "minimum": 1,
               "x-tura-optional": true,
-              "description": "Dependency group and execution order. Commands in the same step must have no output dependency on each other and may run together. Independent read/search/list commands with no output dependency must share one step. Commands that depend on earlier output, known work, or completed edits must use a later unique ordered step. When using task_status compact_context for a checkpoint, place that task_status command after the work it summarizes."
+              "description": "Dependency group/order. Same-step commands run together and must be independent; dependencies and post-edit validation use later steps. Put compact_context after the work it summarizes."
             }
           }
         }

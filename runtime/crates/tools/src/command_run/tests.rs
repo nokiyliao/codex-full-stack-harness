@@ -10,6 +10,29 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[tokio::test]
+async fn focused_verifier_never_falls_back_to_shell_without_router_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("not-executed");
+    let args = json!({"commands":[{"command_type":"focused_verifier",
+        "command_line": format!("touch {}", marker.display())}]});
+    let preflight = super::command_run_preflight_commands(&args).unwrap();
+    assert_eq!(preflight[0].command, "focused_verifier");
+    let result = super::execute_async_value_with_source_read_admission(
+        args,
+        root.path().to_path_buf(),
+        None,
+        None,
+        false,
+        crate::runtime::tool::CancellationToken::new(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(result["results"][0]["success"], false);
+    assert!(!marker.exists());
+}
+
 #[test]
 fn command_allowlist_matches_shell_aliases_by_canonical_identity() {
     let allowed = BTreeSet::from(["shell_command".to_string()]);
@@ -721,6 +744,137 @@ async fn streaming_executor_returns_safe_shell_result_before_finish() {
     let _ = std::fs::remove_dir_all(workspace);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn direct_command_run_keeps_receipts_in_original_directory_after_replacement() {
+    let workspace = temporary_workspace("direct-receipt-directory-replacement");
+    let output = super::execute_async_value(
+        json!({
+            "execution_id": "direct-receipt-directory-replacement",
+            "commands": [
+                {
+                    "command_type": "shell_command",
+                    "command_line": "mv .tura/run/command_receipts .tura/run/previous_command_receipts && mkdir .tura/run/command_receipts",
+                    "workdir": workspace,
+                    "timeout_ms": 3000,
+                    "step": 1
+                },
+                {
+                    "command_type": "shell_command",
+                    "command_line": "printf 'second step\\n'",
+                    "workdir": workspace,
+                    "timeout_ms": 3000,
+                    "step": 2
+                }
+            ]
+        }),
+        workspace.clone(),
+    )
+    .await;
+
+    assert_eq!(output["results"][0]["success"], true, "{output}");
+    assert_eq!(output["results"][1]["success"], true, "{output}");
+    let receipt_root = workspace.join(".tura/run");
+    assert!(
+        std::fs::read_dir(receipt_root.join("previous_command_receipts"))
+            .expect("original receipt directory")
+            .count()
+            > 0
+    );
+    assert_eq!(
+        std::fs::read_dir(receipt_root.join("command_receipts"))
+            .expect("replacement receipt directory")
+            .count(),
+        0,
+        "no command_run operation may re-open the replacement directory"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn streaming_command_run_keeps_receipts_in_original_directory_after_replacement() {
+    let workspace = temporary_workspace("streaming-receipt-directory-replacement");
+    let mut executor = super::StreamingCommandRunExecutor::new(workspace.clone());
+    let receipt_root = workspace.join(".tura/run");
+    std::fs::rename(
+        receipt_root.join("command_receipts"),
+        receipt_root.join("previous_command_receipts"),
+    )
+    .expect("replace receipt directory after executor construction");
+    std::fs::create_dir(receipt_root.join("command_receipts"))
+        .expect("replacement receipt directory");
+
+    let results = executor
+        .push_command_value(json!({
+            "command_type": "shell_command",
+            "command_line": "printf 'bound receipt store\\n'",
+            "workdir": workspace,
+            "timeout_ms": 3000
+        }))
+        .await;
+    assert_eq!(results[0]["success"], true, "{results:?}");
+    assert!(
+        std::fs::read_dir(receipt_root.join("previous_command_receipts"))
+            .expect("original receipt directory")
+            .count()
+            > 0
+    );
+    assert_eq!(
+        std::fs::read_dir(receipt_root.join("command_receipts"))
+            .expect("replacement receipt directory")
+            .count(),
+        0
+    );
+
+    let _ = executor.finish().await;
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_run_entrypoints_fail_closed_when_receipt_store_cannot_open() {
+    let workspace = temporary_workspace("receipt-store-open-failure");
+    std::fs::create_dir(workspace.join("outside")).expect("outside directory");
+    std::os::unix::fs::symlink("outside", workspace.join(".tura"))
+        .expect("symlinked receipt ancestor");
+    let marker = workspace.join("must-not-run");
+    let command = json!({
+        "command_type": "shell_command",
+        "command_line": "touch must-not-run",
+        "workdir": workspace,
+        "timeout_ms": 3000
+    });
+
+    let direct =
+        super::execute_async_value(json!({"commands": [command.clone()]}), workspace.clone()).await;
+    assert_eq!(direct["results"][0]["success"], false, "{direct}");
+    assert!(
+        direct["results"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("failed to bind command_run receipt store")),
+        "{direct}"
+    );
+
+    let mut executor = super::StreamingCommandRunExecutor::new(workspace.clone());
+    let streamed = executor.push_command_value(command).await;
+    assert_eq!(streamed[0]["success"], false, "{streamed:?}");
+    assert!(
+        streamed[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("failed to bind command_run receipt store")),
+        "{streamed:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "failed receipt binding must precede execution"
+    );
+
+    let _ = executor.finish().await;
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
 #[tokio::test]
 async fn parallel_read_only_shells_each_preserve_a_known_terminal_receipt() {
     let workspace = temporary_workspace("parallel-read-only-terminal-receipts");
@@ -849,6 +1003,231 @@ async fn streaming_executor_publishes_bindings_only_after_the_producer_step() {
     let _ = std::fs::remove_dir_all(workspace);
 }
 
+#[test]
+fn terminal_status_guard_keeps_unknown_predecessor_after_successful_verification() {
+    let mut guard = super::CommandRunTerminalStatusGuard::default();
+    guard.observe_step(Some(1));
+    guard.observe_result(None);
+    guard.observe_step(Some(2));
+    guard.observe_result(Some(true));
+    assert!(guard.done_error(Some(3), true).is_some_and(|error|
+        error.starts_with("TERMINAL_STATUS_PRIOR_RESULT")));
+}
+
+#[test]
+fn terminal_status_guard_fails_closed_and_reuses_status_parsing() {
+    for success in [None, Some(false), Some(true)] {
+        let mut guard = super::CommandRunTerminalStatusGuard::default();
+        guard.observe_step(Some(1));
+        guard.observe_result(success);
+        assert_eq!(guard.done_error(Some(2), true).is_none(), success == Some(true));
+        assert!(guard.done_error(Some(1), true).is_some());
+        assert!(guard.done_error(Some(2), false).is_some());
+    }
+    for command in [
+        json!({"command_type": "task_status", "command_line": "status: DONE", "step": 2}),
+        json!({"command": "task-status", "arguments": {"status": "done"}, "step": 2}),
+        json!({"command_type": "task_status", "command": "{\"status\":\"done\"}", "step": 2}),
+        json!({"command_type": "task_status", "status": "done", "step": 2}),
+    ] {
+        assert_eq!(
+            super::CommandRunTerminalStatusGuard::command_metadata(&command),
+            (Some(2), true),
+            "{command}"
+        );
+    }
+    assert_eq!(
+        super::CommandRunTerminalStatusGuard::command_metadata(&json!({
+            "command_type": "task_status", "arguments": {"status": "done"},
+            "command_line": "doing", "step": 2
+        })),
+        (Some(2), false),
+        "command_line must keep its existing precedence over inline arguments"
+    );
+}
+
+#[tokio::test]
+async fn batch_terminal_status_accepts_successful_work_at_a_later_final_step() {
+    let workspace = tempfile::tempdir().unwrap();
+    let output = super::execute_async_value(
+        json!({"commands": [terminal_readback(1), terminal_readback(1), terminal_done(2)]}),
+        workspace.path().to_path_buf(),
+    )
+    .await;
+    let results = output["results"].as_array().expect("results");
+    assert_eq!(results.len(), 3, "{output}");
+    assert!(results.iter().all(|result| result["success"] == true), "{output}");
+    assert_eq!(results[2]["output"]["task_status"]["status"], "done");
+    assert_eq!(results[2]["step"], 2);
+    assert_eq!(results[2]["id"], "terminal");
+}
+
+#[tokio::test]
+async fn batch_terminal_status_fences_failures_without_halting_exploration_or_nonterminal_status() {
+    let workspace = tempfile::tempdir().unwrap();
+    for failure in terminal_prior_failures() {
+        let output = super::execute_async_value(
+            json!({"commands": [
+                failure, terminal_readback(2),
+                {"command_type": "task_status", "command_line": "doing", "step": 3},
+                {"command_type": "task_status", "command_line": "question", "step": 3},
+                {"command_type": "task_status", "task_group": "command batch execution", "step": 3},
+                terminal_done(4)
+            ]}),
+            workspace.path().to_path_buf(),
+        )
+        .await;
+        let results = output["results"].as_array().expect("results");
+        assert_eq!(results.len(), 6, "{output}");
+        assert_eq!(results[0]["success"], false, "{output}");
+        assert!(results[1..5].iter().all(|result| result["success"] == true), "{output}");
+        assert_terminal_status_blocked(&results[5], "TERMINAL_STATUS_PRIOR_RESULT");
+        assert!(output.get("cancelled").is_none(), "ordinary errors must not halt: {output}");
+    }
+    let recovered = super::execute_async_value(
+        json!({"commands": [terminal_readback(1), terminal_done(2)]}),
+        workspace.path().to_path_buf(),
+    )
+    .await;
+    assert_eq!(recovered["results"][1]["success"], true, "new batch: {recovered}");
+}
+
+#[tokio::test]
+async fn batch_terminal_status_rejects_shared_nonfinal_and_repaired_terminal_steps() {
+    let workspace = tempfile::tempdir().unwrap();
+    for commands in [
+        vec![terminal_readback(1), terminal_done(1)],
+        vec![terminal_done(1), terminal_readback(1)],
+        vec![terminal_done(1), terminal_readback(2)],
+        vec![terminal_readback(3), terminal_done(2)],
+        vec![terminal_readback(1), terminal_done(2), terminal_readback(3)],
+    ] {
+        let expected_count = commands.len();
+        let output = super::execute_async_value(
+            json!({"commands": commands}), workspace.path().to_path_buf(),
+        ).await;
+        let results = output["results"].as_array().expect("results");
+        assert_eq!(results.len(), expected_count, "every command needs a result: {output}");
+        assert_eq!(results.iter().filter(|result| result["id"] == "terminal").count(), 1);
+        for result in results {
+            if result["id"] == "terminal" {
+                assert_terminal_status_blocked(result, "TERMINAL_STATUS_BATCH_ORDER");
+            } else {
+                assert_eq!(result["success"], true, "{output}");
+            }
+        }
+        assert!(output.get("cancelled").is_none(), "{output}");
+    }
+}
+
+#[tokio::test]
+async fn streaming_terminal_status_waits_for_finish_after_successful_work() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut executor = super::StreamingCommandRunExecutor::new(workspace.path().to_path_buf());
+    let earlier = executor.push_command_value(terminal_readback(1)).await;
+    assert_eq!(earlier.len(), 1);
+    assert_eq!(earlier[0]["success"], true, "{earlier:?}");
+    assert!(executor.push_command_value(terminal_done(2)).await.is_empty());
+    let final_results = executor.finish().await;
+    assert_eq!(final_results.len(), 1);
+    assert_eq!(final_results[0]["success"], true, "{final_results:?}");
+    assert_eq!(final_results[0]["output"]["task_status"]["status"], "done");
+    assert_eq!(final_results[0]["id"], "terminal");
+}
+
+#[tokio::test]
+async fn streaming_terminal_status_remembers_drained_failures_and_allows_a_new_batch() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut failures = terminal_prior_failures();
+    failures.push(json!({"step": 1})); // Streamed parse error, not a tool result.
+    for failure in failures {
+        let mut executor = super::StreamingCommandRunExecutor::new(workspace.path().to_path_buf());
+        let failed = executor.push_command_value(failure).await;
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0]["success"], false, "{failed:?}");
+        let recovery = executor.push_command_value(json!({
+            "command_type": "task_status", "command_line": "doing", "step": 2
+        })).await;
+        assert_eq!(recovery[0]["success"], true, "{recovery:?}");
+        let blocked = executor.push_command_value(terminal_done(3)).await;
+        assert_eq!(blocked.len(), 1);
+        assert_terminal_status_blocked(&blocked[0], "TERMINAL_STATUS_PRIOR_RESULT");
+        assert!(!executor.is_halted());
+        assert!(executor.finish().await.is_empty());
+    }
+    let mut fresh = super::StreamingCommandRunExecutor::new(workspace.path().to_path_buf());
+    assert!(fresh.push_command_value(terminal_done(1)).await.is_empty());
+    assert_eq!(fresh.finish().await[0]["success"], true);
+}
+
+#[tokio::test]
+async fn streaming_terminal_status_rejects_following_work_and_ambiguous_steps() {
+    let workspace = tempfile::tempdir().unwrap();
+    for next_step in [1, 2] {
+        let mut executor = super::StreamingCommandRunExecutor::new(workspace.path().to_path_buf());
+        assert!(executor.push_command_value(terminal_done(1)).await.is_empty());
+        let results = executor.push_command_value(json!({
+            "command_type": "task_status", "command_line": "doing", "step": next_step
+        })).await;
+        assert_eq!(results.len(), 2);
+        assert_terminal_status_blocked(&results[0], "TERMINAL_STATUS_BATCH_ORDER");
+        assert_eq!(results[1]["success"], true, "{results:?}");
+        assert!(!executor.is_halted());
+        assert!(executor.finish().await.is_empty());
+    }
+    for steps in [vec![None], vec![Some(1)], vec![Some(3), Some(2)]] {
+        let mut executor = super::StreamingCommandRunExecutor::new(workspace.path().to_path_buf());
+        for step in &steps {
+            let result = executor.push_command_value(json!({
+                "command_type": "task_status", "command_line": "doing", "step": step
+            })).await;
+            assert_eq!(result[0]["success"], true, "{result:?}");
+        }
+        let done_step = if steps == vec![Some(1)] { 1 } else { 5 };
+        let result = executor.push_command_value(terminal_done(done_step)).await;
+        assert_eq!(result.len(), 1);
+        assert_terminal_status_blocked(&result[0], "TERMINAL_STATUS_BATCH_ORDER");
+        assert!(!executor.is_halted());
+    }
+}
+
+fn terminal_readback(step: u64) -> Value {
+    json!({"command_type": crate::commands::active_shell_command_name(),
+        "command_line": binding_consumer_command("verified"), "timeout_ms": 3000, "step": step})
+}
+
+fn terminal_done(step: u64) -> Value {
+    json!({"command_type": "task_status", "command_line": "{\"status\":\"done\"}",
+        "id": "terminal", "step": step})
+}
+
+fn terminal_prior_failures() -> Vec<Value> {
+    let no_match_search = if cfg!(windows) {
+        "if (Select-String -Pattern absent -InputObject present -Quiet) { exit 0 } else { exit 1 }"
+    } else {
+        "printf 'present\\n' | grep absent"
+    };
+    vec![
+        json!({"command_type": "source_read", "command_line":
+            "{\"path\":\"missing.rs\",\"start_line\":1,\"end_line\":1}", "step": 1}),
+        json!({"command_type": "focused_verifier", "command_line": "{\"verifier_index\":0}", "step": 1}),
+        json!({"command_type": "task_status", "command_line": "{invalid json", "step": 1}),
+        json!({"command_type": "task_status", "command_line":
+            concat!("#@#", "${missing.status}", "#@#$"), "step": 1}),
+        json!({"command_type": crate::commands::active_shell_command_name(),
+            "command_line": "exit 1", "timeout_ms": 3000, "step": 1}),
+        json!({"command_type": crate::commands::active_shell_command_name(),
+            "command_line": no_match_search, "timeout_ms": 3000, "step": 1}),
+    ]
+}
+
+fn assert_terminal_status_blocked(result: &Value, error_prefix: &str) {
+    assert_eq!(result["command_type"], "task_status", "{result}");
+    assert_eq!(result["success"], false, "{result}");
+    assert!(result.get("output").is_none(), "blocked done must not carry a status output: {result}");
+    assert!(result["error"].as_str().is_some_and(|error| error.starts_with(error_prefix)), "{result}");
+}
+
 fn json_producer_command() -> &'static str {
     if cfg!(windows) {
         "Write-Output '{\"filename\":\"created.txt\"}'"
@@ -870,7 +1249,10 @@ fn temporary_workspace(prefix: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after UNIX_EPOCH")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+    let path = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical temp root")
+        .join(format!("{prefix}-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&path)
         .unwrap_or_else(|error| panic!("failed to create {}: {error}", path.display()));
     path

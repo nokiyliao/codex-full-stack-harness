@@ -212,8 +212,14 @@ if [ "$1" = "mcp" ]; then
   exit 0
 fi
 "#;
-    fs::write(&executable, original.replace(NATIVE_MCP_CATALOG, feature_sensitive_catalog)).unwrap();
-    let envelope = NativeCodexRunner::run(request(executable.clone(), root.path().into(), None)).await.unwrap();
+    fs::write(
+        &executable,
+        original.replace(NATIVE_MCP_CATALOG, feature_sensitive_catalog),
+    )
+    .unwrap();
+    let envelope = NativeCodexRunner::run(request(executable.clone(), root.path().into(), None))
+        .await
+        .unwrap();
     assert_eq!(envelope.terminal_state, NativeCodexTerminalState::Completed);
     let args = fs::read_to_string(format!("{}.argv", executable.display())).unwrap();
     assert!(!args.contains("mcp_servers.codex_app"));
@@ -228,27 +234,45 @@ async fn native_runner_preserves_home_and_explicit_provider_without_policy_bypas
     let executable = fake_codex(root.path(), false);
     let mut req = request(executable.clone(), root.path().to_path_buf(), None);
     let profile = NativeCodexProviderProfile {
-        model: "gpt-6-astra".into(), reasoning_effort: "xhigh".into(),
-        service_tier: ModelServiceTier::Default, model_provider: Some("fixture-provider".into()),
+        model: "gpt-6-astra".into(),
+        reasoning_effort: "xhigh".into(),
+        service_tier: ModelServiceTier::Default,
+        model_provider: Some("fixture-provider".into()),
     };
     req.context.execution_profile_sha256 = profile.semantic_sha256().unwrap();
     req.context.provider_profile = Some(profile);
     let envelope = NativeCodexRunner::run(req).await.unwrap();
     assert_eq!(envelope.terminal_state, NativeCodexTerminalState::Completed);
     let home = fs::read_to_string(format!("{}.home", executable.display())).unwrap();
-    assert_eq!(home, format!("{}\n{}\n", std::env::var("HOME").unwrap_or_default(),
-        std::env::var("CODEX_HOME").unwrap_or_default()));
+    assert_eq!(
+        home,
+        format!(
+            "{}\n{}\n",
+            std::env::var("HOME").unwrap_or_default(),
+            std::env::var("CODEX_HOME").unwrap_or_default()
+        )
+    );
     let args = fs::read_to_string(format!("{}.argv", executable.display())).unwrap();
-    assert!(args.lines().any(|arg| arg == "mcp_servers.unrelated-mcp.enabled=false"));
-    assert!(args.lines().any(|arg| arg == "model_provider=\"fixture-provider\""));
-    assert!(args.lines().any(|arg| arg == "model_reasoning_effort=\"xhigh\""));
+    assert!(
+        args.lines()
+            .any(|arg| arg == "mcp_servers.unrelated-mcp.enabled=false")
+    );
+    assert!(
+        args.lines()
+            .any(|arg| arg == "model_provider=\"fixture-provider\"")
+    );
+    assert!(
+        args.lines()
+            .any(|arg| arg == "model_reasoning_effort=\"xhigh\"")
+    );
     assert!(!args.contains("--ignore-rules"));
     assert!(!args.contains("--ignore-user-config"));
 }
 
 fn native_harness_script(root: &Path, name: &str, body: &str) -> PathBuf {
     let path = root.join(name);
-    fs::write(&path, format!("#!/bin/sh\n{NATIVE_MCP_CATALOG}\n{body}\n")).expect("write local process fixture");
+    fs::write(&path, format!("#!/bin/sh\n{NATIVE_MCP_CATALOG}\n{body}\n"))
+        .expect("write local process fixture");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("fixture executable");
     path
 }
@@ -257,17 +281,26 @@ fn native_harness_script(root: &Path, name: &str, body: &str) -> PathBuf {
 async fn native_runner_rejects_unverifiable_or_colliding_mcp_before_provider() {
     for (catalog, blocker) in [
         ("not-json", "NATIVE_CODEX_MCP_CATALOG_INVALID"),
-        (r#"[{"name":"tura_command_graph"}]"#, "NATIVE_CODEX_MCP_GRAPH_NAME_COLLISION"),
-        (r#"[{"name":"ambiguous.name"}]"#, "NATIVE_CODEX_MCP_NAME_UNSUPPORTED"),
+        (
+            r#"[{"name":"tura_command_graph"}]"#,
+            "NATIVE_CODEX_MCP_GRAPH_NAME_COLLISION",
+        ),
+        (
+            r#"[{"name":"ambiguous.name"}]"#,
+            "NATIVE_CODEX_MCP_NAME_UNSUPPORTED",
+        ),
     ] {
         let root = tempfile::tempdir().unwrap();
         let executable = fake_codex(root.path(), false);
         let original = fs::read_to_string(&executable).unwrap();
-        fs::write(&executable, original.replace(
-            r#"[{"name":"unrelated-mcp","enabled":true}]"#, catalog,
-        )).unwrap();
+        fs::write(
+            &executable,
+            original.replace(r#"[{"name":"unrelated-mcp","enabled":true}]"#, catalog),
+        )
+        .unwrap();
         let error = NativeCodexRunner::run(request(executable.clone(), root.path().into(), None))
-            .await.unwrap_err();
+            .await
+            .unwrap_err();
         assert_eq!(error, blocker);
         assert!(!PathBuf::from(format!("{}.prompt", executable.display())).exists());
     }
@@ -278,17 +311,29 @@ async fn native_runner_catalog_deadline_reaps_before_provider() {
     let root = tempfile::tempdir().unwrap();
     let executable = fake_codex(root.path(), false);
     let original = fs::read_to_string(&executable).unwrap();
-    fs::write(&executable, original.replace(NATIVE_MCP_CATALOG,
-        "if [ \"$1\" = \"mcp\" ]; then echo $$ >\"$0.catalog-pid\"; exec /bin/sleep 10; fi\n",
-    )).unwrap();
+    fs::write(
+        &executable,
+        original.replace(
+            NATIVE_MCP_CATALOG,
+            "if [ \"$1\" = \"mcp\" ]; then echo $$ >\"$0.catalog-pid\"; exec /bin/sleep 10; fi\n",
+        ),
+    )
+    .unwrap();
     let mut req = request(executable.clone(), root.path().into(), None);
     req.timeout = Duration::from_secs(1);
     let error = tokio::time::timeout(Duration::from_secs(4), NativeCodexRunner::run(req))
-        .await.unwrap().unwrap_err();
+        .await
+        .unwrap()
+        .unwrap_err();
     assert_eq!(error, "NATIVE_CODEX_MCP_CATALOG_TIMEOUT");
     let pid = fs::read_to_string(format!("{}.catalog-pid", executable.display())).unwrap();
-    let still_running = Command::new("/bin/kill").args(["-0", pid.trim()])
-        .stdout(Stdio::null()).stderr(Stdio::null()).status().await.unwrap();
+    let still_running = Command::new("/bin/kill")
+        .args(["-0", pid.trim()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .unwrap();
     assert!(!still_running.success());
     assert!(!PathBuf::from(format!("{}.prompt", executable.display())).exists());
 }
@@ -296,11 +341,16 @@ async fn native_runner_catalog_deadline_reaps_before_provider() {
 #[tokio::test]
 async fn native_harness_failure_event_never_becomes_completed() {
     let root = tempfile::tempdir().expect("tempdir");
-    let executable = native_harness_script(root.path(), "failure-then-completed", &format!(
-        "cat >/dev/null\nprintf '%s\\n' '{{\"type\":\"turn.failed\",\"error\":{{\"message\":\"fixture terminal failure\"}}}}'\n{NATIVE_HARNESS_SUCCESS_EVENTS}"
-    ));
+    let executable = native_harness_script(
+        root.path(),
+        "failure-then-completed",
+        &format!(
+            "cat >/dev/null\nprintf '%s\\n' '{{\"type\":\"turn.failed\",\"error\":{{\"message\":\"fixture terminal failure\"}}}}'\n{NATIVE_HARNESS_SUCCESS_EVENTS}"
+        ),
+    );
     let envelope = NativeCodexRunner::run(request(executable, root.path().to_path_buf(), None))
-        .await.expect("typed terminal envelope");
+        .await
+        .expect("typed terminal envelope");
     assert_eq!(envelope.terminal_state, NativeCodexTerminalState::Failed);
     assert_eq!(envelope.error.as_deref(), Some("fixture terminal failure"));
     assert!(envelope.process_reaped);
@@ -311,12 +361,17 @@ async fn native_harness_drains_stderr_past_retention() {
     let root = tempfile::tempdir().expect("tempdir");
     // Shell builtins keep all output in this owned fixture process. The producer
     // must finish all 2 MiB even though only a 1 MiB diagnostic prefix is retained.
-    let executable = native_harness_script(root.path(), "stderr-pipe-pressure", &format!(
-        "cat >/dev/null\nchunk='{}'\ni=0\nwhile test $i -lt 512; do\n  printf '%s' \"$chunk\" >&2 || exit 70\n  i=$((i + 1))\ndone\n{NATIVE_HARNESS_SUCCESS_EVENTS}",
-        "x".repeat(4096)
-    ));
+    let executable = native_harness_script(
+        root.path(),
+        "stderr-pipe-pressure",
+        &format!(
+            "cat >/dev/null\nchunk='{}'\ni=0\nwhile test $i -lt 512; do\n  printf '%s' \"$chunk\" >&2 || exit 70\n  i=$((i + 1))\ndone\n{NATIVE_HARNESS_SUCCESS_EVENTS}",
+            "x".repeat(4096)
+        ),
+    );
     let envelope = NativeCodexRunner::run(request(executable, root.path().to_path_buf(), None))
-        .await.expect("drained terminal envelope");
+        .await
+        .expect("drained terminal envelope");
     assert_eq!(envelope.terminal_state, NativeCodexTerminalState::Completed);
     assert_eq!(envelope.final_text.as_deref(), Some("fixture complete"));
     assert!(envelope.process_reaped);
@@ -325,7 +380,10 @@ async fn native_harness_drains_stderr_past_retention() {
 fn native_harness_large_request(executable: PathBuf, workspace: PathBuf) -> NativeCodexRunRequest {
     let mut req = request(executable, workspace, None);
     let mut delta = serde_json::to_value(&req.context.task_delta).expect("delta value");
-    delta.as_object_mut().expect("delta object").remove("semantic_sha256");
+    delta
+        .as_object_mut()
+        .expect("delta object")
+        .remove("semantic_sha256");
     delta["instruction"] = json!("pipe pressure ".repeat(14_000));
     delta["semantic_sha256"] = json!(canonical_sha256(&delta));
     req.context.task_delta = NativeCodexTaskDelta::from_value(delta).expect("large bounded delta");
@@ -336,15 +394,26 @@ fn native_harness_large_request(executable: PathBuf, workspace: PathBuf) -> Nati
 #[tokio::test]
 async fn native_harness_drains_stdout_while_sending_large_prompt() {
     let root = tempfile::tempdir().expect("tempdir");
-    let executable = native_harness_script(root.path(), "bidirectional-pipe-pressure", &format!(
-        "printf '%s\\n' '{}'\ncat >\"$0.prompt\"\n{NATIVE_HARNESS_SUCCESS_EVENTS}",
-        " ".repeat(131_072)
-    ));
+    let executable = native_harness_script(
+        root.path(),
+        "bidirectional-pipe-pressure",
+        &format!(
+            "printf '%s\\n' '{}'\ncat >\"$0.prompt\"\n{NATIVE_HARNESS_SUCCESS_EVENTS}",
+            " ".repeat(131_072)
+        ),
+    );
     let req = native_harness_large_request(executable.clone(), root.path().to_path_buf());
     let envelope = tokio::time::timeout(Duration::from_secs(4), NativeCodexRunner::run(req))
-        .await.expect("prompt/output pipe cycle must make progress").expect("terminal envelope");
+        .await
+        .expect("prompt/output pipe cycle must make progress")
+        .expect("terminal envelope");
     assert_eq!(envelope.terminal_state, NativeCodexTerminalState::Completed);
-    assert!(fs::metadata(format!("{}.prompt", executable.display())).expect("prompt").len() > 131_072);
+    assert!(
+        fs::metadata(format!("{}.prompt", executable.display()))
+            .expect("prompt")
+            .len()
+            > 131_072
+    );
     assert!(envelope.process_reaped);
 }
 
@@ -358,20 +427,32 @@ async fn native_harness_timeout_includes_stalled_prompt_write() {
     // machine-load benchmark; the provider still stalls for ten seconds.
     req.timeout = Duration::from_secs(1);
     let envelope = tokio::time::timeout(Duration::from_secs(4), NativeCodexRunner::run(req))
-        .await.expect("execution deadline must include prompt writes").expect("interrupted envelope");
-    assert_eq!(envelope.terminal_state, NativeCodexTerminalState::Interrupted);
-    assert_eq!(envelope.error.as_deref(), Some("NATIVE_CODEX_RUNNER_TIMEOUT"));
+        .await
+        .expect("execution deadline must include prompt writes")
+        .expect("interrupted envelope");
+    assert_eq!(
+        envelope.terminal_state,
+        NativeCodexTerminalState::Interrupted
+    );
+    assert_eq!(
+        envelope.error.as_deref(),
+        Some("NATIVE_CODEX_RUNNER_TIMEOUT")
+    );
     assert!(envelope.process_reaped);
 }
 
 #[tokio::test]
 async fn native_harness_invalid_output_stops_and_reaps_without_waiting_for_deadline() {
     let root = tempfile::tempdir().expect("tempdir");
-    let executable = native_harness_script(root.path(), "invalid-output-then-sleep",
-        "cat >/dev/null\nprintf 'invalid-json\\n'\nexec /bin/sleep 10");
+    let executable = native_harness_script(
+        root.path(),
+        "invalid-output-then-sleep",
+        "cat >/dev/null\nprintf 'invalid-json\\n'\nexec /bin/sleep 10",
+    );
     let req = request(executable, root.path().to_path_buf(), None);
     let error = tokio::time::timeout(Duration::from_secs(4), NativeCodexRunner::run(req))
-        .await.expect("parser failure must cancel the other I/O branches immediately")
+        .await
+        .expect("parser failure must cancel the other I/O branches immediately")
         .expect_err("malformed event must not produce a successful terminal");
     assert!(error.starts_with("NATIVE_CODEX_EVENT_INVALID_JSON:"));
 }
@@ -429,24 +510,43 @@ async fn native_runner_projects_unicode_without_losing_restrictions_or_identity(
     let mut value = serde_json::to_value(&run_request.context.task_context_capsule).unwrap();
     value["mission"]["objective"] = json!("保留必要證據😀");
     value["authority"]["must_preserve"] = json!(["broker", "mining", "exact-P0"]);
-    value["context_summary"] = json!(serde_json::to_string(&json!({
-        "mission": value["mission"], "surface": value["surface"],
-        "dcf_generation": value["dcf_generation"], "new_detail": "不可丟失"
-    })).unwrap());
+    value["context_summary"] = json!(
+        serde_json::to_string(&json!({
+            "mission": value["mission"], "surface": value["surface"],
+            "dcf_generation": value["dcf_generation"], "new_detail": "不可丟失"
+        }))
+        .unwrap()
+    );
     value.as_object_mut().unwrap().remove("semantic_sha256");
-    value["semantic_sha256"] = json!(runtime_contract::task_context_semantic_sha256_v1(&value).unwrap());
+    value["semantic_sha256"] =
+        json!(runtime_contract::task_context_semantic_sha256_v1(&value).unwrap());
     let capsule = TaskContextCapsule::from_value(value.clone()).unwrap();
     run_request.context.expected_task_context_capsule_sha256 = capsule.semantic_sha256.clone();
     run_request.context.task_context_capsule = capsule.clone();
-    let envelope = NativeCodexRunner::run(run_request).await.expect("projected request");
+    let envelope = NativeCodexRunner::run(run_request)
+        .await
+        .expect("projected request");
     let input = fs::read_to_string(format!("{}.prompt", executable.display())).unwrap();
     assert_eq!(input.matches("保留必要證據😀").count(), 1);
-    for text in ["must_preserve", "broker", "mining", "exact-P0", "不可丟失", "context_summary_inherits"] {
+    for text in [
+        "must_preserve",
+        "broker",
+        "mining",
+        "exact-P0",
+        "不可丟失",
+        "context_summary_inherits",
+    ] {
         assert!(input.contains(text), "missing {text}");
     }
-    assert_eq!(envelope.task_context_capsule_sha256, capsule.semantic_sha256);
+    assert_eq!(
+        envelope.task_context_capsule_sha256,
+        capsule.semantic_sha256
+    );
     assert_eq!(serde_json::to_value(capsule).unwrap(), value);
-    assert_eq!(envelope.provider_input_sha256, format!("{:x}", Sha256::digest(input.as_bytes())));
+    assert_eq!(
+        envelope.provider_input_sha256,
+        format!("{:x}", Sha256::digest(input.as_bytes()))
+    );
 }
 
 #[tokio::test]

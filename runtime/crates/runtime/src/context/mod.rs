@@ -23,7 +23,8 @@ pub(crate) use compaction::{
 pub(crate) use compaction::{
     compact_session_context_automatically, compact_session_context_with_agent_message,
 };
-pub(crate) use workspace::WorkspaceSnapshot;
+pub(crate) use tool_results::strip_tool_reporting_fields;
+pub(crate) use workspace::workspace_snapshot_for_session;
 
 pub trait ContextualUserFragment {
     const ROLE: &'static str;

@@ -11,9 +11,7 @@ use std::io::{self, Write};
 use self::cli::{CliConfig, print_help, wants_help};
 use self::embedded::run_via_runtime_worker;
 use self::env::configure_runtime_env;
-use self::output::{
-    aggregate_runtime_usage, emit_cli_start_events, emit_jsonl, turn_completed_event,
-};
+use self::output::{emit_cli_start_events, write_failed_jsonl};
 use self::router::run_via_router;
 use self::session::{ensure_cli_session, ensure_session_db_owner, reject_busy_session};
 
@@ -56,13 +54,7 @@ fn run() -> Result<i32, String> {
         if let Err(error) = result.as_ref()
             && config.json
         {
-            emit_jsonl(&turn_completed_event(
-                &config,
-                &session_id,
-                aggregate_runtime_usage(&[]),
-                "failed",
-                Some(error),
-            ))?;
+            write_failed_jsonl(&config, &session_id, error)?;
         }
         return result;
     }
@@ -90,5 +82,9 @@ fn run() -> Result<i32, String> {
         reject_busy_session(&session_id, config.json)?;
     }
     ensure_cli_session(&config, &session_id)?;
-    run_via_runtime_worker(&config, &session_id, prompt)
+    let result = run_via_runtime_worker(&config, &session_id, prompt);
+    if let Err(error) = result.as_ref() && config.json {
+        write_failed_jsonl(&config, &session_id, error)?;
+    }
+    result
 }

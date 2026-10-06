@@ -214,6 +214,287 @@ pub struct ContextSlice {
     pub next_management_sequence: u64,
 }
 
+// Execution output reads the immutable raw history, never the retained prompt window.
+pub const EXECUTION_EVIDENCE_PAGE_RECORDS: u64 = 128;
+pub const EXECUTION_EVIDENCE_PAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceSnapshot {
+    pub session_id: String,
+    pub next_sequence: u64,
+    pub next_management_sequence: u64,
+    pub retained_from_sequence: u64,
+}
+
+impl ExecutionEvidenceSnapshot {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.session_id.trim().is_empty() || self.retained_from_sequence > self.next_sequence {
+            return Err("invalid execution evidence identity or retention cursor".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReadExecutionEvidenceRequest {
+    pub session_id: String,
+    pub snapshot: Option<ExecutionEvidenceSnapshot>,
+    pub from_sequence: u64,
+    pub max_records: u64,
+    pub max_bytes: u64,
+    pub include_summary: bool,
+}
+
+impl ReadExecutionEvidenceRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.session_id.trim().is_empty()
+            || !(1..=EXECUTION_EVIDENCE_PAGE_RECORDS).contains(&self.max_records)
+            || !(1..=EXECUTION_EVIDENCE_PAGE_BYTES).contains(&self.max_bytes)
+        {
+            return Err("invalid execution evidence identity or page bounds".to_string());
+        }
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.validate()?;
+            if snapshot.session_id != self.session_id || self.from_sequence > snapshot.next_sequence {
+                return Err("execution evidence request identity/cursor mismatch".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceSummary {
+    pub usage: serde_json::Value,
+    pub provider_observation: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidencePage {
+    pub snapshot: ExecutionEvidenceSnapshot,
+    pub next_sequence: u64,
+    pub records: Vec<SessionContextRecord>,
+    pub summary: Option<ExecutionEvidenceSummary>,
+}
+
+impl ExecutionEvidencePage {
+    pub fn validate(&self, request: &ReadExecutionEvidenceRequest) -> Result<(), String> {
+        request.validate()?;
+        self.snapshot.validate()?;
+        if self.snapshot.session_id != request.session_id
+            || request.snapshot.as_ref().is_some_and(|expected| expected != &self.snapshot)
+            || request.from_sequence > self.snapshot.next_sequence
+            || self.records.len() as u64 > request.max_records
+            || self.summary.is_some() != request.include_summary
+        {
+            return Err("execution evidence snapshot/identity drift".to_string());
+        }
+        let mut next = request.from_sequence;
+        let mut bytes = 0_u64;
+        for record in &self.records {
+            if record.sequence != next || next >= self.snapshot.next_sequence {
+                return Err(format!("execution evidence sequence gap/duplicate at {next}"));
+            }
+            bytes = bytes.checked_add(record.raw_record.len() as u64)
+                .ok_or("execution evidence page byte overflow")?;
+            if bytes > request.max_bytes {
+                return Err("execution evidence page exceeds byte bound".to_string());
+            }
+            let value: serde_json::Value = serde_json::from_str(&record.raw_record)
+                .map_err(|error| format!("invalid execution evidence record {next}: {error}"))?;
+            if !value.is_object()
+                || value.get("session_id").is_some_and(|id| id.as_str() != Some(request.session_id.as_str()))
+            {
+                return Err(format!("execution evidence record {next} has wrong session identity"));
+            }
+            next += 1;
+        }
+        if self.next_sequence != next || (next < self.snapshot.next_sequence && self.records.is_empty()) {
+            return Err("execution evidence traversal made no progress or changed cursor".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceReference {
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub snapshot: ExecutionEvidenceSnapshot,
+    pub turn_started_at_ms: i64,
+}
+
+impl ExecutionEvidenceReference {
+    pub fn new(snapshot: ExecutionEvidenceSnapshot, turn_started_at_ms: i64) -> Self {
+        Self { record_type: "execution_evidence_v1".to_string(), snapshot, turn_started_at_ms }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.record_type != "execution_evidence_v1" {
+            return Err("unsupported execution evidence reference".to_string());
+        }
+        self.snapshot.validate()
+    }
+}
+
+/// One page is dropped before requesting the next; even the empty terminal page
+/// is checked, so a changing session cannot produce a complete-looking prefix.
+pub fn visit_execution_evidence(
+    snapshot: &ExecutionEvidenceSnapshot,
+    mut read: impl FnMut(ReadExecutionEvidenceRequest) -> Result<ExecutionEvidencePage, String>,
+    mut visit: impl FnMut(&SessionContextRecord) -> Result<(), String>,
+) -> Result<(), String> {
+    snapshot.validate()?;
+    let mut from_sequence = 0;
+    loop {
+        let request = ReadExecutionEvidenceRequest {
+            session_id: snapshot.session_id.clone(), snapshot: Some(snapshot.clone()),
+            from_sequence, max_records: EXECUTION_EVIDENCE_PAGE_RECORDS,
+            max_bytes: EXECUTION_EVIDENCE_PAGE_BYTES, include_summary: false,
+        };
+        let page = read(request.clone())?;
+        page.validate(&request)?;
+        for record in &page.records { visit(record)?; }
+        if from_sequence == snapshot.next_sequence { return Ok(()); }
+        from_sequence = page.next_sequence;
+    }
+}
+
+pub fn observed_evidence_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value.get(key).and_then(serde_json::Value::as_str).map(str::trim)
+        .filter(|text| !text.is_empty() && text.len() <= 256 && !text.chars().any(char::is_control))
+        .map(str::to_owned)
+}
+
+pub const EVIDENCE_USAGE_KEYS: [&str; 7] = [
+    "input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens",
+    "reasoning_tokens", "total_tokens", "latency_ms",
+];
+
+/// Shared parser for one runtime. Canonical reads order/group on disk instead
+/// of keeping an unbounded map of every historical runtime in the caller.
+#[derive(Debug, Default)]
+pub struct RuntimeEvidenceState {
+    pub usage_records: u64,
+    pub usage_valid: bool,
+    pub tokens: [u64; 7],
+    pub observation: Option<(Option<String>, Option<String>, Option<String>)>,
+    pub observation_conflict: bool,
+}
+
+impl RuntimeEvidenceState {
+    pub fn add(&mut self, value: &serde_json::Value) {
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("runtime_usage") {
+            let usage = &value["usage"];
+            let valid = ["input_tokens", "output_tokens", "total_tokens"].iter()
+                .all(|key| usage.get(*key).and_then(serde_json::Value::as_u64).is_some())
+                && ["cached_input_tokens", "cache_write_tokens", "reasoning_tokens", "latency_ms"].iter()
+                    .all(|key| usage.get(*key).is_none_or(|field| field.as_u64().is_some()));
+            self.usage_valid = self.usage_records == 0 && valid;
+            self.usage_records = self.usage_records.saturating_add(1);
+            for (total, key) in self.tokens.iter_mut().zip(EVIDENCE_USAGE_KEYS) {
+                *total = total.saturating_add(usage.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0));
+            }
+        } else if value.get("type").and_then(serde_json::Value::as_str) == Some("runtime_provider_observation") {
+            let observation = &value["provider_observation"];
+            let current = if observation.get("schema_version").and_then(serde_json::Value::as_str) == Some("provider_observation_v1")
+                && observation.get("source").and_then(serde_json::Value::as_str) == Some("provider_response") {
+                Some((observed_evidence_field(observation, "response_id"),
+                    observed_evidence_field(observation, "model"), observed_evidence_field(observation, "service_tier")))
+            } else { None };
+            if self.observation.is_some() || self.observation_conflict {
+                if self.observation != current {
+                    self.observation_conflict = true;
+                    self.observation = None;
+                }
+            } else if current.is_some() {
+                self.observation = current;
+            } else if !observation.is_null() {
+                self.observation_conflict = true;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct RuntimeEvidenceTotals {
+    pub tokens: [u64; 7],
+    pub runtime_count: u64,
+    pub valid_usage_count: u64,
+    pub observation_count: u64,
+    pub conflict_count: u64,
+    pub unbound_or_malformed: bool,
+}
+
+impl RuntimeEvidenceTotals {
+    pub fn add(&mut self, bound: bool, state: &RuntimeEvidenceState) {
+        for (total, value) in self.tokens.iter_mut().zip(state.tokens) {
+            *total = total.saturating_add(value);
+        }
+        if !bound { self.unbound_or_malformed = true; return; }
+        self.runtime_count += 1;
+        self.valid_usage_count += u64::from(state.usage_records == 1 && state.usage_valid);
+        self.observation_count += u64::from(state.observation.is_some() && !state.observation_conflict);
+        self.conflict_count += u64::from(state.observation_conflict);
+    }
+
+    pub fn usage(&self) -> serde_json::Value {
+        let [input, cached, write, output, reasoning, total, latency] = self.tokens;
+        let total = if total == 0 { input.saturating_add(output).saturating_add(reasoning) } else { total };
+        serde_json::json!({"input_tokens":input, "cached_input_tokens":cached, "cache_write_tokens":write,
+            "output_tokens":output, "reasoning_output_tokens":reasoning, "reasoning_tokens":reasoning,
+            "total_tokens":total, "latency_ms":latency, "coverage":{
+                "schema_version":"runtime_usage_coverage_v1",
+                "scope":"recorded_session_context_runtimes_not_provider_attempts_or_billing",
+                "known_runtime_count":self.runtime_count, "valid_usage_count":self.valid_usage_count,
+                "missing_usage_count":self.runtime_count - self.valid_usage_count,
+                "status":if self.runtime_count == 0 {"unknown"} else if self.runtime_count == self.valid_usage_count && !self.unbound_or_malformed {"complete"} else {"incomplete"}}})
+    }
+
+    pub fn provider_summary(&self, model: serde_json::Value, service_tier: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"schema_version":"provider_observation_summary_v1", "source":"provider_response",
+            "runtime_count":self.runtime_count, "observation_count":self.observation_count,
+            "conflict_count":self.conflict_count, "model":model, "service_tier":service_tier})
+    }
+}
+
+/// Values arrive sorted by the existing SQLite owner; exact distinct counts
+/// need only one previous value and the same eight displayed values as before.
+#[derive(Debug, Default)]
+pub struct SortedObservedEvidence {
+    previous: Option<String>,
+    observed_count: u64,
+    distinct_count: u64,
+    values: Vec<String>,
+}
+
+impl SortedObservedEvidence {
+    pub fn add(&mut self, value: Option<&str>) -> Result<(), String> {
+        let Some(value) = value else { return Ok(()); };
+        if self.previous.as_deref().is_some_and(|previous| previous > value) {
+            return Err("provider evidence traversal is not monotonic".to_string());
+        }
+        self.observed_count += 1;
+        if self.previous.as_deref() != Some(value) {
+            self.distinct_count += 1;
+            self.previous = Some(value.to_string());
+            if self.values.len() < 8 { self.values.push(value.to_string()); }
+        }
+        Ok(())
+    }
+
+    pub fn summary(&self, runtime_count: u64) -> serde_json::Value {
+        serde_json::json!({"value":if runtime_count > 0 && self.observed_count == runtime_count && self.distinct_count == 1 {
+            self.previous.clone() } else { None }, "observed_count":self.observed_count,
+            "distinct_count":self.distinct_count, "distinct_values":self.values})
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CreateSessionRequest {
@@ -867,6 +1148,7 @@ pub enum SessionLogCommand {
     RecoveryCloseRuntime(RecoveryCloseRuntimeRequest),
     PersistSessionDelta(Box<PersistSessionDeltaRequest>),
     ReadContextSlice(ReadContextSliceRequest),
+    ReadExecutionEvidence(ReadExecutionEvidenceRequest),
     ApplyCommandCheckpoint(Box<CommandCheckpoint>),
     GetSession(GetSessionRequest),
     ListWorkspaces,
@@ -935,6 +1217,9 @@ pub enum SessionLogResponse {
     },
     ContextSlice {
         context: ContextSlice,
+    },
+    ExecutionEvidence {
+        evidence: ExecutionEvidencePage,
     },
     Workspaces {
         workspaces: Vec<WorkspaceSummary>,
@@ -1041,6 +1326,93 @@ mod tests {
         assert_eq!(page.page, 0);
         assert_eq!(page.page_size, 50);
         assert_eq!(page.total, 7);
+    }
+
+    #[test]
+    fn execution_evidence_visits_complete_history_in_bounded_pages_and_checks_terminal_cursor() {
+        use std::cell::Cell;
+        let snapshot = super::ExecutionEvidenceSnapshot {
+            session_id: "paged-history".to_string(), next_sequence: 1025,
+            next_management_sequence: 3, retained_from_sequence: 1000,
+        };
+        let seen = Cell::new(0_u64);
+        let largest = Cell::new(0_usize);
+        let calls = Cell::new(0_usize);
+        let terminal = Cell::new(false);
+        super::visit_execution_evidence(&snapshot, |request| {
+            assert_eq!(request.from_sequence, seen.get());
+            assert_eq!(request.snapshot.as_ref(), Some(&snapshot));
+            let end = (request.from_sequence + request.max_records).min(snapshot.next_sequence);
+            let records = (request.from_sequence..end).map(|sequence| super::SessionContextRecord {
+                sequence, raw_record: json!({"session_id":"paged-history", "content":"fixture"}).to_string(),
+            }).collect::<Vec<_>>();
+            largest.set(largest.get().max(records.len()));
+            calls.set(calls.get() + 1);
+            terminal.set(request.from_sequence == snapshot.next_sequence);
+            Ok(super::ExecutionEvidencePage { snapshot: snapshot.clone(), next_sequence: end, records, summary: None })
+        }, |record| {
+            assert_eq!(record.sequence, seen.get());
+            seen.set(seen.get() + 1);
+            Ok(())
+        }).expect("bounded complete evidence traversal");
+        assert_eq!(seen.get(), 1025);
+        assert!(largest.get() <= super::EXECUTION_EVIDENCE_PAGE_RECORDS as usize);
+        assert_eq!(calls.get(), 10); // nine data pages plus an independently checked terminal page
+        assert!(terminal.get());
+        let terminal_drift = Cell::new(false);
+        let result = super::visit_execution_evidence(&snapshot, |request| {
+            let end = (request.from_sequence + request.max_records).min(snapshot.next_sequence);
+            let mut actual = snapshot.clone();
+            if request.from_sequence == snapshot.next_sequence {
+                terminal_drift.set(true);
+                actual.next_management_sequence += 1;
+            }
+            Ok(super::ExecutionEvidencePage { snapshot:actual, next_sequence:end,
+                records:(request.from_sequence..end).map(|sequence| super::SessionContextRecord {
+                    sequence, raw_record:json!({"content":"fixture"}).to_string() }).collect(), summary:None })
+        }, |_| Ok(()));
+        assert!(terminal_drift.get());
+        assert!(result.is_err(), "a drift after the last data page is not completion");
+    }
+
+    #[test]
+    fn execution_evidence_rejects_identity_gaps_duplicates_drift_and_unbounded_pages() {
+        let snapshot = super::ExecutionEvidenceSnapshot { session_id:"identity".to_string(),
+            next_sequence:2, next_management_sequence:3, retained_from_sequence:1 };
+        let request = super::ReadExecutionEvidenceRequest { session_id:snapshot.session_id.clone(),
+            snapshot:Some(snapshot.clone()), from_sequence:0, max_records:2,
+            max_bytes:super::EXECUTION_EVIDENCE_PAGE_BYTES, include_summary:false };
+        let valid = super::ExecutionEvidencePage { snapshot:snapshot.clone(), next_sequence:2,
+            records:(0..2).map(|sequence| super::SessionContextRecord { sequence,
+                raw_record:json!({"session_id":"identity","content":"fixture"}).to_string() }).collect(), summary:None };
+        valid.validate(&request).expect("valid complete page");
+        for case in 0..8 {
+            let mut page = valid.clone();
+            match case {
+                0 => page.snapshot.session_id = "other".to_string(),
+                1 => page.snapshot.next_management_sequence += 1,
+                2 => page.records[0].sequence = 1,
+                3 => page.records[1].sequence = 0,
+                4 => { page.records.clear(); page.next_sequence = 0; },
+                5 => page.records[0].raw_record = json!({"session_id":"other"}).to_string(),
+                6 => page.records[0].raw_record = "not JSON".to_string(),
+                _ => page.next_sequence = 1,
+            }
+            assert!(page.validate(&request).is_err(), "must fail closed for case {case}");
+        }
+        let mut small = request.clone();
+        small.max_bytes = 1;
+        assert!(valid.validate(&small).is_err());
+        small.max_records = 0;
+        assert!(small.validate().is_err());
+        let mut wrong = request.clone();
+        wrong.session_id = "other".to_string();
+        assert!(wrong.validate().is_err());
+        let mut changed = snapshot.clone();
+        changed.next_sequence += 1;
+        assert!(super::visit_execution_evidence(&snapshot, |_| Ok(super::ExecutionEvidencePage {
+            snapshot:changed.clone(), next_sequence:0, records:Vec::new(), summary:None
+        }), |_| panic!("drifted evidence must not reach projection")).is_err());
     }
 
     #[test]

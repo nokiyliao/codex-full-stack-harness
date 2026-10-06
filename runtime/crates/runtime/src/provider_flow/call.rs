@@ -22,7 +22,7 @@ use crate::provider_flow::request_options::{
     route_for_provider_name, session_max_tokens, session_model_override_route,
     session_reasoning_effort, session_service_tier, stream_options,
 };
-use crate::provider_flow::usage::usage_report_from_metrics;
+use crate::provider_flow::usage::{provider_observation, usage_report_from_metrics};
 use crate::runtime::types::RuntimeQueueItem;
 use crate::runtime_event_writer::RuntimeEventWriter;
 use lifecycle::RuntimeAggregate;
@@ -79,7 +79,7 @@ pub(crate) async fn call_runtime_with_writer(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let provider_messages = normalize_provider_messages(input.messages);
+    let mut provider_messages = normalize_provider_messages(input.messages);
     profile_timings::log_elapsed(
         "call_runtime.normalize_provider_messages",
         normalize_start,
@@ -95,7 +95,7 @@ pub(crate) async fn call_runtime_with_writer(
         }),
     );
     let clone_input_start = Instant::now();
-    let input_messages = provider_messages.clone();
+    let mut input_messages = provider_messages.clone();
     let input_tools = input.tools.clone();
     profile_timings::log_elapsed(
         "call_runtime.clone_provider_input",
@@ -170,16 +170,39 @@ pub(crate) async fn call_runtime_with_writer(
         )
     );
     #[cfg(feature = "nokiy-ablation-benchmark")]
-    let taskcore_full_core = taskcore_full_core || pre_provider_or_failed_runtime!(
-        "nokiy_readonly_ablation_admission",
-        ablation::admitted(&input.session_directory, input.disable_permission_restrictions)
-    );
+    let taskcore_full_core = taskcore_full_core
+        || pre_provider_or_failed_runtime!(
+            "nokiy_readonly_ablation_admission",
+            ablation::admitted(
+                &input.session_directory,
+                input.disable_permission_restrictions
+            )
+        );
     if !taskcore_full_core && legacy_codex_provider_requested(&input.provider_name) {
         return finish_provider_route_admission_failure(
             runtime,
             runtime_event_writer,
             "legacy provider 'codex' is disabled; use 'official_codex_app_server'".to_string(),
         );
+    }
+
+    let execution_budget = pre_provider_or_failed_runtime!(
+        "execution_time_budget",
+        super::execution_budget::ExecutionBudget::observe(
+            taskcore_full_core,
+            &runtime.session_id,
+            std::env::var(super::execution_budget::ENV).ok().as_deref(),
+            Utc::now().timestamp_millis(),
+        )
+    );
+    if let Some(budget) = &execution_budget {
+        // Only this request's suffix changes; durable conversation prefixes and
+        // the authorized tool/model settings remain untouched.
+        let message = budget.message();
+        provider_messages.push(message.clone());
+        input_messages.push(message);
+        runtime.provider.base.time_out_ms =
+            budget.provider_timeout_ms(runtime.provider.base.time_out_ms);
     }
 
     let direct_route = route_for_provider_name(tura_settings.as_ref(), &input.provider_name);
@@ -241,6 +264,7 @@ pub(crate) async fn call_runtime_with_writer(
                 "store": call_options.store,
                 "tool_choice": call_options.tool_choice.clone(),
                 "context_window": call_options.context_window,
+                "execution_budget": execution_budget.as_ref().map(|b| b.observation()),
             }
         }))
     );
@@ -354,7 +378,9 @@ fn taskcore_context_admitted(
     directory: &std::path::Path,
     contract: Option<&serde_json::Value>,
 ) -> Result<bool, String> {
-    let Some(marker) = marker else { return Ok(false) };
+    let Some(marker) = marker else {
+        return Ok(false);
+    };
     if disable_permission_restrictions {
         return Err("TASKCORE_PERMISSION_BYPASS_FORBIDDEN".into());
     }
@@ -379,7 +405,9 @@ fn provider_for_execution(
         // still use their existing implementations; this selects no fallback.
         Ok(None)
     } else {
-        route.official_codex_app_server_provider().map_err(|error| error.to_string())
+        route
+            .official_codex_app_server_provider()
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -498,7 +526,14 @@ async fn call_runtime_non_streaming(
         }
         Ok(Ok(response)) => {
             let finished_at = Utc::now();
-            runtime.set_output(response.content.clone())?;
+            runtime.set_output_with_provider_observation(
+                super::responses_continuity::capture_reasoning(
+                    response.content.clone(),
+                    &response.raw,
+                    &runtime.provider,
+                ),
+                Some(provider_observation(&response.raw)),
+            )?;
             apply_provider_response(runtime, &response.content, finished_at)?;
 
             runtime
@@ -571,7 +606,9 @@ pub async fn dequeue_runtime(
 
 #[cfg(test)]
 mod tests {
-    use super::{CallRuntimeInput, call_runtime, provider_for_execution, taskcore_context_admitted};
+    use super::{
+        CallRuntimeInput, call_runtime, provider_for_execution, taskcore_context_admitted,
+    };
     use chrono::Utc;
     use lifecycle::{ProviderConfig, ToolChoice};
     use lifecycle::{RuntimeAggregate, RuntimeProviderConfig};
@@ -678,16 +715,30 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let contract = taskcore_contract(root.path());
         let digest = contract["semantic_sha256"].as_str().unwrap();
-        assert_eq!(taskcore_context_admitted(None, false, root.path(), None), Ok(false));
-        assert_eq!(taskcore_context_admitted(Some(digest), false, root.path(), Some(&contract)), Ok(true));
-        assert!(taskcore_context_admitted(Some(digest), true, root.path(), Some(&contract)).is_err());
+        assert_eq!(
+            taskcore_context_admitted(None, false, root.path(), None),
+            Ok(false)
+        );
+        assert_eq!(
+            taskcore_context_admitted(Some(digest), false, root.path(), Some(&contract)),
+            Ok(true)
+        );
+        assert!(
+            taskcore_context_admitted(Some(digest), true, root.path(), Some(&contract)).is_err()
+        );
         assert!(taskcore_context_admitted(Some(digest), false, root.path(), None).is_err());
-        assert!(taskcore_context_admitted(Some("wrong"), false, root.path(), Some(&contract)).is_err());
+        assert!(
+            taskcore_context_admitted(Some("wrong"), false, root.path(), Some(&contract)).is_err()
+        );
         let mut tampered = contract.clone();
         tampered["write_scopes"] = json!(["**"]);
-        assert!(taskcore_context_admitted(Some(digest), false, root.path(), Some(&tampered)).is_err());
+        assert!(
+            taskcore_context_admitted(Some(digest), false, root.path(), Some(&tampered)).is_err()
+        );
         let other = tempfile::tempdir().unwrap();
-        assert!(taskcore_context_admitted(Some(digest), false, other.path(), Some(&contract)).is_err());
+        assert!(
+            taskcore_context_admitted(Some(digest), false, other.path(), Some(&contract)).is_err()
+        );
     }
 
     #[test]
@@ -702,6 +753,70 @@ mod tests {
         route.providers[0].provider = "official_codex_app_server".into();
         assert!(provider_for_execution(&route, false).unwrap().is_some());
         assert!(provider_for_execution(&route, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn exhausted_worker_budget_finishes_before_route_resolution() {
+        const CHILD_ROOT: &str = "NOKIY_BUDGET_TEST_ROOT";
+        const ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let root = match std::env::var_os(CHILD_ROOT) {
+            Some(root) => std::path::PathBuf::from(root),
+            None => {
+                let root = tempfile::tempdir().unwrap();
+                let contract = taskcore_contract(root.path());
+                // Set the environment at process creation, never racing other tests.
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "provider_flow::call::tests::exhausted_worker_budget_finishes_before_route_resolution", "--nocapture"])
+                    .env(CHILD_ROOT, root.path())
+                    .env("TURA_TASKCORE_JSPACE_SHA256", contract["semantic_sha256"].as_str().unwrap())
+                    .env(super::super::execution_budget::ENV, json!({
+                        "schema_version": "nokiy_execution_budget_v1", "request_sha256": ID,
+                        "timeout_ms": 360_000, "reserve_ms": 10_000,
+                        "deadline_unix_ms": Utc::now().timestamp_millis() + 5_000,
+                    }).to_string())
+                    .output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                return;
+            }
+        };
+        let mut aggregate = runtime();
+        aggregate.session_id = format!("full-{ID}");
+        let result = call_runtime(
+            CallRuntimeInput {
+                runtime: aggregate,
+                messages: vec![json!({"role": "user", "content": "never dispatch"})],
+                tools: Vec::new(),
+                provider_name: "missing-route".into(),
+                stream: false,
+                max_tokens: 128,
+                tool_choice: None,
+                session_directory: root.clone(),
+                allowed_command_run_commands: Some(BTreeSet::new()),
+                disable_permission_restrictions: false,
+                jspace_contract: Some(taskcore_contract(&root)),
+                require_startup_task_state: false,
+            },
+            empty_settings(),
+            Arc::new(TuraConfig::new(".env.budget-test")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.state, lifecycle::RuntimeState::Failed);
+        assert!(result.input.is_none() && result.usage.is_none());
+        let error = result.error.unwrap();
+        assert!(
+            error
+                .error_text
+                .unwrap()
+                .starts_with("execution_time_budget: NOKIY_EXECUTION_BUDGET_EXHAUSTED")
+        );
+        assert!(!error.retry_allowed && !error.fallback_allowed);
     }
 
     #[tokio::test]

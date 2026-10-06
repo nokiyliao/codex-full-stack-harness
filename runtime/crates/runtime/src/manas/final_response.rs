@@ -12,7 +12,8 @@ pub(crate) fn user_visible_runtime_text(text: &str) -> Option<String> {
         return None;
     }
     if let Some(reply_message) = extract_reply_message_from_json(trimmed) {
-        return Some(reply_message);
+        // Decoded JSON strings can contain thought markup, including escaped tags.
+        return user_visible_runtime_text(&reply_message);
     }
 
     let mut visible = String::new();
@@ -37,7 +38,7 @@ pub(crate) fn user_visible_runtime_text(text: &str) -> Option<String> {
             return None;
         }
         if let Some(reply_message) = extract_reply_message_from_json(&visible) {
-            return Some(reply_message);
+            return user_visible_runtime_text(&reply_message);
         }
         if looks_like_tool_payload(&visible) {
             return None;
@@ -45,26 +46,8 @@ pub(crate) fn user_visible_runtime_text(text: &str) -> Option<String> {
         return Some(visible);
     }
 
-    let fallback = strip_runtime_markup(
-        trimmed
-            .replace("<think>", "")
-            .replace("</think>", "")
-            .trim(),
-    );
-    let fallback = strip_tool_payload_suffix(&fallback);
-    if fallback.trim().is_empty() {
-        return None;
-    }
-    if is_code_fence_only(&fallback) {
-        return None;
-    }
-    if let Some(reply_message) = extract_reply_message_from_json(&fallback) {
-        return Some(reply_message);
-    }
-    if looks_like_tool_payload(&fallback) {
-        return None;
-    }
-    Some(fallback)
+    // Never recover an answer from a hidden or unfinished thought block.
+    None
 }
 
 pub(crate) fn user_visible_runtime_output_text(output: &serde_json::Value) -> Option<String> {
@@ -85,7 +68,7 @@ pub(crate) fn user_visible_runtime_output_text(output: &serde_json::Value) -> Op
     }
     let content = tura_llm_rust::normalize_response_content(output);
     let text = tura_llm_rust::extract_response_text(&content)?;
-    user_visible_runtime_text(&tura_llm_rust::strip_thought_blocks(&text))
+    user_visible_runtime_text(&text)
 }
 
 fn strip_tool_payload_suffix(text: &str) -> String {
@@ -249,6 +232,113 @@ pub(crate) fn summarize_tool_results_for_user(session: &SessionManagement) -> Op
 mod tests {
     use super::{user_visible_runtime_output_text, user_visible_runtime_text};
     use serde_json::json;
+
+    #[test]
+    fn user_visible_runtime_text_rejects_thought_only_text() {
+        for text in [
+            "<think>planning only</think>",
+            " \t<think>planning\nonly</think>\u{2003}",
+            "<think>first</think>\n<think>second</think>",
+            "<think>unfinished",
+            "<think>unfinished</think",
+            r#"<think>{"reply_message":"hidden answer"}</think>"#,
+            r#"<think>{"answer":42}</think>"#,
+            r#"<think>{"reply_message":"hidden answer"}"#,
+        ] {
+            assert_eq!(user_visible_runtime_text(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn user_visible_runtime_text_filters_decoded_json_replies() {
+        for reply in ["<think>hidden</think>", "<think>unfinished"] {
+            let text = json!({"input": {"reply_message": reply}}).to_string();
+            assert_eq!(user_visible_runtime_text(&text), None, "{text:?}");
+        }
+        assert_eq!(
+            user_visible_runtime_text(
+                r#"{"reply_message":"\u003cthink\u003ehidden\u003c/think\u003e"}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn user_visible_runtime_text_preserves_visible_text_around_thoughts() {
+        for (text, expected) in [
+            ("<think>hidden</think>Done.", "Done."),
+            (
+                "Before.<think>hidden</think>\n\nAfter.",
+                "Before.\n\nAfter.",
+            ),
+            ("Done.<think>unfinished", "Done."),
+            ("<think>first</think>Done.<think>unfinished", "Done."),
+            (
+                r#"<think>hidden</think>{"reply_message":"Done."}"#,
+                "Done.",
+            ),
+            (
+                r#"<think>hidden</think>{"answer":42}"#,
+                r#"{"answer":42}"#,
+            ),
+            (
+                r#"{"input":{"reply_message":"<think>hidden</think>Done."}}"#,
+                "Done.",
+            ),
+        ] {
+            assert_eq!(
+                user_visible_runtime_text(text).as_deref(),
+                Some(expected),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_visible_runtime_text_preserves_concise_plain_and_json_answers() {
+        for reply in ["Done.", "完", "42", r#"{"answer":42}"#] {
+            assert_eq!(user_visible_runtime_text(reply).as_deref(), Some(reply));
+            let text = json!({"input": {"reply_message": reply}}).to_string();
+            assert_eq!(user_visible_runtime_text(&text).as_deref(), Some(reply));
+        }
+    }
+
+    #[test]
+    fn user_visible_runtime_text_keeps_tool_payload_and_fence_filtering() {
+        let payload = r#"{"commands":[{"command_type":"task_status"}]}"#;
+        for suffix in [payload, "```", "```json"] {
+            let text = format!("<think>hidden</think>{suffix}");
+            assert_eq!(user_visible_runtime_text(&text), None, "{text:?}");
+        }
+        let text = format!("<think>hidden</think>Done.{payload}");
+        assert_eq!(user_visible_runtime_text(&text).as_deref(), Some("Done."));
+    }
+
+    #[test]
+    fn user_visible_runtime_output_text_filters_thoughts_in_provider_text() {
+        for (text, expected) in [
+            ("<think>hidden</think>", None),
+            ("<think>unfinished", None),
+            (r#"<think>{"reply_message":"hidden"}</think>"#, None),
+            (r#"{"reply_message":"<think>hidden</think>"}"#, None),
+            ("<think>hidden</think>Done.", Some("Done.")),
+        ] {
+            for output in [
+                json!(text),
+                json!({"reply_message": text}),
+                json!({"text": text}),
+                json!({"choices": [{"message": {"content": text}}]}),
+                json!({"parts": [{"text": text}]}),
+            ] {
+                assert_eq!(
+                    user_visible_runtime_output_text(&output).as_deref(),
+                    expected,
+                    "{output:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn user_visible_runtime_text_extracts_reply_message_from_tool_payload() {
         let text = json!({

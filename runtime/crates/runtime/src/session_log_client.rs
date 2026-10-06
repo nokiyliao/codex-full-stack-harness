@@ -7,6 +7,8 @@ use session_log_contract::{
     ListSessionsRequest, Page, PersistSessionDeltaRequest, ReadContextSliceRequest,
     ReplayRuntimeRequest, RuntimeReplay, SessionLogCommand, SessionLogResponse, SessionRecord,
     SessionSnapshot, WorkspaceSummary,
+    ExecutionEvidenceSnapshot, ReadExecutionEvidenceRequest,
+    EXECUTION_EVIDENCE_PAGE_BYTES, EXECUTION_EVIDENCE_PAGE_RECORDS,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -67,6 +69,30 @@ impl SessionLogClient {
             other => Err(format!(
                 "unexpected session_log response for read_context_slice: {other:?}"
             )),
+        }
+    }
+
+    pub(crate) fn execution_evidence_snapshot(
+        &self,
+        session_id: &str,
+        expected_next_sequence: u64,
+    ) -> Result<ExecutionEvidenceSnapshot, String> {
+        let request = ReadExecutionEvidenceRequest {
+            session_id: session_id.to_string(), snapshot: None,
+            from_sequence: expected_next_sequence,
+            max_records: EXECUTION_EVIDENCE_PAGE_RECORDS,
+            max_bytes: EXECUTION_EVIDENCE_PAGE_BYTES, include_summary: false,
+        };
+        match self.call_typed_sync(SessionLogCommand::ReadExecutionEvidence(request.clone()))? {
+            SessionLogResponse::ExecutionEvidence { evidence } => {
+                evidence.validate(&request)?;
+                if evidence.snapshot.next_sequence != expected_next_sequence {
+                    return Err(format!("session {session_id} execution evidence end differs from runtime end {expected_next_sequence}"));
+                }
+                Ok(evidence.snapshot)
+            }
+            SessionLogResponse::Error { error } => Err(format!("session_log execution evidence failed: {error}")),
+            other => Err(format!("unexpected session_log execution evidence response: {other:?}")),
         }
     }
 
@@ -226,6 +252,7 @@ fn session_log_command_name(command: &SessionLogCommand) -> &'static str {
         SessionLogCommand::RecoveryCloseRuntime(_) => "recovery_close_runtime",
         SessionLogCommand::PersistSessionDelta(_) => "persist_session_delta",
         SessionLogCommand::ReadContextSlice(_) => "read_context_slice",
+        SessionLogCommand::ReadExecutionEvidence(_) => "read_execution_evidence",
         SessionLogCommand::ApplyCommandCheckpoint(_) => "apply_command_checkpoint",
         SessionLogCommand::GetSession(_) => "get_session",
         SessionLogCommand::ListWorkspaces => "list_workspaces",

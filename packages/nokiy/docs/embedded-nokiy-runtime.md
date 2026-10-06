@@ -68,7 +68,7 @@ New requests use `tura_embedded_request_v3` and bind:
 - `authority_effect=none` or `workspace`.
 
 For new v3 requests, omitted `model` and `reasoning_effort` default to
-`gpt-6-astra` and `high`. If neither `service_tier` nor the legacy
+`gpt-6-sol` and `max`. If neither `service_tier` nor the legacy
 `model_acceleration` field is supplied, the service tier defaults to `default`.
 Defaults are resolved into the canonical request before computing its identity.
 An explicit profile takes precedence; existing request bytes and identities
@@ -78,8 +78,8 @@ Prefer an explicit profile when handing a request to another task:
 
 ```json
 {
-  "model": "gpt-6-astra",
-  "reasoning_effort": "high",
+  "model": "gpt-6-sol",
+  "reasoning_effort": "max",
   "service_tier": "default"
 }
 ```

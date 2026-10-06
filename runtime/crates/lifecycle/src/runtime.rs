@@ -189,6 +189,8 @@ pub enum RuntimeCommand {
     },
     CaptureOutput {
         output: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_observation: Option<ProviderObservation>,
     },
     RecordToolCall {
         record: ToolCallRecord,
@@ -245,6 +247,8 @@ pub enum RuntimeEvent {
     },
     OutputCaptured {
         output: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_observation: Option<ProviderObservation>,
     },
     ToolCallRecorded {
         record: ToolCallRecord,
@@ -291,8 +295,12 @@ impl RuntimeEvent {
             Self::InputCaptured { input } => Some(RuntimeCommand::CaptureInput {
                 input: input.clone(),
             }),
-            Self::OutputCaptured { output } => Some(RuntimeCommand::CaptureOutput {
+            Self::OutputCaptured {
+                output,
+                provider_observation,
+            } => Some(RuntimeCommand::CaptureOutput {
                 output: output.clone(),
+                provider_observation: provider_observation.clone(),
             }),
             Self::ToolCallRecorded { record } => Some(RuntimeCommand::RecordToolCall {
                 record: record.clone(),
@@ -418,6 +426,17 @@ impl std::fmt::Display for RuntimeTransitionError {
 
 impl std::error::Error for RuntimeTransitionError {}
 
+/// Bounded metadata from the provider response, separate from assistant output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderObservation {
+    pub schema_version: String,
+    pub source: String,
+    pub response_id: Option<String>,
+    pub model: Option<String>,
+    pub service_tier: Option<String>,
+}
+
 /// Canonical state for one provider invocation.
 #[derive(Debug, Clone)]
 pub struct RuntimeAggregate {
@@ -448,6 +467,7 @@ pub struct RuntimeAggregate {
     pub input: Option<serde_json::Value>,
     /// Full provider response payload received for this runtime call.
     pub output: Option<serde_json::Value>,
+    pub provider_observation: Option<ProviderObservation>,
     /// Assistant text output.
     pub text: OutputText,
     /// Tool call reports.
@@ -478,6 +498,7 @@ impl PartialEq for RuntimeAggregate {
             && self.reasoning_hash == other.reasoning_hash
             && self.input == other.input
             && self.output == other.output
+            && self.provider_observation == other.provider_observation
             && self.text == other.text
             && self.tool_call == other.tool_call
             && self.context_tokens == other.context_tokens
@@ -490,8 +511,10 @@ impl Serialize for RuntimeAggregate {
     where
         S: Serializer,
     {
-        let field_count =
-            18 + usize::from(self.input.is_some()) + usize::from(self.output.is_some());
+        let field_count = 18
+            + usize::from(self.input.is_some())
+            + usize::from(self.output.is_some())
+            + usize::from(self.provider_observation.is_some());
         let mut wire = serializer.serialize_struct("RuntimeAggregate", field_count)?;
         wire.serialize_field("runtime_id", &self.runtime_id)?;
         wire.serialize_field("created_at", &self.created_at)?;
@@ -511,6 +534,9 @@ impl Serialize for RuntimeAggregate {
         }
         if let Some(output) = &self.output {
             wire.serialize_field("output", output)?;
+        }
+        if let Some(observation) = &self.provider_observation {
+            wire.serialize_field("provider_observation", observation)?;
         }
         wire.serialize_field("text", &self.text)?;
         wire.serialize_field("tool_call", &self.tool_call)?;
@@ -547,6 +573,8 @@ impl<'de> Deserialize<'de> for RuntimeAggregate {
             input: Option<serde_json::Value>,
             #[serde(default)]
             output: Option<serde_json::Value>,
+            #[serde(default)]
+            provider_observation: Option<ProviderObservation>,
             text: OutputText,
             tool_call: Vec<ToolCallRecord>,
             #[serde(default)]
@@ -577,6 +605,7 @@ impl<'de> Deserialize<'de> for RuntimeAggregate {
             reasoning_hash: wire.reasoning_hash,
             input: wire.input,
             output: wire.output,
+            provider_observation: wire.provider_observation,
             text: wire.text,
             tool_call: wire.tool_call,
             context_tokens: wire.context_tokens,
@@ -633,6 +662,7 @@ impl RuntimeAggregate {
             reasoning_hash: None,
             input: None,
             output: None,
+            provider_observation: None,
             text: String::new(),
             tool_call: Vec::new(),
             context_tokens,
@@ -687,6 +717,7 @@ impl RuntimeAggregate {
             reasoning_hash: None,
             input: None,
             output: None,
+            provider_observation: None,
             text: String::new(),
             tool_call: Vec::new(),
             context_tokens,
@@ -769,9 +800,15 @@ impl RuntimeAggregate {
                 self.require_live_command("capture_input")?;
                 Ok(RuntimeEvent::InputCaptured { input })
             }
-            RuntimeCommand::CaptureOutput { output } => {
+            RuntimeCommand::CaptureOutput {
+                output,
+                provider_observation,
+            } => {
                 self.require_live_command("capture_output")?;
-                Ok(RuntimeEvent::OutputCaptured { output })
+                Ok(RuntimeEvent::OutputCaptured {
+                    output,
+                    provider_observation,
+                })
             }
             RuntimeCommand::RecordToolCall { record } => {
                 self.require_live_command("record_tool_call")?;
@@ -853,7 +890,13 @@ impl RuntimeAggregate {
             }
             RuntimeEvent::TextAppended { chunk } => self.text.push_str(chunk),
             RuntimeEvent::InputCaptured { input } => self.input = Some(input.clone()),
-            RuntimeEvent::OutputCaptured { output } => self.output = Some(output.clone()),
+            RuntimeEvent::OutputCaptured {
+                output,
+                provider_observation,
+            } => {
+                self.output = Some(output.clone());
+                self.provider_observation = provider_observation.clone();
+            }
             RuntimeEvent::ToolCallRecorded { record } => self.tool_call.push(record.clone()),
             RuntimeEvent::ContextTokensUpdated { context_tokens } => {
                 self.context_tokens = *context_tokens;
@@ -949,8 +992,19 @@ impl RuntimeAggregate {
 
     /// Stores the full provider response payload.
     pub fn set_output(&mut self, output: serde_json::Value) -> Result<(), String> {
-        self.execute(RuntimeCommand::CaptureOutput { output })
-            .map(|_| ())
+        self.set_output_with_provider_observation(output, None)
+    }
+
+    pub fn set_output_with_provider_observation(
+        &mut self,
+        output: serde_json::Value,
+        provider_observation: Option<ProviderObservation>,
+    ) -> Result<(), String> {
+        self.execute(RuntimeCommand::CaptureOutput {
+            output,
+            provider_observation,
+        })
+        .map(|_| ())
     }
 
     /// Adds one tool call record.
@@ -1142,6 +1196,59 @@ mod tests {
             provider_config(),
             Utc::now(),
         )
+    }
+
+    #[test]
+    fn output_observation_survives_snapshot_and_event_replay_without_changing_output() {
+        let mut runtime = runtime();
+        runtime.mark_called(runtime.created_at).expect("start");
+        let observation = super::ProviderObservation {
+            schema_version: "provider_observation_v1".into(),
+            source: "provider_response".into(),
+            response_id: Some("resp-final".into()),
+            model: Some("gpt-6".into()),
+            service_tier: Some("default".into()),
+        };
+        runtime
+            .set_output_with_provider_observation(
+                serde_json::json!({"text":"hi"}),
+                Some(observation.clone()),
+            )
+            .expect("output");
+        assert_eq!(runtime.output, Some(serde_json::json!({"text":"hi"})));
+        let wire = serde_json::to_value(&runtime).expect("snapshot");
+        assert_eq!(
+            serde_json::from_value::<RuntimeAggregate>(wire.clone()).expect("restore"),
+            runtime
+        );
+        let events = runtime.take_uncommitted_events();
+        let restored = events.into_iter().map(|event| {
+            serde_json::from_value::<RuntimeEvent>(serde_json::to_value(event).expect("event"))
+                .expect("event restore")
+        });
+        assert_eq!(
+            RuntimeAggregate::replay(runtime.runtime_id.clone(), restored).expect("replay"),
+            runtime
+        );
+        let mut old_wire = wire;
+        old_wire
+            .as_object_mut()
+            .expect("object")
+            .remove("provider_observation");
+        assert_eq!(
+            serde_json::from_value::<RuntimeAggregate>(old_wire)
+                .expect("old snapshot")
+                .provider_observation,
+            None
+        );
+        let old_event: RuntimeEvent = serde_json::from_value(
+            serde_json::json!({"event":"output_captured", "output":{"text":"legacy"}}),
+        )
+        .expect("old event");
+        assert_eq!(
+            serde_json::to_value(old_event).expect("old event round trip"),
+            serde_json::json!({"event":"output_captured", "output":{"text":"legacy"}})
+        );
     }
 
     fn usage_report() -> UsageReport {

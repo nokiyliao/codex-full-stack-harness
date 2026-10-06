@@ -1,8 +1,10 @@
 use serde_json::Value;
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
+use tura_path::command_receipts::ReceiptStore;
 
 use super::file_locks;
 
@@ -37,6 +39,8 @@ pub struct ToolContext {
     hooks: Arc<std::sync::Mutex<ToolHooks>>,
     current_call_id: Option<String>,
     lock_scope: Option<String>,
+    source_read_root: Option<Arc<File>>,
+    receipt_store: Option<Arc<ReceiptStore>>,
 }
 
 impl ToolContext {
@@ -65,6 +69,8 @@ impl ToolContext {
             hooks: Arc::new(std::sync::Mutex::new(ToolHooks::default())),
             current_call_id: None,
             lock_scope: normalize_lock_scope(lock_scope),
+            source_read_root: None,
+            receipt_store: None,
         }
     }
 
@@ -77,6 +83,8 @@ impl ToolContext {
             hooks: Arc::clone(&self.hooks),
             current_call_id: self.current_call_id.clone(),
             lock_scope: self.lock_scope.clone(),
+            source_read_root: self.source_read_root.clone(),
+            receipt_store: self.receipt_store.clone(),
         }
     }
 
@@ -88,6 +96,31 @@ impl ToolContext {
 
     pub fn current_call_id(&self) -> Option<&str> {
         self.current_call_id.as_deref()
+    }
+
+    pub fn with_source_read_root(mut self, root: Option<Arc<File>>) -> Self {
+        self.source_read_root = root;
+        self
+    }
+
+    pub fn source_read_root(&self) -> Option<&File> {
+        self.source_read_root.as_deref()
+    }
+
+    pub fn with_receipt_store(mut self, store: Option<Arc<ReceiptStore>>) -> Self {
+        self.receipt_store = store;
+        self
+    }
+
+    pub fn receipt_store(&self) -> Option<&ReceiptStore> {
+        self.receipt_store.as_deref()
+    }
+
+    pub fn bound_receipt_store(&self) -> std::io::Result<Arc<ReceiptStore>> {
+        match &self.receipt_store {
+            Some(store) => Ok(Arc::clone(store)),
+            None => ReceiptStore::open(&self.session_dir).map(Arc::new),
+        }
     }
 
     pub fn lock_scope(&self) -> Option<&str> {
@@ -295,6 +328,7 @@ pub struct CommandRouter {
     zsh: crate::commands::zsh::ZshHandler,
     apply_patch: crate::commands::apply_patch::ApplyPatchHandler,
     planning: crate::commands::planning::PlanningHandler,
+    source_read: crate::commands::source_read::SourceReadHandler,
 }
 
 impl CommandRouter {
@@ -306,6 +340,7 @@ impl CommandRouter {
             zsh: crate::commands::zsh::ZshHandler,
             apply_patch: crate::commands::apply_patch::ApplyPatchHandler,
             planning: crate::commands::planning::PlanningHandler,
+            source_read: crate::commands::source_read::SourceReadHandler,
         }
     }
 
@@ -322,6 +357,7 @@ impl CommandRouter {
             "bash" => Some("bash".to_string()),
             "zsh" => Some("zsh".to_string()),
             "apply_patch" => Some("apply_patch".to_string()),
+            "source_read" => Some("source_read".to_string()),
             "planning" if planning_command_enabled() => Some("planning".to_string()),
             command_name => self
                 .external_manifest(command_name)
@@ -335,6 +371,7 @@ impl CommandRouter {
             "bash" => Some(&self.bash),
             "zsh" => Some(&self.zsh),
             "apply_patch" => Some(&self.apply_patch),
+            "source_read" => Some(&self.source_read),
             "planning" if planning_command_enabled() => Some(&self.planning),
             _ => None,
         }
@@ -636,6 +673,20 @@ mod tests {
 
         context.cancellation.cancel();
         assert!(child.cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn tool_context_child_retains_bound_receipt_store() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = temp.path().canonicalize().expect("canonical workspace");
+        let store = Arc::new(ReceiptStore::open(&workspace).expect("receipt store"));
+        let context = ToolContext::new(workspace).with_receipt_store(Some(store));
+        let child = context.child();
+
+        assert!(std::ptr::eq(
+            context.receipt_store().expect("parent store"),
+            child.receipt_store().expect("child store")
+        ));
     }
 
     #[tokio::test]

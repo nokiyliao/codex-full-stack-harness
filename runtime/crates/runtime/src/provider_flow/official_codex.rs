@@ -3,6 +3,7 @@ use lifecycle::{RuntimeAggregate, RuntimeState};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use tura_path::command_receipts::ReceiptStore;
 
 use crate::provider_flow::call::flush_runtime_events;
 use crate::provider_flow::errors::finish_runtime_failure_with_retry_policy;
@@ -11,8 +12,9 @@ use crate::runtime_event_writer::RuntimeEventWriter;
 use tura_llm_rust::official_codex_app_server::{
     CodexAppServerExecutable, CodexCommandRunCommandObservation, CodexCommandRunEffectObservation,
     CodexExecutionLedger, CodexObservedCommandAccess, CodexReadOnlyCommandObservation,
-    CodexReadOnlyEffectObservation, OfficialCodexServerRequest, OfficialCodexServerRequestFuture,
-    OfficialCodexServerRequestHandler, OfficialCodexTurnRequest, run_official_codex_turn,
+    CodexReadOnlyDispatchPhase, CodexReadOnlyEffectObservation, OfficialCodexServerRequest,
+    OfficialCodexServerRequestFuture, OfficialCodexServerRequestHandler, OfficialCodexTurnRequest,
+    run_official_codex_turn,
 };
 
 pub(crate) struct OfficialCodexRuntimeInput {
@@ -423,6 +425,7 @@ impl OfficialCodexServerRequestHandler for RuntimeOfficialCodexHandler {
             tool_call_id,
             execution_id,
             commands: observations,
+            dispatch_phase: None,
         }))
     }
 
@@ -430,22 +433,24 @@ impl OfficialCodexServerRequestHandler for RuntimeOfficialCodexHandler {
         &mut self,
         observation: &CodexReadOnlyEffectObservation,
     ) -> Result<(), String> {
+        if observation.dispatch_phase != Some(CodexReadOnlyDispatchPhase::NotDispatched) {
+            return Err("durable pre-dispatch proof is unavailable".to_string());
+        }
         self.verify_read_only_effect_identity(observation)?;
+        let store = match ReceiptStore::open_existing(&self.session_directory) {
+            Ok(store) => store,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "command receipt state is unavailable for {}: {error}",
+                    self.session_directory.display()
+                ));
+            }
+        };
         for command in &observation.commands {
             let encoded = safe_call_id(&command.claim_identity);
-            let receipt_directory = self
-                .session_directory
-                .join(".tura")
-                .join("run")
-                .join("command_receipts");
-            require_artifact_absent(
-                &receipt_directory.join(format!("{encoded}.claim.json")),
-                "claim",
-            )?;
-            require_artifact_absent(
-                &receipt_directory.join(format!("{encoded}.json")),
-                "terminal receipt",
-            )?;
+            require_artifact_absent(&store, &format!("{encoded}.claim.json"), "claim")?;
+            require_artifact_absent(&store, &format!("{encoded}.json"), "terminal receipt")?;
         }
         Ok(())
     }
@@ -609,10 +614,13 @@ fn safe_call_id(call_id: &str) -> String {
     }
 }
 
-fn require_artifact_absent(path: &Path, artifact: &str) -> Result<(), String> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(format!("exact {artifact} exists at {}", path.display())),
+fn require_artifact_absent(store: &ReceiptStore, name: &str, artifact: &str) -> Result<(), String> {
+    let path = store
+        .display_path(name)
+        .map_err(|error| format!("exact {artifact} path is invalid: {error}"))?;
+    match store.read_optional(name) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(format!("exact {artifact} exists at {}", path.display())),
         Err(error) => Err(format!(
             "exact {artifact} state is unavailable at {}: {error}",
             path.display()
@@ -724,7 +732,9 @@ mod tests {
     use std::{collections::BTreeSet, path::Path, sync::Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tura_llm_rust::official_codex_app_server::{
-        CODEX_EXECUTION_LEDGER_SCHEMA_VERSION, CodexExecutionLedger, OfficialCodexServerRequest,
+        CODEX_EXECUTION_LEDGER_SCHEMA_VERSION, CodexExecutionLedger, CodexObservedCommandAccess,
+        CodexReadOnlyCommandObservation, CodexReadOnlyDispatchPhase,
+        CodexReadOnlyEffectObservation, OfficialCodexServerRequest,
         OfficialCodexServerRequestHandler,
     };
 
@@ -1065,6 +1075,111 @@ mod tests {
         assert_eq!(safe_call_id("receipt.name-1_2"), "receipt.name-1_2");
         assert_eq!(safe_call_id("\u{e9}\u{96ea}"), "_xe9__x96ea_");
         assert_eq!(safe_call_id(""), "command_run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn never_claimed_proof_rejects_symlinked_receipt_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let mut handler = RuntimeOfficialCodexHandler {
+            session_directory: workspace.clone(),
+            session_id: "session-original".to_string(),
+            runtime_id: "runtime-original".to_string(),
+            allowed_command_run_commands: None,
+            disable_permission_restrictions: false,
+            jspace_contract: None,
+        };
+        let observation = CodexReadOnlyEffectObservation {
+            original_runtime_id: "runtime-original".to_string(),
+            tool_call_id: "call-original".to_string(),
+            execution_id: "runtime-original:call-original".to_string(),
+            commands: vec![CodexReadOnlyCommandObservation {
+                access: CodexObservedCommandAccess::ReadOnly,
+                command_type: "zsh".to_string(),
+                command_line: "pwd".to_string(),
+                enumerated_index: 0,
+                effective_step: 1,
+                binding_id: None,
+                claim_identity: "runtime-original:call-original:step:1:index:0".to_string(),
+            }],
+            dispatch_phase: Some(CodexReadOnlyDispatchPhase::NotDispatched),
+        };
+        handler
+            .verify_never_claimed_read_only_effect(&observation)
+            .expect("missing receipt subtree is absence");
+
+        std::fs::create_dir_all(workspace.join(".tura/run")).expect("receipt parent");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside directory");
+        symlink(&outside, workspace.join(".tura/run/command_receipts"))
+            .expect("symlink receipt directory");
+        assert!(
+            handler
+                .verify_never_claimed_read_only_effect(&observation)
+                .unwrap_err()
+                .contains("unavailable")
+        );
+    }
+
+    #[test]
+    fn never_claimed_proof_requires_dispatch_barrier_even_after_receipt_subtree_replacement() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let mut handler = RuntimeOfficialCodexHandler {
+            session_directory: workspace.clone(),
+            session_id: "session-original".to_string(),
+            runtime_id: "runtime-original".to_string(),
+            allowed_command_run_commands: None,
+            disable_permission_restrictions: false,
+            jspace_contract: None,
+        };
+        let mut observation = CodexReadOnlyEffectObservation {
+            original_runtime_id: "runtime-original".to_string(),
+            tool_call_id: "call-original".to_string(),
+            execution_id: "runtime-original:call-original".to_string(),
+            commands: vec![CodexReadOnlyCommandObservation {
+                access: CodexObservedCommandAccess::ReadOnly,
+                command_type: "zsh".to_string(),
+                command_line: "pwd".to_string(),
+                enumerated_index: 0,
+                effective_step: 1,
+                binding_id: None,
+                claim_identity: "runtime-original:call-original:step:1:index:0".to_string(),
+            }],
+            dispatch_phase: Some(CodexReadOnlyDispatchPhase::NotDispatched),
+        };
+        handler
+            .verify_never_claimed_read_only_effect(&observation)
+            .expect("missing subtree is safe only with pre-dispatch proof");
+
+        let receipts = workspace.join(".tura/run/command_receipts");
+        std::fs::create_dir_all(&receipts).expect("empty receipt subtree");
+        handler
+            .verify_never_claimed_read_only_effect(&observation)
+            .expect("empty subtree is safe only with pre-dispatch proof");
+
+        std::fs::rename(&receipts, receipts.with_file_name("old-command-receipts"))
+            .expect("move receipt subtree");
+        std::fs::create_dir(&receipts).expect("replacement receipt subtree");
+        for phase in [None, Some(CodexReadOnlyDispatchPhase::MayHaveDispatched)] {
+            observation.dispatch_phase = phase;
+            assert!(
+                handler
+                    .verify_never_claimed_read_only_effect(&observation)
+                    .unwrap_err()
+                    .contains("pre-dispatch proof"),
+                "a replacement subtree cannot prove zero effect after dispatch"
+            );
+        }
     }
 
     #[test]
