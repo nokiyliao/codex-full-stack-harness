@@ -48,6 +48,25 @@ Both public notes actually reached the coordinator's batch result unchanged:270/
 
 Against the earlier zero-worker candidate itself, revised-policy Efficient is29.95% faster and30.44% cheaper, but native also changed332.4to451.7s. Against V461 Efficient330.9s, the new candidate is27.6s faster. These are descriptive observations, not isolated policy/note causal effects or stable universal gains. The prior negative pair is retained, not retried unchanged for a prettier ratio. All coordinator contract drafting, discovery, implementation and delivery costs remain in the totals regardless of their labels.
 
+## Current Efficient On The Second Task
+
+One fresh DCF2 engineering pair used the same V462 caller/fa0b537 policy/V457 runtime, Sol6.1/max coordinator and native baseline, Terra6.1/xhigh worker profile, frozen task/quality rules and price basis. Policy/route hashes were included in the unchanged before/after controls; controls matched with no issues and both root CLI usage totals reconciled exactly.
+
+| Metric | Efficient | Native Sol |
+| --- | ---: | ---: |
+| End-to-end seconds | 230.0 | 519.9 |
+| Full API-equivalent USD | 0.2542672 | 0.4178072 |
+| Total tokens | 466514 | 946662 |
+| Uncached input | 111373 | 64436 |
+| Root / worker model calls | 3 / 11 | 14 / 0 |
+| Fixed quality and source integrity | PASS | PASS |
+
+Observed time-55.76%, estimate-39.13%. Efficient's two workers cost$0.1085864 combined, coordinator$0.1456808 (57.29% of total); all are included. Uncached input increased72.85%, despite lower complete cost; output10565 versus20274 and model mix matter. Quality totals686/709 include permitted additions, and each arm retains the same ten allowed accepted-reference skips. These are not whole-repository test totals or newly relaxed exclusions.
+
+The parent prepared at10.692s, dispatched at80.038s, received its original batch at195.130s and produced the final response at229.830s. No post-batch tool call or source reread occurred. Two worker command envelopes overlap58.033s; that is not full-lifecycle/provider-span overlap. Both bound public notes reached the coordinator unchanged,244/285text bytes (3345bytes including metadata), complete MODEL_REPORTED with parent acceptance required. Neither final verifier/done shared an array; locations combined its final mechanical readback with done instead. No terminal-shortcut speedup is established.
+
+The coordinator made no DCF navigation call: DCF is the source being repaired, not evidence that navigation was invoked. Do not attribute total gains to DCF navigation or the optional note alone. Current-surface gains were observed on R19 and DCF2, one pair each; provider/native timing varies, and transfer observations are not stable universal or isolated causal estimates. The negative zero-worker pair remains above. No production source change, new release or additional model pair was needed after this cross-task acceptance.
+
 ## Ultra Picker Profiles And Second Task
 
 All three rows below use an Astra/xhigh coordinator and a fresh native Astra/xhigh control. Source/configuration controls and root CLI usage reconciliation passed. All coordinator, workers and native children are counted, including incomplete attempts and their repairs. Frozen task/quality rules did not change.
