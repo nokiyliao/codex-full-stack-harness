@@ -182,12 +182,15 @@ def _pins(workspace: Path, contract: dict, *, dcf_generation: dict | None = None
         return None
     pins = {}
     for name in names:
+        # Explicit absence has no readable preimage or complete definition to project.
+        if name in snapshot and snapshot[name] is None:
+            continue
         row = snapshot.get(name)
         digest = _sha(row.get("sha256")) if isinstance(row, dict) else None
         if digest is None:
             return None
         pins[name] = digest
-    return pins
+    return pins or None
 
 
 def _identity_rows(pins: dict[str, str]) -> list[dict]:

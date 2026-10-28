@@ -12,6 +12,8 @@ from unittest.mock import patch
 from codex_collaboration_harness import batch
 from codex_collaboration_harness.embedded_nokiy import EmbeddedNokiyError
 import test_nokiy_batch as fixtures
+from test_batch_verifier_delivery import verified_evidence
+from test_summary_compaction import fixture as result_fixture
 
 
 def reference_fit(summary):
@@ -165,6 +167,83 @@ class SummaryBindingTests(unittest.TestCase):
                 self.assertFalse(row['cleanup_pass'])
                 self.assertEqual(summary['status'], 'BLOCKED')
                 self.assertEqual(row['first_typed_blocker'], result['first_typed_blocker'])
+
+
+class OptionalVerifierContextBudgetTests(unittest.TestCase):
+    def test_fit_drops_context_before_receipts_results_or_previews(self):
+        source = summary_fixture(['unique result'])
+        source['members'][0]['result_artifact_preview'] = {'text': 'preview'}
+        source['members'][0]['verifier_delivery'] = batch._verifier_delivery(
+            verified_evidence('def support():\n    return "' + 'x' * 12000 + '"\n'))
+        expected = deepcopy(source)
+        expected['members'][0]['verifier_delivery']['receipts'][0].pop('source_postimage_context', None)
+        actual = batch._fit_summary(source)
+        self.assertEqual(batch.expand_summary(actual), batch.expand_summary(batch._fit_summary(expected)))
+        self.assertEqual(actual['members'][0]['result_text'], 'unique result')
+        self.assertIn('verifier_delivery', actual['members'][0])
+        self.assertIn('result_artifact_preview', actual['members'][0])
+
+    def test_twenty_members_drop_context_before_unique_diffs_results_or_receipts(self):
+        source = summary_fixture([f'unique result {index}' for index in range(20)])
+        for index, row in enumerate(source['members']):
+            row['changes'] = {'diff': f'unique diff {index}'}
+            row['verifier_delivery'] = batch._verifier_delivery(verified_evidence(
+                'def support():\n    return "' + str(index) + 'x' * 12000 + '"\n'))
+        expected = deepcopy(source)
+        for row in expected['members']:
+            row['verifier_delivery']['receipts'][0].pop('source_postimage_context')
+        actual = batch.expand_summary(batch._fit_summary(source, max_bytes=batch.MAX_BATCH_SUMMARY_BYTES))
+        self.assertEqual(actual, batch.expand_summary(batch._fit_summary(
+            expected, max_bytes=batch.MAX_BATCH_SUMMARY_BYTES)))
+        for index, row in enumerate(actual['members']):
+            self.assertEqual(row['changes']['diff'], f'unique diff {index}')
+            self.assertEqual(row['result_text'], f'unique result {index}')
+            self.assertIn('verifier_delivery', row)
+
+    def test_mutation_context_drops_before_original_diff_allocation_or_receipts(self):
+        for count in (2, 6):
+            with self.subTest(count=count):
+                self.check_mutation_context_budget(count)
+
+    def check_mutation_context_budget(self, count):
+        source = result_fixture(count)
+        source.update(status='RESULT_AVAILABLE', first_typed_blocker=None)
+        for index, member in enumerate(source['members']):
+            member.update(status='RESULT_AVAILABLE', first_typed_blocker=None, cleanup_pass=True,
+                          artifact_root=f'/fixture/{index}')
+            member['terminal'] = {'result_text': 'bounded answer', 'result_inspection': verified_evidence(
+                'def support():\n    return "' + str(index) + 'x' * 24000 + '"\n')}
+            diff = f'--- a/file{index}.py\n+++ b/file{index}.py\n@@ -1 +1 @@\n-old\n+unique-{index}\n'
+            member['changes'] = {'status': 'COMPLETE', 'diff': diff, 'diff_bytes': len(diff),
+                                 'diff_path': f'/fixture/{index}/changes.diff',
+                                 'files': [{'path': f'file{index}.py', 'added': 1, 'removed': 1}]}
+        baseline = deepcopy(source)
+        for member in baseline['members']:
+            for context in member['terminal']['result_inspection']['parent_review_context']['verifier_contexts']:
+                context['source_postimages'].pop('schema_version')
+        budgets = []
+        inline = batch._inline_diffs
+        def record_inline(rows, budget):
+            budgets.append(budget)
+            inline(rows, budget)
+        with patch.object(batch, '_diff_text', side_effect=lambda changes: changes['diff']), \
+                patch.object(batch, '_inline_diffs', side_effect=record_inline), \
+                patch.object(Path, 'open', side_effect=AssertionError('new I/O')):
+            expected = batch.expand_summary(batch.summarize(baseline))
+            actual = batch.expand_summary(batch.summarize(source))
+        self.assertEqual(budgets[0], budgets[1])
+        without_context = deepcopy(actual)
+        for row in without_context['members']:
+            row['verifier_delivery']['receipts'][0].pop('source_postimage_context', None)
+        self.assertEqual(without_context, expected)
+        for original, row in zip(source['members'], actual['members']):
+            self.assertEqual(row['changes']['diff'], original['changes']['diff'])
+            self.assertFalse(row['changes']['diff_inline_truncated'])
+            self.assertEqual(row['result_text'], 'bounded answer')
+            self.assertIn('verifier_delivery', row)
+            self.assertEqual('source_postimage_context' in row['verifier_delivery']['receipts'][0], count == 2)
+        self.assertLessEqual(len(json.dumps(actual, ensure_ascii=True, sort_keys=True).encode()),
+                             batch.MAX_BATCH_SUMMARY_BYTES)
 
 
 class ParallelPreflightTests(unittest.TestCase):

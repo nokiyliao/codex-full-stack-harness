@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import embedded_nokiy as caller
+from . import postimage_context
 from .graph_process import native_batch_scope
 from .result_inspection import (
     INSPECTION_SUMMARY_FILE, MAX_PROJECTED_BYTES, project_terminal, retain_inspection_summary,
@@ -831,6 +832,15 @@ def expand_summary(summary: dict[str, Any]) -> dict[str, Any]:
             "schema_version": "nokiy_direct_batch_summary_v1", "members": rows}
 
 
+def _drop_postimage_context(rows: list[dict[str, Any]]) -> list[tuple[dict, dict]]:
+    dropped = []
+    for row in rows:
+        for receipt in row.get("verifier_delivery", {}).get("receipts", []):
+            if "source_postimage_context" in receipt:
+                dropped.append((receipt, receipt.pop("source_postimage_context")))
+    return dropped
+
+
 def _fit_summary(summary: dict[str, Any], *, max_bytes: int = 8000) -> dict[str, Any]:
     """Maintain exact JSON byte accounting while applying the legacy truncation order."""
     def encoded(value: Any) -> bytes:
@@ -846,6 +856,8 @@ def _fit_summary(summary: dict[str, Any], *, max_bytes: int = 8000) -> dict[str,
         if compact_size < size:
             summary, size = compact, compact_size
             rows = summary["members"]
+    if size > max_bytes and _drop_postimage_context(rows):
+        size = len(encoded(summary))
     if size > max_bytes and any("result_artifact_preview" in row for row in rows):
         # Optional report transport must not displace legacy text or artifact references.
         for row in rows:
@@ -964,6 +976,40 @@ def _delivery_binding(terminal: dict[str, Any], inspection: dict[str, Any],
             "result_bytes": len(encoded), "terminal_sha256": inspection.get("terminal_sha256")}
 
 
+def _verified_postimage_context(inspection: dict[str, Any], sources: dict) -> bool:
+    """Reuse inspected context only; no extraction, source reads or new authority."""
+    schemas = {
+        postimage_context.SCHEMA_VERSION: ("verifier_postimage_context", postimage_context.NOTICE),
+        postimage_context.DELTA_SCHEMA_VERSION: ("verifier_postimage_delta", postimage_context.DELTA_NOTICE),
+        postimage_context.DELTA_NAVIGATION_SCHEMA_VERSION: (
+            "verifier_postimage_delta", postimage_context.DELTA_NAVIGATION_NOTICE),
+    }
+    schema = sources.get("schema_version")
+    files = sources.get("files")
+    if (inspection.get("projection_partial") is True or not isinstance(schema, str) or schema not in schemas
+            or (sources.get("kind"), sources.get("notice")) != schemas[schema]
+            or not isinstance(files, list) or not files):
+        return False
+    changes = inspection.get("file_changes")
+    postimages = changes.get("postimages") if isinstance(changes, dict) else None
+    if not isinstance(postimages, list):
+        return False
+    current = {row.get("path"): row.get("sha256") for row in postimages if isinstance(row, dict)}
+    for file in files:
+        if (not isinstance(file, dict) or not isinstance(file.get("path"), str)
+                or not isinstance(file.get("postimage_sha256"), str)
+                or file["postimage_sha256"] != current.get(file.get("path"))):
+            return False
+        if schema == postimage_context.SCHEMA_VERSION:
+            locators = file.get("locators")
+            if (not isinstance(locators, list) or not locators or not file.get("spans")
+                    or any(not isinstance(row, dict) or row.get("complete") is not True for row in locators)):
+                return False
+        elif file.get("coverage") != "all_text_changes" or not file.get("hunks"):
+            return False
+    return True
+
+
 def _verifier_delivery(inspection: dict[str, Any]) -> dict[str, Any] | None:
     """Project existing matched verifier receipts, not a new acceptance claim."""
     if (inspection.get("status") != "EVIDENCE_VERIFIED"
@@ -981,7 +1027,7 @@ def _verifier_delivery(inspection: dict[str, Any]) -> dict[str, Any] | None:
                and c.get("execution_proof") == "known_success"
                and c.get("receipt_check") == "matched"
                and type(c.get("exit_code")) is int and c["exit_code"] == 0}
-    receipts = []
+    receipts, delivered_contexts = [], set()
     contexts = context.get("verifier_contexts", [])
     if not isinstance(contexts, list):
         return None
@@ -999,6 +1045,11 @@ def _verifier_delivery(inspection: dict[str, Any]) -> dict[str, Any] | None:
                              {key: file[key] for key in
                               ("path", "preimage_sha256", "postimage_sha256") if key in file}
                              for file in sources.get("files", []) if isinstance(file, dict)]})
+        if _verified_postimage_context(inspection, sources):
+            identity = json.dumps(sources, sort_keys=True, ensure_ascii=True)
+            if identity not in delivered_contexts:
+                receipts[-1]["source_postimage_context"] = sources
+                delivered_contexts.add(identity)
     represented = {r["source_event"]["event_index"] for r in receipts}
     for command in commands:
         if (not isinstance(command, dict) or type(command.get("event_index")) is not int
@@ -1112,14 +1163,21 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         return _fit_summary(summary, max_bytes=MAX_PROJECTED_BYTES)
     # Mutation batches: deliver each member's exact diff so the parent reviews it
     # directly; the full diff and its record stay in the member artifact root.
-    plain = json.loads(json.dumps(summary))
     base = len(json.dumps(summary, ensure_ascii=True, sort_keys=True).encode("ascii"))
+    contexts = (_drop_postimage_context(rows)
+                if base > MAX_BATCH_SUMMARY_BYTES - MAX_INLINE_DIFF_BYTES - 4096 else [])
+    if contexts:
+        base = len(json.dumps(summary, ensure_ascii=True, sort_keys=True).encode("ascii"))
     if base > MAX_BATCH_SUMMARY_BYTES - MAX_INLINE_DIFF_BYTES - 4096:
         for row in rows:
             row.pop("verifier_delivery", None)
-        plain = json.loads(json.dumps(summary))
         base = len(json.dumps(summary, ensure_ascii=True, sort_keys=True).encode("ascii"))
+    plain = json.loads(json.dumps(summary))
     _inline_diffs(rows, min(MAX_INLINE_DIFF_BYTES, MAX_BATCH_SUMMARY_BYTES - base - 4096))
+    # Reserve the original diff share first; context may use only actual spare space.
+    # Receipts removed by the legacy fallback are no longer part of the summary.
+    for receipt, context in contexts:
+        receipt["source_postimage_context"] = context
     fitted = _fit_summary(summary, max_bytes=MAX_BATCH_SUMMARY_BYTES)
     if fitted.get("status") == "COMPACT_METADATA_TOO_LARGE":
         fitted = _fit_summary(plain, max_bytes=MAX_BATCH_SUMMARY_BYTES)

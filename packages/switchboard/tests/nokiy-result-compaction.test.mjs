@@ -92,6 +92,35 @@ test("a truncated inline diff keeps its full diff path; other JSON and other ite
   assert.equal(compactNokiyResults([toolOutput(other), user]), null);
 });
 
+test("verified definition and delta context semantics survive provider compaction verbatim", () => {
+  for (const schema of ["nokiy_source_postimages_v1", "nokiy_source_postimage_delta_v1", "nokiy_source_postimage_delta_v2"]) {
+    const definition = schema === "nokiy_source_postimages_v1";
+    const context = {
+      schema_version: schema, kind: definition ? "verifier_postimage_context" : "verifier_postimage_delta",
+      jspace_semantic_sha256: H("a"), notice: "Context only; parent acceptance and missing-source reads remain required.",
+      files: [{ path: "x.py", preimage_sha256: H("b"), postimage_sha256: H("3"),
+        ...(definition ? { locators: [{ qualified_name: "support", kind: "function", complete: true,
+          line: 1, start_line: 1, end_line: 2 }], spans: [{ start_line: 1, end_line: 2,
+          text: "def support():\n    return 2\n" }] } : { coverage: "all_text_changes", hunks: [{
+            before_start_line: 1, before_line_count: 1, before_text: "old\n",
+            after_start_line: 1, after_line_count: 1, after_text: "new\n" }],
+          ...(schema.endsWith("v2") ? { locators: [{ qualified_name: "support", kind: "function",
+            line: 1, start_line: 1, end_line: 2 }] } : {}) }) }],
+    };
+    const summary = batchSummary();
+    summary.members[0].verifier_delivery.receipts[0].source_postimage_context = context;
+    const original = structuredClone(summary);
+    const result = compactNokiyResults([toolOutput(JSON.stringify(summary))]);
+    const projected = JSON.parse(result.input[0].output);
+    assert.deepEqual(projected.members[0].verifier_delivery.receipts[0].source_postimage_context, context);
+    assert.equal(projected.members[0].changes.diff, summary.members[0].changes.diff);
+    assert.equal(projected.post_batch_verifier.receipt_path, "/work/final/receipt.json");
+    assert.deepEqual(projected.post_batch_verifier.source_postimages, summary.post_batch_verifier.source_postimages);
+    assert.deepEqual(summary, original);
+    assert.equal(compactNokiyResults(result.input), null);
+  }
+});
+
 test("desktop code-mode command results are projected inside their output string or object", () => {
   const stdout = output();
   const wrapped = JSON.stringify({ chunk_id: "abc123", wall_time_seconds: 0.5, exit_code: 0, original_token_count: 9000, output: stdout });

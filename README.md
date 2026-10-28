@@ -1,8 +1,8 @@
 # Nokiy Full-Stack Harness
 
-Current source surface: **V459 publication: unchanged V458 caller da72a7d + V457 Rust 5154083 + switchboard ae4091e**, synchronized on 2026-10-28.
+Current source surface: **V461 caller 62bb896 + unchanged V457 Rust 5154083 + switchboard 472f90e**, synchronized on 2026-10-28.
 
-This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V459 delivers explicitly requested external verifier text as context while preserving the original exclusive preparation identity, including across old/new host races. The V458 execution-context projection and V457 typed missing-file repair remain. These changes do not expand permissions or change models.
+This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V461 preserves already-verified definition context in parent batch delivery and prevents explicitly unpinned planned files from hiding valid existing-file context. V459's stable external-evidence preparation identity, V458 execution-context projection and V457 typed missing-file repair remain. These changes do not expand permissions or change models.
 
 ```text
 Native Codex thread / Goal / UI
@@ -18,7 +18,7 @@ Native Codex thread / Goal / UI
 | Modified Tura-derived execution engine | [runtime](runtime) | `5154083b3a2cee92dc3264920f0df480f0fda389` | AGPL-3.0-or-later |
 | Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `e5f757d8cdd810bbe625f9660129b6979d054ae2` | Repository AGPL-3.0-or-later |
 
-[Current source manifest](releases/v459.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
+[Current source manifest](releases/v461.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
 
 ## What Is Included
 
@@ -70,6 +70,8 @@ Do not start or admit a service by copying another machine's configuration. Inst
 ## Measured Results and Limits
 
 [Benchmark summary](docs/benchmark-summary.md) includes positive and negative controls. The V458 DCF2 pair observed -35.13% time/-71.15% API-equivalent cost versus native Astra/xhigh; earlier default R19/DCF gains and the slower high/Sol arm remain visible. All coordinator and execution-child usage is included. Each is one descriptive pair, not subscription charges, stable universal speedups or causal proof of an individual patch. Initial read-scope choices also differed between the two DCF2 pairs.
+
+Two subsequent Efficient/Sol pairs observed 283.1s/$0.3191698 versus382.8s/$0.6064524, and315.8s/$0.2425276 versus555.1s/$0.6306024. The candidate itself became32.7s slower between them, despite the improved native-relative ratio. V460's new context did not activate because explicit null snapshot entries disabled upstream capture; the final V461 omission repair passed deterministic original-contract replay but has not received another model benchmark. No speed gain is attributed to that repair.
 
 The source export matches all 48 non-cache files in the installed caller package, all 602 recorded Rust build-source inputs, and the current switchboard commit except explicitly excluded operator-only diagnostics and compiled caches. Recorded binary hashes are provenance, not a byte-reproducible-build claim. Clean-machine installation and cross-platform service operation have not been established by this publication.
 

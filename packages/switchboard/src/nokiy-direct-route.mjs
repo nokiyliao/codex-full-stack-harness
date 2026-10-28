@@ -205,6 +205,8 @@ export function elideNativeStaleAppshots(body, isOfficialModel = () => true) {
 // the same rule, so the upstream conversation and later replays stay identical.
 const COMPACT_RESULT_SCHEMAS = new Set(["nokiy_direct_batch_summary_v1", "nokiy_direct_batch_summary_v2",
   "nokiy_terminal_summary_v1"]);
+const SOURCE_POSTIMAGE_CONTEXT_SCHEMAS = new Set(["nokiy_source_postimages_v1",
+  "nokiy_source_postimage_delta_v1", "nokiy_source_postimage_delta_v2"]);
 const RESULT_AUDIT_KEYS = new Set(["sha256", "request_sha256", "terminal_sha256", "terminal_content_sha256",
   "diff_sha256", "preimage_sha256", "request_file_sha256", "executable_sha256", "event_sha256", "command_sha256",
   "stdout_sha256", "stderr_sha256", "evidence_sha256", "receipt_sha256", "result_sha256", "native_thread_id",
@@ -212,7 +214,8 @@ const RESULT_AUDIT_KEYS = new Set(["sha256", "request_sha256", "terminal_sha256"
 
 function compactResultValue(value, key, depth) {
   if (Array.isArray(value)) return value.map((item) => compactResultValue(item, key, depth + 1));
-  if (!value || typeof value !== "object" || key === "source_postimages") return value;
+  if (!value || typeof value !== "object" || key === "source_postimages"
+      || (key === "source_postimage_context" && SOURCE_POSTIMAGE_CONTEXT_SCHEMAS.has(value.schema_version))) return value;
   const out = {};
   for (const [name, item] of Object.entries(value)) {
     if (RESULT_AUDIT_KEYS.has(name) || (depth > 0 && name === "schema_version")) continue;

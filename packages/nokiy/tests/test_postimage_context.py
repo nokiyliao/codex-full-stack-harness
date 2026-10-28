@@ -1527,6 +1527,73 @@ class PostimageContextTests(unittest.TestCase):
             self.assertIsNone(self.project(preimages))
             reads.assert_not_called()
 
+    def add_null_planned_target(self, name="planned.py"):
+        self.contract["allowed_operations"].append("create")
+        self.contract["denied_operations"] = ["delete"]
+        self.contract["read_scopes"].append(name)
+        self.contract["write_scopes"].append(name)
+        self.contract["dcf_generation"]["source_snapshot"][name] = None
+
+    def test_null_planned_target_does_not_hide_existing_definition_context_or_get_read(self):
+        for schema in ("jspace_contract_v2", "jspace_contract_v3"):
+            for exists in (False, True):
+                with self.subTest(schema=schema, exists=exists):
+                    self.fixture()
+                    self.contract["schema_version"] = schema
+                    planned = f"planned_{schema[-1]}_{exists}.py"
+                    self.add_null_planned_target(planned)
+                    if exists:
+                        self.write(planned, "not valid Python )\n")
+                    original = copy.deepcopy(self.contract)
+                    reader = context.source_excerpt._read_exact
+                    with patch.object(context.source_excerpt, "_read_exact", wraps=reader) as reads:
+                        preimages = context.capture_preimages(self.workspace, self.contract)
+                        self.assertIsNotNone(preimages)
+                        self.assertEqual(set(preimages.pins), {"work.py"})
+                        self.assertEqual(set(preimages.sources), {"work.py"})
+                        self.write("work.py", "def answer():\n    return 2\n")
+                        self.write(planned, "def newly_created():\n    return 3\n")
+                        row, = self.assert_wire(self.project(preimages))
+                    self.assertEqual(row["path"], "work.py")
+                    self.assertTrue(all(call.args[1] == "work.py" for call in reads.call_args_list))
+                    self.assertEqual(self.contract, original)
+                    self.contract["authorization_semantic_sha256"] = "b" * 64
+                    self.assertIsNone(self.project(preimages))
+
+    def test_all_null_targets_do_not_invent_a_preimage_or_read_new_bytes(self):
+        self.fixture()
+        self.contract["dcf_generation"]["source_snapshot"]["work.py"] = None
+        self.add_null_planned_target()
+        with patch.object(context.source_excerpt, "_read_exact") as reads:
+            self.assertIsNone(context.capture_preimages(self.workspace, self.contract))
+            self.assertIsNone(self.project(None))
+        reads.assert_not_called()
+
+    def test_null_skip_keeps_missing_malformed_and_stale_pins_fail_closed(self):
+        self.fixture()
+        self.add_null_planned_target()
+        original = copy.deepcopy(self.contract)
+        for bad in ("missing_planned", "missing_existing", {}, {"sha256": None},
+                    {"sha256": "g" * 64}, {"sha256": "b" * 64}):
+            with self.subTest(bad=bad):
+                self.contract = copy.deepcopy(original)
+                snapshot = self.contract["dcf_generation"]["source_snapshot"]
+                if bad == "missing_planned":
+                    snapshot.pop("planned.py")
+                elif bad == "missing_existing":
+                    snapshot.pop("work.py")
+                else:
+                    snapshot["work.py"] = bad
+                self.assertIsNone(context.capture_preimages(self.workspace, self.contract))
+
+    def test_v3_without_snapshot_still_cannot_use_v2_observed_byte_capture(self):
+        self.fixture(dcf=True)
+        self.contract["schema_version"] = "jspace_contract_v3"
+        with patch.object(context.source_excerpt, "_read_exact") as reads:
+            self.assertIsNone(context.capture_preimages(self.workspace, self.contract,
+                validated_dcf_generation=self.contract["dcf_generation"]))
+        reads.assert_not_called()
+
     def test_dcf_exact_capture_file_and_byte_boundaries_are_all_or_none(self):
         self.fixture({name: "def answer():\n    return 1\n" for name in ("a.py", "b.py")}, dcf=True)
         generation = self.contract["dcf_generation"]
