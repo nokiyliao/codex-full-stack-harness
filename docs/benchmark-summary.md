@@ -2,6 +2,37 @@
 
 These are descriptive engineering measurements, not universal speedups, subscription billing or isolated causal estimates. Complete reported coordinator, worker and native-child usage is included; unreported provider attempts are not asserted to be covered.
 
+## Caller-Only V465 Deployment
+
+The deployed composition is caller V465 (`bf6463b`) + unchanged V464 Rust (`1304065`) + Switchboard `35e4fe4`; V465 is not a universal runtime version. Lossless batch diff context dedup preserves the complete diff and nontext proof; partial, mismatched or tiny cases retain independent context. There are no new caps or truncation, and permissions/model/effort configuration is unchanged.
+
+A real-code-delta replay reduced encoded bytes from 58,078 to 44,285 (-23.75%). This was not historical exact-wire replay; provider token, cost and time savings remain UNMEASURED. A post-cutover native tool read succeeded. Deployment/test evidence and byte reduction are distinct from the model measurements below, all of which predate this caller change.
+
+## Second Same-ID Task Before V465
+
+The newly accepted second same-ID task used Switchboard35e4fe4 + V464 caller/Rust, BEFORE V465 dedup. Code/config/runtime hashes matched; cache warmth was NOT controlled.
+
+| Metric | Efficient | Native | Difference |
+| --- | ---: | ---: | ---: |
+| App turn seconds | 327.835 | 726.842 | -54.90% |
+| API-equivalent USD | 0.5753314 | 0.64037 | -10.16% |
+| Total tokens | 1109878 | 1860793 | -40.35% |
+| Uncached input | 255390 | 122593 | |
+| Coordinator calls | 3 | 11 | |
+| Worker calls | 17 | 0 | |
+| Workers | 2 | 0 | |
+| Quality tests | 690 | 690 | |
+| Skipped tests | 10 | 10 | |
+| Failures / errors / integrity failures | 0 / 0 / 0 | 0 / 0 / 0 | |
+
+Efficient totals include coordinator $0.4065676 and workers $0.1687638; native used no native children. Observed worker overlap was 31.186904s, with two peak workers. Both coordinator wire efforts were max. Terra workers were observed, with xhigh requested and terminal-reported; actual worker wire effort remains UNKNOWN.
+
+App CLI counter reconciliation is UNAVAILABLE. Complete retained telemetry is not complete provider billing; estimates use fixed historical 2026-10-22 API-equivalent prices, not invoices or subscription billing. Timing covers App turn duration only: external evaluators ran after both arms, so full contiguous E2E wall is unobserved. Engineering investigations are not benchmark arms. The original test chats were formally archived; original affected live-target recovery remains unverified. This one task does not prove stable long-session or causal gains and is not a V465 performance measurement.
+
+### Uncontrolled First Cold Request
+
+Efficient's first request had 138,811 input tokens, zero cached tokens and a $0.280182 estimate, 48.70% of its total. Native's first request had 44,928 cached tokens. Cache warmth was uncontrolled and the cause remains UNKNOWN: do not blame the pipeline or assume all cache-miss costs were avoidable. No warmup, context-window or model change was made. V465 did not affect this first request; its encoded-byte reduction is separate evidence.
+
 ## Complete R19 Pair At Switchboard 372c9b2
 
 One concurrent frozen R19 repair pair used earlier Switchboard `372c9b26b65b3ce9319877651bf63a1696232b24`, before the native-catalog fallback repair. Caller/Rust remained V464. Controls matched and both fixed quality gates passed, with no failures, errors or skips.
@@ -20,7 +51,7 @@ All totals include both coordinators, Efficient's two Workers and the correlated
 
 This one pair observed joint time/cost gains. It is not evidence that the later native-catalog repair caused the gain, and it does not establish stable same-ID long-workflow gains. The earlier negative same-ID cost result, observation-only policy comparison and incomplete cancelled usage remain below.
 
-Current Switchboard `35e4fe45a0e6170e539bc567def3451e93c69ca3` is a verified hot deployment (`hot_reload`) with 1,056 passing source tests, no App restart and no permission/model changes; caller/Rust V464 is unchanged. Original affected target-task recovery remains unverified, and no latency/cost percentage is assigned to this protocol repair.
+Current Switchboard `35e4fe45a0e6170e539bc567def3451e93c69ca3` is a verified hot deployment (`hot_reload`) with 1,056 passing source tests, no App restart and no permission/model changes; Rust remains V464 and the current caller is V465. Original affected target-task recovery remains unverified, and no latency/cost percentage is assigned to this protocol repair.
 
 Fixed-quality Efficient engineering pair, 2026-10-28, integration source d53f7e4:
 
@@ -163,4 +194,4 @@ On2026-10-29, one sequential fresh-CLI acceptance-only pair compared Efficient b
 
 Both root CLI usage totals reconciled exactly (REPORTED_TOTALS_MATCH). Controls were stable within each arm; the only cross-arm changes were coordinator observation-guidance source and admission release metadata. Totals include measured coordinator/correlated usage; engineering-chat usage is excluded by operator scope. Removing cached input reduces tokens with a lower API cost weight, so token savings need not equal cost savings.
 
-This one pair does not establish full repair-workflow or same-ID/multiturn stability. The small 2.52% wall-time difference is insufficient for a stable speedup claim. Costs use frozen2026-10-22 standard API-equivalent rates, not subscription consumption or invoices. Current Switchboard source is 35e4fe4, while runtime remains V464. The complete R19 pair above was measured at 372c9b2 before the native-catalog repair; no model measurement here proves that repair caused a gain.
+This one pair does not establish full repair-workflow or same-ID/multiturn stability. The small 2.52% wall-time difference is insufficient for a stable speedup claim. Costs use frozen2026-10-22 standard API-equivalent rates, not subscription consumption or invoices. Current Switchboard source is 35e4fe4 with caller-only V465 and unchanged V464 Rust. The complete R19 pair above was measured at 372c9b2 before the native-catalog repair; no model measurement here proves that repair caused a gain.

@@ -12,7 +12,7 @@ from unittest.mock import patch
 from codex_collaboration_harness import batch
 from codex_collaboration_harness.embedded_nokiy import EmbeddedNokiyError
 import test_nokiy_batch as fixtures
-from test_batch_verifier_delivery import public_note, verified_evidence
+from test_batch_verifier_delivery import diff_context_fixture, public_note, verified_evidence
 from test_summary_compaction import fixture as result_fixture
 
 
@@ -170,6 +170,31 @@ class SummaryBindingTests(unittest.TestCase):
 
 
 class OptionalVerifierContextBudgetTests(unittest.TestCase):
+    def test_diff_context_reference_survives_only_with_complete_inline_diff(self):
+        source, text, context = diff_context_fixture()
+        encoded = lambda value: json.dumps(value, ensure_ascii=True, sort_keys=True).encode('ascii')
+        with patch.object(batch, '_diff_text', return_value=text), \
+             patch.object(batch, '_deduplicate_diff_context'):
+            baseline = batch.expand_summary(batch.summarize(source))
+        fitted = batch._fit_summary(deepcopy(baseline), max_bytes=len(encoded(baseline)) - 1)
+        row = batch.expand_summary(fitted)['members'][0]
+        self.assertEqual(row['changes']['diff'], text)
+        self.assertFalse(row['changes']['diff_inline_truncated'])
+        self.assertEqual(row['verifier_delivery']['receipts'][0]['source_postimage_context']['hunk_text_reference'],
+                         'changes.diff')
+        without_context = deepcopy(baseline)
+        batch._drop_optional_handoff(without_context['members'])
+        minimal = batch._fit_summary(without_context, max_bytes=batch.MAX_BATCH_SUMMARY_BYTES)
+        smaller = batch._fit_summary(deepcopy(batch.expand_summary(fitted)), max_bytes=len(encoded(minimal)))
+        self.assertEqual(batch.expand_summary(smaller), batch.expand_summary(minimal))
+        self.assertNotIn('source_postimage_context', batch.expand_summary(smaller)['members'][0]
+                         ['verifier_delivery']['receipts'][0])
+        with patch.object(batch, '_diff_text', return_value=text), \
+             patch.object(batch, 'MAX_INLINE_DIFF_BYTES', 3000):
+            partial = batch.expand_summary(batch.summarize(source))['members'][0]
+        self.assertTrue(partial['changes']['diff_inline_truncated'])
+        self.assertEqual(partial['verifier_delivery']['receipts'][0]['source_postimage_context'], context)
+
     def test_twenty_public_notes_yield_before_original_diff_text_and_receipts(self):
         source = summary_fixture([f'unique result {index}' for index in range(20)])
         for index, row in enumerate(source['members']):

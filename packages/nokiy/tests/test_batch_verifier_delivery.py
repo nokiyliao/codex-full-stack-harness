@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -31,6 +32,38 @@ def verified_evidence(text="def support():\n    return 2\n"):
                     "spans": [{"start_line": 1, "end_line": 2, "text": text}]}]},
         }]},
     }
+
+
+def diff_context_fixture(before=None, after=None):
+    """Existing summary/receipt fixtures with a real, matching textual delta."""
+    if before is None:
+        before = 'def support():\n    return "' + 'representative source ' * 90 + 'old"\n'
+    if after is None:
+        after = before.replace('old"', 'new"')
+    sha = lambda text: hashlib.sha256(text.encode()).hexdigest()
+    evidence = verified_evidence()
+    source = evidence["parent_review_context"]["verifier_contexts"][0]["source_postimages"]
+    source.update(schema_version=postimage_context.DELTA_NAVIGATION_SCHEMA_VERSION,
+                  kind="verifier_postimage_delta", notice=postimage_context.DELTA_NAVIGATION_NOTICE)
+    file = postimage_context._project_delta_file("source.py", sha(after), sha(before),
+                                                postimage_context._line_changes(before, after))
+    file["locators"] = [{"qualified_name": "support", "kind": "function", "line": 1,
+                         "start_line": 1, "end_line": len(after.splitlines())}]
+    source["files"] = [file]
+    evidence["file_changes"]["postimages"][0]["sha256"] = sha(after)
+    evidence["parent_review_context"]["verifier_contexts"][0]["source_event"].update(
+        runtime_id="fixture-runtime", provider_tool_call_id="fixture-call", command_index=0,
+        item_id="fixture-item", execution_proof="known_success", receipt_check="matched",
+        exit_code=0, cleanup_pass=True)
+    text, added, removed = batch._unified("source.py", before.encode(), after.encode())
+    result = fixture(1)
+    result["members"][0]["terminal"]["result_inspection"].update(evidence)
+    result["members"][0]["changes"] = {
+        "schema_version": batch.CHANGES_SCHEMA, "status": "COMPLETE",
+        "diff_path": "/fixture/changes.diff", "diff_sha256": sha(text), "diff_bytes": len(text.encode()),
+        "files": [{"path": "source.py", "change": "modify", "preimage_sha256": sha(before),
+                   "postimage_sha256": sha(after), "added": added, "removed": removed}]}
+    return result, text, source
 
 
 def public_note(text="Semantic delta and retained invariants; source.py:1; parent review pending."):
@@ -108,6 +141,84 @@ class PublicHandoffDeliveryTests(unittest.TestCase):
         self.assertFalse(row["task_status_final_reply"]["complete"])
         self.assertTrue(row["task_status_final_reply"]["truncated"])
         self.assertEqual(row["task_status_final_reply"]["truncation_reason"], "MAX_RESULT_BYTES")
+
+
+class DiffContextDedupTests(unittest.TestCase):
+    def encoded(self, value):
+        return json.dumps(value, ensure_ascii=True, sort_keys=True).encode("ascii")
+
+    def test_complete_diff_factors_only_text_preserving_all_metadata_and_proof(self):
+        for final_newline in (True, False):
+            with self.subTest(final_newline=final_newline):
+                before = None if final_newline else 'def support():\r\n    return "' + 'source ' * 100 + 'old"'
+                result, text, source = diff_context_fixture(before)
+                if not final_newline:
+                    source.update(schema_version=postimage_context.DELTA_SCHEMA_VERSION,
+                                  notice=postimage_context.DELTA_NOTICE)
+                    source["files"][0].pop("locators")
+                original = copy.deepcopy(result)
+                with patch.object(batch, "_diff_text", return_value=text), \
+                     patch.object(Path, "open", side_effect=AssertionError("new I/O")), \
+                     patch.object(batch.caller, "execute", side_effect=AssertionError("model execution")), \
+                     patch.object(batch, "project_terminal", side_effect=AssertionError("reinspection")):
+                    with patch.object(batch, "_deduplicate_diff_context"):
+                        baseline = batch.summarize(result)
+                    actual = batch.summarize(result)
+                expanded = batch.expand_summary(actual)
+                row = expanded["members"][0]
+                self.assertEqual(row["changes"]["diff"], text)
+                self.assertFalse(row["changes"]["diff_inline_truncated"])
+                restored = copy.deepcopy(expanded)
+                context = restored["members"][0]["verifier_delivery"]["receipts"][0]["source_postimage_context"]
+                self.assertEqual(context.pop("hunk_text_reference"), "changes.diff")
+                for file, original_file in zip(context["files"], source["files"]):
+                    for hunk, original_hunk in zip(file["hunks"], original_file["hunks"]):
+                        self.assertNotIn("before_text", hunk)
+                        self.assertNotIn("after_text", hunk)
+                        hunk.update({key: original_hunk[key] for key in ("before_text", "after_text")})
+                self.assertEqual(restored, batch.expand_summary(baseline))
+                self.assertEqual(result, original)
+                before_bytes, after_bytes = len(self.encoded(baseline)), len(self.encoded(actual))
+                self.assertLess(after_bytes, before_bytes)
+                print(json.dumps({"evidence_kind": "offline_payload_evidence",
+                    "final_newline": final_newline, "before_bytes": before_bytes, "after_bytes": after_bytes,
+                    "saved_bytes": before_bytes - after_bytes, "proof_preserved": True,
+                    "provider_token_cost_time_savings": "unmeasured", "historical_exact_wire_replay": False},
+                    sort_keys=True))
+
+    def test_uncovered_or_mismatching_diff_keeps_independent_context(self):
+        result, text, source = diff_context_fixture()
+        with patch.object(batch, "_diff_text", return_value=text), \
+             patch.object(batch, "_deduplicate_diff_context"):
+            baseline = batch.expand_summary(batch.summarize(result))
+        for invalid in ("incomplete", "truncated", "partial", "binding", "text", "malformed", "binary", "empty"):
+            with self.subTest(invalid=invalid):
+                summary = copy.deepcopy(baseline)
+                changes = summary["members"][0]["changes"]
+                if invalid == "incomplete":
+                    changes["status"] = "UNAVAILABLE"
+                elif invalid == "truncated":
+                    changes["diff_inline_truncated"] = True
+                elif invalid == "partial":
+                    changes["diff_inline_files"] = [{"path": "source.py", "inline": "partial"}]
+                elif invalid == "binding":
+                    changes["files"][0]["postimage_sha256"] = "e" * 64
+                elif invalid == "binary":
+                    changes["files"][0]["binary"] = True
+                else:
+                    changes["diff"] = (text.replace('old"', 'different"') if invalid == "text"
+                                       else text.rsplit("\n", 2)[0] + "\n" if invalid == "malformed" else "")
+                    changes["diff_bytes"] = len(changes["diff"].encode())
+                    changes["diff_sha256"] = hashlib.sha256(changes["diff"].encode()).hexdigest()
+                actual = batch.expand_summary(batch._fit_summary(summary, max_bytes=batch.MAX_BATCH_SUMMARY_BYTES))
+                self.assertEqual(actual["members"][0]["verifier_delivery"]["receipts"][0]["source_postimage_context"],
+                                 source)
+
+    def test_tiny_context_stays_inline_when_reference_would_grow_payload(self):
+        result, text, source = diff_context_fixture("a", "b")
+        with patch.object(batch, "_diff_text", return_value=text):
+            row = batch.expand_summary(batch.summarize(result))["members"][0]
+        self.assertEqual(row["verifier_delivery"]["receipts"][0]["source_postimage_context"], source)
 
 
 class VerifierDeliveryTests(unittest.TestCase):

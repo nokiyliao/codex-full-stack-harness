@@ -519,7 +519,8 @@ def _diff_text(changes: dict[str, Any]) -> str | None:
     return data.decode("utf-8")
 
 
-_HUNK_HEADER = re.compile(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+_HUNK_HEADER = re.compile(r"@@ -(?P<before_start>\d+)(?:,(?P<before_count>\d+))? "
+                          r"\+(?P<after_start>\d+)(?:,(?P<after_count>\d+))? @@")
 _TEST_DIRECTORIES = frozenset({"test", "tests", "testing", "__tests__", "spec", "specs"})
 _TEST_FILE = re.compile(r"^tests?_|^conftest\.py$|(?:_tests?|_spec|\.test|\.spec)\.[^.]+$")
 
@@ -540,12 +541,15 @@ def _diff_lines(text: str) -> list[str]:
     return [line + "\n" for line in text[:-1].split("\n")]
 
 
-def _diff_sections(text: str) -> list[tuple[str, str]] | None:
+def _diff_sections(text: str, *, hunks: dict[str, list[dict]] | None = None
+                   ) -> list[tuple[str, str]] | None:
     """Split a member diff into (path, text) file sections by counting hunk lines.
 
     Counting lines, rather than matching '--- ' anywhere, keeps a removed line that
     itself starts with '-- ' from being read as a file header. Anything that is not
-    exactly the unified format _record_changes writes returns None.
+    exactly the unified format _record_changes writes returns None. An optional
+    hunk projection recovers exact source text and coordinates for context reuse;
+    discard that projection if parsing fails.
     """
     if not text.endswith("\n"):
         return None
@@ -558,15 +562,21 @@ def _diff_sections(text: str) -> list[tuple[str, str]] | None:
             return None
         name = lines[index + 1 if lines[index + 1] != "+++ /dev/null\n" else index][4:-1]
         path = name[2:] if name.startswith(("a/", "b/")) else name
+        if hunks is not None:
+            if (path in hunks or lines[index] not in (f"--- a/{path}\n", "--- /dev/null\n")
+                    or lines[index + 1] not in (f"+++ b/{path}\n", "+++ /dev/null\n")):
+                return None
+            hunks[path] = []
         index += 2
         while index < len(lines) and lines[index].startswith("@@"):
             match = _HUNK_HEADER.match(lines[index])
-            if match is None:
+            if match is None or (hunks is not None and match.end() != len(lines[index]) - 1):
                 return None
-            old_left = 1 if match.group(1) is None else int(match.group(1))
-            new_left = 1 if match.group(2) is None else int(match.group(2))
+            old_count = old_left = int(match.group("before_count") or 1)
+            new_count = new_left = int(match.group("after_count") or 1)
+            old_text, new_text, previous = [], [], None
             index += 1
-            while old_left or new_left:
+            while old_left or new_left or (index < len(lines) and lines[index].startswith("\\")):
                 if index >= len(lines):
                     return None
                 marker = lines[index][:1]
@@ -576,11 +586,33 @@ def _diff_sections(text: str) -> list[tuple[str, str]] | None:
                     old_left -= 1
                 elif marker == "+" and new_left:
                     new_left -= 1
-                elif marker != "\\":
+                elif marker == "\\":
+                    if hunks is not None:
+                        if (lines[index] != "\\ No newline at end of file\n"
+                                or previous not in (" ", "-", "+")):
+                            return None
+                        if previous in (" ", "-"):
+                            old_text[-1] = old_text[-1][:-1]
+                        if previous in (" ", "+"):
+                            new_text[-1] = new_text[-1][:-1]
+                        previous = None
+                    index += 1
+                    continue
+                else:
                     return None
+                if hunks is not None:
+                    if marker in (" ", "-"):
+                        old_text.append(lines[index][1:])
+                    if marker in (" ", "+"):
+                        new_text.append(lines[index][1:])
+                    previous = marker
                 index += 1
-            while index < len(lines) and lines[index].startswith("\\"):
-                index += 1
+            if hunks is not None:
+                hunks[path].append({
+                    "before_start_line": int(match.group("before_start")) + (old_count == 0),
+                    "before_line_count": old_count, "before_text": "".join(old_text),
+                    "after_start_line": int(match.group("after_start")) + (new_count == 0),
+                    "after_line_count": new_count, "after_text": "".join(new_text)})
         if index == start + 2:
             return None
         sections.append((path, "".join(lines[start:index])))
@@ -832,6 +864,71 @@ def expand_summary(summary: dict[str, Any]) -> dict[str, Any]:
             "schema_version": "nokiy_direct_batch_summary_v1", "members": rows}
 
 
+def _deduplicate_diff_context(row: dict[str, Any]) -> None:
+    """Factor delta text only into this member's complete, bound inline diff.
+
+    The reference uses each retained file path and hunk coordinates in changes.diff.
+    Definition/support spans and every nontext field remain independent evidence.
+    """
+    changes = row.get("changes")
+    if (not isinstance(changes, dict) or changes.get("schema_version") != CHANGES_SCHEMA
+            or changes.get("status") != "COMPLETE"
+            or changes.get("diff_inline_truncated") is not False or changes.get("diff_inline_files")):
+        return
+    receipts = row.get("verifier_delivery", {}).get("receipts", [])
+    schemas = (postimage_context.DELTA_SCHEMA_VERSION, postimage_context.DELTA_NAVIGATION_SCHEMA_VERSION)
+    contexts = [(receipt, receipt.get("source_postimage_context")) for receipt in receipts]
+    contexts = [(receipt, source) for receipt, source in contexts
+                if isinstance(source, dict) and source.get("schema_version") in schemas
+                and "hunk_text_reference" not in source]
+    if not contexts:
+        return
+    text, files = changes.get("diff"), changes.get("files")
+    if not isinstance(text, str) or not text or not isinstance(files, list) or not files:
+        return
+    try:
+        data = text.encode("utf-8")
+    except UnicodeEncodeError:
+        return
+    if (type(changes.get("diff_bytes")) is not int or len(data) != changes["diff_bytes"]
+            or hashlib.sha256(data).hexdigest() != changes.get("diff_sha256")
+            or any(not isinstance(file, dict) or not isinstance(file.get("path"), str)
+                   or file.get("binary") for file in files)):
+        return
+    bindings = {file["path"]: file for file in files}
+    hunks: dict[str, list[dict]] = {}
+    if (len(bindings) != len(files) or _diff_sections(text, hunks=hunks) is None
+            or set(hunks) != set(bindings)):
+        return
+    for receipt, source in contexts:
+        source_files = source.get("files")
+        if not isinstance(source_files, list) or not source_files:
+            continue
+        projected = []
+        for file in source_files:
+            if not isinstance(file, dict) or not isinstance(file.get("path"), str):
+                break
+            binding = bindings.get(file["path"], {})
+            expected = hunks.get(file["path"], [])
+            actual = file.get("hunks")
+            if (file.get("coverage") != "all_text_changes" or not expected
+                    or any(postimage_context._sha(file.get(key)) is None
+                           or file[key] != binding.get(key)
+                           for key in ("preimage_sha256", "postimage_sha256"))
+                    or not isinstance(actual, list) or len(actual) != len(expected)
+                    or any(not isinstance(hunk, dict)
+                           or any(hunk.get(key) != value for key, value in parsed.items())
+                           for hunk, parsed in zip(actual, expected))):
+                break
+            projected.append({**file, "hunks": [
+                {key: value for key, value in hunk.items() if key not in ("before_text", "after_text")}
+                for hunk in actual]})
+        else:
+            replacement = {**source, "files": projected, "hunk_text_reference": "changes.diff"}
+            if len(json.dumps(replacement, ensure_ascii=True)) < len(json.dumps(source, ensure_ascii=True)):
+                receipt["source_postimage_context"] = replacement
+
+
 def _drop_optional_handoff(rows: list[dict[str, Any]]) -> list[tuple[dict, str, dict]]:
     dropped = []
     for row in rows:
@@ -851,6 +948,7 @@ def _fit_summary(summary: dict[str, Any], *, max_bytes: int = 8000) -> dict[str,
     rows = summary["members"]
     for row in rows:
         row["result_truncated"] = bool(row["result_truncated"])
+        _deduplicate_diff_context(row)
     size = len(encoded(summary))
     if size > 8000:
         compact = _compact_summary(summary)
