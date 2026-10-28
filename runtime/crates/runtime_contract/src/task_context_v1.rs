@@ -1,10 +1,12 @@
 //! Python-compatible v1 capsule bytes and lossless local presentation.
 //! Never use this hash domain for unrelated artifact schemas.
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write};
+use std::path::{Component, Path, PathBuf};
 
 pub const PRESENTATION_VERSION: &str = "task_context_presentation_v1";
 
@@ -180,6 +182,221 @@ impl<'de> Deserialize<'de> for StrictJson {
     }
 }
 
+pub const READONLY_SOURCE_OUTLINE_MARKER: &str =
+    "\nExact J-Space-authorized source excerpt (context only; not a new grant):\n";
+const MAXIMUM_READONLY_SOURCE_OUTLINE_BYTES: usize = 24_576;
+const MAXIMUM_READONLY_SOURCE_OUTLINE_FILES: usize = 32;
+pub const READONLY_SOURCE_OUTLINE_NOTICE: &str = concat!(
+    "Source outline, not runtime dependency resolution or complete implementation evidence. ",
+    "Definitions: [qualified_name, f=function/c=class, start, end], including decorators. ",
+    "Imports/aliases: [start, end, normalized declaration], verified source syntax: reuse ",
+    "for declaration-level claims without rereading solely to confirm that syntax. Imports ",
+    "match granted module paths syntactically; aliases are not evaluated. Globals: ",
+    "[bound_names, start, end]. Definitions/globals are locators, not body/value evidence. ",
+    "Only direct module bindings are listed, in source order; conditional/dynamic bindings ",
+    "and unmatched imports are omitted. Declarations do not prove runtime resolution or ",
+    "absence of rebinding. Read missing behavior with source_read and expected_sha256. ",
+    "Collect conclusion-relevant helper/exception definitions with their callers before ",
+    "final synthesis; batch known independent reads, not every symbol or whole files. ",
+    "Existing read scopes and limits are unchanged.",
+);
+
+/// Validated capsule expectations only. J-Space still admits every actual read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapsuleSourceReadBinding {
+    capsule_semantic_sha256: String,
+    jspace_authorization_semantic_sha256: String,
+    jspace_contract_semantic_sha256: String,
+    repo_root: PathBuf,
+    source_sha256: BTreeMap<String, String>,
+}
+
+impl CapsuleSourceReadBinding {
+    pub fn capsule_semantic_sha256(&self) -> &str {
+        &self.capsule_semantic_sha256
+    }
+
+    pub fn jspace_authorization_semantic_sha256(&self) -> &str {
+        &self.jspace_authorization_semantic_sha256
+    }
+
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
+    pub fn source_sha256(&self) -> &BTreeMap<String, String> {
+        &self.source_sha256
+    }
+
+    pub fn digest(&self, path: &str) -> Option<&str> {
+        self.source_sha256.get(path).map(String::as_str)
+    }
+
+    pub fn validate_against(&self, contract: &Value, root: &Path) -> Result<(), String> {
+        let scopes = readonly_source_scopes(contract, root)?;
+        if !super::is_lower_sha256(&self.capsule_semantic_sha256)
+            || self.source_sha256.values().any(|digest| !super::is_lower_sha256(digest))
+            || self.repo_root.as_os_str() != root.as_os_str()
+            || contract.get("authorization_semantic_sha256").and_then(Value::as_str)
+                != Some(self.jspace_authorization_semantic_sha256.as_str())
+            || semantic_sha256(contract)? != self.jspace_contract_semantic_sha256
+            || self.source_sha256.keys().cloned().collect::<BTreeSet<_>>() != scopes
+        {
+            return Err("CAPSULE_SOURCE_READ_BINDING_MISMATCH: changed contract or root".into());
+        }
+        Ok(())
+    }
+}
+
+fn source_binding_error(detail: &str) -> String {
+    format!("CAPSULE_SOURCE_READ_BINDING_INVALID: {detail}")
+}
+
+fn exact_python_source_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.bytes().any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\' | 0))
+        && value.split('/').all(|part| !matches!(part, "" | "." | ".." | ".git"))
+        && !Path::new(value).is_absolute()
+        && Path::new(value).extension().is_some_and(|extension| extension == "py")
+}
+
+fn exact_root(value: &Value, root: &Path) -> bool {
+    value.as_str().is_some_and(|value| Path::new(value).as_os_str() == root.as_os_str())
+}
+
+fn absent_or_empty_array(contract: &Value, key: &str) -> bool {
+    contract.get(key).is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+}
+
+fn readonly_source_scopes(contract: &Value, root: &Path) -> Result<BTreeSet<String>, String> {
+    let normalized: PathBuf = root.components().collect();
+    if !root.is_absolute()
+        || normalized.as_os_str() != root.as_os_str()
+        || root.components().any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+        || !exact_root(&contract["repo_root"], root)
+        || contract["source_read"] != true
+        || contract["write_scopes"].as_array().is_none_or(|values| !values.is_empty())
+        || ["mapped_source_reads", "command_templates", "verifier_commands", "verifier_grants",
+            "verifier_command_templates"].iter().any(|key| !absent_or_empty_array(contract, key))
+    {
+        return Err(source_binding_error("expected exact read-only contract and root"));
+    }
+    let generation = contract.get("dcf_generation").and_then(Value::as_object)
+        .ok_or_else(|| source_binding_error("missing DCF generation"))?;
+    if generation.get("generation_id").and_then(Value::as_str).is_none_or(|id| id.trim().is_empty())
+        || generation.get("repo_root").is_some_and(|value| !exact_root(value, root))
+    {
+        return Err(source_binding_error("invalid DCF generation"));
+    }
+    let allowed = contract.get("allowed_operations").and_then(Value::as_array)
+        .ok_or_else(|| source_binding_error("missing allowed operations"))?;
+    let denied = contract.get("denied_operations").and_then(Value::as_array)
+        .ok_or_else(|| source_binding_error("missing denied operations"))?;
+    if allowed.len() != 2
+        || !allowed.iter().any(|operation| operation == "read")
+        || !allowed.iter().any(|operation| operation == "command")
+        || denied.iter().any(|operation| operation.as_str().is_none()
+            || operation == "read" || operation == "command")
+    {
+        return Err(source_binding_error("operations are not read/command only"));
+    }
+    let scopes = contract.get("read_scopes").and_then(Value::as_array)
+        .ok_or_else(|| source_binding_error("missing exact read scopes"))?;
+    if !(1..=MAXIMUM_READONLY_SOURCE_OUTLINE_FILES).contains(&scopes.len()) {
+        return Err(source_binding_error("read scope count is outside 1..32"));
+    }
+    let mut exact = BTreeSet::new();
+    for scope in scopes {
+        let name = scope.as_str().filter(|name| exact_python_source_path(name))
+            .ok_or_else(|| source_binding_error("read scope is not an exact Python path"))?;
+        if !exact.insert(name.to_owned()) {
+            return Err(source_binding_error("duplicate read scope"));
+        }
+    }
+    Ok(exact)
+}
+
+pub(super) fn readonly_source_read_binding(
+    capsule: &super::TaskContextCapsule,
+    contract: &Value,
+    root: &Path,
+) -> Result<Option<CapsuleSourceReadBinding>, String> {
+    capsule.validate()?;
+    let Some((prose, suffix)) = capsule.context_summary.split_once(READONLY_SOURCE_OUTLINE_MARKER) else {
+        return Ok(None);
+    };
+    if prose.trim().is_empty()
+        || suffix.contains(READONLY_SOURCE_OUTLINE_MARKER)
+        || suffix.len() > MAXIMUM_READONLY_SOURCE_OUTLINE_BYTES
+    {
+        return Err(source_binding_error("outline marker or byte bound is invalid"));
+    }
+    capsule.bind_jspace(Some(contract))?;
+    let authorization = contract.get("authorization_semantic_sha256").and_then(Value::as_str)
+        .filter(|digest| super::is_lower_sha256(digest))
+        .ok_or_else(|| source_binding_error("missing J-Space authorization digest"))?;
+    let scopes = readonly_source_scopes(contract, root)?;
+    if !capsule.surface.is_object() || !capsule.dcf_generation.is_object() {
+        return Err(source_binding_error("capsule source metadata is not an object"));
+    }
+    for value in [capsule.surface.get("repo_root"), capsule.dcf_generation.get("repo_root")]
+        .into_iter().flatten()
+    {
+        if !exact_root(value, root) {
+            return Err(source_binding_error("capsule root differs from J-Space root"));
+        }
+    }
+    if capsule.dcf_generation.get("generation_id").is_some_and(|generation|
+        generation.as_str().is_none_or(|id| id.trim().is_empty())
+            || generation != &contract["dcf_generation"]["generation_id"])
+    {
+        return Err(source_binding_error("capsule DCF generation differs from J-Space"));
+    }
+    let StrictJson(outline) = serde_json::from_str::<StrictJson>(suffix)
+        .map_err(|error| source_binding_error(&format!("malformed outline JSON: {error}")))?;
+    if outline.as_object().is_none_or(|object| object.len() != 3)
+        || outline["kind"] != "readonly_source_outline"
+        || outline["notice"] != READONLY_SOURCE_OUTLINE_NOTICE
+    {
+        return Err(source_binding_error("foreign outline kind"));
+    }
+    let files = outline.get("files").and_then(Value::as_array)
+        .ok_or_else(|| source_binding_error("missing outline files"))?;
+    if !(1..=MAXIMUM_READONLY_SOURCE_OUTLINE_FILES).contains(&files.len()) {
+        return Err(source_binding_error("outline file count is outside 1..32"));
+    }
+    let mut source_sha256 = BTreeMap::new();
+    for file in files {
+        let fields = file.as_object().ok_or_else(|| source_binding_error("outline file is not an object"))?;
+        if !["path", "source_sha256", "definitions"].iter().all(|key| fields.contains_key(*key))
+            || fields.keys().any(|key| !matches!(key.as_str(),
+                "path" | "source_sha256" | "definitions" | "aliases" | "imports" | "globals"))
+        {
+            return Err(source_binding_error("unexpected outline file fields"));
+        }
+        let path = file.get("path").and_then(Value::as_str)
+            .filter(|path| exact_python_source_path(path))
+            .ok_or_else(|| source_binding_error("outline path is not an exact Python path"))?;
+        let digest = file.get("source_sha256").and_then(Value::as_str)
+            .filter(|digest| super::is_lower_sha256(digest))
+            .ok_or_else(|| source_binding_error("outline hash is not lowercase SHA-256"))?;
+        if source_sha256.insert(path.to_owned(), digest.to_owned()).is_some() {
+            return Err(source_binding_error("duplicate outline path"));
+        }
+    }
+    if source_sha256.keys().cloned().collect::<BTreeSet<_>>() != scopes {
+        return Err(source_binding_error("outline paths differ from exact read scopes"));
+    }
+    Ok(Some(CapsuleSourceReadBinding {
+        capsule_semantic_sha256: capsule.semantic_sha256.clone(),
+        jspace_authorization_semantic_sha256: authorization.into(),
+        jspace_contract_semantic_sha256: semantic_sha256(contract)?,
+        repo_root: root.to_path_buf(),
+        source_sha256,
+    }))
+}
+
 const LOCAL_SOURCE_SECTIONS_MARKER: &str =
     "\nExact local source sections (context only; not a new grant):\n";
 
@@ -295,8 +512,7 @@ pub(super) fn presentation(capsule: &Value) -> String {
                     // Preserve unknown schemas and every non-identical value.
                     if object.get("schema_version").and_then(Value::as_str)
                         == Some("utm-dcf-generic-task/v1")
-                    {
-                        if let Some(data) = object.get_mut("data").and_then(Value::as_object_mut) {
+                        && let Some(data) = object.get_mut("data").and_then(Value::as_object_mut) {
                             for key in ["mission", "surface", "dcf_generation"] {
                                 if data
                                     .get(key)
@@ -307,7 +523,6 @@ pub(super) fn presentation(capsule: &Value) -> String {
                                 }
                             }
                         }
-                    }
                 }
                 body["context_summary"] = context;
             }
@@ -324,11 +539,14 @@ pub(super) fn presentation(capsule: &Value) -> String {
     // ASCII canonicalization plus a Unicode decoding pass would risk escapes;
     // ordinary sorted UTF-8 JSON is appropriate for presentation, not identity.
     let body_json = super::canonical_json(&body);
+    // The digest differs per member and per capsule while the body is mostly
+    // shared by a batch (authority, DCF generation, source outline). Keep the
+    // digest after the body so provider prompt caching can reuse that prefix.
     format!(
-        "Task Context Capsule {}\nEvidence only; no apply/admission or source freshness claim.\nPresentation: {}\n{}",
-        digest.as_str().expect("digest string"),
+        "Task Context Capsule\nEvidence only; no apply/admission or source freshness claim.\nPresentation: {}\n{}\nCapsule digest: {}",
         PRESENTATION_VERSION,
-        body_json
+        body_json,
+        digest.as_str().expect("digest string"),
     )
 }
 
@@ -346,6 +564,95 @@ mod tests {
             "jspace_semantic_sha256":"a".repeat(64)});
         value["semantic_sha256"] = json!(semantic_sha256(&value).unwrap());
         value
+    }
+
+    fn readonly_capsule(outline: Value) -> (TaskContextCapsule, Value) {
+        let contract = json!({"repo_root":"/workspace", "source_read":true,
+            "read_scopes":["src/one.py"], "write_scopes":[],
+            "allowed_operations":["read","command"], "denied_operations":["modify"],
+            "dcf_generation":{"generation_id":"generation-one","repo_root":"/workspace"},
+            "authorization_semantic_sha256":"a".repeat(64)});
+        let mut value = capsule();
+        value["context_summary"] = json!(format!("Bounded source{}{}", READONLY_SOURCE_OUTLINE_MARKER, outline));
+        value["dcf_generation"] = contract["dcf_generation"].clone();
+        value.as_object_mut().unwrap().remove("semantic_sha256");
+        value["semantic_sha256"] = json!(semantic_sha256(&value).unwrap());
+        (TaskContextCapsule::from_value(value).unwrap(), contract)
+    }
+
+    fn readonly_outline() -> Value {
+        json!({"kind":"readonly_source_outline", "notice":READONLY_SOURCE_OUTLINE_NOTICE,
+            "files":[{"path":"src/one.py", "source_sha256":"b".repeat(64),
+                "definitions":[], "globals":[[["value"],1,1]]}]})
+    }
+
+    #[test]
+    fn capsule_source_binding_is_typed_bound_and_roundtrips() {
+        let (capsule, contract) = readonly_capsule(readonly_outline());
+        let binding = capsule.readonly_source_read_binding(&contract, Path::new("/workspace")).unwrap().unwrap();
+        assert_eq!(binding.digest("src/one.py"), Some("b".repeat(64).as_str()));
+        let wire = serde_json::to_value(&binding).unwrap();
+        let decoded: CapsuleSourceReadBinding = serde_json::from_value(wire.clone()).unwrap();
+        decoded.validate_against(&contract, Path::new("/workspace")).unwrap();
+        for field in ["capsule_semantic_sha256", "jspace_authorization_semantic_sha256", "jspace_contract_semantic_sha256"] {
+            let mut malformed = wire.clone();
+            malformed[field] = json!("bad");
+            let malformed: CapsuleSourceReadBinding = serde_json::from_value(malformed).unwrap();
+            assert!(malformed.validate_against(&contract, Path::new("/workspace")).is_err(), "{field}");
+        }
+        assert!(decoded.validate_against(&contract, Path::new("/foreign")).is_err());
+        let mut changed = contract.clone();
+        changed["dcf_generation"]["generation_id"] = json!("generation-two");
+        assert!(decoded.validate_against(&changed, Path::new("/workspace")).is_err());
+        let mut malformed = wire;
+        malformed["source_sha256"]["src/one.py"] = json!("bad");
+        let malformed: CapsuleSourceReadBinding = serde_json::from_value(malformed).unwrap();
+        assert!(malformed.validate_against(&contract, Path::new("/workspace")).is_err());
+        let mut tampered = capsule;
+        tampered.context_summary.push(' ');
+        assert!(tampered.readonly_source_read_binding(&contract, Path::new("/workspace")).is_err());
+    }
+
+    #[test]
+    fn capsule_source_binding_rejects_malformed_outline_metadata() {
+        for case in 0..10 {
+            let mut outline = readonly_outline();
+            match case {
+                0 => { outline.as_object_mut().unwrap().remove("notice"); }
+                1 => outline["notice"] = json!("foreign"),
+                2 => outline["extra"] = json!(true),
+                3 => outline["files"][0]["extra"] = json!(true),
+                4 => { outline["files"][0].as_object_mut().unwrap().remove("definitions"); }
+                5 => outline["files"][0]["source_sha256"] = json!("b".repeat(67)),
+                6 => outline["files"][0]["path"] = json!("../one.py"),
+                7 => outline["files"][0]["path"] = json!("src/outside.py"),
+                8 => { let row = outline["files"][0].clone(); outline["files"].as_array_mut().unwrap().push(row); }
+                _ => outline["kind"] = json!("foreign"),
+            }
+            let (capsule, contract) = readonly_capsule(outline);
+            assert!(capsule.readonly_source_read_binding(&contract, Path::new("/workspace")).is_err(), "case {case}");
+        }
+        let (mut capsule, contract) = readonly_capsule(readonly_outline());
+        for suffix in [r#"{"kind":"readonly_source_outline","kind":"readonly_source_outline"}"#,
+            READONLY_SOURCE_OUTLINE_MARKER] {
+            capsule.context_summary = format!("Source{READONLY_SOURCE_OUTLINE_MARKER}{suffix}");
+            let mut wire = serde_json::to_value(&capsule).unwrap();
+            wire.as_object_mut().unwrap().remove("semantic_sha256");
+            capsule.semantic_sha256 = semantic_sha256(&wire).unwrap();
+            assert!(capsule.readonly_source_read_binding(&contract, Path::new("/workspace")).is_err());
+        }
+    }
+
+    #[test]
+    fn capsule_source_binding_rejects_nonreadonly_grants() {
+        let (bound_capsule, contract) = readonly_capsule(readonly_outline());
+        for key in ["write_scopes", "mapped_source_reads", "verifier_commands", "command_templates"] {
+            let mut changed = contract.clone();
+            changed[key] = json!(["src/one.py"]);
+            assert!(bound_capsule.readonly_source_read_binding(&changed, Path::new("/workspace")).is_err(), "{key}");
+        }
+        let capsule = TaskContextCapsule::from_value(capsule()).unwrap();
+        assert!(capsule.readonly_source_read_binding(&contract, Path::new("/workspace")).unwrap().is_none());
     }
     #[test]
     fn python_ascii_golden_vectors() {
@@ -411,7 +718,7 @@ mod tests {
             let mut value = capsule();
             value["context_summary"] = json!(summary);
             let result = presentation(&value);
-            let body: Value = serde_json::from_str(result.lines().last().unwrap()).unwrap();
+            let body: Value = serde_json::from_str(presentation_json_line(&result)).unwrap();
             assert_eq!(body["context_summary"], summary);
         }
     }
@@ -450,7 +757,14 @@ mod tests {
     }
 
     fn presentation_body(value: &Value) -> Value {
-        serde_json::from_str(presentation(value).lines().last().unwrap()).unwrap()
+        serde_json::from_str(presentation_json_line(&presentation(value))).unwrap()
+    }
+
+    // The canonical body is the single line after the presentation marker; the
+    // capsule digest follows it.
+    fn presentation_json_line(rendered: &str) -> &str {
+        let marker = format!("Presentation: {PRESENTATION_VERSION}\n");
+        rendered.split_once(marker.as_str()).unwrap().1.lines().next().unwrap()
     }
 
     fn assert_opaque_presentation(value: &Value) {
@@ -495,8 +809,9 @@ mod tests {
         );
         assert_eq!(reconstructed, value["context_summary"].as_str().unwrap());
         assert_eq!(rendered.matches("\"text\":").count(), texts.len());
-        assert!(rendered.starts_with(&format!(
-            "Task Context Capsule {}\n",
+        assert!(rendered.starts_with("Task Context Capsule\n"));
+        assert!(rendered.ends_with(&format!(
+            "\nCapsule digest: {}",
             value["semantic_sha256"].as_str().unwrap()
         )));
         body["context_summary"] = json!(reconstructed);

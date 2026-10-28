@@ -34,6 +34,29 @@ PARTIAL_EDIT_NOTICE = (
     "and deferred target locators require ordinary source_read. After mutation, use "
     "ordinary source_read for fresh readback; this preimage is not post-edit verification."
 )
+READONLY_PARTIAL_KIND = "readonly_definitions_only_deferred_support"
+OUTLINE_KIND = "readonly_source_outline"
+MAX_OUTLINE_FILES = 32
+MAX_OUTLINE_SOURCE_BYTES = 4 * MAX_SOURCE_BYTES
+OUTLINE_NOTICE = (
+    "Source outline, not runtime dependency resolution or complete implementation evidence. "
+    "Definitions: [qualified_name, f=function/c=class, start, end], including decorators. "
+    "Imports/aliases: [start, end, normalized declaration], verified source syntax: reuse "
+    "for declaration-level claims without rereading solely to confirm that syntax. Imports "
+    "match granted module paths syntactically; aliases are not evaluated. Globals: "
+    "[bound_names, start, end]. Definitions/globals are locators, not body/value evidence. "
+    "Only direct module bindings are listed, in source order; conditional/dynamic bindings "
+    "and unmatched imports are omitted. Declarations do not prove runtime resolution or "
+    "absence of rebinding. Read missing behavior with source_read and expected_sha256. "
+    "Collect conclusion-relevant helper/exception definitions with their callers before "
+    "final synthesis; batch known independent reads, not every symbol or whole files. "
+    "Existing read scopes and limits are unchanged."
+)
+PARTIAL_READONLY_NOTICE = (
+    "Read-only definitions-only context: complete target definition (including decorators), "
+    "NOT complete files or dependency evidence. Syntactic support is deferred to ordinary "
+    "source_read; same-file support locators are candidates only, not new grants."
+)
 
 
 class ExcerptBudgetExceeded(caller.EmbeddedNokiyError):
@@ -52,7 +75,8 @@ def _exact_python_path(name: str) -> bool:
     return _exact_source_path(name) and Path(name).suffix == ".py"
 
 
-def _read_exact(workspace: Path, name: str, *, python_only: bool = True) -> bytes:
+def _read_exact(workspace: Path, name: str, *, python_only: bool = True, limit: int | None = None) -> bytes:
+    limit = MAX_SOURCE_BYTES if limit is None else limit
     if not (_exact_python_path(name) if python_only else _exact_source_path(name)):
         description = "Python source" if python_only else "source"
         raise caller.EmbeddedNokiyError(CODE, f"excerpt requires one exact {description} path")
@@ -68,10 +92,10 @@ def _read_exact(workspace: Path, name: str, *, python_only: bool = True) -> byte
             directory = next_directory
         source = os.open(relative.parts[-1], flags, dir_fd=directory)
         before = os.fstat(source)
-        if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_SOURCE_BYTES:
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
             raise caller.EmbeddedNokiyError(CODE, "source is not a bounded regular file")
         chunks = []
-        remaining = MAX_SOURCE_BYTES + 1
+        remaining = limit + 1
         while remaining:
             chunk = os.read(source, remaining)
             if not chunk:
@@ -94,6 +118,122 @@ def _read_exact(workspace: Path, name: str, *, python_only: bool = True) -> byte
             os.close(directory)
 
 
+def readonly_outline_eligible(contract: dict) -> bool:
+    operations = contract.get("allowed_operations")
+    denied = contract.get("denied_operations", [])
+    scopes = contract.get("read_scopes")
+    generation = contract.get("dcf_generation")
+    return (
+        contract.get("source_read") is True and contract.get("write_scopes") == []
+        and isinstance(operations, list) and "read" in operations and "command" in operations
+        and all(operation in ("read", "command") for operation in operations)
+        and isinstance(denied, list) and "read" not in denied and "command" not in denied
+        and not any(contract.get(key) for key in
+                    ("command_templates", "verifier_commands", "verifier_grants",
+                     "verifier_command_templates"))
+        and isinstance(scopes, list) and 1 <= len(scopes) <= MAX_OUTLINE_FILES
+        and all(_exact_python_path(name) for name in scopes) and len(set(scopes)) == len(scopes)
+        and isinstance(generation, dict) and isinstance(generation.get("generation_id"), str)
+        and bool(generation["generation_id"])
+    )
+
+
+def _binding_names(node: ast.AST) -> list[str]:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [node.name]
+    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        return [part.id for item in targets for part in ast.walk(item)
+                if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Store)]
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return [alias.asname or (alias.name.split(".")[0]
+                if isinstance(node, ast.Import) else alias.name)
+                for alias in node.names if alias.name != "*"]
+    return []
+
+
+def _simple_alias(node: ast.AST | None) -> bool:
+    if isinstance(node, ast.Name):
+        return True
+    if isinstance(node, ast.Attribute):
+        return _simple_alias(node.value)
+    return isinstance(node, (ast.Tuple, ast.List)) and bool(node.elts) and all(
+        _simple_alias(item) for item in node.elts)
+
+
+def _outline_bindings(tree: ast.Module, path: str, modules: set[str]) -> dict:
+    result = {"imports": [], "aliases": [], "globals": []}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            matches = any(alias.name in modules for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                package = path.split("/")[:-1]
+                if node.level > len(package):
+                    continue
+                module = ".".join(package[:len(package) - node.level + 1]
+                                  + ([module] if module else []))
+            matches = module in modules or any(
+                f"{module}.{alias.name}" in modules for alias in node.names)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            names = _binding_names(node)
+            if names:
+                if not isinstance(node, ast.AugAssign) and _simple_alias(node.value):
+                    result["aliases"].append([node.lineno, node.end_lineno, ast.unparse(node)])
+                else:
+                    result["globals"].append([names, node.lineno, node.end_lineno])
+            continue
+        else:
+            continue
+        if matches:
+            result["imports"].append([node.lineno, node.end_lineno, ast.unparse(node)])
+    return {key: rows for key, rows in result.items() if rows}
+
+
+def encode_context(excerpt: dict) -> str:
+    # Other excerpt shapes retain their existing wire representation.
+    options = {"separators": (",", ":")} if excerpt.get("kind") == OUTLINE_KIND else {}
+    return json.dumps(excerpt, sort_keys=True, ensure_ascii=True, **options)
+
+
+def extract_outline(workspace: Path, contract: dict) -> dict:
+    """Ephemeral navigation over exact granted files; no imports, graph build or cache."""
+    if not readonly_outline_eligible(contract):
+        raise caller.EmbeddedNokiyError(CODE, "outline requires exact read-only Python grants")
+    result = {"kind": OUTLINE_KIND, "notice": OUTLINE_NOTICE, "files": []}
+    modules = {name.removesuffix(".py").replace("/", ".").removesuffix(".__init__")
+               for name in contract["read_scopes"]}
+    total_bytes = 0
+    for name in sorted(contract["read_scopes"]):
+        data = _read_exact(workspace, name)
+        total_bytes += len(data)
+        if total_bytes > MAX_OUTLINE_SOURCE_BYTES:
+            raise ExcerptBudgetExceeded(CODE, "outline source volume exceeds preparation budget")
+        definitions = []
+
+        def visit(node, prefix=""):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                prefix = f"{prefix}.{node.name}" if prefix else node.name
+                start = min([node.lineno] + [item.lineno for item in node.decorator_list])
+                definitions.append([prefix, "c" if isinstance(node, ast.ClassDef) else "f",
+                                    start, node.end_lineno])
+            for child in ast.iter_child_nodes(node):
+                visit(child, prefix)
+
+        try:
+            tree = ast.parse(data.decode("utf-8"))
+            visit(tree)
+            bindings = _outline_bindings(tree, name, modules)
+        except (UnicodeError, SyntaxError, RecursionError) as error:
+            raise caller.EmbeddedNokiyError(CODE, "outline source cannot be parsed as Python") from error
+        result["files"].append({"path": name, "source_sha256": hashlib.sha256(data).hexdigest(),
+                                "definitions": definitions, **bindings})
+        if len(encode_context(result).encode()) > MAX_ENVELOPE_BYTES:
+            raise ExcerptBudgetExceeded(CODE, "complete outline exceeds context budget")
+    return result
+
+
 def _supporting_ranges(tree: ast.Module, target: ast.AST) -> list[tuple[int, int]]:
     """Conservative syntactic support, not scope resolution or dependency proof.
 
@@ -102,18 +242,7 @@ def _supporting_ranges(tree: ast.Module, target: ast.AST) -> list[tuple[int, int
     """
     bindings = {}
     for node in tree.body:
-        names = []
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names = [node.name]
-        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            names = [part.id for item in targets for part in ast.walk(item)
-                     if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Store)]
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names = [alias.asname or (alias.name.split(".")[0]
-                     if isinstance(node, ast.Import) else alias.name)
-                     for alias in node.names if alias.name != "*"]
-        for name in names:
+        for name in _binding_names(node):
             bindings.setdefault(name, []).append(node)
 
     pending = [target]
@@ -158,8 +287,19 @@ def _supporting_ranges(tree: ast.Module, target: ast.AST) -> list[tuple[int, int
 
 
 def extract(workspace: Path, contract: dict, locator: dict, *,
-            include_dependencies: bool = False) -> dict:
+            include_dependencies: bool = False, allow_definitions_only: bool = False) -> dict:
     """Return exact source, optionally with bounded same-file syntactic support."""
+    if (type(allow_definitions_only) is not bool
+            or (allow_definitions_only and include_dependencies is not True)):
+        raise caller.EmbeddedNokiyError(CODE, "definitions-only fallback requires syntactic support")
+    if allow_definitions_only:
+        generation = contract.get("dcf_generation")
+        if (not isinstance(generation, dict)
+                or not isinstance(generation.get("generation_id"), str)
+                or not generation["generation_id"]
+                or locator.get("generation_id") != generation["generation_id"]
+                or type(locator.get("line")) is not int or locator["line"] < 1):
+            raise caller.EmbeddedNokiyError(CODE, "exact current read-only locator required")
     name = locator["path"]
     operations = contract.get("allowed_operations", [])
     bounded_read = (
@@ -192,6 +332,7 @@ def extract(workspace: Path, contract: dict, locator: dict, *,
     if len(nodes) != 1 or nodes[0].end_lineno is None:
         raise caller.EmbeddedNokiyError(CODE, "DCF line does not identify one complete definition")
     end = nodes[0].end_lineno
+    # Full results retain the legacy representation used by their verifier.
     lines = source.splitlines(keepends=True)
     excerpt = "".join(lines[line - 1:end])
     if end - line + 1 > MAX_EXCERPT_LINES or len(excerpt.encode("utf-8")) > MAX_EXCERPT_BYTES:
@@ -207,7 +348,27 @@ def extract(workspace: Path, contract: dict, locator: dict, *,
             line_count += stop - start + 1
             byte_count += len(text.encode("utf-8"))
             if line_count > MAX_EXCERPT_LINES or byte_count > MAX_EXCERPT_BYTES:
-                raise ExcerptBudgetExceeded(CODE, "support exceeds the bounded excerpt budget")
+                if not allow_definitions_only:
+                    raise ExcerptBudgetExceeded(CODE, "support exceeds the bounded excerpt budget")
+                # Reuse edit context's whole-definition spans and bounded navigation,
+                # never its write grants or larger allocation modes. Decorators are
+                # part of the complete retained target, not deferred support.
+                start = min([line] + [item.lineno for item in nodes[0].decorator_list])
+                # Only the new partial shape uses AST-aligned physical lines;
+                # embedded formfeeds/Unicode separators are not source newlines.
+                physical_lines = io.StringIO(source, newline="").readlines()
+                target_text = "".join(physical_lines[start - 1:end])
+                if (end - start + 1 > MAX_EXCERPT_LINES
+                        or len(target_text.encode("utf-8")) > MAX_EXCERPT_BYTES):
+                    raise ExcerptBudgetExceeded(CODE, "definition exceeds the bounded excerpt budget")
+                partial = {"kind": READONLY_PARTIAL_KIND, "notice": PARTIAL_READONLY_NOTICE,
+                           "locator": {key: locator[key] for key in ("path", "line", "generation_id")},
+                           "files": [{"path": name, "source_sha256": result["source_sha256"],
+                                      "spans": [{"start_line": start, "end_line": end,
+                                                 "text": target_text}]}]}
+                if len(json.dumps(partial, sort_keys=True, ensure_ascii=True).encode()) > MAX_ENVELOPE_BYTES:
+                    raise ExcerptBudgetExceeded(CODE, "serialized excerpt exceeds context budget")
+                return _add_support_navigation(partial, _direct_support_locators(tree, nodes[0], name))
             spans.append({"start_line": start, "end_line": stop, "text": text})
         result["supporting_spans"] = spans
     return result
@@ -446,7 +607,8 @@ def extract_edits(workspace: Path, contract: dict, locators: list, *,
 
 
 def still_current(workspace: Path, excerpt: dict) -> bool:
-    files = excerpt["files"] if excerpt.get("kind") == "edit_preimage" else [excerpt]
+    files = (excerpt["files"] if excerpt.get("kind") in
+             ("edit_preimage", READONLY_PARTIAL_KIND, OUTLINE_KIND) else [excerpt])
     return all(hashlib.sha256(_read_exact(workspace, row["path"])).hexdigest() == row["source_sha256"]
                for row in files)
 
@@ -559,8 +721,7 @@ def _verify_edit_excerpt(workspace: Path, contract: dict, excerpt: dict, *,
         raise caller.EmbeddedNokiyError(CODE, "edit preimage changed or was tampered; fresh source_read and context required")
 
 
-def verify_context_excerpt(workspace: Path, context: dict, contract: dict, *,
-                           after_execution: bool = False) -> dict | None:
+def _decode_context_excerpt(context: dict) -> dict | None:
     summary = context.get("context_summary")
     if not isinstance(summary, str) or CONTEXT_MARKER not in summary:
         return
@@ -574,8 +735,97 @@ def verify_context_excerpt(workspace: Path, context: dict, contract: dict, *,
                              parse_constant=caller._invalid_constant)
     except ValueError as error:
         raise caller.EmbeddedNokiyError(CODE, "source excerpt context is invalid") from error
+    return excerpt
+
+
+def readonly_outline_pins(context: dict, contract: dict) -> dict[str, str]:
+    """Project bound expectations only; the reader still enforces scope and bytes."""
+    if (not isinstance(context, dict) or not readonly_outline_eligible(contract)
+            or contract.get("schema_version") != "jspace_contract_v2"
+            or contract.get("mapped_source_reads")
+            or context.get("schema_version") != "task_context_capsule_v1"
+            or context.get("jspace_semantic_sha256") != contract.get("authorization_semantic_sha256")):
+        return {}
+    try:
+        caller._require_sha256("authorization_semantic_sha256",
+                               contract.get("authorization_semantic_sha256"))
+    except caller.EmbeddedNokiyError:
+        return {}
+    body = {key: value for key, value in context.items() if key != "semantic_sha256"}
+    if context.get("semantic_sha256") != caller._canonical_sha256(body):
+        return {}
+    root = contract.get("repo_root")
+    if not isinstance(root, str) or not Path(root).is_absolute():
+        return {}
+    for metadata in (context.get("surface", {}), context.get("dcf_generation", {}),
+                     contract["dcf_generation"]):
+        if (not isinstance(metadata, dict)
+                or ("repo_root" in metadata and metadata["repo_root"] != root)):
+            return {}
+    generation = context.get("dcf_generation", {})
+    if ("generation_id" in generation
+            and generation["generation_id"] != contract["dcf_generation"]["generation_id"]):
+        return {}
+    try:
+        excerpt = _decode_context_excerpt(context)
+    except caller.EmbeddedNokiyError:
+        return {}
+    if (not isinstance(excerpt, dict) or set(excerpt) != {"kind", "notice", "files"}
+            or excerpt.get("kind") != OUTLINE_KIND or excerpt.get("notice") != OUTLINE_NOTICE
+            or not isinstance(excerpt.get("files"), list)):
+        return {}
+    pins = {}
+    for row in excerpt["files"]:
+        if (not isinstance(row, dict) or not {"path", "source_sha256", "definitions"} <= set(row)
+                or set(row) - {"path", "source_sha256", "definitions", "aliases", "imports", "globals"}
+                or row.get("path") not in contract["read_scopes"] or row["path"] in pins
+                or not isinstance(row.get("source_sha256"), str)
+                or len(row["source_sha256"]) != 64
+                or any(char not in "0123456789abcdef" for char in row["source_sha256"])):
+            return {}
+        pins[row["path"]] = row["source_sha256"]
+    return dict(sorted(pins.items())) if set(pins) == set(contract["read_scopes"]) else {}
+
+
+def verify_context_excerpt(workspace: Path, context: dict, contract: dict, *,
+                           after_execution: bool = False) -> dict | None:
+    excerpt = _decode_context_excerpt(context)
+    if excerpt is None:
+        return
+    if isinstance(excerpt, dict) and excerpt.get("kind") == OUTLINE_KIND:
+        try:
+            current = extract_outline(workspace, contract)
+        except ExcerptBudgetExceeded as error:
+            raise caller.EmbeddedNokiyError(CODE, "outline no longer fits its budget") from error
+        if caller._canonical_bytes(current) != caller._canonical_bytes(excerpt):
+            raise caller.EmbeddedNokiyError(CODE, "outline changed or was tampered")
+        return
     if isinstance(excerpt, dict) and excerpt.get("kind") == "edit_preimage":
         return _verify_edit_excerpt(workspace, contract, excerpt, after_execution=after_execution)
+    if isinstance(excerpt, dict) and excerpt.get("kind") == READONLY_PARTIAL_KIND:
+        fields = {"kind", "notice", "locator", "files"}
+        locator = excerpt.get("locator")
+        if (set(excerpt) not in (fields, fields | {"support_navigation"})
+                or excerpt.get("notice") != PARTIAL_READONLY_NOTICE
+                or not isinstance(locator, dict)
+                or set(locator) != {"path", "line", "generation_id"}
+                or not isinstance(locator["path"], str)
+                or type(locator["line"]) is not int or locator["line"] < 1
+                or not isinstance(locator["generation_id"], str) or not locator["generation_id"]):
+            raise caller.EmbeddedNokiyError(CODE, "partial read-only excerpt fields are invalid")
+        try:
+            current = extract(workspace, contract, locator, include_dependencies=True,
+                              allow_definitions_only=True)
+            # Re-derive the omission marker and every source/navigation field;
+            # canonical bytes also distinguish bool/float from integer metadata.
+            matches = caller._canonical_bytes(current) == caller._canonical_bytes(excerpt)
+        except ExcerptBudgetExceeded as error:
+            raise caller.EmbeddedNokiyError(CODE, "source excerpt no longer fits its budget") from error
+        except (TypeError, ValueError) as error:
+            raise caller.EmbeddedNokiyError(CODE, "partial read-only excerpt fields are invalid") from error
+        if not matches:
+            raise caller.EmbeddedNokiyError(CODE, "partial read-only excerpt changed or was tampered")
+        return
     fields = {"path", "start_line", "end_line", "source_sha256", "text"}
     if (not isinstance(excerpt, dict)
             or set(excerpt) not in (fields, fields | {"supporting_spans"})

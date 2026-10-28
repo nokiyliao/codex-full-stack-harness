@@ -18,6 +18,12 @@ use tura_llm_rust::{
     TuraConfig,
 };
 
+// The receipt store opens every session path component without following symlinks;
+// macOS temp dirs sit under the /var -> /private/var symlink, so tests use the physical root.
+fn physical_tempdir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)
+}
+
 static MOCK_ROUTER_ADDR: OnceLock<String> = OnceLock::new();
 static MOCK_ROUTER_INIT: Mutex<()> = Mutex::new(());
 static TEST_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -112,7 +118,7 @@ async fn runtime_provider_timeout_business_flow_marks_runtime_timed_out_without_
 #[tokio::test]
 async fn streamed_command_run_waits_for_commands_after_provider_stream_completes() {
     let _guard = TEST_ENV.lock().await;
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = physical_tempdir().expect("workspace");
     let output_path = workspace.path().join("completed-provider-command.txt");
     let provider = CompletedResponsesProvider::start(delayed_command(&output_path));
     let router_addr = mock_command_run_router_addr();
@@ -240,7 +246,7 @@ async fn streamed_command_run_waits_for_commands_after_provider_stream_completes
 #[tokio::test]
 async fn failed_apply_patch_finishes_tool_turn_without_cancelling_runtime() {
     let _guard = TEST_ENV.lock().await;
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = physical_tempdir().expect("workspace");
     let source_path = workspace.path().join("app.txt");
     let skipped_path = workspace.path().join("must-not-run.txt");
     std::fs::write(&source_path, "actual\n").expect("write patch fixture");
@@ -349,7 +355,7 @@ async fn failed_apply_patch_finishes_tool_turn_without_cancelling_runtime() {
 #[tokio::test]
 async fn streamed_command_run_gateway_callbacks_do_not_gate_command_execution_business_flow() {
     let _guard = TEST_ENV.lock().await;
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = physical_tempdir().expect("workspace");
     let output_path = workspace.path().join("completed-with-hanging-gateway.txt");
     let provider = CompletedResponsesProvider::start(delayed_command(&output_path));
     let hanging_gateway = HangingGateway::start(Duration::from_secs(5));

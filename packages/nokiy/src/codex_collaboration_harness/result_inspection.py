@@ -12,24 +12,33 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import stat
+import sys
 from typing import Any
 
 from . import embedded_nokiy as caller
 from . import full_core
 from . import file_change_evidence
 from . import postimage_context
-from .verifier_parent import VERIFICATION_EVIDENCE_SCHEMA, _verification_targets
+from .verifier_parent import VERIFICATION_EVIDENCE_SCHEMA, _admitted_absent_creation, _verification_targets
 
 MAX_JSON = 2 * 1024 * 1024
 PAGE_SIZE = 16
 MAX_SELECTED_COMMANDS = 8
 MAX_PAGE_BYTES = 32768
 MAX_COMMAND_BYTES = 2048
+# Parent projections show a settled long command by its first line and identity only;
+# the body stays in the inspection pages (inspect with an offset) and the event index.
+MAX_COMMAND_HEAD_CHARS = 160
+# Coordinator summaries carry usage totals only; coverage detail stays in terminal.json.
+SUMMARY_USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
+                        "total_tokens")
 MAX_DIAGNOSTIC_BYTES = 512
 MAX_PROJECTED_BYTES = 64 * 1024
 MAX_REVIEW_CONTEXT_BYTES = 12 * 1024
 INSPECTION_SUMMARY_FILE = "inspection-summary.json"
+PARENT_REVIEW_INPUT_SCHEMA = "nokiy_parent_review_input_v1"
 MAX_CAPABILITY_GAP_BYTES = 8192
 MAX_CAPABILITY_DIFF_BYTES = 4096
 USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "total_tokens",
@@ -204,8 +213,9 @@ class _ReadEfficiency:
 
 
 class InspectionError(ValueError):
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, diagnostic: dict[str, Any] | None = None):
         self.code = code
+        self.diagnostic = diagnostic
         super().__init__(code)
 
 
@@ -259,7 +269,37 @@ def _artifact(run: Path, name: str, ref: object, limit: int) -> tuple[bytes, dic
     return raw, {"path": name, "sha256": source.record["sha256"], "bytes": source.record["bytes"]}
 
 
-def _receipt(run: Path, output: dict[str, Any]) -> str:
+def _receipt_locator(value: str, *, path: bool = False) -> str | dict[str, Any]:
+    """Bound locator metadata; never truncate an identity into a different one."""
+    raw = value.encode("utf-8", errors="replace")
+    if (len(raw) <= (1024 if path else 512)
+            and not any(ord(c) < 32 or 127 <= ord(c) <= 159 or c in "\u2028\u2029" for c in value)
+            and (path or re.fullmatch(r"[A-Za-z0-9_.:-]+", value))):
+        return value
+    return {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+
+def _receipt_observed(receipt: dict[str, Any], field: str) -> dict[str, Any]:
+    """Finite vocabulary plus small typed scalars, never arbitrary receipt text."""
+    if field not in receipt:
+        return {"type": "missing"}
+    value = receipt[field]
+    if value is None:
+        return {"type": "null"}
+    if type(value) is bool:
+        return {"type": "bool", "value": value}
+    if type(value) is int:
+        return {"type": "int", **({"value": value} if -(2**31) <= value < 2**31 else {"bounded": False})}
+    if isinstance(value, str):
+        allowed = {"schema_version": ("tura_command_terminal_receipt_v1",),
+                   "outcome": ("known", "unknown"),
+                   "terminal_state": ("completed", "failed", "cancelled", "running", "unknown")}
+        return {"type": "str", **({"value": value} if value in allowed.get(field, ()) else {"redacted": True})}
+    return {"type": "object" if isinstance(value, dict) else "array" if isinstance(value, list) else "number"}
+
+
+def _receipt(run: Path, output: dict[str, Any], *, item: dict[str, Any] | None = None,
+             event_index: int | None = None, result_index: int | None = None) -> str:
     value, name = output.get("terminal_receipt"), output.get("terminal_receipt_path")
     if value is None and name is None:
         return "unavailable"
@@ -277,14 +317,34 @@ def _receipt(run: Path, output: dict[str, Any]) -> str:
         raise InspectionError("RECEIPT_MISMATCH")
     # Integrity proves a known, settled outcome, not necessarily success. Check
     # both copies: dict equality alone treats bools and integers as equal.
-    for receipt in (actual, value):
+    for copy, receipt in (("file", actual), ("embedded", value)):
         code = receipt.get("exit_code")
-        if (receipt.get("schema_version") != "tura_command_terminal_receipt_v1"
-                or receipt.get("outcome") != "known" or type(code) is not int
-                or receipt.get("terminal_state") != ("completed" if code == 0 else "failed")
-                or any(receipt.get(key) is not True for key in
-                       ("process_reaped", "process_group_empty", "termination_proven"))):
-            raise InspectionError("RECEIPT_PROOF_INVALID")
+        checks = [("schema_version", "equals", "tura_command_terminal_receipt_v1",
+                   receipt.get("schema_version") == "tura_command_terminal_receipt_v1"),
+                  ("outcome", "equals", "known", receipt.get("outcome") == "known"),
+                  ("exit_code", "type_is_int", "int", type(code) is int),
+                  ("terminal_state", "equals", "completed" if code == 0 else "failed",
+                   receipt.get("terminal_state") == ("completed" if code == 0 else "failed"))]
+        checks.extend((key, "is_true", True, receipt.get(key) is True) for key in
+                      ("process_reaped", "process_group_empty", "termination_proven"))
+        for field, predicate, expected, passed in checks:
+            if passed:
+                continue
+            identity = {key: _receipt_locator(item[key]) for key in
+                        ("command_id", "command_run_id", "runtime_id", "provider_tool_call_id")
+                        if isinstance(item, dict) and isinstance(item.get(key), str)}
+            if isinstance(item, dict) and type(item.get("command_index")) is int and 0 <= item["command_index"] < 128:
+                identity["command_index"] = item["command_index"]
+            diagnostic = {"schema_version": "nokiy_receipt_diagnostic_v1", "code": "RECEIPT_PROOF_INVALID",
+                          "request_locator": {"request_id": _receipt_locator(run.name),
+                                              "artifact_root": _receipt_locator(str(run.parent), path=True)},
+                          "identity": identity, "receipt_path": _receipt_locator(str(path), path=True),
+                          "receipt_copy": copy, "failed_field": field, "failed_predicate": predicate,
+                          "expected": expected, "observed": _receipt_observed(receipt, field)}
+            for key, index in (("event_index", event_index), ("result_index", result_index)):
+                if type(index) is int and 0 <= index < 2**31:
+                    diagnostic[key] = index
+            raise InspectionError("RECEIPT_PROOF_INVALID", diagnostic=diagnostic)
     return "matched"
 
 
@@ -295,36 +355,61 @@ def _compact_utf8_json(value: object) -> bytes:
                       separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
-def _source_read_arguments(line: str) -> tuple[dict[str, Any] | None, bool]:
-    """Parse once, recognizing syntax and unambiguous named-argument type errors.
+def _source_read_arguments(line: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Recognize argument rejection kinds, never content or permission failures.
 
-    Do not infer a rejection from diagnostics, paths, ranges, hashes or read
-    permissions. The durable router witness still has to attest the rejection.
-    Positional forms are not reconstructed from a projected observation.
+    A malformed hash is distinct from a valid hash that does not match a file.
+    The durable router witness still has to attest the exact rejection kind.
+    Positional fields are decoded only for classification; command identity
+    remains bound to the original raw argument string.
     """
     try:
-        args = _json(line.encode("utf-8"))
-    except InspectionError as exc:
-        # Recursion/budget errors and unsupported positional forms are not proof
-        # of the router's typed parser rejection. Strict JSON errors are.
-        return None, isinstance(exc.__cause__, (json.JSONDecodeError, caller.EmbeddedNokiyError))
-    if "path" not in args or not isinstance(args["path"], str):
-        return args, True
-    for key in ("start_line", "end_line", "context_lines"):
+        args = json.loads(line, object_pairs_hook=caller._unique_object,
+                          parse_constant=caller._invalid_constant)
+    except (json.JSONDecodeError, caller.EmbeddedNokiyError):
+        return None, "json_syntax_or_shape"
+    except (UnicodeError, ValueError, RecursionError):
+        return None, None
+    # Mirror SourceReadRequest's deny_unknown_fields before semantic checks.
+    fields = ("path", "start_line", "end_line", "expected_sha256", "line_numbers",
+              "search_terms", "context_lines", "json_pointer", "expected_sha256_ref", "children_offset")
+    if isinstance(args, list):
+        if not 1 <= len(args) <= 8:
+            return None, "json_syntax_or_shape"
+        # Omitted optional fields default in serde; a missing range is semantic.
+        args = dict(zip(fields, args))
+    if not isinstance(args, dict):
+        return None, None
+    if set(args) - set(fields) or "path" not in args or not isinstance(args["path"], str):
+        return args, "json_syntax_or_shape"
+    # A present json_pointer is deserialized as String, unlike Option fields.
+    if "json_pointer" in args and not isinstance(args["json_pointer"], str):
+        return args, "json_syntax_or_shape"
+    for key in ("start_line", "end_line", "context_lines", "children_offset"):
         value = args.get(key)
         if value is not None and (type(value) is not int or not 0 <= value < 2**64):
-            return args, True
-    return args, ((args.get("line_numbers") is not None and type(args["line_numbers"]) is not bool)
+            return args, "json_syntax_or_shape"
+    if ((args.get("line_numbers") is not None and type(args["line_numbers"]) is not bool)
                  or (args.get("expected_sha256") is not None and not isinstance(args["expected_sha256"], str))
+                 or (args.get("expected_sha256_ref") is not None and not isinstance(args["expected_sha256_ref"], str))
                  or (args.get("search_terms") is not None and (
                      not isinstance(args["search_terms"], list)
-                     or any(not isinstance(term, str) for term in args["search_terms"]))))
+                     or any(not isinstance(term, str) for term in args["search_terms"])))):
+        return args, "json_syntax_or_shape"
+    pin = args.get("expected_sha256")
+    if (isinstance(pin, str) and re.fullmatch(r"[0-9a-fA-F]{64}", pin) is None
+            and len(args["path"].encode("utf-8")) <= 512
+            and _normalized_source_read(_compact_utf8_json({**args, "expected_sha256": "0" * 64}).decode()) is not None):
+        return args, "invalid_expected_sha256"
+    return args, None
 
 
-def _rejected_source_read_command(item: dict[str, Any]) -> dict[str, Any] | None:
+def _rejected_source_read_command(item: dict[str, Any], rejection_kind: object) -> dict[str, Any] | None:
     """Reconstruct one exact command, never guess omitted optional metadata."""
     kind, line = item.get("command_type"), item.get("command")
-    if not isinstance(line, str) or len(line.encode("utf-8")) > 16384 or kind not in (None, "source_read", "command_run"):
+    if (rejection_kind not in ("json_syntax_or_shape", "invalid_expected_sha256")
+            or not isinstance(line, str) or len(line.encode("utf-8")) > 16384
+            or kind not in (None, "source_read", "command_run")):
         return None
     declared, rejected = _source_read_arguments(line)
     wrapped = kind == "command_run" or (declared is not None and "commands" in declared)
@@ -351,7 +436,7 @@ def _rejected_source_read_command(item: dict[str, Any]) -> dict[str, Any] | None
         return None
     if wrapped:
         _, rejected = _source_read_arguments(command["command_line"])
-    if not rejected:
+    if rejected != rejection_kind:
         return None
     return {**{key: value for key, value in command.items() if key in semantic},
             "step": command.get("step", 1)}
@@ -379,7 +464,7 @@ def _source_read_rejection(run: Path, item: dict[str, Any], output: dict[str, An
     keys = {"schema_version", "owner", "rejection_kind", "session_id", "runtime_id", "execution_id",
             "call_id", "authorization_semantic_sha256", "command_sha256", "step", "error_message",
             "effect_state", "process_started", "source_content_read", "mutation_count", "authority_effect"}
-    command = _rejected_source_read_command(item)
+    command = _rejected_source_read_command(item, value.get("rejection_kind") if isinstance(value, dict) else None)
     scopes, allowed, denied = (contract.get("read_scopes"), contract.get("allowed_operations"),
                                contract.get("denied_operations", []))
     if (set(output) != {"pre_execution_rejection"} or not isinstance(value, dict) or set(value) != keys
@@ -389,7 +474,7 @@ def _source_read_rejection(run: Path, item: dict[str, Any], output: dict[str, An
                                            "source_postimages", "terminal_receipt", "terminal_receipt_path",
                                            "stdout", "stderr"))
             or value["schema_version"] != "nokiy_source_read_pre_execution_rejection_v1"
-            or value["owner"] != "router" or value["rejection_kind"] != "json_syntax_or_shape"
+            or value["owner"] != "router"
             or value["session_id"] != "full-" + original["request_sha256"]
             or any(not isinstance(value[key], str) or not value[key].strip() or len(value[key].encode("utf-8")) > 256
                    for key in ("runtime_id", "execution_id", "call_id"))
@@ -442,6 +527,64 @@ def _source_read_rejection(run: Path, item: dict[str, Any], output: dict[str, An
                         "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}}
 
 
+_JSPACE_REFUSAL_KEYS = {
+    "schema_version", "owner", "session_id", "runtime_id", "execution_id", "call_id",
+    "authorization_semantic_sha256", "command_type", "command_line_sha256", "step", "jspace_error_code",
+    "operation", "target", "error_message", "effect_state", "process_started", "mutation_count",
+    "authority_effect"}
+
+
+def _jspace_refusal(run: Path, item: dict[str, Any], original: dict[str, Any],
+                    contract: dict[str, Any]) -> dict[str, Any]:
+    """Authenticate a J-Space refusal as a non-attempt from the router's durable witness.
+
+    The router refuses a streamed command before dispatch and records why under its call
+    identity. The witness must describe exactly this command line, step and refusal text."""
+    error, call, runtime, line = (item.get("aggregated_output"), item.get("command_id"),
+                                  item.get("runtime_id"), item.get("command"))
+    step = item.get("step", 1)
+    if (item.get("command_type") != "jspace" or item.get("status") != "failed"
+            or item.get("exit_code") is not None or item.get("success", False) is not False
+            or not isinstance(error, str) or not error.startswith("JSPACE_")
+            or not isinstance(line, str) or not isinstance(runtime, str) or not runtime.strip()
+            or not isinstance(call, str) or not call.startswith(runtime + ".tool.command_run:")
+            or type(step) is not int or not 0 < step < 2**64
+            or any(key in item for key in ("results", "changes", "file_changes", "terminal_receipt",
+                                           "terminal_receipt_path", "stdout", "stderr"))):
+        raise InspectionError("JSPACE_REFUSAL_INVALID")
+    session = "full-" + original["request_sha256"]
+    name = "jspace-policy-denial-" + hashlib.sha256(_compact_utf8_json([session, runtime, call])).hexdigest() + ".json"
+    # Pin the physical parents and open the witness without following any symlink.
+    with _summary_directory(run) as run_fd:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        state_fd = os.open("execution-state", flags, dir_fd=run_fd)
+        try:
+            receipts_fd = os.open("command_receipts", flags, dir_fd=state_fd)
+            try:
+                raw = _file(Path(name), 32768, dir_fd=receipts_fd)
+            finally:
+                os.close(receipts_fd)
+        finally:
+            os.close(state_fd)
+    value = _json(raw)
+    authorization = contract.get("authorization_semantic_sha256")
+    if (not isinstance(value, dict) or set(value) != _JSPACE_REFUSAL_KEYS
+            or value["schema_version"] != "nokiy_jspace_policy_denial_v1" or value["owner"] != "router"
+            or value["session_id"] != session or value["runtime_id"] != runtime or value["call_id"] != call
+            or value["error_message"] != error or type(value["step"]) is not int or value["step"] != step
+            or value["command_line_sha256"] != hashlib.sha256(line.encode("utf-8")).hexdigest()
+            or not isinstance(value["jspace_error_code"], str) or not error.startswith(value["jspace_error_code"])
+            or value["effect_state"] != "not_started" or value["process_started"] is not False
+            or type(value["mutation_count"]) is not int or value["mutation_count"] != 0
+            or value["authority_effect"] != "none"
+            or not isinstance(authorization, str) or value["authorization_semantic_sha256"] != authorization):
+        raise InspectionError("JSPACE_REFUSAL_MISMATCH")
+    return {"call_id": call, "jspace_error_code": value["jspace_error_code"], "operation": value["operation"],
+            "target": value["target"], "effect_state": "not_started", "receipt_check": "matched",
+            "receipt": {"path": "execution-state/command_receipts/" + name,
+                        "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}}
+
+
 def _process(pid: object) -> str:
     if type(pid) is not int or pid <= 0:
         return "unknown"
@@ -452,6 +595,127 @@ def _process(pid: object) -> str:
     except (PermissionError, OSError):
         return "permission_unknown"
     return "present_unowned"
+
+
+def _supervisor_process(scope: dict[str, Any], *, bound: bool) -> str:
+    observed = _process(scope.get("supervisor_pid"))
+    if (bound and scope.get("isolation_source") == "native_command_root"
+            and scope.get("supervisor_pid") == os.getpid()):
+        try:
+            # This caller is still rendering its result, not running the engine.
+            # Recheck the exclusive kernel scope; a PID or receipt label is not proof.
+            if full_core.inherited_root_parent() is not None:
+                return "current_root_settled"
+        except (OSError, full_core.ProcessScopeError):
+            pass
+    return observed
+
+
+def _cleanup_settled(cleanup: dict[str, Any]) -> bool:
+    return (cleanup.get("historical_pass") is True and cleanup.get("engine_pid") == "absent"
+            and cleanup.get("supervisor_pid") in ("absent", "current_root_settled"))
+
+
+_NATIVE_COMMAND_IDENTITY = {"runtime_id", "step", "command_index", "command_id",
+                            "command_run_id", "provider_tool_call_id"}
+
+
+def _native_command_identity(item: dict) -> bool:
+    runtime, call, run = (item.get(key) for key in ("runtime_id", "provider_tool_call_id", "command_run_id"))
+    index, step = item.get("command_index"), item.get("step")
+    return (_NATIVE_COMMAND_IDENTITY <= item.keys()
+            and isinstance(runtime, str) and re.fullmatch(r"runtime-[A-Za-z0-9-]+", runtime) is not None
+            and isinstance(call, str) and re.fullmatch(r"call_[A-Za-z0-9_-]+", call) is not None
+            and run == runtime + ".tool.command_run"
+            and type(index) is int and 0 <= index < 2**32
+            and type(step) is int and 0 < step < 2**32
+            and item.get("command_id") == f"{run}:{call}:{index}")
+
+
+def _native_task_status(event: dict, command_ids: dict[str, int]) -> bool:
+    """Only exact native bookkeeping acknowledgements may bypass effect barriers."""
+    item = event["item"]
+    if (event.get("type") != "item.completed" or item.get("status") != "completed"
+            or item.get("exit_code") is not None or item.get("command_type") not in (None, "task_status")
+            or set(item) - {"type", "id", "status", "exit_code", "command", "aggregated_output",
+                            "command_type"} - _NATIVE_COMMAND_IDENTITY
+            or _NATIVE_COMMAND_IDENTITY.intersection(item) and (
+                not _native_command_identity(item) or command_ids.get(item["command_id"]) != 1)):
+        return False
+    try:
+        output = full_core._structured_output(item)
+    except (caller.EmbeddedNokiyError, ValueError, RecursionError):
+        return False
+    control = output.get("task_status")
+    if (set(output) != {"task_status"} or not isinstance(control, dict)
+            or set(control) - {"status", "task_type", "task_group", "compact_context",
+                               "final_reply", "final_reply_format"}
+            or "status" in control and control["status"] not in ("doing", "question", "done")
+            or "task_group" in control and not isinstance(control["task_group"], str)
+            or "compact_context" in control and not isinstance(control["compact_context"], str)
+            or "task_type" in control and (not isinstance(control["task_type"], list)
+                or not all(isinstance(kind, str) for kind in control["task_type"]))
+            or not isinstance(item.get("command"), str)):
+        return False
+    try:
+        command = _json(item["command"].encode())
+        if "final_reply" in control or "final_reply_format" in control:
+            if control.get("status") != "done" or "compact_context" in control:
+                return False
+            reply = command.get("final_reply")
+            if isinstance(reply, str):
+                if not reply.strip() or "final_reply_format" in control:
+                    return False
+            elif isinstance(reply, (dict, list)) and reply:
+                if control.get("final_reply_format") != "json" or not isinstance(control.get("final_reply"), str):
+                    return False
+                control = {key: value for key, value in control.items() if key != "final_reply_format"}
+                control["final_reply"] = json.loads(control["final_reply"], object_pairs_hook=caller._unique_object,
+                                                    parse_constant=caller._invalid_constant)
+            else:
+                return False
+        # Canonical bytes preserve JSON types, unlike Python's True == 1 equality.
+        return caller._canonical_bytes(command) == caller._canonical_bytes(control)
+    except (InspectionError, caller.EmbeddedNokiyError, UnicodeError, ValueError, RecursionError):
+        return False
+
+
+def _postgate_policy_denial(item: dict, original: dict, contract: dict) -> bool:
+    """Native typed no-start evidence permits another verifier, never reconciles failure."""
+    denial = item.get("policy_denial")
+    fields = {"jspace_error_code", "operation", "target", "effect_state", "mutation_count",
+              "authority_effect", "delivery_state", "replayable"}
+    if (not isinstance(denial, dict) or set(denial) != fields
+            or denial.get("jspace_error_code") != "JSPACE_SOURCE_READ_PATH_DENIED"
+            or denial.get("operation") != "read" or denial.get("effect_state") != "not_started"
+            or type(denial.get("mutation_count")) is not int or denial["mutation_count"] != 0
+            or denial.get("authority_effect") != "none"
+            or denial.get("delivery_state") != "deterministic_policy_denial"
+            or denial.get("replayable") is not True
+            or item.get("type") != "command_execution" or item.get("command_type") != "jspace"
+            or item.get("status") != "failed" or item.get("exit_code") is not None
+            or not isinstance(item.get("command"), str)
+            or not isinstance(item.get("aggregated_output"), str)
+            or set(item) - {"id", "type", "command", "aggregated_output", "exit_code", "status",
+                            "command_type", "runtime_id", "step", "command_index", "command_id",
+                            "command_run_id", "provider_tool_call_id", "policy_denial"}):
+        return False
+    args, rejection = _source_read_arguments(item["command"])
+    target = denial["target"]
+    if (args is None or rejection is not None or args.get("path") != target
+            or not isinstance(target, str) or "\\" in target or "\0" in target
+            or any(part in ("", ".", "..", ".git") for part in target.split("/"))
+            or contract.get("repo_root") != original.get("workspace")
+            or contract.get("source_read") is not True
+            or not {"read", "command"}.issubset(contract.get("allowed_operations", []))
+            or {"read", "command"}.intersection(contract.get("denied_operations", []))):
+        return False
+    scopes = contract.get("read_scopes")
+    if (not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes)
+            or not any(target == scope or scope.endswith("/**") and target.startswith(scope[:-3] + "/")
+                       for scope in scopes)):
+        return False
+    return _native_command_identity(item)
 
 
 def _command_selection(values: object) -> tuple[str, ...]:
@@ -471,8 +735,235 @@ def _settled_output(value: dict[str, Any]) -> bool:
             and value.get("terminal_state") in (None, "completed"))
 
 
+def _command_head(command: str) -> str:
+    return command.split("\n", 1)[0][:MAX_COMMAND_HEAD_CHARS]
+
+
+def _parent_command_row(row: dict[str, Any]) -> dict[str, Any]:
+    """One command as the coordinator sees it.
+
+    Failures, rejections and verifier rows keep their body: the parent needs them to judge
+    the result. A settled long or multi-line command is shown by its first line, hash and
+    size; the full body stays in the inspection pages and the indexed event.
+    """
+    projected = {key: row[key] for key in ("event_index", "command", "exit_code",
+                                          "receipt_check", "execution_proof")}
+    command = row["command"]
+    settled = (row["execution_proof"] == "known_success" and "failure_resolution" not in row
+               and "pre_execution_rejection" not in row and "verifier_output_excerpt" not in row)
+    if command is None or (settled and (len(command) > MAX_COMMAND_HEAD_CHARS or "\n" in command)):
+        projected["command"] = None
+        head = row.get("command_head") if command is None else _command_head(command)
+        if isinstance(head, str):
+            projected["command_head"] = head
+        projected["command_sha256"] = row["command_sha256"]
+        projected["command_bytes"] = row["command_bytes"]
+    if "evidence_source" in row:
+        projected.update(evidence_source=row["evidence_source"], command_id=row["command_id"])
+    if "first_blocker_detail" in row:
+        projected["first_blocker_detail"] = row["first_blocker_detail"]
+    if "failure_resolution" in row:
+        projected["failure_resolution"] = row["failure_resolution"]
+    if "verifier_recovery_observation" in row:
+        projected["verifier_recovery_observation"] = row["verifier_recovery_observation"]
+    if "pre_execution_rejection" in row:
+        projected["pre_execution_rejection"] = row["pre_execution_rejection"]
+    if "verifier_output_excerpt" in row:
+        projected["diagnostic_excerpt"] = row["verifier_output_excerpt"]
+    elif (row["execution_proof"] == "known_failure" and isinstance(row.get("diagnostic_excerpt"), str)
+          and row["diagnostic_excerpt"]):
+        projected["diagnostic_excerpt"] = row["diagnostic_excerpt"].encode("utf-8", errors="replace")[
+            :MAX_DIAGNOSTIC_BYTES].decode("utf-8", errors="ignore")
+    return projected
+
+
+# rg, grep and git grep exit 1 only when nothing matched; their errors exit 2.
+_SEARCH_PROGRAMS = frozenset({"rg", "grep", "egrep", "fgrep"})
+_SHELL_OPERATOR = frozenset("();<>|&")
+
+
+def _search_no_match(command: Any, output: dict[str, Any]) -> bool:
+    """A search that ran to completion and matched nothing: its exit 1 is an answer.
+
+    Only one simple command qualifies, with an authenticated workload exit and no
+    stderr. A shell operator, substitution or expansion keeps the failure, since the
+    status could then come from another program."""
+    receipt = output.get("terminal_receipt")
+    if (not isinstance(command, str) or output.get("stderr") != ""
+            or not isinstance(receipt, dict) or receipt.get("termination_origin") != "workload"
+            or any(marker in command for marker in ("`", "$(", "${", "\n", "\r"))):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        argv = list(lexer)
+    except ValueError:
+        return False
+    if not argv or any(token and set(token) <= _SHELL_OPERATOR for token in argv):
+        return False
+    program = os.path.basename(argv[0])
+    return program in _SEARCH_PROGRAMS or (program == "git" and argv[1:2] == ["grep"])
+
+
+# The runtime's in-process source_read receipt for a failure that returned no content.
+_EFFECT_FREE_READ_RECEIPT = {
+    "termination_origin": "in_process_source_read", "pid": None, "outcome": "known",
+    "terminal_state": "failed", "exit_code": 1, "authority_effect": "none", "staging_authority": "none",
+    "authoritative_publication": "unproven", "termination_proven": True, "process_reaped": True,
+    "process_group_empty": True, "reconcile_required": True, "retry_safe": False,
+    "auto_retry_allowed": False,
+}
+
+
+def _source_read_digest_mismatch(item: dict[str, Any], command: Any, output: dict[str, Any]) -> bool:
+    """A read whose well-formed expected_sha256 did not match the file (for example a digest
+    copied from another file) ended in-process before returning any content: no effect.
+
+    Like a no-match search this explains its own failed record. It settles execution
+    certainty only; the read stays failed and no content or dependency proof is inferred."""
+    receipt, evidence = output.get("terminal_receipt"), output.get("source_read_evidence")
+    if (item.get("command_type") != "source_read" or not isinstance(command, str)
+            or set(output) - {"error_type", "exit_code", "source_read_evidence", "stderr", "stdout",
+                              "terminal_receipt", "terminal_receipt_path"}
+            or output.get("error_type") != "SOURCE_READ_SHA256_MISMATCH"
+            or output.get("stdout") != "" or output.get("stderr") != "SOURCE_READ_SHA256_MISMATCH"
+            or not isinstance(receipt, dict) or not isinstance(evidence, dict)
+            or receipt.get("source_read_evidence") != evidence
+            or any(receipt.get(key) != value or (value is not None and type(receipt.get(key)) is not type(value))
+                   for key, value in _EFFECT_FREE_READ_RECEIPT.items())
+            or evidence.get("schema_version") != "nokiy_source_read_content_v1"
+            or evidence.get("content_satisfied") is not False):
+        return False
+    request, actual = evidence.get("request"), evidence.get("source_sha256")
+    expected = request.get("expected_sha256") if isinstance(request, dict) else None
+    if (not isinstance(expected, str) or _SHA.fullmatch(expected) is None
+            or not isinstance(actual, str) or _SHA.fullmatch(actual) is None or actual == expected):
+        return False
+    try:
+        line = json.loads(command)
+    except (ValueError, RecursionError):
+        return False
+    if isinstance(line, list) and len(line) == 4:
+        line = dict(zip(("path", "start_line", "end_line", "expected_sha256"), line))
+    if not isinstance(line, dict):
+        return False
+    return (line.get("path") == request.get("path") and line.get("expected_sha256") == expected
+            and all(line[key] == request.get(key) for key in ("start_line", "end_line") if key in line))
+
+
+def _outside_write_scope(path: Any, contract: dict[str, Any]) -> bool:
+    """Writable paths stay with the own-edit read rules: there a stale pin means the worker
+    has not observed its own change. Any non-exact write scope keeps every path writable."""
+    scopes = [scope for key in ("write_scopes", "declared_targets") for scope in contract.get(key) or ()]
+    return (isinstance(path, str) and bool(path)
+            and all(isinstance(scope, str) and "*" not in scope for scope in scopes) and path not in scopes)
+
+
+_INSPECT_SHELL_KINDS = frozenset({"zsh", "bash", "shell_command"})
+# The runtime's receipt for a shell workload that exited non-zero and was fully reaped.
+_CLOSED_SHELL_FAILURE_RECEIPT = {
+    "termination_origin": "workload", "failure_class": "workload_exit_nonzero", "outcome": "known",
+    "terminal_state": "failed", "authority_effect": "none", "staging_authority": "none",
+    "authoritative_publication": "unproven", "termination_proven": True, "process_reaped": True,
+    "process_group_empty": True, "reconcile_required": True,
+}
+
+
+def _inspect_shell_failure(item: dict[str, Any], output: dict[str, Any]) -> bool:
+    """A shell line that exited non-zero and was fully reaped without any recorded effect.
+
+    Under an admitted inspect contract the bound Seatbelt profile confines such shells to the
+    task-local evidence root, so the exit is a finding (a crashed probe, a failing check), not an
+    unknown effect. Like a no-match search it explains its own failed record only."""
+    receipt, exit_code = output.get("terminal_receipt"), output.get("exit_code")
+    return (item.get("command_type") in _INSPECT_SHELL_KINDS
+            and not set(output) - {"exit_code", "message", "stderr", "stdout",
+                                   "terminal_receipt", "terminal_receipt_path"}
+            and type(exit_code) is int and exit_code != 0
+            and isinstance(receipt, dict) and type(receipt.get("exit_code")) is int
+            and receipt["exit_code"] == exit_code
+            and all(receipt.get(key) == value and type(receipt.get(key)) is type(value)
+                    for key, value in _CLOSED_SHELL_FAILURE_RECEIPT.items())
+            and all(receipt.get(key) in (None, False) for key in ("timed_out", "cancelled"))
+            and receipt.get("error") in (None, "")
+            and all(receipt.get(key) in (None, []) for key in ("unresolved_effects", "apply_patch_changes")))
+
+
+def _admitted_inspect_contract(contract: dict[str, Any]) -> bool:
+    """J-Space admits inspect_shell only on a v2 read/command contract without write grants."""
+    policy = contract.get("inspect_shell")
+    operations = contract.get("allowed_operations")
+    return (isinstance(policy, dict) and policy.get("schema_version") == "nokiy_inspect_shell_v1"
+            and contract.get("schema_version") == "jspace_contract_v2"
+            and isinstance(operations, list) and sorted(operations) == ["command", "read"]
+            and contract.get("write_scopes") == [] and contract.get("declared_targets") in (None, []))
+
+
+def _parent_shell_failure(item: dict[str, Any], output: dict[str, Any]) -> bool:
+    """A parent-executed shell line (J-Space parent_shell) that exited non-zero and was fully settled.
+
+    The parent ran it under the contract's bound read-only profile, so like an inspect shell the
+    exit is a finding, not an unknown effect; it explains its own failed record only."""
+    receipt, exit_code = output.get("terminal_receipt"), output.get("exit_code")
+    return (item.get("command_type") in _INSPECT_SHELL_KINDS
+            and not set(output) - {"exit_code", "message", "stderr", "stdout",
+                                   "terminal_receipt", "terminal_receipt_path"}
+            and type(exit_code) is int and exit_code != 0
+            and isinstance(receipt, dict) and type(receipt.get("exit_code")) is int
+            and receipt["exit_code"] == exit_code and receipt.get("pid") is None
+            and all(receipt.get(key) == value and type(receipt.get(key)) is type(value)
+                    for key, value in {**_CLOSED_SHELL_FAILURE_RECEIPT,
+                                       "termination_origin": "parent_shell"}.items())
+            and all(receipt.get(key) in (None, False) for key in ("timed_out", "cancelled"))
+            and receipt.get("error") in (None, "")
+            and all(receipt.get(key) in (None, []) for key in ("unresolved_effects", "apply_patch_changes")))
+
+
+def _admitted_parent_shell_contract(contract: dict[str, Any]) -> bool:
+    """J-Space admits parent_shell with read and command operations and without an inspect shell."""
+    policy = contract.get("parent_shell")
+    operations = contract.get("allowed_operations")
+    return (isinstance(policy, dict) and policy.get("schema_version") == "nokiy_parent_shell_v1"
+            and isinstance(operations, list) and {"read", "command"}.issubset(operations)
+            and "inspect_shell" not in contract)
+
+
+def _source_read_without_content(item: dict[str, Any], command: Any, output: dict[str, Any]) -> str | None:
+    """The path of an in-process read that failed before returning any content.
+
+    A page out of range, an over-long line, a missing JSON pointer, an oversized value or a
+    mismatched digest all end in the runtime's effect-free read receipt. Off the writable paths
+    such a failure explains its own record; nothing about the source is inferred from it."""
+    receipt, error = output.get("terminal_receipt"), output.get("error_type")
+    if (item.get("command_type") != "source_read" or not isinstance(command, str)
+            # Diagnostics such as json_recovery may vary; effect-bearing fields may not appear.
+            or set(output) & {"changes", "results", "pre_execution_rejection", "file_changes"}
+            or not isinstance(error, str) or not error.startswith("SOURCE_READ_")
+            or output.get("stderr") != error or output.get("stdout") != ""
+            or not isinstance(receipt, dict)
+            or any(receipt.get(key) != value or (value is not None and type(receipt.get(key)) is not type(value))
+                   for key, value in _EFFECT_FREE_READ_RECEIPT.items())):
+        return None
+    args, rejection = _source_read_arguments(command)
+    if args is None or rejection is not None or not isinstance(args.get("path"), str):
+        return None
+    # Facts the receipt binds must be the ones shown, and must describe this exact read.
+    if any(key in receipt and output.get(key) != receipt[key]
+           for key in ("navigation_refusal", "source_read_evidence")):
+        return None
+    evidence = receipt.get("source_read_evidence")
+    if evidence is not None:
+        request = evidence.get("request") if isinstance(evidence, dict) else None
+        if (not isinstance(request, dict) or evidence.get("content_satisfied") is not False
+                or request.get("path") != args["path"]
+                or any(args[key] != request.get(key) for key in ("start_line", "end_line") if key in args)):
+            return None
+    return args["path"]
+
+
 def _checked_results(run: Path, output: dict[str, Any],
-                     payload_receipts: list[str] | None = None) -> list[str]:
+                     payload_receipts: list[str] | None = None, *,
+                     item: dict[str, Any] | None = None, event_index: int | None = None) -> list[str]:
     """Check every batch result, including receipts of commands we will retain."""
     if "results" not in output:
         return []
@@ -480,20 +971,22 @@ def _checked_results(run: Path, output: dict[str, Any],
     if not isinstance(entries, list) or not entries:
         return ["unavailable"]
     proofs = []
-    for entry in entries:
+    for result_index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             proofs.append("unavailable")
             if payload_receipts is not None:
                 payload_receipts.append("unavailable")
             continue
-        entry_receipt = _receipt(run, entry)
+        identity = {**({"runtime_id": item["runtime_id"]} if isinstance(item, dict) and "runtime_id" in item else {}),
+                    **entry}
+        entry_receipt = _receipt(run, entry, item=identity, event_index=event_index, result_index=result_index)
         payload = entry.get("output")
         if not isinstance(payload, dict):
             proofs.append("unavailable")
             if payload_receipts is not None:
                 payload_receipts.append("unavailable")
             continue
-        payload_receipt = _receipt(run, payload)
+        payload_receipt = _receipt(run, payload, item=identity, event_index=event_index, result_index=result_index)
         if payload_receipts is not None:
             payload_receipts.append(payload_receipt)
         if (entry_receipt == payload_receipt == "matched"
@@ -558,6 +1051,409 @@ def _typed_parts(item: dict[str, Any], output: dict[str, Any],
     return parts
 
 
+def _normalized_source_read(line: str) -> dict[str, Any] | None:
+    """The source_read selector contract, including its positional range form."""
+    if len(line.encode("utf-8")) > 16384:
+        return None
+    try:
+        args = json.loads(line, object_pairs_hook=caller._unique_object,
+                          parse_constant=caller._invalid_constant)
+    except (ValueError, RecursionError):
+        return None
+    fields = ("path", "start_line", "end_line", "expected_sha256", "line_numbers", "search_terms", "context_lines")
+    if isinstance(args, list):
+        if not 3 <= len(args) <= 7:
+            return None
+        args = dict(zip(fields, args))
+    if not isinstance(args, dict) or set(args) - set(fields) - {"json_pointer", "children_offset"}:
+        return None
+    if "json_pointer" in args and not isinstance(args["json_pointer"], str):
+        return None
+    if "children_offset" in args and (type(args["children_offset"]) is not int
+                                      or not 0 <= args["children_offset"] < 2**64):
+        return None
+    args = {key: value for key, value in args.items() if value is not None}
+    path, pin = args.get("path"), args.get("expected_sha256")
+    if (not isinstance(path, str) or not path or len(path.encode()) > 4096 or "\\" in path or "\0" in path
+            or any(part in ("", ".", "..") for part in path.split("/"))
+            or not isinstance(pin, str) or re.fullmatch(r"[0-9a-fA-F]{64}", pin) is None
+            or any(type(args[key]) is not int or not 0 <= args[key] < 2**64
+                   for key in ("start_line", "end_line", "context_lines") if key in args)
+            or ("line_numbers" in args and type(args["line_numbers"]) is not bool)):
+        return None
+    args["expected_sha256"] = pin.lower()
+    if "json_pointer" in args:
+        pointer = args["json_pointer"]
+        if (set(args) - {"path", "expected_sha256", "json_pointer", "children_offset"}
+                or pointer and not pointer.startswith("/") or re.search(r"~(?:[^01]|$)", pointer)):
+            return None
+    elif "children_offset" in args:
+        return None
+    elif "search_terms" in args:
+        terms = args["search_terms"]
+        if ("end_line" in args or args.get("line_numbers", True) is not True
+                or not isinstance(terms, list) or not 1 <= len(terms) <= 16
+                or any(not isinstance(term, str) or not term for term in terms)
+                or sum(len(term.encode()) for term in terms) > 2048
+                or args.get("start_line", 1) == 0 or args.get("context_lines", 0) > 5):
+            return None
+        args.update(start_line=args.get("start_line", 1), context_lines=args.get("context_lines", 0), line_numbers=True)
+    else:
+        if ("context_lines" in args or not 0 < args.get("start_line", 0) <= args.get("end_line", 0)):
+            return None
+        args["line_numbers"] = args.get("line_numbers", True)
+    return args
+
+
+def _own_edit_receipt_settled(payload: dict[str, Any], origin: str, failed: bool) -> bool:
+    receipt = payload.get("terminal_receipt", {})
+    code, state = (1, "failed") if failed else (0, "completed")
+    return (receipt.get("termination_origin") == origin and receipt.get("pid") is None
+            and type(receipt.get("exit_code")) is int and receipt["exit_code"] == code
+            and receipt.get("failure_class") == ("workload_exit_nonzero" if failed else "none")
+            and receipt.get("reconcile_required") is failed
+            and all(receipt.get(key) is False for key in ("retry_safe", "auto_retry_allowed"))
+            and receipt.get("authority_effect") == receipt.get("staging_authority") == "none"
+            and receipt.get("authoritative_publication") == "unproven"
+            and all(value.get("outcome", "known") == "known"
+                    and value.get("terminal_state", state) == state
+                    and value.get("status", state) == state
+                    and all(value.get(key, True) is True for key in
+                            ("process_reaped", "process_group_empty", "termination_proven"))
+                    and all(value.get(key, False) is False for key in ("timed_out", "cancelled"))
+                    and value.get("isError", False) is False
+                    and value.get("reconcile_required", failed) is failed
+                    and value.get("unresolved_effects") in (None, []) and value.get("error") in (None, "")
+                    for value in (receipt, payload))
+            and payload.get("success", not failed) is (not failed)
+            and type(payload.get("exit_code")) is int and payload["exit_code"] == code)
+
+
+def _source_read_content(line: str, payload: dict[str, Any], failed: bool) -> dict[str, Any] | None:
+    proof = payload.get("source_read_evidence")
+    request = _normalized_source_read(line)
+    if (not isinstance(proof, dict) or set(proof) != {"schema_version", "request", "source_sha256", "content_satisfied"}
+            or len(_compact_utf8_json(proof)) > 4096 or request is None
+            or proof["schema_version"] != "nokiy_source_read_content_v1"
+            or _compact_utf8_json(proof["request"]) != _compact_utf8_json(request)
+            or not file_change_evidence._sha(proof["source_sha256"])
+            or proof["content_satisfied"] is not (not failed)
+            or proof["content_satisfied"] is not (request["expected_sha256"] == proof["source_sha256"])
+            or _compact_utf8_json(payload["terminal_receipt"].get("source_read_evidence")) != _compact_utf8_json(proof)
+            or not _own_edit_receipt_settled(payload, "in_process_source_read", failed)
+            or payload.get("changes") not in (None, [])
+            or payload.get("failed_change") is not None or payload.get("jspace_error_code") is not None
+            or (failed and (payload.get("error_type") != "SOURCE_READ_SHA256_MISMATCH"
+                            or payload.get("stdout") != "" or payload.get("stderr") != "SOURCE_READ_SHA256_MISMATCH"))
+            or (not failed and (payload.get("truncated") is not False or payload.get("path") != request["path"]
+                                or payload.get("source_sha256") != proof["source_sha256"]))):
+        return None
+    return proof
+
+
+def _source_read_json_oversize(line: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Bind the observed object/array recovery hint, never the failed value body."""
+    request = _normalized_source_read(line)
+    recovery = payload.get("json_recovery")
+    error = "SOURCE_READ_JSON_VALUE_TOO_LARGE"
+    if (request is None or set(request) != {"path", "expected_sha256", "json_pointer"}
+            or not _own_edit_receipt_settled(payload, "in_process_source_read", True)
+            or "source_read_evidence" in payload or "source_read_evidence" in payload["terminal_receipt"]
+            or payload.get("error_type") != error or payload.get("stderr") != error
+            or payload.get("stdout") != "" or payload.get("changes") not in (None, [])
+            or payload.get("failed_change") is not None or payload.get("jspace_error_code") is not None
+            or not isinstance(recovery, dict) or set(recovery) != {
+                "child_count", "children", "children_page", "incomplete", "parent_pointer",
+                "parent_pointer_omitted", "parent_type", "source_sha256"}
+            or len(_compact_utf8_json(recovery)) > 4096
+            or recovery["source_sha256"] != request["expected_sha256"]
+            or payload.get("source_sha256", recovery["source_sha256"]) != recovery["source_sha256"]
+            or payload.get("path", request["path"]) != request["path"]
+            or recovery["parent_pointer"] != request["json_pointer"]
+            or recovery["parent_pointer_omitted"] is not False
+            or recovery["parent_type"] not in ("object", "array")
+            or type(recovery["child_count"]) is not int or not 0 < recovery["child_count"] < 2**64
+            or not isinstance(recovery["children"], list)
+            or not 0 < len(recovery["children"]) <= min(recovery["child_count"], 128)
+            or recovery["incomplete"] is not (len(recovery["children"]) < recovery["child_count"])
+            or _compact_utf8_json(recovery["children_page"]) != _compact_utf8_json(
+                {"json_pointer": request["json_pointer"], "children_offset": 0})):
+        return None
+    token = "key" if recovery["parent_type"] == "object" else "index"
+    seen = set()
+    for child in recovery["children"]:
+        if not isinstance(child, dict) or set(child) != {token, "json_pointer", "type"}:
+            return None
+        value = child[token]
+        if ((token == "key" and not isinstance(value, str))
+                or (token == "index" and (type(value) is not int or not 0 <= value < recovery["child_count"]))
+                or child["type"] not in ("object", "array", "string", "number", "boolean", "null")):
+            return None
+        pointer = request["json_pointer"] + "/" + str(value).replace("~", "~0").replace("/", "~1")
+        if value in seen or child["json_pointer"] != pointer:
+            return None
+        seen.add(value)
+    return {"request": request, "source_sha256": recovery["source_sha256"], "json_recovery": recovery}
+
+
+def _source_read_json_route(content: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate only the returned projection/page; summaries do not cover child values."""
+    request = content["request"]
+    text = payload.get("stdout")
+    if ("json_pointer" not in request or payload.get("json_pointer") != request["json_pointer"]
+            or payload.get("stderr") != "" or payload.get("error_type") is not None
+            or not isinstance(text, str) or not text or len(text.encode("utf-8")) > 10000):
+        return None
+    if "children_offset" not in request:
+        if payload.get("mode") != "json_projection":
+            return None
+        try:
+            json.loads(text, object_pairs_hook=caller._unique_object, parse_constant=caller._invalid_constant)
+        except (ValueError, RecursionError, caller.EmbeddedNokiyError):
+            return None
+        return {"mode": "json_projection"}
+    counts = ("child_count", "child_inline_bytes", "children_offset", "children_returned", "children_summarized")
+    if (payload.get("mode") != "json_children" or payload.get("parent_type") not in ("object", "array")
+            or any(type(payload.get(key)) is not int or not 0 <= payload[key] < 2**64 for key in counts)
+            or not {"children_at_end", "children_next_offset"} <= payload.keys()
+            or payload["children_offset"] != request["children_offset"] or payload["child_inline_bytes"] != 1024
+            or not 0 < payload["children_returned"] <= payload["child_count"] - payload["children_offset"]
+            or payload["children_summarized"] > payload["children_returned"]):
+        return None
+    end = payload["children_offset"] + payload["children_returned"]
+    if (payload["children_at_end"] is not (end == payload["child_count"])
+            or _compact_utf8_json(payload["children_next_offset"]) != _compact_utf8_json(
+                None if end == payload["child_count"] else end)):
+        return None
+    try:
+        rows = [_json(row.encode("utf-8")) for row in text.splitlines()]
+    except InspectionError:
+        return None
+    token = "key" if payload["parent_type"] == "object" else "index"
+    seen, summarized = set(), 0
+    for offset, row in enumerate(rows, payload["children_offset"]):
+        value = row.get(token)
+        if ((token == "key" and not isinstance(value, str))
+                or (token == "index" and (type(value) is not int or value != offset)) or value in seen):
+            return None
+        seen.add(value)
+        if set(row) == {token, "value"}:
+            continue
+        if (set(row) - {token, "json_pointer", "type", "bytes", "child_count"}
+                or row.get("json_pointer") != request["json_pointer"] + "/" + str(value).replace("~", "~0").replace("/", "~1")
+                or row.get("type") not in ("object", "array", "string", "number", "boolean", "null")
+                or type(row.get("bytes")) is not int or row["bytes"] <= payload["child_inline_bytes"]
+                or (row["type"] in ("object", "array") and
+                    (type(row.get("child_count")) is not int or not 0 <= row["child_count"] < 2**64))
+                or (row["type"] not in ("object", "array") and "child_count" in row)):
+            return None
+        summarized += 1
+    if len(rows) != payload["children_returned"] or summarized != payload["children_summarized"]:
+        return None
+    return {"mode": "json_children", "parent_type": payload["parent_type"], "child_count": payload["child_count"]}
+
+
+def _own_edit_position(meta: dict[str, Any], payload: dict[str, Any]) -> tuple[str, int, int] | None:
+    call = payload.get("terminal_receipt", {}).get("call_id")
+    step, index = meta.get("step"), meta.get("command_index")
+    if (not isinstance(call, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", call) is None
+            or type(step) is not int or not 0 < step < 2**64
+            or any(meta.get(key) is not None for key in ("workdir", "cwd", "arguments", "jspace_error_code"))):
+        return None
+    runtime, sep, tail = call.partition(".tool.command_run:")
+    if not runtime or not sep or meta.get("runtime_id") != runtime:
+        return None
+    provider, identity = meta.get("provider_tool_call_id"), meta.get("command_id")
+    if provider is not None or identity is not None:
+        if (not isinstance(provider, str) or type(index) is not int or not 0 <= index < 512
+                or tail != f"{provider}:{index}"):
+            return None
+        # Runtime results use relative IDs; gateway events qualify them with
+        # the runtime. Accept either complete pair, never a mixture of both.
+        if (identity, meta.get("command_run_id", provider)) not in (
+                (tail, provider), (call, f"{runtime}.tool.command_run")):
+            return None
+        return runtime + sep + provider, step, index
+    match = re.fullmatch(r"(.+):step:([0-9]+):index:([0-9]+)", tail)
+    if match is None or int(match[2]) != step or int(match[3]) >= 512:
+        return None
+    if index is not None and (type(index) is not int or index != int(match[3])):
+        return None
+    return runtime + sep + match[1], step, int(match[3])
+
+
+def _own_edit_observation_settled(value: dict[str, Any], failed: bool) -> bool:
+    state = "failed" if failed else "completed"
+    code = value.get("exit_code")
+    return (value.get("outcome", "known") == "known" and value.get("status", state) == state
+            and value.get("terminal_state", state) == state and value.get("success", not failed) is (not failed)
+            and value.get("isError", False) is False
+            and (code is None or type(code) is int and code == int(failed))
+            and all(value.get(key, True) is True for key in ("process_reaped", "process_group_empty", "termination_proven"))
+            and all(value.get(key, False) is False for key in ("timed_out", "cancelled"))
+            and value.get("unresolved_effects") in (None, [])
+            and value.get("error") in ((None, "", "SOURCE_READ_SHA256_MISMATCH") if failed else (None, "")))
+
+
+def _resolve_own_edit_reads(run: Path, events: list[dict[str, Any]], checked: dict[int, Any],
+                            original: dict[str, Any], contract: dict[str, Any]) -> tuple[dict[int, Any], int]:
+    """Reconcile stale own-edit pins and observed JSON routes, never rewrite history."""
+    scopes = [contract.get(key, ()) for key in ("read_scopes", "write_scopes", "declared_targets")]
+    if (contract.get("repo_root") != original.get("workspace") or contract.get("source_read") is not True
+            or not file_change_evidence._sha(contract.get("authorization_semantic_sha256"))
+            or not {"command", "read"} <= set(contract.get("allowed_operations", ()))
+            or {"command", "read"} & set(contract.get("denied_operations", ()))):
+        return {}, 0
+    own_edits_allowed = ("modify" in contract.get("allowed_operations", ())
+                         and "modify" not in contract.get("denied_operations", ()))
+    groups, calls, eligible, failed_count = [], {}, {}, 0
+    closed = set()
+    for event_index, event in enumerate(events):
+        item = event.get("item", {})
+        if event.get("type") != "item.completed" or item.get("type") not in ("command_execution", "file_change"):
+            continue
+        output = full_core._structured_output(item)
+        for call in _command_call_ids(item, output):
+            calls[call] = calls.get(call, 0) + 1
+        parts, proofs, receipts = checked.get(event_index, ([], [], []))
+        if item["type"] == "file_change":
+            parts, proofs, receipts = [("apply_patch", "", output)], ["known_success"], [
+                _receipt(run, output, item=item, event_index=event_index)]
+        if not parts:
+            # Native status-only bookkeeping is not an effect or a repair proof.
+            if item.get("command_type") == "task_status" and item.get("status") == "completed" and set(output) == {"task_status"}:
+                continue
+            groups.append((None, []))
+            continue
+        eligible[event_index] = (len(parts) == len(proofs) == len(receipts)
+                                 and _own_edit_observation_settled(item, "known_failure" in proofs)
+                                 and _own_edit_observation_settled(output, "known_failure" in proofs))
+        event_settled = eligible[event_index]
+        declared = _json(item["command"].encode()).get("commands") if "results" in output else None
+        part_calls = set()
+        for part_index, ((kind, line, payload), proof, receipt_check) in enumerate(zip(parts, proofs, receipts)):
+            meta = item if declared is None else {**declared[part_index], **output["results"][part_index]}
+            position = _own_edit_position(meta, payload) if event_settled and receipt_check == "matched" else None
+            if not _own_edit_observation_settled(meta, proof == "known_failure"):
+                position = None
+            if declared is not None:
+                entry, command = output["results"][part_index], declared[part_index]
+                if (meta.get("command_index", part_index) != part_index
+                        or any(key in entry and key in command and _compact_utf8_json(entry[key]) != _compact_utf8_json(command[key])
+                               for key in ("step", "command_index", "command_id", "command_run_id", "provider_tool_call_id", "runtime_id"))):
+                    position = None
+            call = payload.get("terminal_receipt", {}).get("call_id")
+            if isinstance(call, str):
+                if call in part_calls:
+                    calls[call] += 1  # Reuse inside one batch is not a duplicate reporting copy.
+                part_calls.add(call)
+            failed = proof == "known_failure"
+            failed_count += kind == "source_read" and failed
+            if proof != "known_success" and not (kind == "source_read" and failed):
+                eligible[event_index] = False
+            prefix = position[0] if position else None
+            row = (event_index, kind, line, payload, proof, position, call)
+            if groups and prefix is not None and groups[-1][0] == prefix:
+                groups[-1][1].append(row)
+            else:
+                if prefix in closed:
+                    return {}, failed_count  # Crossed/interleaved batch identities are ambiguous.
+                if groups and groups[-1][0] is not None:
+                    closed.add(groups[-1][0])
+                groups.append((prefix, [row]))
+    patches, failures, generation = {}, [], 0
+    for batch_index, (prefix, rows) in enumerate(groups):
+        if prefix is None:
+            patches.clear()
+            generation += 1
+            continue
+        if len({row[5][2] for row in rows}) != len(rows):
+            return {}, failed_count
+        mutations = [row[5][1] for row in rows if row[1] not in ("source_read", "focused_verifier", "task_status", "planning")]
+        for event_index, kind, line, payload, proof, position, call in sorted(rows, key=lambda row: (row[5][1], row[5][2])):
+            at = (batch_index, position[1])
+            if calls.get(call) != 1:
+                eligible[event_index] = False
+                patches.clear()
+                generation += 1
+                continue
+            if kind not in ("source_read", "focused_verifier", "task_status", "planning"):
+                patches.clear()
+                generation += 1
+                facts = payload.get("terminal_receipt", {}).get("apply_patch_changes")
+                changes = payload.get("changes")
+                if (not own_edits_allowed or kind != "apply_patch" or proof != "known_success" or mutations.count(position[1]) != 1
+                        or not _own_edit_receipt_settled(payload, "in_process_apply_patch", False)
+                        or payload.get("failed_change") is not None or not isinstance(facts, list)
+                        or not 0 < len(facts) <= 128 or len(_compact_utf8_json(facts)) > 16384
+                        or not isinstance(changes, list) or len(changes) != len(facts)):
+                    continue
+                valid = all(isinstance(fact, dict) and set(fact) == {"kind", "path", "preimage_sha256", "postimage_sha256"}
+                            and fact["kind"] == "update" and all(fact["path"] in scope for scope in scopes)
+                            and all(file_change_evidence._sha(fact[key]) for key in ("preimage_sha256", "postimage_sha256"))
+                            and _normalized_source_read(json.dumps({"path": fact["path"], "start_line": 1, "end_line": 1,
+                                                                  "expected_sha256": fact["postimage_sha256"]})) is not None
+                            and isinstance(change, dict) and change.get("move_path") is None
+                            and _compact_utf8_json({key: change.get(key) for key in fact}) == _compact_utf8_json(fact)
+                            for fact, change in zip(facts, changes))
+                if valid and len({fact["path"] for fact in facts}) == len(facts):
+                    patches = {fact["path"]: (at, fact, call) for fact in facts}
+            elif kind == "source_read" and position[1] not in mutations:
+                oversized = _source_read_json_oversize(line, payload) if proof == "known_failure" else None
+                if oversized is not None and oversized["request"]["path"] in scopes[0]:
+                    failures.append([event_index, oversized, generation, at, call, None, None])
+                    continue
+                content = _source_read_content(line, payload, proof == "known_failure")
+                if content is None or content["request"]["path"] not in scopes[0]:
+                    if proof != "known_success":
+                        eligible[event_index] = False
+                    continue
+                if proof == "known_failure":
+                    patch = patches.get(content["request"]["path"])
+                    if (patch is None or patch[0] >= at or patch[1]["preimage_sha256"] != content["request"]["expected_sha256"]
+                            or patch[1]["postimage_sha256"] != content["source_sha256"]):
+                        eligible[event_index] = False
+                        continue
+                    failures.append([event_index, content, generation, at, call, patch[2], None])
+                elif proof == "known_success":
+                    selector = {key: value for key, value in content["request"].items() if key != "expected_sha256"}
+                    route = _source_read_json_route(content, payload)
+                    for failure in failures:
+                        if (failure[2] != generation or failure[3] >= at
+                                or content["source_sha256"] != failure[1]["source_sha256"]):
+                            continue
+                        if failure[5] is None:
+                            parent = failure[1]["request"]["json_pointer"]
+                            pointer = content["request"].get("json_pointer")
+                            same_parent = pointer == parent and route is not None and route["mode"] == "json_children"
+                            if (failure[6] is None and route is not None and isinstance(pointer, str)
+                                    and content["request"]["path"] == failure[1]["request"]["path"]
+                                    and (pointer.startswith(parent + "/") or same_parent
+                                         and route["parent_type"] == failure[1]["json_recovery"]["parent_type"]
+                                         and route["child_count"] == failure[1]["json_recovery"]["child_count"])):
+                                failure[6] = {"passing_event_index": event_index, "failed_call_id": failure[4],
+                                              "passing_call_id": call, "path": content["request"]["path"],
+                                              "source_sha256": content["source_sha256"],
+                                              "failure_kind": "SOURCE_READ_JSON_VALUE_TOO_LARGE",
+                                              "recovery_kind": "json_read_route", "mode": route["mode"],
+                                              "observed_request": content["request"],
+                                              "original_request_satisfied": False, "original_value_coverage": "unproven"}
+                            continue
+                        old_selector = {key: value for key, value in failure[1]["request"].items() if key != "expected_sha256"}
+                        if selector == old_selector:
+                            failure[6] = {"passing_event_index": event_index, "failed_call_id": failure[4],
+                                          "passing_call_id": call, "patch_call_id": failure[5],
+                                          "path": content["request"]["path"], "postimage_sha256": content["source_sha256"]}
+            elif kind == "source_read" and proof != "known_success":
+                eligible[event_index] = False
+    resolved = {}
+    for event_index in {row[0] for row in failures}:
+        links = [row[6] for row in failures if row[0] == event_index]
+        if eligible.get(event_index) and links and all(link is not None for link in links):
+            resolved[event_index] = {"status": "resolved", "source_reads": links}
+    return resolved, failed_count
+
+
 def _parent_verifier_observation(line: str, payload: dict[str, Any],
                                  receipt_state: str) -> dict[str, Any] | None:
     """Only an authenticated workload observation, never a tool/transport failure."""
@@ -612,7 +1508,7 @@ def _inspection_contract(run: Path, terminal: dict[str, Any], original: dict[str
 
 
 def _resolution_sources(original: dict[str, Any], contract: dict[str, Any],
-                        postimages: list[dict[str, Any]] | None) -> dict[str, dict] | None:
+                        postimages: list[dict[str, Any]] | None) -> dict[str, dict | None] | None:
     """Use only request-bound initial identities and verified closeout postimages."""
     digest = caller._canonical_sha256({k: v for k, v in original.items()
                                       if k not in ("request_id", "request_sha256")})
@@ -634,6 +1530,9 @@ def _resolution_sources(original: dict[str, Any], contract: dict[str, Any],
     for name in names:
         if name in final:
             continue
+        if _admitted_absent_creation(contract, name):
+            final[name] = None
+            continue
         row = initial.get(name) if isinstance(initial, dict) else None
         if (not isinstance(row, dict) or not file_change_evidence._sha(row.get("sha256"))
                 or type(row.get("mode")) is not int or not 0 <= row["mode"] <= 0o7777
@@ -645,7 +1544,7 @@ def _resolution_sources(original: dict[str, Any], contract: dict[str, Any],
 
 
 def _verification_matches(observation: dict[str, Any], contract: dict[str, Any],
-                          sources: dict[str, dict]) -> bool:
+                          sources: dict[str, dict | None]) -> bool:
     value = observation["verification_evidence"]
     grants = contract.get("verifier_commands")
     index = observation["verifier_index"]
@@ -661,11 +1560,12 @@ def _verification_matches(observation: dict[str, Any], contract: dict[str, Any],
         return False
     postimages = value["source_postimages"]
     return (isinstance(postimages, dict) and set(postimages) == set(sources)
-            and all(isinstance(row, dict) and set(row) == {"sha256", "bytes", "mode"}
+            and all((row is None if sources[name] is None else
+                     isinstance(row, dict) and set(row) == {"sha256", "bytes", "mode"}
                     and file_change_evidence._sha(row["sha256"])
                     and type(row["bytes"]) is int and 0 <= row["bytes"] <= file_change_evidence.MAX_FILE_BYTES
                     and type(row["mode"]) is int and 0 <= row["mode"] <= 0o7777
-                    and all(row[key] == expected for key, expected in sources[name].items())
+                    and all(row[key] == expected for key, expected in sources[name].items()))
                     for name, row in postimages.items()))
 
 
@@ -701,8 +1601,10 @@ class _ParentReviewContext:
     retained range fits. All inputs come from the existing verified inspection pass.
     """
     def __init__(self, contract: dict[str, Any], postimages: list[dict[str, Any]],
-                 request: dict[str, Any]) -> None:
+                 request: dict[str, Any], mutation_indices: dict[str, int]) -> None:
         self.contract, self.postimages, self.request = contract, postimages, request
+        self.mutation_indices = mutation_indices
+        self.raw_blocked = False
         self.sources: dict[str, dict] | None = None
         scopes = contract.get("read_scopes")
         allowed, denied = contract.get("allowed_operations"), contract.get("denied_operations", [])
@@ -716,16 +1618,20 @@ class _ParentReviewContext:
 
     def reset(self) -> None:
         # A later typed mutation invalidates earlier observations, even at the same SHA.
-        self.ranges: dict[tuple[str, str, int, int], dict[str, Any]] = {}
-        self.seen: dict[tuple[str, int], str] = {}
-        self.totals: dict[str, int] = {}
-        self.bytes = 0
+        self.reset_reads()
         self.verifiers: list[dict[str, Any]] = []
         self.verifier_files: dict[str, tuple[str, dict, int]] = {}
         self.verifier_seen: dict[tuple[str, int], str] = {}
         self.verifier_calls: set[str] = set()
         self.verifier_bytes = 0
         self.invalid = False
+
+    def reset_reads(self) -> None:
+        # Raw-only effect barriers must not change verifier or conflict rules.
+        self.ranges: dict[tuple[str, str, int, int], dict[str, Any]] = {}
+        self.seen: dict[tuple[str, int], str] = {}
+        self.totals: dict[str, int] = {}
+        self.bytes = 0
 
     @staticmethod
     def _body(text: object, count: int) -> list[str]:
@@ -899,11 +1805,15 @@ class _ParentReviewContext:
             self.invalid = True  # Optional bodies can never change inspection facts.
 
     def add(self, parts: list[tuple[str, str, dict[str, Any]]], proof: str,
-            index: int, event_sha256: str, last_mutation_index: int) -> None:
-        if self.invalid or proof != "known_success" or index <= last_mutation_index:
+            index: int, event_sha256: str) -> None:
+        if self.invalid or self.raw_blocked or proof != "known_success":
             return
         for part_index, part in enumerate(parts):
             payload = part[2]
+            path = payload.get("path")
+            if (isinstance(path, str) and path in self.mutation_indices
+                    and index <= self.mutation_indices[path]):
+                continue
             try:
                 if not _read_only([part], proof):
                     continue
@@ -914,7 +1824,8 @@ class _ParentReviewContext:
             path, sha = payload["path"], payload["source_sha256"]
             if (not isinstance(receipt, dict)
                     or receipt.get("termination_origin") != "in_process_source_read"
-                    or self.final.get(path) != sha):
+                    or self.final.get(path) != sha
+                    or path not in self.mutation_indices):
                 continue
             returned = _read_lines(payload)
             if not returned:
@@ -1008,7 +1919,14 @@ def _display_commands(result, commands, selected, offset, *, command_stream="his
         result["pagination"].update(stream="priority",
                                     omitted_source_read_commands=len(displayed) - len(retained),
                                     total_commands=len(retained))
-        displayed = retained
+        # Failed or unproven commands lead the priority stream, then verifier results, so the first
+        # page names what the parent must repair or accept without opening the artifacts; the
+        # stable sort keeps event order within each rank.
+        def rank(row):
+            if row.get("execution_proof") != "known_success":
+                return 0
+            return 1 if "verifier_output_excerpt" in row else 2
+        displayed = sorted(retained, key=rank)
     if offset > len(displayed):
         raise InspectionError("OFFSET_OUT_OF_RANGE")
     for command in displayed[offset:offset + PAGE_SIZE]:
@@ -1327,8 +2245,6 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
             result["usage"] = {k: usage[k] for k in USAGE_FIELDS
                                if type(usage.get(k)) is int and 0 <= usage[k] < 10**18}
         result["cleanup"]["historical_pass"] = terminal.get("cleanup_pass") is True
-        trajectory_ref = full_core._artifact_reference(run / "core.jsonl", terminal.get("trajectory_artifact"))
-        events = full_core._Trajectory(run / "core.jsonl", reference=trajectory_ref)
         refs = (("supervision", "supervision.json", MAX_JSON),)
         data = {}
         for key, name, limit in refs:
@@ -1340,13 +2256,13 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
         cleanup_bound = (isinstance(scope, dict) and isinstance(cleanup, dict)
                          and all(scope.get(k) == cleanup.get(k) for k in
                                  ("engine_pid", "supervisor_pid", "engine_reaped",
-                                  "no_live_descendants", "cleanup_error"))
+                                  "no_live_descendants", "cleanup_error", "isolation_source"))
                          and scope.get("engine_reaped") is True
                          and scope.get("no_live_descendants") is True
                          and scope.get("cleanup_error") is None)
         if isinstance(scope, dict):
             result["cleanup"]["engine_pid"] = _process(scope.get("engine_pid"))
-            result["cleanup"]["supervisor_pid"] = _process(scope.get("supervisor_pid"))
+            result["cleanup"]["supervisor_pid"] = _supervisor_process(scope, bound=cleanup_bound)
         original, expected_turn = None, None
         identity_path = run / "request-identity.json"
         # Removing a receipt label cannot downgrade a retained request binding.
@@ -1373,29 +2289,112 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
             if trajectory_limit is not None and (
                     type(trajectory_limit) is not int or not 1024 <= trajectory_limit <= caller.MAX_TRAJECTORY_BYTES):
                 raise InspectionError("TRAJECTORY_BUDGET_INVALID")
-            if terminal.get("status") == "RESULT_AVAILABLE":
-                events.limit = trajectory_limit
         result_limit = original.get("max_result_bytes") if original is not None else caller.MAX_RESULT_BYTES
         if type(result_limit) is not int or not 256 <= result_limit <= caller.MAX_RESULT_BYTES:
             raise InspectionError("RESULT_BUDGET_INVALID")
+        if (terminal.get("status") == "BLOCKED"
+                and detail in ("NOKIY_FULL_CORE_SERVICE_NOT_READY", "GRAPH_BATCH_PEER_FAILED")
+                and terminal.get("trajectory_artifact") is None):
+            # A service refusal or peer cancellation can precede CLI creation.
+            # Verify retained evidence without inventing a trajectory or usage.
+            engine = supervision.get("result")
+            result["usage"] = None
+            if (not isinstance(engine, dict)
+                    or any(terminal.get(key) is not None for key in (
+                        "usage", "observed_model", "observed_service_tier", "tool_loop",
+                        "command_evidence_summary"))
+                    or terminal.get("result_text") not in (None, "")
+                    or any(engine.get(key) is not None for key in (
+                        "usage", "trajectory_artifact", "command_evidence", "tool_loop",
+                        "provider_observation", "terminal_evidence", "result_artifact"))
+                    or engine.get("turn_completed") is True
+                    or engine.get("final_text") not in (None, "")):
+                raise InspectionError("PRE_CLI_EVIDENCE_CONFLICT")
+            core_path = run / "core.jsonl"
+            stderr_path = run / "core.stderr"
+            if (core_path.exists() or core_path.is_symlink()
+                    or stderr_path.exists() or stderr_path.is_symlink()
+                    or any(terminal.get(key) is not None for key in (
+                        "command_evidence_artifact", "file_change_evidence_artifact", "result_artifact"))):
+                raise InspectionError("ARTIFACT_REFERENCE_MISSING")
+            if supervision.get("failure") != detail:
+                raise InspectionError("SUPERVISION_FAILURE_MISMATCH")
+            diagnostic = terminal.get("startup_failure_diagnostic")
+            if diagnostic is not None:
+                engine = supervision.get("result")
+                if (not isinstance(diagnostic, dict) or not isinstance(engine, dict)
+                        or set(diagnostic) != {"schema_version", "service", "reason", "exit_code", "os_errno",
+                                              "log_artifact", "log_tail", "log_truncated", "log_capture_blocker"}
+                        or diagnostic != engine.get("startup_failure_diagnostic")
+                        or diagnostic.get("schema_version") != "nokiy_full_core_startup_failure_v1"
+                        or detail != "NOKIY_FULL_CORE_SERVICE_NOT_READY"
+                        or not isinstance(diagnostic.get("service"), str)
+                        or diagnostic["service"] not in {"tura_session_db", "tura_router"}
+                        or not isinstance(diagnostic.get("reason"), str)
+                        or diagnostic["reason"] not in {"spawn_failed", "process_exited", "readiness_timeout"}
+                        or diagnostic["exit_code"] is not None and type(diagnostic["exit_code"]) is not int
+                        or diagnostic["os_errno"] is not None and type(diagnostic["os_errno"]) is not int
+                        or diagnostic["log_capture_blocker"] is not None and (
+                            not isinstance(diagnostic["log_capture_blocker"], str)
+                            or len(diagnostic["log_capture_blocker"]) > 256)):
+                    raise InspectionError("STARTUP_DIAGNOSTIC_INVALID")
+                reference = diagnostic.get("log_artifact")
+                if reference is not None:
+                    if type(diagnostic.get("log_truncated")) is not bool:
+                        raise InspectionError("STARTUP_DIAGNOSTIC_INVALID")
+                    full_core._artifact_reference(run / (diagnostic["service"] + ".log"), reference)
+                    log = full_core._startup_log(run, diagnostic["service"], reference=reference)
+                    if any(diagnostic.get(key) != value for key, value in log.items()):
+                        raise InspectionError("STARTUP_DIAGNOSTIC_MISMATCH")
+                    result["artifacts"]["startup_log"] = reference
+                elif diagnostic.get("log_tail") is not None or diagnostic.get("log_truncated") is not None:
+                    raise InspectionError("STARTUP_DIAGNOSTIC_INVALID")
+                result["startup_failure_diagnostic"] = diagnostic
+            if _file(run / "terminal.json", caller.MAX_TERMINAL_BYTES) != terminal_raw:
+                raise InspectionError("TERMINAL_CHANGED")
+            result.update(first_blocker=detail, trajectory_status="absent", artifact_integrity="verified")
+            return result
+        trajectory_ref = full_core._artifact_reference(run / "core.jsonl", terminal.get("trajectory_artifact"))
+        events = full_core._Trajectory(run / "core.jsonl", reference=trajectory_ref)
+        if original is not None and terminal.get("status") == "RESULT_AVAILABLE":
+            events.limit = trajectory_limit
         capability_request = original  # Retain the already checked binding, not later proof-local reads.
         turn = full_core._TurnSummary(expected_turn, require_completed=terminal.get("status") == "RESULT_AVAILABLE")
         delivery = full_core._TerminalEvidence(original if full_core_receipt else None)
+        handoff = full_core._EvidenceHandoff(original, run, readback=True)
+        failure = (full_core._FailedTurnDiagnostic(original)
+                   if original is not None and terminal.get("status") == "BLOCKED"
+                   and "provider_failure_diagnostic" in terminal else None)
         event_count = file_count = 0
+        command_ids = {}
         last_mutation_index = -1
+        mutation_positions = []
+        def record_mutation_position(item, output):
+            if any(key in item for key in ("runtime_id", "provider_tool_call_id", "command_id",
+                                           "command_run_id", "command_index", "step")):
+                mutation_positions.append(_own_edit_position(item, output))
+
         message_preview, message_truncated, message_ref = None, False, None
         message_gap = None
+        message_answer = None
         def observations():
             nonlocal event_count, file_count, last_mutation_index
             nonlocal message_preview, message_truncated, message_ref, message_gap
-            for event in events:
+            nonlocal message_answer
+            for event in failure.events(events) if failure is not None else events:
                 event_count += 1
                 delivery.observe(event)
+                handoff.observe(event, event_count - 1)
                 turn.observe(event)
                 item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "command_execution":
+                    command_id = item.get("command_id")
+                    if isinstance(command_id, str):
+                        command_ids[command_id] = command_ids.get(command_id, 0) + 1
                 file_count += isinstance(item, dict) and item.get("type") == "file_change"
                 if isinstance(item, dict) and item.get("type") == "file_change":
                     last_mutation_index = event_count - 1
+                    record_mutation_position(item, full_core._structured_output(item))
                 if (full_core_receipt and event.get("type") == "item.completed"
                         and isinstance(item, dict) and item.get("type") == "assistant_message"):
                     text = item.get("text", "")
@@ -1404,12 +2403,19 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
                     message_preview, message_truncated = full_core._text_preview(text, result_limit)
                     message_ref = (full_core._message_reference(run / "last-message.txt", text)
                                    if message_truncated else None)
+                    message_answer = (text if message_truncated and not delivery.enabled
+                                      and message_ref["bytes"] <= MAX_PAGE_BYTES else None)
                     # Overwrite even with absence/error: only the LAST completed
                     # message can supply a handoff, after all later integrity checks.
                     message_gap = (_gap_decode(text) if terminal.get("status") == "RESULT_AVAILABLE" else None)
                     del text
                 yield event
         expected_evidence = full_core._command_evidence(observations())
+        if failure is not None:
+            diagnostic = full_core.provider_failure_diagnostic_with_snapshot(
+                failure.finish(events.reference), terminal, run, require_existing=True)
+            if diagnostic is not None:
+                result["provider_failure_diagnostic_sha256"] = caller._canonical_sha256(diagnostic)
         result["artifacts"]["trajectory"] = {"path": "core.jsonl", "sha256": events.reference["sha256"],
                                               "bytes": events.reference["bytes"]}
         if full_core_receipt and terminal.get("status") == "RESULT_AVAILABLE":
@@ -1420,12 +2426,22 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
             if evidence_text is not None:
                 message_preview, message_truncated, message_ref = evidence_text, False, None
                 message_gap = None
+                message_answer = None
             delivery.validate_projection(terminal)
             if (message_preview is None or message_preview != terminal.get("result_text")
                     or message_truncated is not terminal.get("result_truncated")
-                    or message_ref != terminal.get("result_artifact")):
+                    or delivery.marker is None and message_ref != terminal.get("result_artifact")):
                 raise InspectionError("NOKIY_FULL_CORE_RESULT_INVALID")
-        if terminal.get("result_truncated") is True or terminal.get("result_artifact") is not None:
+        if delivery.marker is not None:
+            handoff_fields = handoff.project(terminal, delivery.marker, inline_limit=result_limit)
+            if handoff_fields:
+                result["evidence_handoff"] = {
+                    "terminal_content_sha256": caller._canonical_sha256(terminal), **handoff_fields}
+                result_ref = handoff_fields["result_artifact"]
+                if result_ref is not None:
+                    result["artifacts"]["result"] = {"path": "worker-handoff.txt", "sha256": result_ref["sha256"],
+                                                      "bytes": result_ref["bytes"]}
+        elif terminal.get("result_truncated") is True or terminal.get("result_artifact") is not None:
             _, _, result_ref = full_core._result_projection(
                 run, terminal.get("result_text"), terminal.get("result_truncated"), terminal.get("result_artifact"), result_limit)
             result["artifacts"]["result"] = {"path": "last-message.txt", "sha256": result_ref["sha256"],
@@ -1433,8 +2449,7 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
         if terminal.get("status") == "BLOCKED" and terminal.get("command_evidence_artifact") is None:
             # No replay and no terminal rewrite. Only settled, request-local DB
             # observations can supplement a failed execution's missing projection.
-            if (not cleanup_bound or result["cleanup"]["historical_pass"] is not True
-                    or any(result["cleanup"][k] != "absent" for k in ("engine_pid", "supervisor_pid"))):
+            if not cleanup_bound or not _cleanup_settled(result["cleanup"]):
                 raise InspectionError("CLEANUP_UNPROVEN")
             from . import durable_recovery
             recovered = durable_recovery.recover(run, terminal, events)
@@ -1449,6 +2464,12 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
                 c["execution_proof"] == "known_success" for c in commands) else
                 "known_failure" if any(c["execution_proof"] == "known_failure" for c in commands) else "unproven")
             result["first_blocker"] = "TERMINAL_NOT_AVAILABLE"
+            if recovered["first_blocker_detail"] is not None:
+                result.update(first_blocker="RECEIPT_PROOF_INVALID",
+                              first_blocker_detail=recovered["first_blocker_detail"], command_success="unproven",
+                              task_success=False, automatic_retry_allowed=False, execution_replayed=False)
+            result["observation_availability"] = recovered["details"]["observation_availability"]
+            result["aggregate_execution_proof"] = "unproven"
             _display_commands(result, commands, selected, offset, command_stream=command_stream)
             return result
         data["command_evidence"], result["artifacts"]["command_evidence"] = _artifact(
@@ -1458,6 +2479,7 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
         file_summary = terminal.get("file_change_evidence_summary")
         file_blocker = None
         file_postimages = None
+        file_mutation_indices = None
         bound_contract = None
         if file_count or file_ref is not None or file_summary is not None:
             if file_ref is None or file_summary is None:
@@ -1480,6 +2502,10 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
                     result["file_changes"] = verified
                     bound_contract = contract
                     file_postimages = proof["postimages"]
+                    # verify checked every normalized path and event identity in order.
+                    # These recorded fences are not live source freshness.
+                    file_mutation_indices = {change["path"]: row["event_index"]
+                                             for row in proof["records"] for change in row["changes"]}
                     result["file_change_success"] = "known_success"
                 except file_change_evidence.EffectError as exc:
                     file_blocker = str(exc)
@@ -1504,17 +2530,38 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
         commands = []
         source_reads = set()
         reads = _ReadEfficiency()
-        review = (_ParentReviewContext(bound_contract, file_postimages, capability_request)
+        review = (_ParentReviewContext(bound_contract, file_postimages, capability_request,
+                                       file_mutation_indices)
                   if capability_request is not None
-                  and capability_request.get("terminal_delivery") == "evidence_only"
-                  and bound_contract is not None and file_postimages is not None else None)
+                  and bound_contract is not None and file_postimages is not None
+                  and file_mutation_indices is not None else None)
         failed_indices, raw_failed_indices = set(), set()
+        search_no_match, digest_mismatch, inspect_failures, no_content_reads = set(), set(), set(), set()
         verifier_failures, verifier_passes, verifier_calls = {}, [], {}
+        verifier_identity = {"request_id": terminal["request_id"], "request_sha256": terminal["request_sha256"],
+                             "session_id": "full-" + terminal["request_sha256"],
+                             "native_thread_id": expected_thread_id}
         rejection_candidates, rejection_calls = {}, {}
+        refusal_candidates, refusal_calls = {}, {}
+        postgate_denials, postgate_receipts = {}, set()
+        postgate_unindexed = False
+        checked_parts = {}
         by_index = {record["event_index"]: record for record in records}
         for index, event in enumerate(events):
             record = by_index.get(index)
             if record is None:
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "command_execution":
+                    # The index parser excludes native task bookkeeping, including
+                    # JSON-string outputs without command_type. Only settled,
+                    # matching status-only controls can bypass the unknown-effect fence.
+                    if not _native_task_status(event, command_ids):
+                        # No checked command identity/settlement: do not guess a link
+                        # to another event or retain raw context across unknown effects.
+                        postgate_unindexed = True
+                        if review is not None:
+                            review.reset_reads()
+                            review.raw_blocked = True
                 continue
             item = event["item"]
             command = item.get("command")
@@ -1535,9 +2582,9 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
                      if "exit_code" in value and value["exit_code"] is not None]
             if any(type(code) is not int for code in codes):
                 raise InspectionError("EXIT_CODE_INVALID")
-            receipt_state = _receipt(run, output)
+            receipt_state = _receipt(run, output, item=item, event_index=index)
             child_receipts: list[str] = []
-            child_proofs = _checked_results(run, output, child_receipts)
+            child_proofs = _checked_results(run, output, child_receipts, item=item, event_index=index)
             if receipt_state == "matched":
                 codes.append(output["terminal_receipt"]["exit_code"])
             if len(set(codes)) > 1:
@@ -1560,6 +2607,8 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
             commands.append({"event_index": index, "event_sha256": record["event_sha256"],
                              "command_sha256": record["command_sha256"],
                              "command": command if len(command.encode()) <= MAX_COMMAND_BYTES else None,
+                             **({"command_head": _command_head(command)}
+                                if len(command.encode()) > MAX_COMMAND_BYTES else {}),
                              "command_bytes": len(command.encode()),
                              "status": status[:32] if isinstance(status, str) else None,
                              "diagnostic_excerpt": diagnostic[:512] if isinstance(diagnostic, str) else None,
@@ -1567,6 +2616,44 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
                              "execution_proof": proof})
             if record["success"] is False or proof == "known_failure":
                 failed_indices.add(index)
+            if (proof == "known_failure" and receipt_state == "matched" and exit_code == 1
+                    and "results" not in output and _search_no_match(command, output)):
+                search_no_match.add(index)
+            if (proof == "known_failure" and receipt_state == "matched" and exit_code == 1
+                    and "results" not in output and capability_request is not None
+                    and _source_read_digest_mismatch(item, command, output)):
+                try:
+                    if bound_contract is None:
+                        bound_contract = _inspection_contract(run, terminal, capability_request,
+                            result["artifacts"], require_artifact=False)
+                    if _outside_write_scope(output["source_read_evidence"]["request"].get("path"), bound_contract):
+                        digest_mismatch.add(index)
+                except (InspectionError, OSError, ValueError, TypeError, KeyError):
+                    pass  # Without the bound contract the failure stays unexplained.
+            if (proof == "known_failure" and receipt_state == "matched" and "results" not in output
+                    and capability_request is not None
+                    and (_inspect_shell_failure(item, output) or _parent_shell_failure(item, output))):
+                try:
+                    if bound_contract is None:
+                        bound_contract = _inspection_contract(run, terminal, capability_request,
+                            result["artifacts"], require_artifact=False)
+                    if ((_inspect_shell_failure(item, output) and _admitted_inspect_contract(bound_contract))
+                            or (_parent_shell_failure(item, output)
+                                and _admitted_parent_shell_contract(bound_contract))):
+                        inspect_failures.add(index)
+                except (InspectionError, OSError, ValueError, TypeError, KeyError):
+                    pass  # Without the bound contract the failure stays unexplained.
+            if (proof == "known_failure" and receipt_state == "matched" and exit_code == 1
+                    and "results" not in output and capability_request is not None
+                    and (read_path := _source_read_without_content(item, command, output)) is not None):
+                try:
+                    if bound_contract is None:
+                        bound_contract = _inspection_contract(run, terminal, capability_request,
+                            result["artifacts"], require_artifact=False)
+                    if _outside_write_scope(read_path, bound_contract):
+                        no_content_reads.add(index)
+                except (InspectionError, OSError, ValueError, TypeError, KeyError):
+                    pass  # Without the bound contract the failure stays unexplained.
             if "pre_execution_rejection" in output and capability_request is not None:
                 try:
                     if bound_contract is None:
@@ -1577,18 +2664,65 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
                 except (InspectionError, OSError, ValueError, TypeError, KeyError, IndexError,
                         RecursionError, OverflowError):
                     pass  # An unauthenticated claim leaves the original failure blocked.
+            if item.get("command_type") == "jspace" and capability_request is not None:
+                call = item.get("command_id")
+                if isinstance(call, str):
+                    refusal_calls[call] = refusal_calls.get(call, 0) + 1
+                try:
+                    if bound_contract is None:
+                        bound_contract = _inspection_contract(run, terminal, capability_request,
+                            result["artifacts"], require_artifact=False)
+                    refusal_candidates[index] = _jspace_refusal(run, item, capability_request, bound_contract)
+                except (InspectionError, OSError, ValueError, TypeError, KeyError, IndexError,
+                        RecursionError, OverflowError):
+                    pass  # Without the router's witness the refusal stays an unexplained failure.
+            if "policy_denial" in item and capability_request is not None:
+                try:
+                    if bound_contract is None:
+                        bound_contract = _inspection_contract(run, terminal, capability_request,
+                            result["artifacts"], require_artifact=False)
+                    if _postgate_policy_denial(item, capability_request, bound_contract):
+                        postgate_denials[index] = item["command_id"]
+                except (InspectionError, OSError, ValueError, TypeError, KeyError):
+                    pass  # Historical text and malformed metadata never establish no-start.
+            if (receipt_state == "matched" and proof in ("known_success", "known_failure")
+                    and output.get("outcome") in (None, "known")
+                    and all(state == "matched" for state in child_receipts)
+                    and all(child in ("known_success", "known_failure") for child in child_proofs)):
+                postgate_receipts.add(index)
             parts = _typed_parts(item, output, receipt_state)
             if any(kind == "apply_patch" for kind, _, _ in parts):
                 last_mutation_index = max(last_mutation_index, index)
+                record_mutation_position(item, output)
                 if review is not None:
                     review.reset()
             part_proofs = child_proofs if "results" in output else [proof]
             part_receipts = child_receipts if "results" in output else [receipt_state]
+            checked_parts[index] = (parts, part_proofs, part_receipts)
             eligible, failed_verifiers = bool(parts) and len(parts) == len(part_proofs), []
+            raw_context_safe = eligible
             for part_index, ((kind, line, payload), part_proof, part_receipt) in enumerate(
                     zip(parts, part_proofs, part_receipts)):
                 observation = (_parent_verifier_observation(line, payload, part_receipt)
                                if kind == "focused_verifier" else None)
+                if observation is not None:
+                    if any(key in value and value[key] != expected
+                           for value in (item, payload) for key, expected in verifier_identity.items()):
+                        observation = None
+                    elif "results" not in output and any(key in item for key in (
+                            "runtime_id", "provider_tool_call_id", "command_id", "command_run_id",
+                            "command_index", "step")):
+                        position = _own_edit_position(item, payload)
+                        if position is None:
+                            observation = None
+                        else:
+                            observation["position"] = position
+                if review is not None and (
+                        part_receipt != "matched" or part_proof not in ("known_success", "known_failure")
+                        or not (observation is not None or part_proof == "known_success" and (
+                            kind == "task_status" or kind == "source_read"
+                            and payload["terminal_receipt"].get("termination_origin") == "in_process_source_read"))):
+                    raw_context_safe = False
                 if observation is not None:
                     call_id = observation["call_id"]
                     verifier_calls[call_id] = verifier_calls.get(call_id, 0) + 1
@@ -1615,35 +2749,61 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
                     commands[-1]["verifier_output_excerpt"] = excerpt
             reads.add(item, output, receipt_state)
             if review is not None:
-                review.add(parts, proof, index, record["event_sha256"], last_mutation_index)
+                if raw_context_safe:
+                    review.add(parts, proof, index, record["event_sha256"])
+                else:
+                    # A settled opaque/mutating command is still a global raw-read
+                    # barrier, including mixed batches with ambiguous effect order.
+                    review.reset_reads()
         if evidence["complete"] and failures != evidence["failed_count"]:
             raise InspectionError("EVIDENCE_FAILURE_COUNT_MISMATCH")
         if not evidence["complete"] and not (failures <= evidence["failed_count"] <= total_commands):
             raise InspectionError("EVIDENCE_FAILURE_COUNT_MISMATCH")
         if evidence["failed_count"] != expected_evidence["failed_count"]:
             raise InspectionError("EVIDENCE_FAILURE_COUNT_MISMATCH")
-        resolved = {}
+        resolved, verifier_recoveries = {}, {}
         if (evidence["complete"] and file_blocker is None and capability_request is not None
-                and verifier_failures and any(row["verification_evidence"] is not None
-                                             for _, row in verifier_passes)):
+                and verifier_failures and verifier_passes):
             try:
                 if bound_contract is None:
                     bound_contract = _inspection_contract(run, terminal, capability_request,
                         result["artifacts"], require_artifact=False)
                 sources = _resolution_sources(capability_request, bound_contract, file_postimages)
-                if sources is not None:
+                if isinstance(bound_contract.get("verifier_commands"), list):
                     passes = [(i, row) for i, row in verifier_passes
-                              if i > last_mutation_index and verifier_calls[row["call_id"]] == 1
-                              and _verification_matches(row, bound_contract, sources)]
+                               if i > last_mutation_index and verifier_calls[row["call_id"]] == 1
+                               and rejection_calls.get(row["call_id"]) == 1
+                               and row["verifier_index"] < len(bound_contract["verifier_commands"])
+                               # JSONL completion order cannot order parallel steps.
+                               # Every native mutation must precede a same-batch PASS
+                               # in a strictly earlier step; malformed positions fence it.
+                               and all(position is not None and "position" in row
+                                       and (position[0] != row["position"][0]
+                                            or position[1] < row["position"][1])
+                                       for position in mutation_positions)]
                     for failed_index, rows in verifier_failures.items():
-                        links = []
+                        links, unknown = [], []
                         for failed in rows:
-                            match = next(((i, row) for i, row in passes
-                                          if i > failed_index
-                                          and row["verifier_index"] == failed["verifier_index"]
-                                          and verifier_calls[failed["call_id"]] == 1), None)
+                            candidates = [(i, row) for i, row in passes
+                                          if i > failed_index and row["verifier_index"] == failed["verifier_index"]
+                                          and verifier_calls[failed["call_id"]] == 1
+                                          and rejection_calls.get(failed["call_id"]) == 1
+                                          and ("position" not in row or "position" not in failed
+                                               or row["position"][0] != failed["position"][0]
+                                               or row["position"][1] > failed["position"][1])]
+                            match = next(((i, row) for i, row in candidates if sources is not None
+                                          and _verification_matches(row, bound_contract, sources)), None)
                             if match is None:
-                                break
+                                if candidates:
+                                    passing_index, passed = candidates[-1]
+                                    unknown.append({"passing_event_index": passing_index,
+                                        "verifier_index": passed["verifier_index"],
+                                        "failed_call_id": failed["call_id"], "passing_call_id": passed["call_id"],
+                                        "reason": ("VERIFICATION_EVIDENCE_MISSING"
+                                                   if passed["verification_evidence"] is None else
+                                                   "SOURCE_COVERAGE_UNPROVEN" if sources is None else
+                                                   "VERIFICATION_EVIDENCE_MISMATCH")})
+                                continue
                             passing_index, passed = match
                             links.append({"passing_event_index": passing_index,
                                           "verifier_index": passed["verifier_index"],
@@ -1651,14 +2811,56 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
                                           "failed_call_id": failed["call_id"], "passing_call_id": passed["call_id"]})
                         if len(links) == len(rows):
                             resolved[failed_index] = {"status": "resolved", "verifiers": links}
+                        elif unknown:
+                            # A later settled exit 0 is observable even when the producer
+                            # omitted source/contract proof. It never discharges the failure.
+                            verifier_recoveries[failed_index] = {"status": "UNKNOWN", "verifiers": unknown}
             except (InspectionError, OSError, ValueError, TypeError, KeyError, IndexError,
                     RecursionError, OverflowError):
                 pass  # Missing optional proof never excuses the original failure.
-        non_attempts = {index: proof for index, proof in rejection_candidates.items()
-                        if rejection_calls[proof["call_id"]] == 1}
+        source_non_attempts = {index: proof for index, proof in rejection_candidates.items()
+                               if rejection_calls[proof["call_id"]] == 1}
+        # A reused call identity cannot be bound to one refusal.
+        refusals = {index: proof for index, proof in refusal_candidates.items()
+                    if refusal_calls.get(proof["call_id"]) == 1}
+        non_attempts = {**source_non_attempts, **refusals}
+        verifier_resolved_count = len(resolved)
+        read_resolved, read_failure_count = {}, 0
+        has_failed_source_read = any(
+            kind == "source_read" and proof == "known_failure"
+            for parts, proofs, _ in checked_parts.values()
+            for (kind, _, _), proof in zip(parts, proofs)
+        )
+        if (has_failed_source_read and evidence["complete"]
+                and file_blocker is None and capability_request is not None):
+            try:
+                if bound_contract is None:
+                    bound_contract = _inspection_contract(run, terminal, capability_request,
+                        result["artifacts"], require_artifact=False)
+                read_resolved, read_failure_count = _resolve_own_edit_reads(
+                    run, events, checked_parts, capability_request, bound_contract)
+                resolved.update(read_resolved)
+            except (InspectionError, OSError, ValueError, TypeError, KeyError, IndexError,
+                    RecursionError, OverflowError):
+                pass  # Optional content evidence never turns a failure into success.
+        # A no-match search answered its question; that explains its own failed record.
+        no_match = {index: {"status": "resolved", "search": "no_match"}
+                    for index in sorted(search_no_match) if index not in resolved}
+        resolved.update(no_match)
+        mismatched = {index: {"status": "resolved", "source_read": "digest_mismatch_no_content"}
+                      for index in sorted(digest_mismatch) if index not in resolved}
+        resolved.update(mismatched)
+        inspected = {index: {"status": "resolved", "inspect_shell": "closed_exit_no_effect"}
+                     for index in sorted(inspect_failures) if index not in resolved}
+        resolved.update(inspected)
+        unread = {index: {"status": "resolved", "source_read": "failed_without_content"}
+                  for index in sorted(no_content_reads) if index not in resolved}
+        resolved.update(unread)
         for command in commands:
             if command["event_index"] in resolved:
                 command["failure_resolution"] = resolved[command["event_index"]]
+            elif command["event_index"] in verifier_recoveries:
+                command["verifier_recovery_observation"] = verifier_recoveries[command["event_index"]]
             if command["event_index"] in non_attempts:
                 command["execution_proof"] = "not_attempted"
                 command["pre_execution_rejection"] = non_attempts[command["event_index"]]
@@ -1681,16 +2883,54 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
             c["execution_proof"] == "known_success" or c["event_index"] in resolved
             or c["event_index"] in non_attempts for c in commands) and (not non_attempts or actual_success)
             else "known_failure" if unresolved else "unproven")
-        if known_failure and (not non_attempts or verifier_failures):
+        if (known_failure and (not non_attempts or verifier_failures)
+                and (verifier_failures or failed_indices - no_match.keys() - mismatched.keys()
+                     - inspected.keys() - unread.keys() - non_attempts.keys())):
             result["verifier_failure_resolution"] = {
                 "schema_version": "nokiy_focused_verifier_resolution_v1",
-                "resolved_count": len(resolved), "unresolved_count": unresolved,
+                "resolved_count": verifier_resolved_count, "unresolved_count": unresolved,
                 "effective_command_success": effective_success,
             }
-        if non_attempts:
+        if read_failure_count:
+            result["source_read_failure_resolution"] = {
+                "schema_version": "nokiy_source_read_failure_resolution_v1",
+                "resolved_count": len(read_resolved), "unresolved_count": unresolved,
+                "effective_command_success": effective_success,
+            }
+        if source_non_attempts:
             result["source_read_rejection_reconciliation"] = {
                 "schema_version": "nokiy_source_read_rejection_reconciliation_v1",
-                "not_attempted_count": len(non_attempts), "unresolved_count": unresolved,
+                "not_attempted_count": len(source_non_attempts), "unresolved_count": unresolved,
+                "effective_command_success": effective_success,
+            }
+        if refusals:
+            result["jspace_refusal_reconciliation"] = {
+                "schema_version": "nokiy_jspace_refusal_reconciliation_v1",
+                "not_attempted_count": len(refusals), "unresolved_count": unresolved,
+                "effective_command_success": effective_success,
+            }
+        if no_match:
+            result["search_no_match_reconciliation"] = {
+                "schema_version": "nokiy_search_no_match_reconciliation_v1",
+                "no_match_count": len(no_match), "unresolved_count": unresolved,
+                "effective_command_success": effective_success,
+            }
+        if mismatched:
+            result["source_read_digest_mismatch_reconciliation"] = {
+                "schema_version": "nokiy_source_read_digest_mismatch_reconciliation_v1",
+                "mismatch_count": len(mismatched), "unresolved_count": unresolved,
+                "effective_command_success": effective_success,
+            }
+        if inspected:
+            result["inspect_shell_failure_reconciliation"] = {
+                "schema_version": "nokiy_inspect_shell_failure_reconciliation_v1",
+                "failure_count": len(inspected), "unresolved_count": unresolved,
+                "effective_command_success": effective_success,
+            }
+        if unread:
+            result["source_read_no_content_reconciliation"] = {
+                "schema_version": "nokiy_source_read_no_content_reconciliation_v1",
+                "failure_count": len(unread), "unresolved_count": unresolved,
                 "effective_command_success": effective_success,
             }
         result["source_read_efficiency"] = reads.summary(
@@ -1698,17 +2938,53 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
         blocker = ("EVIDENCE_INDEX_PARTIAL" if not evidence["complete"] else
                    "COMMAND_FAILURE" if unresolved else
                     "EXECUTION_PROOF_UNAVAILABLE" if total_commands and effective_success != "known_success" else
-                   "COMMAND_IDENTITY_OMITTED" if any(c["command"] is None for c in commands) else
                    file_blocker if file_blocker else
                     "EXECUTION_PROOF_UNAVAILABLE" if not total_commands and result["file_change_success"] != "known_success" else
-                   "CLEANUP_UNPROVEN" if (not cleanup_bound or result["cleanup"]["historical_pass"] is not True
-                       or any(result["cleanup"][k] != "absent"
-                              for k in ("engine_pid", "supervisor_pid"))) else
+                   "CLEANUP_UNPROVEN" if not cleanup_bound or not _cleanup_settled(result["cleanup"]) else
                    "TERMINAL_NOT_AVAILABLE" if terminal.get("status") != "RESULT_AVAILABLE" or detail is not None else None)
         if blocker is None and delivery.marker is not None and delivery.marker["terminal_status"] == "blocked":
             blocker = "WORKER_TERMINAL_EVIDENCE_BLOCKED"
         result["first_blocker"] = blocker
         result["status"] = "EVIDENCE_VERIFIED" if blocker is None else "INCOMPLETE_EVIDENCE"
+        # This is execution settlement only. Preserve the original unavailable
+        # proof, COMMAND_FAILURE, blocked delivery and all failed records above.
+        denials = {index for index, command_id in postgate_denials.items()
+                   if command_ids.get(command_id) == 1}
+        if (not postgate_unindexed and known_failure
+                and blocker == "COMMAND_FAILURE" and capability_request is not None
+                and evidence["complete"] and len(commands) == total_commands and commands
+                and all(row["event_index"] in postgate_receipts | denials | non_attempts.keys()
+                        for row in commands)
+                and file_blocker is None
+                and (file_count == 0 or result["file_change_success"] == "known_success")
+                and cleanup_bound and _cleanup_settled(result["cleanup"])
+                and terminal.get("status") == "RESULT_AVAILABLE" and detail is None
+                and type(terminal.get("runtime_exit_code")) is int and terminal["runtime_exit_code"] == 0
+                and terminal.get("fallback_used") is False):
+            try:
+                if bound_contract is None:
+                    bound_contract = _inspection_contract(run, terminal, capability_request,
+                        result["artifacts"], require_artifact=False)
+            except InspectionError:
+                pass
+            else:
+                grants = bound_contract.get("verifier_commands")
+                # V2 attests only completed workload-verifier failures, not
+                # arbitrary settled commands or policy-denied non-attempts.
+                focused_only = (not denials and isinstance(grants, list)
+                    and raw_failed_indices == failed_indices == set(verifier_failures)
+                    and len(verifier_failures) == evidence["failed_count"]
+                    and all(verifier_calls[row["call_id"]] == 1
+                            and rejection_calls.get(row["call_id"]) == 1
+                            and row["verifier_index"] < len(grants)
+                            for rows in verifier_failures.values() for row in rows))
+                result["post_batch_verifier_settlement"] = {
+                    "schema_version": ("nokiy_post_batch_verifier_settlement_v2" if focused_only
+                                       else "nokiy_post_batch_verifier_settlement_v1"),
+                    "terminal_sha256": result["terminal_sha256"],
+                    "commands": total_commands, "failed": evidence["failed_count"],
+                    "policy_denials": len(denials), "unsettled_commands": 0,
+                }
         # Selection affects display only, after every indexed event and receipt
         # has been checked. It cannot hide a failure outside the selected commands.
         _display_commands(result, commands, selected, offset, command_stream=command_stream,
@@ -1724,6 +3000,17 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
             result["file_changes"]["postimages"] = file_postimages
             if len(caller._canonical_bytes(result)) > MAX_PAGE_BYTES:
                 result["file_changes"].pop("postimages")
+        if message_answer is not None and result["status"] == "EVIDENCE_VERIFIED" and gap is None:
+            # Reuse the checked final message, not a second artifact read. The
+            # complete body is optional; it must never shorten an evidence page.
+            result["parent_review_answer"] = {
+                "schema_version": "nokiy_parent_review_answer_v1",
+                "terminal_content_sha256": caller._canonical_sha256(terminal),
+                "artifact": dict(message_ref), "text": message_answer,
+                "parent_acceptance_required": True,
+            }
+            if len(caller._canonical_bytes(result)) > MAX_PAGE_BYTES:
+                result.pop("parent_review_answer")
         if review is not None and result["status"] == "EVIDENCE_VERIFIED":
             context = review.project(terminal, verifier_calls)
             if context is not None:
@@ -1731,6 +3018,13 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
                 result["parent_review_context"] = context
                 if len(caller._canonical_bytes(result)) > MAX_PAGE_BYTES:
                     result.pop("parent_review_context")
+        # Optional worker content comes from the completed, request-bound pass.
+        # It never changes legacy handoff identity or command/check outcomes.
+        reply_fields = handoff.reply_fields(terminal, delivery.marker, events.reference, command_ids)
+        if reply_fields:
+            result.setdefault("evidence_handoff", {
+                "terminal_content_sha256": caller._canonical_sha256(terminal)}).update(reply_fields)
+            _bound_terminal_reply(result["evidence_handoff"], result, MAX_PAGE_BYTES)
     except caller.EmbeddedNokiyError as exc:
         result["first_blocker"] = exc.code
     except UnicodeError:
@@ -1738,7 +3032,16 @@ def inspect(artifact_root: Path, request_id: str, expected_thread_id: str,
     except InspectionError as exc:
         result["status"] = "INCOMPLETE_EVIDENCE"
         result["first_blocker"] = exc.code
+        if exc.diagnostic is not None:
+            result["first_blocker_detail"] = exc.diagnostic
     return result
+
+
+def _bound_terminal_reply(fields, container, budget):
+    reply = fields.get("task_status_final_reply")
+    if isinstance(reply, dict) and len(caller._canonical_bytes(container)) > budget:
+        reply.pop("text", None)
+        reply.update(complete=False, truncated=True, truncation_reason="PROJECTION_BUDGET")
 
 
 def project_terminal(terminal: dict[str, Any], artifact_root: Path, request_id: str,
@@ -1766,10 +3069,11 @@ def project_terminal(terminal: dict[str, Any], artifact_root: Path, request_id: 
         else:
             try:
                 evidence = inspect(artifact_root, request_id, thread_id, command_stream="priority")
-                context = evidence.get("parent_review_context")
-                if (context is not None and (not isinstance(context, dict)
-                        or context.get("terminal_content_sha256") != caller._canonical_sha256(terminal))):
-                    evidence.pop("parent_review_context", None)
+                for field in ("parent_review_context", "parent_review_answer"):
+                    context = evidence.get(field)
+                    if (context is not None and (not isinstance(context, dict)
+                            or context.get("terminal_content_sha256") != caller._canonical_sha256(terminal))):
+                        evidence.pop(field, None)
                 # The original terminal already carries identity, usage and artifact
                 # hashes. Keep one copy and use event_index to locate full evidence.
                 for key in ("artifacts", "usage", "expected_thread_id", "request_id",
@@ -1778,26 +3082,13 @@ def project_terminal(terminal: dict[str, Any], artifact_root: Path, request_id: 
                 if evidence.get("counts", {}).get("file_changes") == 0:
                     evidence.pop("file_changes", None)
                     evidence.pop("file_change_success", None)
-                evidence["commands"] = [
-                    {key: row[key] for key in ("event_index", "command", "exit_code",
-                                              "receipt_check", "execution_proof")}
-                    | ({"evidence_source": row["evidence_source"], "command_id": row["command_id"]}
-                       if "evidence_source" in row else {})
-                    | ({"failure_resolution": row["failure_resolution"]} if "failure_resolution" in row else {})
-                    | ({"pre_execution_rejection": row["pre_execution_rejection"]}
-                       if "pre_execution_rejection" in row else {})
-                    | ({"diagnostic_excerpt": row["verifier_output_excerpt"]}
-                       if "verifier_output_excerpt" in row else
-                       {"diagnostic_excerpt": row["diagnostic_excerpt"].encode("utf-8", errors="replace")[
-                           :MAX_DIAGNOSTIC_BYTES].decode("utf-8", errors="ignore")}
-                       if (row["execution_proof"] == "known_failure"
-                           and isinstance(row.get("diagnostic_excerpt"), str)
-                           and row["diagnostic_excerpt"]) else {})
-                    for row in evidence["commands"]
-                ]
+                # Read-efficiency telemetry stays in the inspection pages, not every parent turn.
+                evidence.pop("source_read_efficiency", None)
+                evidence["commands"] = [_parent_command_row(row) for row in evidence["commands"]]
             except (OSError, ValueError, TypeError, KeyError, IndexError,
                     UnicodeError, RecursionError, OverflowError):
                 evidence["first_blocker"] = "INSPECTION_UNAVAILABLE"
+    handoff = evidence.pop("evidence_handoff", None)
     gap_inspected = "capability_gap" in evidence
     gap = evidence.pop("capability_gap", None)
     if gap is not None and "binding" in gap:
@@ -1809,6 +3100,26 @@ def project_terminal(terminal: dict[str, Any], artifact_root: Path, request_id: 
         gap = _gap_diagnostic("CAPABILITY_GAP_UNTRUSTED_RESULT")
         gap["inspection_blocker"] = evidence["first_blocker"]
     projected = {**terminal, "result_inspection": evidence}
+    # Only the current bound artifact verification may supply model-reported text.
+    projected.pop("result_artifact_preview", None)
+    projected.pop("task_status_final_reply", None)
+    if (isinstance(handoff, dict)
+            and handoff.get("terminal_content_sha256") == caller._canonical_sha256(terminal)
+            and "task_status_final_reply" in handoff):
+        projected["task_status_final_reply"] = handoff["task_status_final_reply"]
+    if "result_artifact_source" in terminal:
+        if (isinstance(handoff, dict)
+                and handoff.get("terminal_content_sha256") == caller._canonical_sha256(terminal)):
+            projected.update({key: handoff[key] for key in (
+                "result_artifact", "result_artifact_source", "result_artifact_preview") if key in handoff})
+        else:
+            projected.update(full_core._EvidenceHandoff.unavailable("HANDOFF_EVIDENCE_UNAVAILABLE"))
+    if "provider_failure_diagnostic" in projected:
+        diagnostic = _inspected_failure_diagnostic(projected)
+        if diagnostic is None:
+            projected.pop("provider_failure_diagnostic")
+        else:
+            projected["provider_failure_diagnostic"] = diagnostic
     if gap is not None:
         projected["capability_gap"] = gap
     # Serial delivery appends retained-snapshot or read-only recovery metadata
@@ -1820,9 +3131,15 @@ def project_terminal(terminal: dict[str, Any], artifact_root: Path, request_id: 
             "sha256": "0" * 64, "bytes": MAX_PROJECTED_BYTES},
             "inspection_summary_diagnostic": "x" * 64}
     projection_budget = MAX_PROJECTED_BYTES - (len(caller._canonical_bytes(delivery_metadata)) - 1)
+    _bound_terminal_reply(projected, projected, projection_budget)
+    if len(caller._canonical_bytes(projected)) > projection_budget:
+        # Optional report transport must never displace evidence or add a blocker.
+        projected.pop("result_artifact_preview", None)
     if len(caller._canonical_bytes(projected)) > projection_budget:
         # Discard source bodies before identities, commands, gaps or recovery evidence.
         evidence.pop("parent_review_context", None)
+    if len(caller._canonical_bytes(projected)) > projection_budget:
+        evidence.pop("parent_review_answer", None)
     file_changes = evidence.get("file_changes")
     if (isinstance(file_changes, dict) and "postimages" in file_changes
             and len(caller._canonical_bytes(projected)) > projection_budget):
@@ -1853,7 +3170,10 @@ def project_terminal(terminal: dict[str, Any], artifact_root: Path, request_id: 
             "pagination": {**evidence["pagination"], "next_offset": 0},
             "projection_partial": True, "projection_blocker": "PROJECTION_TOO_LARGE",
             **{key: evidence[key] for key in ("terminal_sha256", "counts", "cleanup", "verifier_failure_resolution",
-                                            "source_read_rejection_reconciliation")
+                                            "source_read_rejection_reconciliation", "source_read_failure_resolution",
+                                            "search_no_match_reconciliation", "source_read_digest_mismatch_reconciliation",
+                                            "inspect_shell_failure_reconciliation", "source_read_no_content_reconciliation",
+                                            "jspace_refusal_reconciliation", "provider_failure_diagnostic_sha256")
                if key in evidence},
         }
     if "capability_gap" in projected and len(caller._canonical_bytes(projected)) > projection_budget:
@@ -1861,9 +3181,23 @@ def project_terminal(terminal: dict[str, Any], artifact_root: Path, request_id: 
     return projected
 
 
+def _inspected_failure_diagnostic(projected: dict[str, Any]) -> dict[str, Any] | None:
+    diagnostic = full_core.valid_provider_failure_diagnostic(projected.get("provider_failure_diagnostic"), projected)
+    inspection = projected.get("result_inspection")
+    if (diagnostic is not None and isinstance(inspection, dict)
+            and inspection.get("provider_failure_diagnostic_sha256") == caller._canonical_sha256(diagnostic)):
+        return diagnostic
+    return None
+
+
 def summarize_terminal(projected: dict[str, Any], artifact_root: Path,
                        request_id: str) -> dict[str, Any]:
-    """Select return fields from an already projected terminal; do not inspect again."""
+    """Select return fields from an already projected terminal; do not inspect again.
+
+    Runtime diagnostics are historical, not quality, provider-speed, billing or fresh-authority proof.
+    Phase timings and usage coverage stay in terminal.json: every parent turn re-reads this
+    summary, so it carries usage totals only.
+    """
     fields = (
         "status", "first_typed_blocker", "first_blocker", "request_id", "request_sha256",
         "native_thread_id", "execution_id", "session_id", "model", "model_route",
@@ -1872,13 +3206,15 @@ def summarize_terminal(projected: dict[str, Any], artifact_root: Path,
         "service_tier", "requested_service_tier", "observed_service_tier",
         "requested_model_provider", "observed_model_provider", "result_text",
         "requested_terminal_delivery", "observed_terminal_delivery", "terminal_evidence",
-        "result_truncated", "result_artifact", "usage", "wall_time_seconds",
+        "result_truncated", "result_artifact", "result_artifact_source", "result_artifact_preview",
+        "task_status_final_reply",
+        "wall_time_seconds", "tool_loop",
         "runtime_exit_code", "cleanup_pass", "continuation_owner", "mission_acceptance",
         "authority_effect", "fallback_used", "result_inspection", "capability_gap",
         "inspection_summary", "inspection_summary_diagnostic", "inspection_summary_omission",
     )
     inspection = projected["result_inspection"]
-    return {
+    summary = {
         "schema_version": "nokiy_terminal_summary_v1",
         "terminal_schema_version": projected.get("schema_version"),
         **{key: projected[key] for key in fields if key in projected},
@@ -1886,6 +3222,49 @@ def summarize_terminal(projected: dict[str, Any], artifact_root: Path,
         # Only inspection can establish this hash. Never hash the projected response.
         "terminal_sha256": inspection.get("terminal_sha256"),
     }
+    if "usage" in projected:
+        usage = projected["usage"]
+        summary["usage"] = ({key: usage[key] for key in SUMMARY_USAGE_FIELDS if key in usage}
+                            if isinstance(usage, dict) else usage)
+    if "provider_failure_diagnostic" in projected:
+        diagnostic = _inspected_failure_diagnostic(projected)
+        if diagnostic is not None:
+            summary["provider_failure_diagnostic"] = diagnostic
+    diagnostic = projected.get("startup_failure_diagnostic")
+    if isinstance(diagnostic, dict) and diagnostic == inspection.get("startup_failure_diagnostic"):
+        summary["startup_failure_diagnostic"] = diagnostic
+    answer = inspection.get("parent_review_answer")
+    artifact = projected.get("result_artifact")
+    if (projected.get("status") == "RESULT_AVAILABLE" and projected.get("cleanup_pass") is True
+            and projected.get("first_typed_blocker") is None and projected.get("first_blocker") is None
+            and projected.get("request_id") == request_id
+            and projected.get("request_sha256") == request_id[-64:]
+            and type(projected.get("native_thread_id")) is str
+            and caller.THREAD_ID_PATTERN.fullmatch(projected["native_thread_id"])
+            and inspection.get("request_id", request_id) == request_id
+            and inspection.get("expected_thread_id", projected["native_thread_id"]) == projected["native_thread_id"]
+            and projected.get("result_truncated") is True and projected.get("capability_gap") is None
+            and inspection.get("status") == "EVIDENCE_VERIFIED" and inspection.get("first_blocker") is None
+            and inspection.get("projection_partial") is not True
+            and inspection.get("artifact_integrity") == "verified"
+            and type(answer) is dict and answer.get("schema_version") == "nokiy_parent_review_answer_v1"
+            and answer.get("parent_acceptance_required") is True
+            and type(artifact) is dict and answer.get("artifact") == artifact
+            and type(answer.get("text")) is str and type(artifact.get("bytes")) is int
+            and type(artifact.get("sha256")) is str and _SHA.fullmatch(artifact["sha256"])
+            and type(answer.get("terminal_content_sha256")) is str
+            and _SHA.fullmatch(answer["terminal_content_sha256"])):
+        try:
+            body = answer["text"].encode("utf-8")
+        except UnicodeError:
+            body = b""
+        if (body and len(body) == artifact["bytes"]
+                and hashlib.sha256(body).hexdigest() == artifact["sha256"]):
+            # The original preview stays in terminal.json. Deliver its already
+            # checked complete answer once, without changing raw truncation facts.
+            summary["result_text"] = ""
+            summary["result_text_omission"] = "VERIFIED_PARENT_REVIEW_ANSWER"
+    return summary
 
 
 def _summary_run(artifact_root: Path, request_id: str) -> Path:
@@ -2097,8 +3476,7 @@ def parent_review_record(projected: dict[str, Any], *, expected_request_id: str,
         raise ValueError("Parent review original terminal/hash mismatch")
     cleanup = inspection.get("cleanup")
     if (projected.get("cleanup_pass") is not True or type(cleanup) is not dict
-            or cleanup.get("historical_pass") is not True
-            or any(cleanup.get(key) != "absent" for key in ("engine_pid", "supervisor_pid"))):
+            or not _cleanup_settled(cleanup)):
         raise ValueError("Parent review cleanup unproven")
     blockers = {
         "terminal": text(projected.get("first_typed_blocker"), 256, nullable=True),
@@ -2154,8 +3532,151 @@ def parent_review_record(projected: dict[str, Any], *, expected_request_id: str,
             "task_evidence": references, "note": text(note, MAX_DIAGNOSTIC_BYTES)}
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def _review_path(value: object, request_id: str | None = None) -> Path:
+    if type(value) is not str or not value.strip() or len(value.encode("utf-8")) > 1024:
+        raise InspectionError("PARENT_REVIEW_PATH_INVALID")
+    parsed = Path(value)
+    if (parsed.anchor != "/" or str(parsed) != value or not parsed.name
+            or any(part in (".", "..") or part != part.strip() or part.startswith("~")
+                   or part.casefold() == ".git"
+                   or request_id is not None and caller.REQUEST_ID_PATTERN.fullmatch(part)
+                   and part != request_id for part in parsed.parts[1:])
+            or any(char in value for char in "\\:*?[]{}")
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        raise InspectionError("PARENT_REVIEW_PATH_INVALID")
+    return parsed
+
+
+def _review_sha256(path: Path) -> str:
+    """Hash a regular file through pinned, no-follow parents, with bounded memory."""
+    with _summary_directory(path.parent) as directory:
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                             dir_fd=directory)
+        with os.fdopen(descriptor, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise InspectionError("UNSAFE_FILE")
+            digest = hashlib.sha256()
+            for raw in iter(lambda: stream.read(65536), b""):
+                digest.update(raw)
+            after = os.fstat(stream.fileno())
+            current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            if (full_core._artifact_stamp(before) != full_core._artifact_stamp(after)
+                    or full_core._artifact_stamp(before) != full_core._artifact_stamp(current)):
+                raise InspectionError("PARENT_REVIEW_EVIDENCE_CHANGED")
+    return digest.hexdigest()
+
+
+def declare_task_review(packet: dict[str, Any], review_path: str) -> dict[str, Any]:
+    """Validate a parent-authored packet, then exclusively create its admitted record.
+
+    This hashes only supplied task evidence/postimages and loads the retained summary;
+    it never reinspects execution or infers semantic acceptance. The parent still owns
+    the complete requirements, review, provenance, output admission and final acceptance.
+    """
+    fields = {"schema_version", "summary_reference", "request_id", "thread_id",
+              "terminal_reference", "required_check_paths", "task_checks",
+              "expected_postimages", "review_complete", "semantic_decision", "note"}
+    if (type(packet) is not dict or set(packet) != fields
+            or type(packet["schema_version"]) is not str
+            or packet["schema_version"] != PARENT_REVIEW_INPUT_SCHEMA
+            or type(packet["request_id"]) is not str
+            or caller.REQUEST_ID_PATTERN.fullmatch(packet["request_id"]) is None
+            or type(packet["thread_id"]) is not str
+            or caller.THREAD_ID_PATTERN.fullmatch(packet["thread_id"]) is None
+            or type(packet["review_complete"]) is not bool
+            or packet["semantic_decision"] is not None and (
+                type(packet["semantic_decision"]) is not str
+                or packet["semantic_decision"] not in ("accepted", "rejected", "pending"))
+            or type(packet["required_check_paths"]) is not list
+            or type(packet["task_checks"]) is not list
+            or len(packet["task_checks"]) > 8
+            or type(packet["expected_postimages"]) is not dict
+            or len(packet["required_check_paths"]) + len(packet["expected_postimages"]) > 8):
+        raise InspectionError("PARENT_REVIEW_INPUT_INVALID")
+    request_id, thread_id = packet["request_id"], packet["thread_id"]
+    output = _review_path(review_path, request_id)
+    required = [str(_review_path(path, request_id)) for path in packet["required_check_paths"]]
+    if len(set(required)) != len(required):
+        raise InspectionError("PARENT_REVIEW_REQUIRED_CHECK_DUPLICATED")
+    postimages = [{"path": str(_review_path(path, request_id)), "sha256": sha,
+                   "check_status": "passed"} for path, sha in packet["expected_postimages"].items()]
+    summary = load_inspection_summary(packet["summary_reference"], expected_request_id=request_id,
+                                     expected_thread_id=thread_id,
+                                     terminal_reference=packet["terminal_reference"])
+    # Check only the original terminal's file kind, not its contents or execution again.
+    with _summary_directory(Path(packet["terminal_reference"]["path"]).parent) as directory:
+        if not stat.S_ISREG(os.stat("terminal.json", dir_fd=directory, follow_symlinks=False).st_mode):
+            raise InspectionError("UNSAFE_FILE")
+    bindings = {"expected_request_id": request_id, "expected_thread_id": thread_id,
+                "terminal_reference": packet["terminal_reference"], "note": packet["note"]}
+    # Reuse the existing builder for reference, identity, integrity and cleanup validation.
+    checked = parent_review_record(summary, **bindings, decision="pending",
+                                   task_evidence=packet["task_checks"] + postimages)["task_evidence"]
+    supplied = {check["path"] for check in checked[:len(packet["task_checks"])]}
+    if (not supplied <= set(required)
+            or str(output) in {*required, *(check["path"] for check in checked),
+                               packet["summary_reference"]["path"], packet["terminal_reference"]["path"]}):
+        raise InspectionError("PARENT_REVIEW_EVIDENCE_SCOPE_INVALID")
+    decision = packet["semantic_decision"] or "pending"
+    if decision == "accepted" and (not packet["review_complete"] or supplied != set(required)):
+        decision = "pending"
+    for check in checked:
+        if _review_sha256(Path(check["path"])) != check["sha256"]:
+            raise InspectionError("PARENT_REVIEW_HASH_MISMATCH")
+    record = parent_review_record(summary, **bindings, decision=decision, task_evidence=checked)
+    raw = caller._canonical_bytes(record) + b"\n"
+    with _summary_directory(output.parent) as directory:
+        descriptor = os.open(output.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+        identity = None
+        try:
+            identity = os.fstat(descriptor)
+            with os.fdopen(descriptor, "wb") as stream:
+                descriptor = -1
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            # Remove only our own interrupted creation, never an existing/replaced output.
+            try:
+                current = os.stat(output.name, dir_fd=directory, follow_symlinks=False)
+                if identity is not None and (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino):
+                    os.unlink(output.name, dir_fd=directory)
+            except OSError:
+                pass
+            raise
+        finally:
+            if descriptor != -1:
+                os.close(descriptor)
+    return record
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["parent-review"]:
+        parser = argparse.ArgumentParser(description="Declare a parent-owned review without reinspection")
+        parser.add_argument("--input", required=True, help="Exact admitted parent-authored JSON packet")
+        parser.add_argument("--output", required=True, help="New normalized absolute admitted record path")
+        args = parser.parse_args(argv[1:])
+        try:
+            source = _review_path(args.input)
+            with _summary_directory(source.parent) as directory:
+                packet = _json(_file(Path(source.name), MAX_PROJECTED_BYTES, dir_fd=directory))
+            thread_id = os.environ.get("CODEX_THREAD_ID")
+            if (type(thread_id) is not str or caller.THREAD_ID_PATTERN.fullmatch(thread_id) is None
+                    or packet.get("thread_id") != thread_id):
+                raise InspectionError("PARENT_REVIEW_CALLING_THREAD_MISMATCH")
+            result = declare_task_review(packet, args.output)
+        except (ValueError, OSError, caller.EmbeddedNokiyError) as error:
+            code = error.code if isinstance(error, InspectionError) else "PARENT_REVIEW_DECLARATION_FAILED"
+            print(json.dumps({"schema_version": "nokiy_parent_review_error_v1", "error": code},
+                             sort_keys=True, separators=(",", ":")))
+            return 2
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return 0
+    parser = argparse.ArgumentParser(description=__doc__, epilog=(
+        "Parent declaration: parent-review --input <parent-authored JSON> --output <new exact record path>"))
     parser.add_argument("--artifact-root", required=True, type=Path)
     parser.add_argument("--request-id", required=True)
     parser.add_argument("--expected-thread-id", required=True)
@@ -2164,7 +3685,7 @@ def main() -> int:
                         help="Offset stream; priority omits only proven successful typed source-read-only commands")
     parser.add_argument("--command-sha256", action="append", default=[],
                         help="Exact UTF-8 command SHA-256 to display; all evidence is still verified")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     result = inspect(args.artifact_root, args.request_id, args.expected_thread_id,
                      offset=args.offset, command_sha256=tuple(args.command_sha256),
                      command_stream=args.command_stream)

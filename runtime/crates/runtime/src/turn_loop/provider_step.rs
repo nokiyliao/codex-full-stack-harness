@@ -6,6 +6,18 @@ use crate::provider_flow::usage::runtime_cache_diagnostics;
 use lifecycle::RuntimeAggregate;
 use lifecycle::SessionManagement;
 
+fn usage_missing_reason(usage_reported: bool, output: Option<&serde_json::Value>) -> Option<&'static str> {
+    if usage_reported {
+        return None;
+    }
+    match output.and_then(|value| value.pointer("/streamed_command_run_result/early_finish_reason"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("apply_patch_failed") => Some("stream_aborted_after_apply_patch_failure"),
+        _ => Some("usage_not_available"),
+    }
+}
+
 pub(crate) fn accumulate_session_from_runtime(
     session: &mut SessionManagement,
     runtime: &RuntimeAggregate,
@@ -38,10 +50,24 @@ pub(crate) fn accumulate_session_from_runtime(
 
     // Count unobserved calls too, so an early tool completion cannot disappear
     // from the denominator when another call later reports a tier.
+    let error_code = runtime.error.as_ref().and_then(|error| error.error_code.as_deref());
+    let provider_call_observation = if runtime.call_result_status()
+        == lifecycle::RuntimeCallResultStatus::Failed
+        && error_code == Some("CALL_FAILED")
+    {
+        runtime.output.as_ref().and_then(|output| output.get("provider_call_observation"))
+    } else {
+        None
+    };
     session.push_log(
         serde_json::json!({
             "type": "runtime_provider_observation",
             "runtime_id": runtime.runtime_id,
+            "session_id": runtime.session_id,
+            "status": format!("{:?}", runtime.call_result_status()),
+            "error_code": error_code,
+            "usage_missing_reason": usage_missing_reason(runtime.usage.is_some(), runtime.output.as_ref()),
+            "provider_call_observation": provider_call_observation,
             "provider_observation": runtime.provider_observation,
             "reasoning_observation": runtime.output.as_ref().and_then(|output| output.get("responses_continuity_observation")),
             "timestamp": now.to_rfc3339(),
@@ -97,6 +123,18 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn missing_usage_reason_does_not_invent_or_discard_usage() {
+        let early = serde_json::json!({"streamed_command_run_result": {
+            "early_finish_reason": "apply_patch_failed"}});
+        assert_eq!(super::usage_missing_reason(false, Some(&early)),
+                   Some("stream_aborted_after_apply_patch_failure"));
+        assert_eq!(super::usage_missing_reason(true, Some(&early)), None);
+        assert_eq!(super::usage_missing_reason(false, None), Some("usage_not_available"));
+        let other = serde_json::json!({"streamed_command_run_result": {"early_finish_reason": "unknown"}});
+        assert_eq!(super::usage_missing_reason(false, Some(&other)), Some("usage_not_available"));
+    }
+
+    #[test]
     fn provider_observation_is_projected_without_usage() {
         let now = Utc::now();
         let mut session = SessionManagement::new(
@@ -148,6 +186,7 @@ mod tests {
                     response_id: Some("resp-final".into()),
                     model: None,
                     service_tier: None,
+                    failed_attempts: Vec::new(),
                 }),
             )
             .expect("output");
@@ -216,6 +255,59 @@ mod tests {
         assert_eq!(value["created_at"], first_token_at.timestamp_millis());
         assert_eq!(value["updated_at"], finished_at.timestamp_millis());
         assert_eq!(value["timestamp"], finished_at.to_rfc3339());
+    }
+
+    #[test]
+    fn authentication_stage_survives_session_projection_without_usage() {
+        let now = Utc::now();
+        let mut session = SessionManagement::new(
+            "session-auth-projection".into(), "auth projection".into(),
+            PathBuf::from("C:/workspace"), false, "coding",
+            SessionInput { user_input: "inspect".into(), file_input: Vec::new(),
+                agent: Some("direct".into()), runtime_context: None, planning_mode_override: None },
+            "inspect".into(), now,
+        );
+        let mut runtime = RuntimeAggregate::new(
+            "runtime-auth-projection".into(), session.session_id.clone(), "agent".into(),
+            provider_config(), now,
+        );
+        runtime.mark_called(now).expect("called");
+        let error = tura_llm_rust::TuraError::AuthenticationBeforeModel {
+            source: Box::new(tura_llm_rust::TuraError::Network { message: "fixture".into() }),
+        };
+        runtime.set_output(crate::provider_flow::errors::provider_failure_output(&error))
+            .expect("producer output");
+        crate::provider_flow::errors::finish_provider_call_failure(
+            &mut runtime, now + Duration::seconds(30), &error, lifecycle::RuntimeState::Failed,
+        ).expect("failed");
+        accumulate_session_from_runtime(&mut session, &runtime, false).expect("projection");
+        assert!(runtime.usage.is_none());
+        assert!(session.runtime_usage.is_null());
+        assert_eq!(session.session_log.len(), 1);
+        let record: serde_json::Value = serde_json::from_str(&session.session_log[0]).unwrap();
+        assert_eq!(record["runtime_id"], runtime.runtime_id);
+        assert_eq!(record["session_id"], runtime.session_id);
+        assert_eq!(record["status"], "Failed");
+        assert_eq!(record["error_code"], "CALL_FAILED");
+        assert_eq!(record["provider_call_observation"]["model_provider_invoked"], false);
+        assert_eq!(record["provider_call_observation"]["stage"], "authentication");
+        assert!(record["provider_observation"].is_null());
+        assert!(record.get("usage").is_none());
+        assert_eq!((runtime.call_finished_at.unwrap() - runtime.called_at.unwrap()).num_seconds(), 30);
+
+        // A successful output cannot authorize a pre-model exclusion by its contents.
+        let mut success = RuntimeAggregate::new(
+            "runtime-success-projection".into(), session.session_id.clone(), "agent".into(),
+            provider_config(), now,
+        );
+        success.mark_called(now).unwrap();
+        success.mark_waiting_first_token().unwrap();
+        success.mark_first_token(now).unwrap();
+        success.set_output(runtime.output.clone().unwrap()).unwrap();
+        success.finish_success(now, None).unwrap();
+        accumulate_session_from_runtime(&mut session, &success, false).unwrap();
+        let record: serde_json::Value = serde_json::from_str(session.session_log.last().unwrap()).unwrap();
+        assert!(record["provider_call_observation"].is_null());
     }
 
     #[test]

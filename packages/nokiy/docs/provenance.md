@@ -18,7 +18,7 @@ The contribution boundary is intentionally explicit:
 | System | Relationship | Included here? |
 |---|---|---|
 | OpenAI Codex | Intended collaboration context and external runtime family | No OpenAI source, service code, or private API material |
-| nokiy native task profile | Thin execution-policy profile for Native Codex | The exact MIT profile resource is packaged; Native Codex retains persistence, lifecycle, tools, effects, and callback ownership |
+| Native Tura role | Preferred thin execution-policy profile for Native Codex | The exact MIT role resource is packaged; Native Codex retains persistence, lifecycle, tools, effects, and callback ownership |
 | External Tura runtime | Historical and optional lineage for lifecycle, receipt, recovery, and continuation engineering | No Tura source is vendored into the MIT wheel; the public AGPL fork is bound by an exact component manifest and connected only through the optional MIT adapter |
 | Deep Context Federation | Separate public MIT companion/inspiration for read-only evidence reconstruction | No vendored code and no runtime dependency |
 | Private collaboration deployments | Engineering experience that motivated the generic control graph | No corpus, raw receipt, local identity, or deployment configuration |
@@ -27,11 +27,6 @@ The contribution boundary is intentionally explicit:
 accepted upstream. This repository is the original reference implementation of
 the generic graph it documents; the related systems retain their own authorship,
 licenses, trademarks, and release histories.
-
-The nokiy name identifies this repository's owned interfaces and integration.
-The full Direct/Balanced execution path still uses modified external Rust
-components. Renaming does not establish a from-scratch rewrite, remove those
-dependencies, or change their license and attribution requirements.
 
 ## Third-Party Inventory
 

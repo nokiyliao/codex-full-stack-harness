@@ -23,6 +23,13 @@ use super::response::{failed_async_response, json_like_output};
 const EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_EXEC_OUTPUT_DELTAS_PER_CALL: usize = 512;
 const PROCESS_TERMINATION_GRACE_SECS: u64 = 5;
+/// Set by the caller for fenced inspect runs: Seatbelt refuses to exec setuid /bin/ps, so the
+/// caller serves `ps` through a broker and puts a shim named ps first on PATH. A call of
+/// /bin/ps by absolute path bypasses that shim.
+const PS_BROKER_ENV: &str = "NOKIY_PS_BROKER";
+const FENCED_PS_HINT: &str = "Note: /bin/ps cannot run by absolute path inside the inspect fence \
+(setuid). Call ps by name, from the shell or as subprocess.run([\"ps\", ...]); the brokered ps \
+on PATH returns the same output.";
 
 pub(super) fn run_command_with_timeout(
     mut command: Command,
@@ -198,6 +205,7 @@ fn command_response_from_status(
         text.push_str("\nStderr:\n");
         text.push_str(&stderr);
     }
+    push_fenced_ps_hint(&mut text, &stdout, &stderr);
     CommandResponse {
         success: status.success(),
         exit_code,
@@ -205,6 +213,26 @@ fn command_response_from_status(
         stderr,
         output: Value::String(text),
         changes: Vec::new(),
+    }
+}
+
+/// The brokered route when a fenced command failed on /bin/ps by path; None outside the fence.
+fn fenced_ps_hint(broker_configured: bool, stdout: &str, stderr: &str) -> Option<&'static str> {
+    let refused = |text: &str| {
+        text.lines().any(|line| {
+            let line = line.to_ascii_lowercase();
+            line.contains("/bin/ps")
+                && (line.contains("operation not permitted") || line.contains("eperm"))
+        })
+    };
+    (broker_configured && (refused(stderr) || refused(stdout))).then_some(FENCED_PS_HINT)
+}
+
+fn push_fenced_ps_hint(text: &mut String, stdout: &str, stderr: &str) {
+    let broker_configured = std::env::var_os(PS_BROKER_ENV).is_some();
+    if let Some(hint) = fenced_ps_hint(broker_configured, stdout, stderr) {
+        text.push('\n');
+        text.push_str(hint);
     }
 }
 
@@ -449,6 +477,7 @@ pub(super) async fn run_tokio_command_with_timeout(
                 text.push_str("\nStderr:\n");
                 text.push_str(&stderr);
             }
+            push_fenced_ps_hint(&mut text, &stdout, &stderr);
             CommandResponse {
                 success: status.success(),
                 exit_code,
@@ -614,7 +643,7 @@ fn terminal_receipt_value(
     process_group_empty: bool,
 ) -> Value {
     let call_id = ctx.current_call_id().unwrap_or("command_run");
-    json!({
+    let mut receipt = json!({
         "schema_version": "tura_command_terminal_receipt_v1",
         "call_id": call_id,
         "pid": pid,
@@ -638,7 +667,57 @@ fn terminal_receipt_value(
             || failure_class == "workload_exit_nonzero"
             || !(process_reaped && process_group_empty),
         "replay_semantics": "diagnosed_replay_only_after_no_authoritative_publication_or_idempotent_cas_proof"
-    })
+    });
+    // Bind operation-buffer facts in the existing durable receipt, not in a
+    // second ledger. The failed outcome and its reconciliation flag stay failed.
+    if pid.is_none() && outcome == "known" && process_reaped && process_group_empty {
+        if termination_origin == "in_process_source_read" && response.changes.is_empty()
+            && !response.success && response.exit_code == 1
+            && response.output["error_type"] == "SOURCE_READ_JSON_VALUE_TOO_LARGE"
+            && crate::commands::source_read::navigation_refusal_matches(
+                &response.output["navigation_refusal"],
+                &response.output["navigation_refusal"]["request"].to_string())
+        {
+            receipt["navigation_refusal"] = response.output["navigation_refusal"].clone();
+        }
+        if termination_origin == "in_process_source_read" && response.changes.is_empty()
+            && let Some(proof) = crate::commands::source_read::SourceReadContentEvidence::parse_bounded(
+                &response.output["source_read_evidence"],
+            )
+            && proof.content_satisfied == response.success
+            && response.exit_code == if proof.content_satisfied { 0 } else { 1 }
+            && (proof.content_satisfied || response.output["error_type"] == "SOURCE_READ_SHA256_MISMATCH")
+        {
+            receipt["source_read_evidence"] = json!(proof);
+        } else if termination_origin == "in_process_apply_patch" && response.success && response.exit_code == 0
+            && let Some(changes) = own_edit_patch_changes(&response.changes, &ctx.session_dir)
+        {
+            receipt["apply_patch_changes"] = changes;
+        }
+    }
+    receipt
+}
+
+fn own_edit_patch_changes(changes: &[Value], workspace: &std::path::Path) -> Option<Value> {
+    use crate::commands::source_read::{parse_command_line, target_path};
+    if changes.is_empty() || changes.len() > 128 { return None; }
+    let mut paths = BTreeSet::new();
+    let mut identities = Vec::with_capacity(changes.len());
+    for change in changes {
+        let (path, before, after) = (change["path"].as_str()?, change["preimage_sha256"].as_str()?,
+            change["postimage_sha256"].as_str()?);
+        if change["kind"] != "update" || change.get("move_path").is_some_and(|path| !path.is_null())
+            || !paths.insert(path) || [before, after].iter().any(|sha|
+                sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        { return None; }
+        let request = parse_command_line(&json!({"path":path, "start_line":1, "end_line":1,
+            "expected_sha256":after}).to_string()).ok()?;
+        target_path(workspace, &request).ok()?; // canonical, regular, no symlink/move
+        identities.push(json!({"kind":"update", "path":path,
+            "preimage_sha256":before, "postimage_sha256":after}));
+    }
+    let value = json!(identities);
+    (serde_json::to_vec(&value).ok()?.len() <= 16 * 1024).then_some(value)
 }
 
 pub(crate) fn preview_in_process_terminal_response(
@@ -1458,7 +1537,7 @@ pub async fn terminalize_interrupted_command_run_claims(
                 .cloned()
                 .unwrap_or(json!(true)),
         );
-        durable_replace_json(store, name, &claim)?;
+        durable_replace_json(store, name, claim)?;
     }
     update_command_run_batch(
         store,
@@ -1853,10 +1932,11 @@ async fn drain_stream_tasks(
 mod tests {
     use super::super::response::failed_async_response;
     use super::{
-        ProgressClock, SharedOutput, begin_command_run_batch, claim_command_execution,
-        command_claim_name, command_claim_path, command_receipt_name, command_receipt_path,
-        command_run_batch_path, durable_write_receipt, mark_command_run_batch_call_accepted,
-        read_stream_with_deltas, reconcile_command_execution_claims, run_command_with_timeout,
+        FENCED_PS_HINT, ProgressClock, SharedOutput, begin_command_run_batch,
+        claim_command_execution, command_claim_name, command_claim_path, command_receipt_name,
+        command_receipt_path, command_run_batch_path, durable_write_receipt, fenced_ps_hint,
+        mark_command_run_batch_call_accepted, read_stream_with_deltas,
+        reconcile_command_execution_claims, run_command_with_timeout,
         run_tokio_command_with_timeout, tail_chars, terminalize_interrupted_command_run_claims,
         terminalize_pre_execution_zero_effect,
     };
@@ -1906,6 +1986,41 @@ mod tests {
             }),
         )
         .expect("test claim");
+    }
+
+    #[test]
+    fn own_edit_receipt_binds_only_successful_regular_unmoved_update_buffers() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        fs::write(workspace.join("file"), "old\n").unwrap();
+        let mut response = crate::commands::apply_patch::execute(
+            "*** Begin Patch\n*** Update File: file\n@@\n-old\n+new\n*** End Patch\n", &workspace);
+        assert!(response.success);
+        let context = ToolContext::new(workspace.clone()).with_call_id("receipt-facts".to_owned());
+        let receipt = super::terminal_receipt_value(&response, &context, None, 0, 0, None,
+            "completed", "none", "in_process_apply_patch", "known", true, true);
+        let fact = &receipt["apply_patch_changes"][0];
+        for key in ["path", "preimage_sha256", "postimage_sha256"] {
+            assert_eq!(fact[key], response.changes[0][key]);
+        }
+        for (key, replacement) in [("kind", json!("add")), ("move_path", json!("other")),
+            ("path", json!("../file")), ("path", json!("./file")),
+            ("preimage_sha256", json!("A".repeat(64))), ("postimage_sha256", serde_json::Value::Null)] {
+            let mut change = response.changes[0].clone();
+            change[key] = replacement;
+            assert!(super::own_edit_patch_changes(&[change], &workspace).is_none(), "{key}");
+        }
+        assert!(super::own_edit_patch_changes(&[response.changes[0].clone(), response.changes[0].clone()], &workspace).is_none());
+        response.success = false;
+        response.exit_code = 1;
+        let failed = super::terminal_receipt_value(&response, &context, None, 0, 0, None,
+            "failed", "workload_exit_nonzero", "in_process_apply_patch", "known", true, true);
+        assert!(failed.get("apply_patch_changes").is_none(), "partial/failed patches certify nothing");
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink("file", workspace.join("alias")).unwrap();
+            let mut change = response.changes[0].clone(); change["path"] = json!("alias");
+            assert!(super::own_edit_patch_changes(&[change], &workspace).is_none());
+        }
     }
 
     fn write_test_terminal_receipt(
@@ -2488,5 +2603,26 @@ mod tests {
         assert_eq!(claim["state"], "terminated");
         assert_eq!(claim["reconcile_required"], true);
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn fenced_ps_refusal_names_the_brokered_route() {
+        // Live 2026-10-19: a fenced worker ran subprocess.run(['/bin/ps', ...]), got EPERM and
+        // ended its run with a capability gap although ps by name was served.
+        let python = "Traceback (most recent call last):\n  File \"<stdin>\", line 2, in <module>\n\
+                      PermissionError: [Errno 1] Operation not permitted: '/bin/ps'\n";
+        for (stdout, stderr) in [
+            ("", python),
+            ("", "zsh:1: operation not permitted: /bin/ps\n"),
+            ("", "bash: /bin/ps: Operation not permitted\n"),
+            ("Error: spawn /bin/ps EPERM\n", ""),
+        ] {
+            assert_eq!(fenced_ps_hint(true, stdout, stderr), Some(FENCED_PS_HINT));
+        }
+        // Without a broker there is no fence and no brokered ps to name.
+        assert_eq!(fenced_ps_hint(false, "", python), None);
+        // Other refusals and ordinary ps output carry no note.
+        assert_eq!(fenced_ps_hint(true, "", "zsh:1: operation not permitted: /usr/bin/top\n"), None);
+        assert_eq!(fenced_ps_hint(true, "  PID COMMAND\n  42 /bin/ps -ax\n", ""), None);
     }
 }

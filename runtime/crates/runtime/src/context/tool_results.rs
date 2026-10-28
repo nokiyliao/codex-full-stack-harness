@@ -1,6 +1,6 @@
 use super::char_budget::{
     COMMAND_RUN_RESULT_OUTPUT_MAX_CHARS, CONTEXT_OUTPUT_MAX_CHARS, context_output_byte_budget,
-    formatted_truncate_text, truncate_middle_with_char_budget,
+    formatted_truncate_text, truncate_middle_with_char_budget, within_char_budget,
 };
 use crate::tool_callback_sanitizer::{
     bounded_source_postimages_for_context, bounded_source_read_page, command_run_context_commands,
@@ -340,32 +340,11 @@ fn command_run_current_style_output_for_context(value: &serde_json::Value) -> St
 
 pub(super) fn command_run_current_style_output_string(value: &serde_json::Value) -> Option<String> {
     let output = value.get("output").unwrap_or(&serde_json::Value::Null);
-    // Guard postimages against the untouched input, including streamed IDs.
-    let input = value.get("input").unwrap_or(&serde_json::Value::Null);
-    let input_commands = input
-        .get("commands")
-        .and_then(|commands| commands.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let input_commands = command_run_results_channel(output)
-        .filter(|_| command_run_tool_identity(value))
-        .and_then(|channel| command_run_context_commands(channel, Some(input_commands)));
-    let results = flattened_command_run_results(output);
-    if results.is_empty() {
+    if flattened_command_run_results(output).is_empty() {
         return None;
     }
-    let results = results
-        .into_iter()
-        .enumerate()
-        .map(|(index, result)| {
-            command_run_context_result(
-                result,
-                input_commands.and_then(|commands| commands.get(index)),
-            ).0
-        })
-        .collect::<Vec<_>>();
-    let output = serde_json::json!({ "results": results });
-    serde_json::to_string(&output).ok()
+    // Provider messages and the immutable cache must use the same projection.
+    serde_json::to_string(&command_run_summary_with_source_page_for_context(value).0).ok()
 }
 
 fn immutable_tool_result_context_item(value: &serde_json::Value) -> serde_json::Value {
@@ -454,6 +433,7 @@ fn context_output_for_tool_result(value: &serde_json::Value) -> (serde_json::Val
     ), false)
 }
 
+#[cfg(test)]
 pub(super) fn command_run_summary_for_context(value: &serde_json::Value) -> serde_json::Value {
     command_run_summary_with_source_page_for_context(value).0
 }
@@ -479,6 +459,16 @@ fn command_run_summary_with_source_page_for_context(
     }
 
     let mut preserve_source_page = false;
+    // Context messages are cached before callback-record sanitization. Apply
+    // the same optional-delta rule here, while identities and exact pages exist.
+    let mut deduplicated = flattened.iter().any(|result|
+        result.pointer("/output/changes").and_then(serde_json::Value::as_array)
+            .is_some_and(|changes| changes.iter().any(|change| change.get("source_delta").is_some())))
+        .then(|| flattened.iter().map(|result| (*result).clone()).collect::<Vec<_>>());
+    if let Some(results) = deduplicated.as_mut() {
+        crate::tool_callback_sanitizer::omit_readback_covered_deltas(results, input_commands);
+    }
+    let flattened = deduplicated.as_ref().map(|results| results.iter().collect::<Vec<_>>()).unwrap_or(flattened);
     let results = flattened
         .into_iter()
         .enumerate()
@@ -498,7 +488,9 @@ pub(super) fn flattened_command_run_results(output: &serde_json::Value) -> Vec<&
     let Some(channel) = command_run_results_channel(output) else {
         return Vec::new();
     };
-    let results = channel["results"].as_array().unwrap();
+    let results = channel["results"]
+        .as_array()
+        .expect("command_run_results_channel admits only a results array");
     let mut flattened = Vec::new();
     for result in results {
         if result.get("mode").and_then(|mode| mode.as_str()) == Some("batch")
@@ -532,6 +524,12 @@ fn command_run_context_result(
             Some(result),
             Some(input_command.unwrap_or(&serde_json::Value::Null)),
         ));
+    let omit_source_read_audit = result.get("command_type").and_then(serde_json::Value::as_str)
+        == Some("source_read")
+        && input_command.and_then(|input| input.get("command_type"))
+            .and_then(serde_json::Value::as_str) == Some("source_read")
+        && is_completed_source_read_result(result)
+        && source_read_evidence_allows_audit_omission(result, input_command);
     let mut cleaned_result = strip_context_reporting_fields(result.clone());
     strip_read_media_payload_data(&mut cleaned_result);
     let result = &cleaned_result;
@@ -553,27 +551,26 @@ fn command_run_context_result(
             .cloned()
             .unwrap_or(serde_json::Value::Null),
     );
+    let mut preserve_applied_delta = false;
     if let Some(output) = result.get("output") {
         let mut output = strip_command_run_context_noise(output.clone());
         if command_type_name.as_deref() == Some("apply_patch") {
             output = summarize_apply_patch_output_for_context(output);
-        } else if command_type_name.as_deref() == Some("source_read")
-            && result
-                .get("command_type")
-                .and_then(serde_json::Value::as_str)
-                == Some("source_read")
-            && input_command
-                .and_then(|input| input.get("command_type"))
-                .and_then(serde_json::Value::as_str)
-                == Some("source_read")
-            && is_completed_source_read_result(result)
-        {
+        } else if omit_source_read_audit {
             omit_source_read_audit_fields_for_context(&mut output);
+        } else if !preserve_source_page {
+            project_rendered_shell_output_for_context(&mut output);
         }
-        item.insert(
-            "output".to_string(),
-            compact_command_run_context_value(output, postimages, preserve_source_page),
-        );
+        let changes = (command_type_name.as_deref() == Some("apply_patch")
+            && result["success"] == true && output["exit_code"] == 0
+            && result.get("error").is_none_or(serde_json::Value::is_null))
+            .then(|| bounded_applied_changes(output.get("changes")?)).flatten();
+        let mut projected = compact_command_run_context_value(output, postimages, preserve_source_page);
+        if let Some(changes) = changes {
+            projected["changes"] = changes;
+            preserve_applied_delta = true;
+        }
+        item.insert("output".to_string(), projected);
     }
     if let Some(error) = result.get("error") {
         item.insert(
@@ -581,7 +578,22 @@ fn command_run_context_result(
             compact_command_run_context_value(strip_command_run_context_noise(error.clone()), None, false),
         );
     }
-    (serde_json::Value::Object(item), preserve_source_page)
+    (serde_json::Value::Object(item), preserve_source_page || preserve_applied_delta)
+}
+
+fn bounded_applied_changes(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let changes = value.as_array()?;
+    if changes.is_empty() || changes.len() > 4 || serde_json::to_vec(value).ok()?.len() > 40_960 {
+        return None;
+    }
+    let mut delta_bytes = 0usize;
+    for change in changes {
+        let map = change.as_object()?;
+        let delta = crate::tool_callback_sanitizer::bounded_applied_delta(map)?;
+        delta_bytes = delta_bytes.checked_add(serde_json::to_vec(&delta).ok()?.len())?;
+        if delta_bytes > 32_768 { return None; }
+    }
+    Some(value.clone())
 }
 
 fn is_completed_source_read_result(result: &serde_json::Value) -> bool {
@@ -621,14 +633,86 @@ fn is_completed_source_read_result(result: &serde_json::Value) -> bool {
         .all(|key| receipt.get(*key).and_then(serde_json::Value::as_bool) == Some(true))
 }
 
-// Only remove these fields at their known audit locations, never in source payloads.
-// The completion guard has already checked the duplicated terminal facts below;
-// keep authority/replay decisions and any unrecognized receipt fields visible.
+fn source_read_evidence_allows_audit_omission(
+    result: &serde_json::Value,
+    input_command: Option<&serde_json::Value>,
+) -> bool {
+    use code_tools::commands::source_read::SourceReadContentEvidence;
+    let output = &result["output"];
+    let receipt = &output["terminal_receipt"];
+    let (evidence, bound_evidence) = (
+        output.get("source_read_evidence"), receipt.get("source_read_evidence"),
+    );
+    if evidence.is_none() && bound_evidence.is_none() {
+        return true; // Keep the ordinary unpinned projection unchanged.
+    }
+    let (Some(evidence), Some(bound_evidence), Some(input)) = (evidence, bound_evidence, input_command)
+        else { return false; };
+    // Compare the untouched witnesses, not parsed/normalized proofs that could
+    // conceal divergent or unknown fields during reporting-field stripping.
+    if evidence != bound_evidence { return false; }
+    let Some(proof) = SourceReadContentEvidence::parse_bounded(evidence) else { return false; };
+    let Some(call_id) = receipt.get("call_id").and_then(serde_json::Value::as_str)
+        .filter(|id| !id.trim().is_empty() && id.len() <= 256) else { return false; };
+    proof.content_satisfied
+        && evidence["request"]["expected_sha256"] == proof.source_sha256
+        && input["command_line"].as_str().is_some_and(|line| proof.matches_command(line))
+        && output["path"] == proof.request.path()
+        && output["source_sha256"] == proof.source_sha256
+        && output["stdout"].is_string() && output["stderr"] == ""
+        && output.get("truncated").is_none_or(|value| value == false)
+        && output.get("truncation_reason").is_none_or(serde_json::Value::is_null)
+        && receipt.get("pid").is_some_and(serde_json::Value::is_null)
+        && receipt["authoritative_publication"] == "unproven"
+        && output.get("terminal_receipt_path").is_none_or(|path|
+            path.as_str().is_some_and(|path| !path.is_empty()))
+        && ["wall_time_ms", "wall_timeout_ms"].iter().all(|key|
+            receipt.get(*key).is_none_or(|value| value.as_u64().is_some()))
+        && receipt.get("stall_timeout_ms").is_none_or(|value| value.is_null() || value.as_u64().is_some())
+        && command_run_tool_identity(result) && command_run_tool_identity(input)
+        && result["step"].as_u64().is_some_and(|step| step > 0)
+        && result.get("step") == input.get("step")
+        && ["command_id", "command_run_id", "provider_tool_call_id", "command_index"].iter().all(|key|
+            match (result.get(*key).filter(|v| !v.is_null()), input.get(*key).filter(|v| !v.is_null())) {
+                (Some(left), Some(right)) => left == right,
+                _ => true,
+            })
+        && result.get("command_id").filter(|value| !value.is_null()).is_none_or(|id|
+            id.as_str().is_some_and(|id| !id.is_empty() && (call_id == id
+                || call_id.strip_suffix(id).is_some_and(|prefix| prefix.ends_with(".tool.command_run:")))))
+        && result.get("runtime_id").is_none_or(|runtime|
+            runtime.as_str().is_some_and(|runtime| !runtime.is_empty()
+                && call_id.strip_prefix(runtime).is_some_and(|suffix| suffix.starts_with(".tool.command_run:"))))
+        && [result, output, receipt].iter().all(|value|
+            ["timed_out", "cancelled", "reconcile_required", "retry_safe", "auto_retry_allowed"].iter().all(|key|
+                value.get(*key).is_none_or(|value| value == false))
+            && value.get("success").is_none_or(|value| value == true)
+            && value.get("exit_code").is_none_or(|value| value.as_i64() == Some(0))
+            && ["status", "terminal_state"].iter().all(|key|
+                value.get(*key).is_none_or(|value| value == "completed"))
+            && value.get("error").is_none_or(|error| error.is_null() || error == "")
+            && ["failed_change", "jspace_error_code", "error_type"].iter().all(|key|
+                value.get(*key).is_none_or(serde_json::Value::is_null))
+            && ["changes", "unresolved_effects"].iter().all(|key|
+                value.get(*key).is_none_or(|value| value.is_null() || value.as_array().is_some_and(Vec::is_empty))))
+        // Value equality alone can ignore object insertion order. Require the
+        // provider-encoded witnesses to be byte-identical before dropping one.
+        && serde_json::to_string(evidence).ok().zip(serde_json::to_string(bound_evidence).ok())
+            .is_some_and(|(evidence, bound)| evidence == bound)
+}
+
+// Only remove fields at their known audit locations, never in source payloads.
+// Recovery authenticates the untouched session-log output and durable receipt
+// (manas/process.rs), not context_cache/context_messages. A pinned witness reaches
+// here only after validation (content satisfied, identical copies, matching command,
+// path and hash); the model never echoes it, so both copies and the receipt identity
+// are audit-only and stay out of the model context.
 fn omit_source_read_audit_fields_for_context(output: &mut serde_json::Value) {
     let Some(output) = output.as_object_mut() else {
         return;
     };
     output.remove("terminal_receipt_path");
+    output.remove("source_read_evidence");
     if let Some(receipt) = output
         .get_mut("terminal_receipt")
         .and_then(serde_json::Value::as_object_mut)
@@ -648,10 +732,49 @@ fn omit_source_read_audit_fields_for_context(output: &mut serde_json::Value) {
             "process_reaped",
             "process_group_empty",
             "termination_proven",
+            "source_read_evidence",
         ] {
             receipt.remove(key);
         }
     }
+}
+
+/// The shell executor renders a result for the model in `message` (exit code, wall time,
+/// "Output:" with stdout, "Stderr:" with stderr, and any runtime note) and repeats the streams in
+/// `stdout`/`stderr`. Keep the rendering once: live 2026-10-19, the repeat was 42% of a worker's
+/// command-output tokens. A cleanly completed command also drops its terminal receipt (9%):
+/// recovery authenticates the session-log output and the durable receipt, never this projection,
+/// and every other outcome keeps the receipt with its replay guidance.
+fn project_rendered_shell_output_for_context(output: &mut serde_json::Value) {
+    let Some(map) = output.as_object_mut() else {
+        return;
+    };
+    let rendered = map
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|message| message.contains("\nOutput:\n"));
+    if !rendered || !(map.contains_key("stdout") || map.contains_key("stderr")) {
+        return;
+    }
+    map.remove("stdout");
+    map.remove("stderr");
+    let clean = map.get("exit_code").and_then(serde_json::Value::as_i64) == Some(0)
+        && map.get("terminal_receipt").is_some_and(cleanly_completed_receipt);
+    if clean {
+        map.remove("terminal_receipt");
+        map.remove("terminal_receipt_path");
+    }
+}
+
+fn cleanly_completed_receipt(receipt: &serde_json::Value) -> bool {
+    [("outcome", "known"), ("terminal_state", "completed"), ("failure_class", "none")]
+        .iter()
+        .all(|(key, expected)| receipt.get(*key).and_then(serde_json::Value::as_str) == Some(*expected))
+        && receipt.get("exit_code").and_then(serde_json::Value::as_i64) == Some(0)
+        && receipt.get("reconcile_required").and_then(serde_json::Value::as_bool) == Some(false)
+        && ["process_reaped", "process_group_empty", "termination_proven"]
+            .iter()
+            .all(|key| receipt.get(*key).and_then(serde_json::Value::as_bool) == Some(true))
 }
 
 fn summarize_apply_patch_output_for_context(value: serde_json::Value) -> serde_json::Value {
@@ -712,9 +835,22 @@ fn summarize_patch_change_object(
         .map(|items| items.len());
     let line_count = map.get("hunks").map(count_patch_hunk_lines).unwrap_or(0);
     let mut summary = serde_json::Map::new();
-    for key in ["kind", "path"] {
+    for key in ["kind", "path", "move_path"] {
         if let Some(value) = map.get(key).cloned() {
             summary.insert(key.to_string(), value);
+        }
+    }
+    for key in ["preimage_sha256", "postimage_sha256"] {
+        if let Some(value) = map.get(key)
+            && (value.is_null()
+                || value.as_str().is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest.bytes().all(|byte| {
+                            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                        })
+                }))
+        {
+            summary.insert(key.to_string(), value.clone());
         }
     }
     if let Some(count) = hunk_count {
@@ -722,6 +858,12 @@ fn summarize_patch_change_object(
     }
     if line_count > 0 {
         summary.insert("line_count".to_string(), serde_json::json!(line_count));
+    }
+    if map.contains_key("source_delta") {
+        summary.insert("source_delta".to_string(),
+            crate::tool_callback_sanitizer::bounded_applied_delta(&map).unwrap_or_else(||
+                serde_json::json!({"omitted_from_context":true,
+                    "reason":"Applied source delta was incomplete or exceeded its bounds; use granted source_read."})));
     }
     summary.insert(
         "hunks_omitted_from_context".to_string(),
@@ -767,7 +909,9 @@ fn compact_command_run_context_value(
                         postimages.take().unwrap_or_else(|| bounded_source_postimages_for_context(&value, None, None))
                     } else if key == "stdout" && preserve_source_stdout {
                         value
-                    } else if matches!(key.as_str(), "stdout" | "stderr" | "output") {
+                    } else if matches!(key.as_str(), "stdout" | "stderr" | "output" | "message") {
+                        // Text streams are cut as text; JSON-encoding a long one first would
+                        // escape every newline and quote before the cut.
                         compact_command_run_context_stream_value(value)
                     } else {
                         compact_json_for_context(value)
@@ -784,7 +928,7 @@ fn compact_command_run_context_stream_value(value: serde_json::Value) -> serde_j
     match value {
         serde_json::Value::String(text) => {
             if text.contains("Total output lines:") {
-                if text.len() <= COMMAND_RUN_RESULT_OUTPUT_MAX_CHARS {
+                if within_char_budget(&text, COMMAND_RUN_RESULT_OUTPUT_MAX_CHARS) {
                     return serde_json::Value::String(text);
                 }
                 return serde_json::Value::String(truncate_middle_with_char_budget(
@@ -842,6 +986,47 @@ mod tests {
 
     fn parse_command_run_context(text: &str) -> Value {
         serde_json::from_str(text).expect("command_run context should be structured JSON")
+    }
+
+    #[test]
+    #[ignore = "requires recorded completed batch; offline provider-context rendering only"]
+    fn covered_delta_recorded_provider_context_and_cache_keep_all_readback() {
+        let batch: Value = serde_json::from_slice(&std::fs::read(
+            std::env::var("NOKIY_READBACK_BATCH_FIXTURE").unwrap()).unwrap()).unwrap();
+        let value = json!({"tool_name":"command_run", "sequence":1, "success":true,
+            "provider_metadata":{"call_id":batch["results"][0]["provider_tool_call_id"]},
+            "input":{"commands":batch["commands"]}, "output":batch});
+        let (_, output) = paired_postimage_output(&value);
+        assert_eq!(output["results"][0]["output"]["changes"][0]["source_delta"]["omitted_from_context"], true);
+        assert_eq!(tool_result_context_cache(&value)["output"], output);
+        let mut cached = value.clone();
+        cached["context_cache"] = tool_result_context_cache(&value);
+        assert_eq!(paired_postimage_output(&cached).1, output);
+        assert_eq!(paired_postimage_output(&sanitize_tool_callback_result(&value)).1, output);
+        let mut prior = value.clone();
+        prior["output"]["results"][0]["output"]["changes"][0]["source_delta"]["schema_version"] = json!("preimage-probe");
+        let (_, mut expected) = paired_postimage_output(&prior);
+        expected["results"][0]["output"]["changes"][0]["source_delta"] = value["output"]["results"][0]["output"]["changes"][0]["source_delta"].clone();
+        let mut restored = output.clone();
+        restored["results"][0]["output"]["changes"][0]["source_delta"] = expected["results"][0]["output"]["changes"][0]["source_delta"].clone();
+        assert_eq!(restored, expected, "every other provider-visible field must remain identical");
+        let before = serde_json::to_vec(&expected).unwrap().len();
+        let after = serde_json::to_vec(&output).unwrap().len();
+        assert!(after < before);
+        println!("READBACK_PROVIDER_JSON_BYTES before={before} after={after} saved={}", before-after);
+        let mut no_read = value.clone();
+        no_read["output"]["results"].as_array_mut().unwrap().truncate(1);
+        no_read["output"]["commands"].as_array_mut().unwrap().truncate(1);
+        no_read["input"]["commands"].as_array_mut().unwrap().truncate(1);
+        let expected_delta = no_read["output"]["results"][0]["output"]["changes"][0]["source_delta"].clone();
+        for observation in [no_read.clone(), sanitize_tool_callback_result(&no_read)] {
+            let (_, delivered) = paired_postimage_output(&observation);
+            assert_eq!(delivered["results"][0]["output"]["changes"][0]["source_delta"], expected_delta,
+                "optional applied source must actually reach the model when no readback covers it");
+            assert_eq!(tool_result_context_cache(&observation)["output"], delivered);
+        }
+        no_read["output"]["results"][0]["output"]["changes"][0]["source_delta"]["line_count"] = json!(0);
+        assert_eq!(paired_postimage_output(&no_read).1["results"][0]["output"]["changes"][0]["source_delta"]["omitted_from_context"], true);
     }
 
     fn source_postimage_projection(delta: bool, text: &str, lines: u64) -> Value {
@@ -1332,7 +1517,7 @@ mod tests {
                 (format!("{prefix}/files/0/path"), json!("src/../escape.py")),
                 (format!("{prefix}/files/0/path"), json!("src\\escape.py")),
                 (format!("{prefix}/files/0/path"), json!("src//empty.py")),
-                (format!("{prefix}/files/0/path"), json!("src/not_python.rs")),
+                (format!("{prefix}/files/0/path"), json!("src/unsupported.go")),
                 (format!("{prefix}/files"), json!([])),
                 ("/output/results/0/command_type".into(), json!("source_read")),
                 ("/input/commands/0/command_type".into(), json!("shell_command")),
@@ -1679,8 +1864,14 @@ mod tests {
             assert!(expected["stdout"].as_str().unwrap().len() > 10_000);
             assert_eq!(expected["next_line"], 249);
             assert!(super::bounded_source_read_page(&result, None).is_some());
-            // Reproduce the old unconditional compactor without changing its budget.
-            assert_ne!(super::compact_command_run_context_stream_value(expected["stdout"].clone()), expected["stdout"]);
+            // Reproduce the old unconditional compactor without changing its budget: it rewrites
+            // pages over its character budget; a multibyte page within it is left intact.
+            let compacted = super::compact_command_run_context_stream_value(expected["stdout"].clone());
+            if expected["stdout"].as_str().unwrap().chars().count() > 10_000 {
+                assert_ne!(compacted, expected["stdout"]);
+            } else {
+                assert_eq!(compacted, expected["stdout"]);
+            }
             for mode in ["direct", "streamed", "batch"] {
                 let mut raw = source_page_tool_result(result.clone());
                 if mode == "streamed" {
@@ -1826,6 +2017,47 @@ mod tests {
         value
     }
 
+    fn completed_pinned_source_read() -> Value {
+        let mut value = completed_source_read();
+        let request = json!({
+            "path": "src/lib.rs", "start_line": 2, "end_line": 3,
+            "line_numbers": true, "expected_sha256": "1".repeat(64),
+        });
+        value["provider_metadata"] = json!({"id": "call_pinned"});
+        value["input"]["commands"][0] = json!({
+            "command_type": "source_read", "command_line": request.to_string(), "step": 1,
+            "command_id": "call_pinned:0", "command_run_id": "call_pinned",
+            "provider_tool_call_id": "call_pinned", "command_index": 0,
+        });
+        let command = value["input"]["commands"][0].clone();
+        let result = &mut value["output"]["results"][0];
+        result["step"] = json!(1);
+        result["error"] = Value::Null;
+        result["runtime_id"] = json!("runtime");
+        for key in ["command_id", "command_run_id", "provider_tool_call_id", "command_index"] {
+            result[key] = command[key].clone();
+        }
+        let output = &mut result["output"];
+        output["source_sha256"] = json!("1".repeat(64));
+        output["stdout"] = json!("2: café\r\n3: 🦀 \"terminal_receipt_path\"\n");
+        output["requested_end_line"] = json!(3);
+        output["total_lines"] = json!(100);
+        output["file_bytes"] = json!(1234);
+        output["line_numbers"] = json!(true);
+        output["ends_with_newline"] = json!(true);
+        output["at_eof"] = json!(false);
+        output["truncated"] = json!(false);
+        output["truncation_reason"] = Value::Null;
+        let evidence = json!({
+            "schema_version": "nokiy_source_read_content_v1", "request": request,
+            "source_sha256": "1".repeat(64), "content_satisfied": true,
+        });
+        output["source_read_evidence"] = evidence.clone();
+        output["terminal_receipt"]["source_read_evidence"] = evidence;
+        output["terminal_receipt"]["call_id"] = json!("runtime.tool.command_run:call_pinned:0");
+        value
+    }
+
     #[test]
     fn command_run_output_serialization_is_lossless_and_compact() {
         for success in [true, false] {
@@ -1859,6 +2091,62 @@ mod tests {
                 assert_eq!(result[field], before["output"]["results"][0]["output"][field]);
             }
         }
+    }
+
+    fn shell_result(exit_code: i64, stdout: &str, stderr: &str) -> Value {
+        let mut message = format!("Exit code: {exit_code}\nWall time: 0.2 seconds\nOutput:\n{stdout}");
+        if !stderr.is_empty() {
+            message.push_str("\nStderr:\n");
+            message.push_str(stderr);
+        }
+        let clean = exit_code == 0;
+        json!({"tool_name": "command_run",
+            "input": {"commands": [{"command": "zsh", "command_type": "zsh", "command_line": "ls", "step": 1}]},
+            "output": {"results": [{"command": "zsh", "command_type": "zsh", "step": 1, "success": clean,
+                "output": {"exit_code": exit_code, "message": message, "stdout": stdout, "stderr": stderr,
+                    "terminal_receipt": {
+                        "schema_version": "tura_command_terminal_receipt_v1", "exit_code": exit_code,
+                        "outcome": "known", "terminal_state": if clean { "completed" } else { "failed" },
+                        "failure_class": if clean { "none" } else { "workload_exit_nonzero" },
+                        "process_reaped": true, "process_group_empty": true, "termination_proven": true,
+                        "reconcile_required": !clean, "termination_origin": "workload",
+                        "authoritative_publication": "unproven", "authority_effect": "none",
+                        "auto_retry_allowed": false, "call_id": "runtime.tool.command_run:call_shell:0",
+                        "pid": null, "retry_safe": false, "staging_authority": "none",
+                        "stall_timeout_ms": null, "wall_time_ms": 200, "wall_timeout_ms": 20000},
+                    "terminal_receipt_path": "/tmp/receipts/call_shell.json"}}]}})
+    }
+
+    #[test]
+    fn rendered_shell_output_reaches_the_model_once() {
+        let clean = shell_result(0, "line one\nline two\n", "");
+        let projected = command_run_summary_for_context(&clean);
+        let output = &projected["results"][0]["output"];
+        assert_eq!(output["message"], clean["output"]["results"][0]["output"]["message"]);
+        assert_eq!(output["exit_code"], 0);
+        for field in ["stdout", "stderr", "terminal_receipt", "terminal_receipt_path"] {
+            assert!(output.get(field).is_none(), "{field}: {output}");
+        }
+        // A failed command keeps its receipt and replay guidance; its streams stay in the rendering.
+        let failed = shell_result(1, "partial\n", "boom\n");
+        let projected = command_run_summary_for_context(&failed);
+        let output = &projected["results"][0]["output"];
+        assert!(output["message"].as_str().unwrap().ends_with("Stderr:\nboom\n"), "{output}");
+        assert!(output.get("stdout").is_none() && output.get("stderr").is_none(), "{output}");
+        assert_eq!(output["terminal_receipt"]["reconcile_required"], true);
+        assert!(output.get("terminal_receipt_path").is_some());
+        // A long rendering is cut as text instead of being JSON-encoded first.
+        let long = shell_result(0, &"row\n".repeat(5_000), "");
+        let projected = command_run_summary_for_context(&long);
+        let message = projected["results"][0]["output"]["message"].as_str().unwrap();
+        assert!(message.starts_with("Total output lines: 5003\n\nExit code: 0"), "{}", &message[..60]);
+        assert!(!message.contains("\\n"));
+        assert!(message.chars().count() <= super::COMMAND_RUN_RESULT_OUTPUT_MAX_CHARS + 64);
+        // Results without the shell rendering keep their streams.
+        let mut plain = shell_result(0, "verifier passed\n", "");
+        plain["output"]["results"][0]["output"].as_object_mut().unwrap().remove("message");
+        let projected = command_run_summary_for_context(&plain);
+        assert_eq!(projected["results"][0]["output"]["stdout"], "verifier passed\n");
     }
 
     #[test]
@@ -1981,6 +2269,203 @@ mod tests {
             tool_result_context_cache(&changed_future)["cache_id"]
         );
         assert_eq!(original, before, "the durable output must not be mutated");
+    }
+
+    #[test]
+    fn completed_pinned_source_read_omits_only_validated_redundancy() {
+        let original = completed_pinned_source_read();
+        let before = original.clone();
+        let durable_bytes = original.to_string();
+        let projected = command_run_summary_for_context(&original);
+        let raw = &before["output"]["results"][0]["output"];
+        let output = &projected["results"][0]["output"];
+        assert_eq!(raw["source_read_evidence"].to_string(), raw["terminal_receipt"]["source_read_evidence"].to_string());
+        let mut expected = raw.clone();
+        expected.as_object_mut().unwrap().remove("terminal_receipt_path");
+        expected.as_object_mut().unwrap().remove("source_read_evidence");
+        let receipt = expected["terminal_receipt"].as_object_mut().unwrap();
+        for key in [
+            "pid", "wall_time_ms", "wall_timeout_ms", "stall_timeout_ms", "outcome",
+            "terminal_state", "exit_code", "failure_class", "process_reaped",
+            "process_group_empty", "termination_proven", "source_read_evidence",
+            "schema_version", "call_id", "termination_origin",
+        ] {
+            receipt.remove(key);
+        }
+        assert_eq!(*output, expected, "no source, binding, authority or unknown field may be lost");
+        assert!(output.get("source_read_evidence").is_none());
+        let bytes_saved = raw.to_string().len() - output.to_string().len();
+        assert!(bytes_saved >= 900, "saved only {bytes_saved} JSON bytes");
+        let messages = immutable_tool_result_context_messages(&original);
+        assert_eq!(messages[0]["call_id"], "call_pinned");
+        assert_eq!(messages[1]["call_id"], "call_pinned");
+        assert_eq!(parse_command_run_context(messages[1]["output"].as_str().unwrap()), projected);
+        assert_eq!(parse_command_run_context(&command_run_function_output_for_context(&original)), projected);
+        let cache = tool_result_context_cache(&original);
+        assert_eq!(cache["output"], projected);
+        let sanitized = sanitize_tool_callback_result(&original);
+        assert_eq!(sanitized["output"]["results"][0]["output"]["terminal_receipt"], raw["terminal_receipt"]);
+        assert_eq!(sanitized["output"]["results"][0]["output"]["source_read_evidence"], raw["source_read_evidence"]);
+        assert_eq!(sanitized["output"]["results"][0]["output"]["terminal_receipt_path"], raw["terminal_receipt_path"]);
+        assert_eq!(immutable_tool_result_context_messages(&sanitized), messages);
+        assert_eq!(tool_result_context_cache(&sanitized)["output"], projected);
+        let mut cached = original.clone();
+        cached["context_cache"] = cache.clone();
+        assert_eq!(immutable_tool_result_context_messages(&cached), messages);
+        let mut changed = original.clone();
+        changed["output"]["results"][0]["output"]["terminal_receipt"]["wall_time_ms"] = json!(500);
+        assert_eq!(tool_result_context_cache(&changed)["cache_id"], cache["cache_id"]);
+        changed["output"]["results"][0]["output"]["terminal_receipt"]["future_field"] = json!("changed");
+        assert_ne!(tool_result_context_cache(&changed)["cache_id"], cache["cache_id"]);
+        assert_eq!(original, before, "recovery must retain both witnesses and the full durable receipt");
+        assert_eq!(original.to_string(), durable_bytes);
+    }
+
+    #[test]
+    fn pinned_source_read_projection_retains_pagination_and_selectors() {
+        let base = completed_pinned_source_read();
+        let range = base["output"]["results"][0]["output"]["source_read_evidence"]["request"].clone();
+        let search = json!({
+            "path": "src/lib.rs", "search_terms": ["café", "literal"], "context_lines": 2,
+            "start_line": 2, "line_numbers": true, "expected_sha256": "1".repeat(64),
+        });
+        let projection = json!({
+            "path": "src/lib.rs", "json_pointer": "/items/0", "expected_sha256": "1".repeat(64),
+        });
+        for request in [range, search, projection] {
+            let mut value = base.clone();
+            value["input"]["commands"][0]["command_line"] = json!(request.to_string());
+            let raw = &mut value["output"]["results"][0]["output"];
+            raw["source_read_evidence"]["request"] = request.clone();
+            raw["terminal_receipt"]["source_read_evidence"]["request"] = request.clone();
+            if let Some(terms) = request.get("search_terms") {
+                raw["search_terms"] = terms.clone();
+                raw["search_matches"] = json!([2, 3]);
+                raw["context_lines"] = json!(2);
+            }
+            if let Some(pointer) = request.get("json_pointer") {
+                raw["json_pointer"] = pointer.clone();
+                raw["selected_json"] = json!({"terminal_receipt_path": "source content", "call_id": "source content"});
+            }
+            let before = value.clone();
+            let provider = parse_command_run_context(&command_run_function_output_for_context(&value));
+            let output = &provider["results"][0]["output"];
+            let raw = &before["output"]["results"][0]["output"];
+            assert!(output["terminal_receipt"].get("source_read_evidence").is_none(), "selector: {request}");
+            assert!(output.get("source_read_evidence").is_none(), "selector: {request}");
+            for key in [
+                "stdout", "stderr", "path", "source_sha256", "start_line",
+                "end_line", "requested_end_line", "next_line", "at_eof", "total_lines", "file_bytes",
+                "line_numbers", "ends_with_newline", "truncated", "truncation_reason",
+                "search_terms", "search_matches", "context_lines", "json_pointer", "selected_json", "future_field",
+            ] {
+                assert_eq!(output.get(key), raw.get(key), "must retain {key} for {request}");
+            }
+            assert_eq!(tool_result_context_cache(&value)["output"], provider);
+            assert_eq!(value, before);
+        }
+    }
+
+    fn assert_pinned_source_read_projection_unchanged(value: &Value) {
+        let before = value.clone();
+        let projected = command_run_summary_for_context(value);
+        assert_eq!(projected["results"][0]["output"], value["output"]["results"][0]["output"]);
+        assert_eq!(parse_command_run_context(&command_run_function_output_for_context(value)), projected);
+        assert_eq!(tool_result_context_cache(value)["output"], projected);
+        assert_eq!(*value, before);
+    }
+
+    #[test]
+    fn pinned_source_read_audit_omission_requires_bound_successful_content() {
+        let base = completed_pinned_source_read();
+        for (scope, key, replacement) in [
+            ("/input/commands/0", "command_type", json!("shell_command")),
+            ("/input/commands/0", "command_line", json!("{}")),
+            ("/input/commands/0", "step", json!(2)),
+            ("/input/commands/0", "command_id", json!("foreign:0")),
+            ("/output/results/0", "success", json!(false)),
+            ("/output/results/0", "success", Value::Null),
+            ("/output/results/0", "error", json!("failed")),
+            ("/output/results/0", "runtime_id", json!("foreign")),
+            ("/output/results/0/output", "exit_code", json!(1)),
+            ("/output/results/0/output", "stderr", json!("SOURCE_READ_SHA256_MISMATCH")),
+            ("/output/results/0/output", "path", json!("src/foreign.rs")),
+            ("/output/results/0/output", "source_sha256", json!("2".repeat(64))),
+            ("/output/results/0/output", "truncated", json!(true)),
+            ("/output/results/0/output", "success", json!(false)),
+            ("/output/results/0/output", "terminal_receipt_path", json!({"unknown": true})),
+            ("/output/results/0/output", "changes", json!([{"effect": "unknown"}])),
+            ("/output/results/0/output/terminal_receipt", "outcome", json!("unknown")),
+            ("/output/results/0/output/terminal_receipt", "terminal_state", json!("failed")),
+            ("/output/results/0/output/terminal_receipt", "call_id", json!("")),
+            ("/output/results/0/output/terminal_receipt", "call_id", json!("foreign.tool.command_run:foreign:0")),
+            ("/output/results/0/output/terminal_receipt", "pid", json!(42)),
+            ("/output/results/0/output/terminal_receipt", "wall_time_ms", json!("unknown")),
+            ("/output/results/0/output/terminal_receipt", "reconcile_required", json!(true)),
+            ("/output/results/0/output/terminal_receipt", "authoritative_publication", json!("unknown")),
+            ("/output/results/0/output/terminal_receipt", "cancelled", json!(true)),
+            ("/output/results/0/output/terminal_receipt", "timed_out", json!(true)),
+            ("/output/results/0/output/terminal_receipt", "unresolved_effects", json!(["unknown"])),
+        ] {
+            let mut value = base.clone();
+            value.pointer_mut(scope).unwrap().as_object_mut().unwrap().insert(key.to_owned(), replacement);
+            assert_pinned_source_read_projection_unchanged(&value);
+        }
+        for (field, replacement) in [
+            ("content_satisfied", json!(false)),
+            ("source_sha256", json!("2".repeat(64))),
+            ("schema_version", json!("future_source_read_content")),
+        ] {
+            let mut value = base.clone();
+            let output = &mut value["output"]["results"][0]["output"];
+            output["source_read_evidence"][field] = replacement.clone();
+            output["terminal_receipt"]["source_read_evidence"] = output["source_read_evidence"].clone();
+            if field == "source_sha256" { output["source_sha256"] = replacement; }
+            assert_pinned_source_read_projection_unchanged(&value);
+        }
+        for field in ["schema_version", "content_satisfied", "source_sha256", "request"] {
+            let mut value = base.clone();
+            for pointer in [
+                "/output/results/0/output/source_read_evidence",
+                "/output/results/0/output/terminal_receipt/source_read_evidence",
+            ] {
+                value.pointer_mut(pointer).unwrap().as_object_mut().unwrap().insert(field.to_owned(), Value::Null);
+            }
+            assert_pinned_source_read_projection_unchanged(&value);
+        }
+        for pointer in [
+            "/output/results/0/output/source_read_evidence",
+            "/output/results/0/output/terminal_receipt/source_read_evidence",
+            "/input/commands/0/command_line",
+        ] {
+            let mut value = base.clone();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            value.pointer_mut(parent).unwrap().as_object_mut().unwrap().remove(key);
+            assert_pinned_source_read_projection_unchanged(&value);
+        }
+        let mut failure = base;
+        failure["output"]["results"][0]["success"] = json!(false);
+        let output = &mut failure["output"]["results"][0]["output"];
+        output["exit_code"] = json!(1);
+        output["stdout"] = json!("");
+        output["stderr"] = json!("SOURCE_READ_SHA256_MISMATCH");
+        output["error_type"] = json!("SOURCE_READ_SHA256_MISMATCH");
+        output["terminal_receipt"]["exit_code"] = json!(1);
+        output["terminal_receipt"]["terminal_state"] = json!("failed");
+        output["terminal_receipt"]["failure_class"] = json!("workload_exit_nonzero");
+        output["terminal_receipt"]["reconcile_required"] = json!(true);
+        output["source_read_evidence"]["content_satisfied"] = json!(false);
+        output["terminal_receipt"]["source_read_evidence"] = output["source_read_evidence"].clone();
+        assert_pinned_source_read_projection_unchanged(&failure);
+    }
+
+    #[test]
+    fn divergent_pinned_source_read_duplicate_evidence_is_not_hidden() {
+        for field in ["content_satisfied", "source_sha256", "request", "future_evidence"] {
+            let mut value = completed_pinned_source_read();
+            value["output"]["results"][0]["output"]["terminal_receipt"]["source_read_evidence"][field] = json!("divergent");
+            assert_pinned_source_read_projection_unchanged(&value);
+        }
     }
 
     #[test]
@@ -2427,6 +2912,8 @@ mod tests {
                         "changes": [{
                             "kind": "update",
                             "path": "app.txt",
+                            "preimage_sha256": "1".repeat(64),
+                            "postimage_sha256": "2".repeat(64),
                             "hunks": [["-old", "+new"]]
                         }]
                     }
@@ -2448,6 +2935,14 @@ mod tests {
             "app.txt"
         );
         assert_eq!(
+            context["results"][0]["output"]["changes"][0]["preimage_sha256"],
+            "1".repeat(64)
+        );
+        assert_eq!(
+            context["results"][0]["output"]["changes"][0]["postimage_sha256"],
+            "2".repeat(64)
+        );
+        assert_eq!(
             context["results"][0]["output"]["changes"][0]["hunk_count"],
             1
         );
@@ -2460,6 +2955,91 @@ mod tests {
                 .get("hunks")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn patch_identity_projection_omits_malformed_digests_without_changing_failure() {
+        for malformed in [
+            json!("f".repeat(63)), json!("g".repeat(64)), json!("F".repeat(64)),
+            json!("f".repeat(100_000)), json!(12), json!({"sha256": "a".repeat(64)}),
+        ] {
+            let value = json!({
+                "tool_name": "command_run",
+                "input": {"commands": [{"step": 1, "command_type": "apply_patch"}]},
+                "output": {"results": [{
+                    "command_type": "apply_patch", "success": false,
+                    "output": {"exit_code": 1, "changes": [{
+                        "kind": "update", "path": "app.txt", "hunks": [["-old", "+new"]],
+                        "preimage_sha256": malformed, "postimage_sha256": "a".repeat(64),
+                    }]},
+                }]},
+            });
+            let context = parse_command_run_context(&command_run_function_output_for_context(&value));
+            assert_eq!(context["results"][0]["success"], false);
+            assert_eq!(context["results"][0]["output"]["exit_code"], 1);
+            let change = &context["results"][0]["output"]["changes"][0];
+            assert!(change.get("preimage_sha256").is_none());
+            assert_eq!(change["postimage_sha256"], "a".repeat(64));
+        }
+    }
+
+    #[test]
+    fn command_run_apply_patch_partial_edits_keep_identities_through_provider_projection() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::write(root.path().join("app.txt"), "old\n").expect("fixture");
+        let patch = "*** Begin Patch\n*** Add File: created.txt\n+payload\n*** Update File: app.txt\n@@\n-old\n+middle\n*** Update File: app.txt\n*** Move to: moved.txt\n@@\n-middle\n+new\n*** Delete File: created.txt\n*** Update File: moved.txt\n@@\n-missing\n+rejected\n*** End Patch\n";
+        let response = code_tools::commands::apply_patch::execute(patch, root.path());
+        assert!(!response.success);
+        assert_eq!(response.changes.len(), 4);
+        let changes = response.changes.clone();
+        let value = json!({
+            "tool_name": "command_run",
+            "input": {"commands": [{
+                "step": 1, "command_type": "apply_patch", "command_line": patch,
+            }]},
+            "output": {"results": [{
+                "step": 1, "command_type": "apply_patch", "success": response.success,
+                "output": {
+                    "ok": response.success, "exit_code": response.exit_code,
+                    "stdout": response.stdout, "stderr": response.stderr,
+                    "output": response.output, "changes": response.changes,
+                },
+            }]},
+        });
+
+        for observed in [value.clone(), sanitize_tool_callback_result(&value)] {
+            let text = command_run_function_output_for_context(&observed);
+            let context = parse_command_run_context(&text);
+            assert_eq!(context["results"][0]["success"], false);
+            let output = &context["results"][0]["output"];
+            assert_eq!(output["exit_code"], 1);
+            assert!(output.get("source_postimages").is_none());
+            let summaries = output["changes"].as_array().expect("change summaries");
+            assert_eq!(summaries.len(), changes.len());
+            for (summary, change) in summaries.iter().zip(&changes) {
+                for key in ["kind", "path", "move_path"] {
+                    assert_eq!(summary.get(key), change.get(key));
+                }
+                for key in ["preimage_sha256", "postimage_sha256"] {
+                    assert_eq!(
+                        summary.get(key),
+                        Some(change.get(key).expect("successful edit identity")),
+                    );
+                }
+                assert!(summary.get("hunks").is_none());
+                assert!(summary.get("lines").is_none());
+                assert_eq!(summary["hunks_omitted_from_context"], true);
+            }
+            assert_eq!(summaries[0]["preimage_sha256"], Value::Null);
+            assert_eq!(summaries[2]["move_path"], "moved.txt");
+            assert_eq!(summaries[3]["postimage_sha256"], Value::Null);
+            assert_eq!(output["output"]["error_type"], "ContextMismatch");
+            let failed = &output["output"]["failed_changes"][0]["failed_change"];
+            assert_eq!(failed["path"], "moved.txt");
+            assert!(failed.get("preimage_sha256").is_none());
+            assert!(failed.get("postimage_sha256").is_none());
+            assert!(failed.get("hunks").is_none());
+        }
     }
 
     #[test]

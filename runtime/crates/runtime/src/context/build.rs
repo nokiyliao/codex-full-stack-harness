@@ -445,22 +445,34 @@ fn build_messages_from_session_with_options(
 
     let raw_initial_user_input = &session.input.user_input;
     let initial_user_input = raw_initial_user_input.trim();
-    if !saw_context_compaction
-        && !initial_user_input.is_empty()
-        && !messages.iter().any(|message| {
+    let scoped_input = session.jspace_contract.is_some();
+    // A scoped invocation's delivery and parent-owned verification instructions
+    // must not depend on a trimmed timeline/handoff. Project only the CURRENT
+    // input; historical grant text never replaces session.jspace_contract.
+    if (!saw_context_compaction || scoped_input) && !initial_user_input.is_empty() {
+        let retained_input = user_input_content_value(if scoped_input {
+            raw_initial_user_input
+        } else {
+            initial_user_input
+        });
+        if !messages.iter().any(|message| {
             message.get("role").and_then(|role| role.as_str()) == Some("user")
                 && message.get("content").is_some_and(|content| {
-                    user_input_content_matches(content, raw_initial_user_input)
+                    if scoped_input {
+                        content == &retained_input
+                    } else {
+                        user_input_content_matches(content, raw_initial_user_input)
+                    }
                 })
-        })
-    {
-        messages.insert(
-            0,
-            serde_json::json!({
-                "role": "user",
-                "content": user_input_content_value(initial_user_input),
-            }),
-        );
+        }) {
+            messages.insert(
+                0,
+                serde_json::json!({
+                    "role": "user",
+                    "content": retained_input,
+                }),
+            );
+        }
     }
 
     messages
@@ -597,6 +609,10 @@ mod tests {
             ))
             .unwrap();
         runtime.state = lifecycle::RuntimeState::Finished;
+        runtime.output.as_mut().unwrap()["provider_transport_timing"] =
+            json!({"first_output_event_ms": 123, "completed_ms": 456});
+        runtime.output.as_mut().unwrap()["provider_request_profile"] =
+            json!({"instructions_source": "model_catalog", "instructions_sha256_16": "e1bdd4f8f0df0000"});
         accumulate_session_from_runtime(&mut session, &runtime, true).unwrap();
         let restored: SessionManagement =
             serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
@@ -606,6 +622,9 @@ mod tests {
                 .iter()
                 .any(|record| record.contains("no_reasoning_items"))
         );
+        let restored_runtime: RuntimeAggregate =
+            serde_json::from_str(&serde_json::to_string(&runtime).unwrap()).unwrap();
+        assert_eq!(restored_runtime.output.unwrap()["provider_transport_timing"]["completed_ms"], 456);
         let next = continuity_runtime(&restored, "next");
         let messages = build_context(ContextInput {
             session: &restored,
@@ -617,6 +636,9 @@ mod tests {
         let serialized = serde_json::to_string(&messages).unwrap();
         assert!(serialized.contains("visible reply"));
         assert!(!serialized.contains("responses_continuity_observation"));
+        assert!(!serialized.contains("provider_transport_timing"));
+        assert!(!serialized.contains("provider_request_profile"));
+        assert!(!serialized.contains("e1bdd4f8f0df0000"));
         assert!(!serialized.contains("reasoning_item_count"));
         assert!(!serialized.contains("no_reasoning_items"));
     }
@@ -943,6 +965,88 @@ mod tests {
             "command_run context without provider metadata must not create orphan tool outputs: {joined}"
         );
         assert!(joined.contains("new-output"));
+    }
+
+    #[test]
+    fn scoped_compaction_retains_exact_current_delivery_without_reviving_old_grants() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let mut session = session();
+        session.session_directory = root.path().to_path_buf();
+        let input = format!(
+            " \n{}\nSource-only delivery: native parent owns Cargo tests and acceptance. Tests are unrun; retain fresh source reads, finish task_status done, and emit no post-terminal narrative.\n ",
+            "Current admitted task context. ".repeat(100)
+        );
+        session.input.user_input = input.clone();
+        let contract = json!({
+            "schema_version": "jspace_contract_v2",
+            "allowed_operations": ["read"],
+            "denied_operations": ["command", "modify", "create", "delete"],
+            "read_scopes": ["admitted.rs"]
+        });
+        session.jspace_contract = Some(contract.clone());
+        session.record_session_capabilities(["focused_verifier"]);
+        session.push_log(json!({"role":"system", "content":"REVOKED_VERIFIER_GRANT"})
+            .to_string(), Utc::now());
+        let capabilities = vec!["task_status".to_string()];
+        session.reset_session_capabilities_at(capabilities.iter().map(String::as_str), Utc::now());
+        session.context_tokens.limit = 256;
+
+        for automatic in [false, true] {
+            if automatic {
+                crate::context::compact_session_context_automatically_with_capabilities(
+                    &mut session, "Continue the same task.", &capabilities,
+                ).expect("automatic compaction");
+            } else {
+                crate::context::compact_session_context_with_agent_message_and_capabilities(
+                    &mut session, "Continue the same task.", None, &capabilities,
+                ).expect("explicit compaction");
+            }
+            assert_eq!(session.jspace_contract.as_ref(), Some(&contract));
+            assert_eq!(session.input.user_input, input);
+            assert!(!session.has_session_capability("focused_verifier"));
+            let messages = build_messages_from_session(&session);
+            assert_eq!(messages.iter().filter(|message|
+                message["role"] == "user" && message["content"].as_str() == Some(input.as_str())
+            ).count(), 1, "current delivery instructions survive even a tiny summary budget");
+            assert!(!messages.iter().any(|message| message["content"] == "REVOKED_VERIFIER_GRANT"));
+        }
+
+        accumulate_message(&mut session, "user", json!(input.trim())).expect("trimmed input");
+        assert_eq!(build_messages_from_session(&session).iter().filter(|message|
+            message["role"] == "user" && message["content"].as_str() == Some(input.as_str())
+        ).count(), 1, "a trimmed historical input cannot stand in for the exact scoped invocation");
+        accumulate_message(&mut session, "user", json!(&input)).expect("current input already present");
+        assert_eq!(build_messages_from_session(&session).iter().filter(|message|
+            message["role"] == "user" && message["content"].as_str() == Some(input.as_str())
+        ).count(), 1, "do not duplicate an exact current input already in context");
+    }
+
+    #[test]
+    fn compaction_does_not_restore_a_revoked_scope_or_an_older_exact_invocation() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let mut session = session();
+        session.session_directory = root.path().to_path_buf();
+        let old_input = format!("{} OLD_DELIVERY_CONTRACT", "Old task context. ".repeat(100));
+        session.jspace_contract = Some(json!({
+            "schema_version":"jspace_contract_v2", "allowed_operations":["read"],
+            "read_scopes":["revoked.rs"]
+        }));
+        session.push_log(json!({"role":"developer", "content":session.jspace_contract.as_ref().unwrap().to_string()})
+            .to_string(), Utc::now());
+        session.push_log(json!({"role":"user", "content":old_input}).to_string(), Utc::now());
+        session.input.user_input = format!("{} CURRENT_DELIVERY_CONTRACT", "Current task. ".repeat(100));
+        session.jspace_contract = None;
+        compact_session_context(&mut session, "A new task with no active J-Space.")
+            .expect("unscoped compaction");
+        let messages = build_messages_from_session(&session);
+        assert!(session.jspace_contract.is_none());
+        assert!(!messages.iter().any(|message|
+            message["content"].as_str().is_some_and(|content| content.contains("revoked.rs"))
+        ), "do not replay a historical grant after the active scope was revoked");
+        assert!(!messages.iter().any(|message| message["content"].as_str() == Some(old_input.as_str())));
+        assert!(!messages.iter().any(|message|
+            message["content"].as_str() == Some(session.input.user_input.as_str())
+        ), "unscoped compaction retains its existing lossy timeline behavior");
     }
 
     #[test]

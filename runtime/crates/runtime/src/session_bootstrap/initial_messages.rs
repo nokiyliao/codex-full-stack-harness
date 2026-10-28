@@ -18,7 +18,10 @@ pub(crate) fn initial_messages_for_session(
         });
         let environment_message = serde_json::json!({
             "role": "developer",
-            "content": environment_context_message(&session.session_directory),
+            "content": crate::manas::tool_catalog::jspace_environment_context(
+                environment_context_message(&session.session_directory),
+                session.jspace_contract.as_ref(),
+            ),
         });
         let runtime_context_message = runtime_context_message(session);
         let user_message = serde_json::json!({
@@ -69,7 +72,7 @@ pub(crate) fn initial_messages_for_session(
 }
 
 fn environment_context_message(cwd: &std::path::Path) -> String {
-    let timezone = std::env::var("TZ").unwrap_or_else(|_| "Europe/Paris".to_string());
+    let timezone = context_blocks::system_timezone();
     let system_language = session_language();
     context_blocks::environment_context(
         cwd,
@@ -403,6 +406,7 @@ mod tests {
             "schema_version": "jspace_contract_v2",
             "allowed_operations": ["read"],
             "read_scopes": ["admitted.txt"],
+            "read_commands": {"roots": ["admitted.txt"], "cat": {"path": "/bin/cat", "sha256": "b"}},
         }));
 
         let messages = initial_messages_for_session(&mut session).expect("initial messages");
@@ -410,6 +414,9 @@ mod tests {
         assert!(snapshot.contains("active J-Space contract"));
         assert!(!snapshot.contains("unadmitted.txt"));
         assert!(snapshot.len() < 200);
+        let environment = messages[1]["content"].as_str().expect("environment context");
+        assert!(environment.contains("<jspace_shell_boundary>"), "{environment}");
+        assert!(environment.contains("Admitted read roots: admitted.txt."));
         assert!(
             session
                 .session_log

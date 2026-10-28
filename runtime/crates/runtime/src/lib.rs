@@ -2,6 +2,10 @@
 #![deny(unsafe_code)]
 #![allow(ambiguous_glob_reexports)]
 
+// Router environment is process-global, including across test modules.
+#[cfg(test)]
+pub(crate) static ROUTER_TEST_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub mod agent_router;
 pub mod checkpoint;
 pub mod context;

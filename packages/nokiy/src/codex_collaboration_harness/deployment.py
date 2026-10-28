@@ -15,6 +15,8 @@ from . import task_closeout as closeout
 
 SCHEMA = "nokiy_deployment_plan_v1"
 TERMINAL = "nokiy_deployment_terminal_v1"
+CLOSEOUT_SCHEMA = "nokiy_task_closeout_plan_v1"
+CLOSEOUT_TERMINAL = "nokiy_task_closeout_terminal_v1"
 STAGES = ("preflight", "apply", "verify")
 LIMIT = 128 * 1024
 ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}\Z")
@@ -85,40 +87,43 @@ def validate_command(spec: Any) -> None:
 
 
 def static_commands(plan: dict[str, Any]) -> list[dict[str, Any]]:
-    specs = list(plan["commands"].values())
+    specs = list(plan.get("commands", {}).values())
     if "task_closeout" in plan:
         specs.append(plan["task_closeout"]["command"])
     return specs
 
 
-def load(path: Path, approved: str) -> tuple[dict[str, Any], str]:
+def load(path: Path, approved: str, *, schema: str = SCHEMA) -> tuple[dict[str, Any], str]:
     plan = document(path)
     digest = caller._canonical_sha256(plan)
     if digest != approved:
         fail("APPROVAL_DIGEST_MISMATCH")
     required = {"schema_version", "action_id", "native_thread_id", "workspace",
-                "artifact_root", "target", "release", "expires_at", "authorization_ref", "commands"}
+                "artifact_root", "expires_at", "authorization_ref"}
+    required |= {"task_closeout"} if schema == CLOSEOUT_SCHEMA else {"target", "release", "commands"}
     if set(plan) not in (required, required | {"task_closeout"}):
         fail("PLAN_FIELDS_INVALID")
-    if plan["schema_version"] != SCHEMA or not isinstance(plan["action_id"], str) or not ID.fullmatch(plan["action_id"]):
+    if plan["schema_version"] != schema or not isinstance(plan["action_id"], str) or not ID.fullmatch(plan["action_id"]):
         fail("PLAN_ID_INVALID")
     thread = plan["native_thread_id"]
     if not isinstance(thread, str) or not caller.THREAD_ID_PATTERN.fullmatch(thread) or thread != os.environ.get("CODEX_THREAD_ID"):
         fail("PARENT_THREAD_MISMATCH")
-    for field in ("target", "release"):
+    for field in (() if schema == CLOSEOUT_SCHEMA else ("target", "release")):
         if not isinstance(plan[field], str) or not plan[field].strip() or len(plan[field]) > 256:
             fail("TARGET_BINDING_REQUIRED")
     absolute(plan["workspace"], directory=True)
     absolute(plan["artifact_root"], directory=True)
-    if not isinstance(plan["commands"], dict) or set(plan["commands"]) != set(STAGES):
+    if schema == SCHEMA and (not isinstance(plan["commands"], dict) or set(plan["commands"]) != set(STAGES)):
         fail("THREE_STAGES_REQUIRED")
     if type(plan["expires_at"]) not in (int, float):
         fail("EXPIRY_REQUIRED")
-    for spec in plan["commands"].values():
+    for spec in plan.get("commands", {}).values():
         validate_command(spec)
     if "task_closeout" in plan:
         closeout.validate(plan["task_closeout"], thread)
         validate_command(plan["task_closeout"]["command"])
+        if schema == CLOSEOUT_SCHEMA and plan["task_closeout"].get("mode", "source") != "source":
+            fail("CLOSEOUT_SOURCE_MODE_REQUIRED")
     return plan, digest
 
 
@@ -141,8 +146,8 @@ def clean(scope: dict[str, Any]) -> bool:
 
 
 def binding(plan: dict[str, Any], digest: str) -> dict[str, Any]:
-    return {"action_id": plan["action_id"], "target": plan["target"],
-            "release": plan["release"], "plan_sha256": digest}
+    return {"action_id": plan["action_id"], "plan_sha256": digest,
+            **{key: plan[key] for key in ("target", "release") if key in plan}}
 
 
 def run_stages(plan: dict[str, Any], digest: str, run: Path,
@@ -243,19 +248,67 @@ def run_closeout(plan: dict[str, Any], digest: str, run: Path, pin: dict[str, An
     return result
 
 
-def read_result(root: Path, action_id: str) -> dict[str, Any]:
+def read_result(root: Path, action_id: str, *, closeout_only: bool = False) -> dict[str, Any]:
     if not ID.fullmatch(action_id):
         fail("PLAN_ID_INVALID")
-    run = absolute(str(root), directory=True) / ("deployment-" + action_id)
+    run = absolute(str(root), directory=True) / (("closeout-" if closeout_only else "deployment-") + action_id)
     absolute(str(run), directory=True)
     result = document(run / "terminal.json")
     saved = document(run / "plan.json")
-    if (result.get("schema_version") != TERMINAL or saved.get("action_id") != action_id
+    if (result.get("schema_version") != (CLOSEOUT_TERMINAL if closeout_only else TERMINAL)
+            or saved.get("schema_version") != (CLOSEOUT_SCHEMA if closeout_only else SCHEMA)
+            or saved.get("action_id") != action_id
             or any(result.get(k) != v for k, v in binding(saved, caller._canonical_sha256(saved)).items())
             or result.get("native_thread_id") != saved.get("native_thread_id")
             or result.get("native_thread_id") != os.environ.get("CODEX_THREAD_ID")):
         fail("RESULT_IDENTITY_MISMATCH")
     return result
+
+
+def execute_closeout(path: Path, approved: str, *, check_only: bool = False) -> dict[str, Any]:
+    plan, digest = load(path, approved, schema=CLOSEOUT_SCHEMA)
+    run = Path(plan["artifact_root"]) / ("closeout-" + plan["action_id"])
+    if run.is_symlink():
+        fail("UNSAFE_RESULT_PATH")
+    if run.exists():
+        if caller._canonical_sha256(document(run / "plan.json")) != digest:
+            fail("ACTION_ID_CONFLICT")
+        if (run / "terminal.json").is_file():
+            return read_result(Path(plan["artifact_root"]), plan["action_id"], closeout_only=True)
+        fail("UNCERTAIN_PRIOR_ATTEMPT")
+    fresh(plan)
+    pin = closeout.paths(plan["task_closeout"])
+    closeout.lease_identity(plan["task_closeout"], pin, plan["native_thread_id"])
+    if check_only:
+        return {"status": "READY", **binding(plan, digest), "execution_started": False,
+                "domain_admission_checked": False, "provider_execution_started": False}
+    try:
+        run.mkdir(mode=0o700)
+    except FileExistsError:
+        fail("UNCERTAIN_PRIOR_ATTEMPT")
+    sync_directory(run.parent)
+    save(run / "plan.json", plan)
+    save(run / "closeout.paths.json", pin)
+    result = run_closeout(plan, digest, run, pin)
+    attempted = (run / "closeout.started.json").exists()
+    terminal = {
+        "schema_version": CLOSEOUT_TERMINAL, **binding(plan, digest),
+        "native_thread_id": plan["native_thread_id"],
+        "status": "VERIFIED" if result["status"] == "VERIFIED" else
+                  "EFFECT_UNCERTAIN" if attempted else "BLOCKED_BEFORE_CLOSEOUT",
+        "first_typed_blocker": result["first_typed_blocker"], "closeout_attempted": attempted,
+        "cleanup_pass": clean(result["cleanup"]) if "cleanup" in result else not attempted,
+        "lease_closeout": {**result, "evidence_scope": "historical_at_execution_not_current_readback"},
+        "lease_evidence": {"active_lease": plan["task_closeout"]["active_lease"], "paths": pin},
+        "execution_model": "exact_parent_admitted_closeout_direct", "provider_execution_started": False,
+        "execution_boundary": "parent_task_environment_no_added_seatbelt",
+        "mission_acceptance": "parent_owned", "automatic_retry": False,
+    }
+    try:
+        save(run / "terminal.json", terminal)
+    except OSError:
+        terminal.update(status="EFFECT_UNCERTAIN", first_typed_blocker="NOKIY_DEPLOYMENT_TERMINAL_NOT_DURABLE")
+    return terminal
 
 
 def execute(path: Path, approved: str, *, check_only: bool = False) -> dict[str, Any]:

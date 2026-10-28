@@ -221,6 +221,41 @@ fn resolve_runtime_binary() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
+fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn join_pipe(
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    name: &str,
+) -> Result<String, String> {
+    let bytes = reader
+        .join()
+        .map_err(|_| format!("runtime worker {name} reader panicked"))?
+        .map_err(|error| format!("failed to read runtime worker {name}: {error}"))?;
+    String::from_utf8(bytes).map_err(|error| format!("runtime worker {name} is not UTF-8: {error}"))
+}
+
+fn parse_worker_response(stdout: &str) -> Result<RuntimeWorkerResponse, String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find_map(|line| serde_json::from_str::<RuntimeWorkerResponse>(line).ok())
+        .ok_or_else(|| "runtime worker returned no valid typed response".to_string())
+}
+
+fn stderr_suffix(stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use session_log_contract::RuntimeLifecycleIdentity;
@@ -293,40 +328,5 @@ mod tests {
         reconstructed
             .validate()
             .expect("durable lifecycle identity");
-    }
-}
-
-fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    pipe.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn join_pipe(
-    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
-    name: &str,
-) -> Result<String, String> {
-    let bytes = reader
-        .join()
-        .map_err(|_| format!("runtime worker {name} reader panicked"))?
-        .map_err(|error| format!("failed to read runtime worker {name}: {error}"))?;
-    String::from_utf8(bytes).map_err(|error| format!("runtime worker {name} is not UTF-8: {error}"))
-}
-
-fn parse_worker_response(stdout: &str) -> Result<RuntimeWorkerResponse, String> {
-    stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .find_map(|line| serde_json::from_str::<RuntimeWorkerResponse>(line).ok())
-        .ok_or_else(|| "runtime worker returned no valid typed response".to_string())
-}
-
-fn stderr_suffix(stderr: &str) -> String {
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        String::new()
-    } else {
-        format!(": {stderr}")
     }
 }

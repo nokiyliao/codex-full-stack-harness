@@ -1,0 +1,46 @@
+{
+  "schema_version": "nokiy_native_intake_v1",
+  "draft": {
+    "type": "object",
+    "required": ["workspace", "artifact_root", "prompt", "authority_effect"],
+    "additionalProperties": false,
+    "properties": {
+      "workspace": {"type": "string", "minLength": 1, "description": "Existing canonical absolute workspace directory"},
+      "artifact_root": {"type": "string", "minLength": 1, "description": "Existing canonical absolute task-local artifact directory"},
+      "prompt": {"type": "string", "minLength": 1, "x-maxUtf8Bytes": 65536},
+      "authority_effect": {"type": "string", "enum": ["none", "workspace"]},
+      "timeout_seconds": {"type": ["integer", "null"], "minimum": 10, "maximum": 900, "default": null},
+      "max_context_age_seconds": {"type": "integer", "minimum": 1, "maximum": 604800, "default": 1800},
+      "max_trajectory_bytes": {"type": ["integer", "null"], "minimum": 1024, "maximum": 67108864, "default": null, "description": "Full-core trajectory is disk-backed with no total byte cap by default; an explicit integer preserves its finite execution budget."},
+      "max_result_bytes": {"type": "integer", "minimum": 256, "maximum": 8192, "default": 8192},
+      "require_tool_call": {"type": "boolean", "default": false},
+      "model_acceleration": {"type": "boolean", "const": false, "description": "Legacy false is treated as omitted; Fast is retired. Do not request true."}
+    }
+  },
+  "action": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {
+      "operations": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": ["read", "create", "modify", "delete", "command"]}, "description": "Declare exact operation kinds, not write. The workspace compiler decides which kinds and scopes are admitted; this vocabulary grants nothing."},
+      "allowed_operations": {"type": "array", "items": {"type": "string", "enum": ["read", "create", "modify", "delete", "command"]}, "description": "Additional requested operations for DCF compilation, not an override of workspace policy. Local preparation uses operations."},
+      "source_read": {"type": "boolean", "description": "True requires read and command operations and selects exact regular-file reads without symlink ancestry. Directory discovery uses read_directories instead; local preparation accepts matching directory/** scopes alongside exact files. False is normalized to omission without adding a read grant."},
+      "read_directories": {"type": "array", "maxItems": 8, "items": {"type": "string"}, "description": "Exact existing non-hidden workspace-relative directories, not '.', '**' or symlinks. Requires read and command operations. DCF also requires matching directory/** read_scopes; local mode accepts the same shape without treating directory scopes as files."},
+      "command_templates": {
+        "type": "array",
+        "maxItems": 32,
+        "description": "Prefer typed declarations; legacy exact scoped cat/pwd strings are normalized automatically. Other strings require a capability-specific action. The workspace compiler checks support, effects, operands and scopes.",
+        "items": {
+          "type": ["object", "string"],
+          "required": ["argv", "effects", "targets"],
+          "additionalProperties": false,
+          "properties": {
+            "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+            "effects": {"type": "array", "items": {"type": "string"}},
+            "targets": {"type": "array", "items": {"type": "object"}}
+          }
+        }
+      }
+    }
+  },
+  "read_http_helper_sha256": "66fc8f5b15039d5829d4e5bc69f51617469c5e1ebc3116f06e43fc612abef57f"
+}

@@ -8,8 +8,13 @@ use std::path::Path;
 
 use lifecycle::SessionState;
 
+mod visible_text;
+pub use visible_text::{clean_agent_message, looks_like_tool_payload, strip_tool_payload_suffix};
+
 mod task_context_v1;
 pub use task_context_v1::{
+    CapsuleSourceReadBinding,
+    READONLY_SOURCE_OUTLINE_MARKER, READONLY_SOURCE_OUTLINE_NOTICE,
     PRESENTATION_VERSION as TASK_CONTEXT_PRESENTATION_VERSION,
     canonical_json as task_context_canonical_json_v1,
     semantic_sha256 as task_context_semantic_sha256_v1,
@@ -31,6 +36,15 @@ pub const MAXIMUM_NATIVE_CODEX_TASK_DELTA_BYTES: usize = 256 * 1024;
 pub const SESSION_SERVICE_TIER_ENV: &str = "TURA_SESSION_SERVICE_TIER";
 pub const NATIVE_CODEX_TERMINAL_ENVELOPE_SCHEMA_VERSION: &str =
     "tura_native_codex_terminal_envelope_v2";
+
+/// Internal tool context, constructed from the verified worker capsule, not model arguments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapsuleSourceReadContext {
+    pub session_id: String,
+    pub runtime_id: String,
+    pub binding: CapsuleSourceReadBinding,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -808,6 +822,15 @@ impl TaskContextCapsule {
         task_context_v1::presentation(
             &serde_json::to_value(self).expect("TaskContextCapsule is JSON encodable"),
         )
+    }
+
+    /// Derives source expectations from original capsule evidence, not authority.
+    pub fn readonly_source_read_binding(
+        &self,
+        jspace_contract: &Value,
+        root: &Path,
+    ) -> Result<Option<CapsuleSourceReadBinding>, String> {
+        task_context_v1::readonly_source_read_binding(self, jspace_contract, root)
     }
 }
 

@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use runtime_contract::{ModelServiceTier, TerminalEvidenceProjection};
+use runtime_contract::{ModelServiceTier, TerminalEvidenceProjection, clean_agent_message};
 use serde_json::{Value, json};
 use session_log_contract::{
     EXECUTION_EVIDENCE_PAGE_BYTES, EXECUTION_EVIDENCE_PAGE_RECORDS,
@@ -17,6 +17,9 @@ use session_log_contract::{
 
 use super::cli::CliConfig;
 use super::env::normalize_model;
+
+/// A runtime's observed provider fields, each selected by the evidence summary.
+type ObservationFields = (Option<String>, Option<String>, Option<String>);
 
 pub(crate) fn write_last_message(path: &Path, text: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
@@ -130,24 +133,25 @@ fn project_context_value(value: &Value, item_index: &mut usize, cwd: &Path,
                 .unwrap_or("tool");
             if tool_name == "command_run" {
                 if emit_messages && *item_index == 0 {
-                    let summary = value
+                    // Only the model's own step summary may open the
+                    // transcript; never substitute invented assistant text.
+                    if let Some(summary) = value
                         .get("input")
                         .and_then(|input| input.get("step_summary"))
                         .and_then(Value::as_str)
                         .map(str::trim)
                         .filter(|summary| !summary.is_empty())
-                        .unwrap_or(
-                            "I'll inspect the requested file first, then apply the patch and run verification.",
-                        );
-                    emit(&json!({
-                        "type": "item.completed",
-                        "item": {
-                            "id": format!("item_{item_index}"),
-                            "type": "agent_message",
-                            "text": summary
-                        }
-                    }))?;
-                    *item_index += 1;
+                    {
+                        emit(&json!({
+                            "type": "item.completed",
+                            "item": {
+                                "id": format!("item_{item_index}"),
+                                "type": "agent_message",
+                                "text": summary
+                            }
+                        }))?;
+                        *item_index += 1;
+                    }
                 }
                 if !live {
                     emit_command_run_events(value, item_index, cwd, emit)?;
@@ -331,7 +335,7 @@ pub(crate) fn aggregate_provider_observations(session_log: &[String]) -> Value {
         .count();
     let conflicts = runtimes.values().filter(|state| state.observation_conflict).count();
     let summarize =
-        |select: fn(&(Option<String>, Option<String>, Option<String>)) -> &Option<String>| {
+        |select: fn(&ObservationFields) -> &Option<String>| {
             let values = runtimes
                 .values()
                 .filter_map(|state| if state.observation_conflict { None } else { state.observation.as_ref() })
@@ -640,11 +644,17 @@ fn emit_command_run_events(
             .or_else(|| result.get("command"))
             .and_then(Value::as_str);
         if command_type == Some("apply_patch") {
-            emit_file_change_event(&result, item_index, cwd, emit)?;
+            emit_file_change_event(&result, item_index, cwd, value["runtime_id"].as_str(), emit)?;
             continue;
         }
-        let command = display_command(&result);
-        emit(&json!({
+        let mut command = display_command(&result);
+        if command.is_empty() {
+            if let Some(arguments) = structured_command_representation(&result, &value["input"],
+                &value["output"], value["runtime_id"].as_str()) {
+                command = arguments;
+            }
+        }
+        let mut event = json!({
             "type": "item.completed",
             "item": {
                 "id": format!("item_{}", *item_index),
@@ -654,30 +664,143 @@ fn emit_command_run_events(
                 "exit_code": result.get("exit_code").and_then(Value::as_i64),
                 "status": if result.get("success").and_then(Value::as_bool).unwrap_or(false) { "completed" } else { "failed" }
             }
-        }))?;
+        });
+        project_command_identity(&result, &mut event["item"], value["runtime_id"].as_str());
+        if let Some(denial) = source_read_policy_denial(&result, &value["input"], &value["output"], value["runtime_id"].as_str()) {
+            event["item"]["policy_denial"] = denial;
+        }
+        emit(&event)?;
         *item_index += 1;
     }
     Ok(())
+}
+
+fn identified_command<'a>(result: &Value, input: &'a Value, output: &'a Value, kind: &str) -> Option<&'a Value> {
+    let output = output.get("streamed_command_run_result").unwrap_or(output);
+    let commands = output.get("commands").or_else(|| input.get("commands"))?.as_array()?;
+    let index = result.get("command_index")?.as_u64()?;
+    let step = result.get("step")?.as_u64()?;
+    let run = result.get("command_run_id")?.as_str()?;
+    let provider = result.get("provider_tool_call_id")?.as_str()?;
+    let runtime = run.strip_suffix(".tool.command_run")?;
+    if index >= u32::MAX as u64 + 1 || step == 0 || step >= u32::MAX as u64 + 1
+        || !runtime.starts_with("runtime-") || runtime.len() == "runtime-".len()
+        || !provider.starts_with("call_") || provider.len() == "call_".len()
+        || !runtime.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || !provider.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        || result.get("command_id")?.as_str()? != format!("{run}:{provider}:{index}")
+    {
+        return None;
+    }
+    // Match the scheduler's explicit identity, never result position or error text.
+    let mut matching = commands.iter().filter(|command| command.get("command_id") == result.get("command_id"));
+    let command = matching.next()?;
+    let fields = ["step", "command_index", "command_id", "command_run_id", "provider_tool_call_id"];
+    if matching.next().is_some()
+        || command.get("command_type").or_else(|| command.get("command")).and_then(Value::as_str) != Some(kind)
+        || command.get("command_line").and_then(Value::as_str).is_none()
+        || fields.iter().any(|key| command.get(*key) != result.get(*key))
+        || result.get("command_line").is_some_and(|line| Some(line) != command.get("command_line"))
+        || result.get("arguments").is_some_and(|arguments| Some(arguments) != command.get("arguments"))
+    {
+        return None;
+    }
+    if let Some(nested) = result.get("command").filter(|value| value.is_object()) {
+        if nested.get("command_type").or_else(|| nested.get("command")).and_then(Value::as_str) != Some(kind)
+            || nested.get("command_line") != command.get("command_line")
+            || nested.get("arguments") != command.get("arguments")
+            || fields.iter().any(|key| nested.get(*key) != command.get(*key))
+        {
+            return None;
+        }
+    }
+    Some(command)
+}
+
+fn identified_source_read_command<'a>(result: &Value, input: &'a Value, output: &'a Value) -> Option<&'a Value> {
+    let command = identified_command(result, input, output, "source_read")?;
+    command["command_line"].as_str().filter(|line| !line.is_empty())?;
+    Some(command)
+}
+
+fn structured_command_representation(result: &Value, input: &Value, output: &Value, runtime: Option<&str>) -> Option<String> {
+    let kind = result.get("command_type")?.as_str()?;
+    let command = identified_command(result, input, output, kind)?;
+    if command["command_line"].as_str()? != ""
+        || command["command_run_id"].as_str()? != format!("{}.tool.command_run", runtime?) {
+        return None;
+    }
+    let arguments = command.get("arguments")?.as_object()?;
+    if arguments.is_empty() { return None; }
+    // This is the scheduled invocation, not a request reconstructed from its output.
+    serde_json::to_string(arguments).ok()
+}
+
+fn source_read_policy_denial(result: &Value, input: &Value, output: &Value, runtime_id: Option<&str>) -> Option<Value> {
+    if result.get("success").and_then(Value::as_bool) != Some(false)
+        || result.get("command_type").and_then(Value::as_str) != Some("jspace")
+        || result.get("operation").and_then(Value::as_str) != Some("read")
+        || result.get("effect_state").and_then(Value::as_str) != Some("not_started")
+        || result.get("mutation_count").and_then(Value::as_u64) != Some(0)
+        || result.get("authority_effect").and_then(Value::as_str) != Some("none")
+        || result.get("delivery_state").and_then(Value::as_str) != Some("deterministic_policy_denial")
+        || result.get("replayable").and_then(Value::as_bool) != Some(true)
+        || ["jspace_error_code", "target"].iter().any(|key| {
+            !result.get(*key).and_then(Value::as_str).is_some_and(|value| !value.is_empty())
+        })
+    {
+        return None;
+    }
+    if !runtime_id.is_some_and(|value| !value.is_empty())
+        || ["step", "command_index"].iter().any(|key| result.get(*key).and_then(Value::as_u64).is_none())
+        || ["command_id", "command_run_id", "provider_tool_call_id"].iter().any(|key| {
+            !result.get(*key).and_then(Value::as_str).is_some_and(|value| !value.is_empty())
+        })
+    {
+        return None;
+    }
+    identified_source_read_command(result, input, output)?;
+    if result["command_run_id"].as_str()? != format!("{}.tool.command_run", runtime_id?) {
+        return None;
+    }
+    // Preserve the router's typed denial separately from its human diagnostic.
+    Some(Value::Object(["jspace_error_code", "operation", "target", "effect_state",
+        "mutation_count", "authority_effect", "delivery_state", "replayable"]
+        .into_iter().map(|key| (key.to_string(), result[key].clone())).collect()))
 }
 
 fn emit_file_change_event(
     result: &Value,
     item_index: &mut usize,
     cwd: &Path,
+    runtime_id: Option<&str>,
     emit: &mut impl FnMut(&Value) -> Result<(), String>,
 ) -> Result<(), String> {
     let changes = file_changes(result, cwd);
-    emit(&json!({
+    let output = command_output(result);
+    let mut event = json!({
         "type": "item.completed",
         "item": {
             "id": format!("item_{}", *item_index),
             "type": "file_change",
             "changes": changes,
+            "aggregated_output": if output.len() <= 64 * 1024 { Some(output) } else { None },
             "status": if result.get("success").and_then(Value::as_bool).unwrap_or(false) { "completed" } else { "failed" }
         }
-    }))?;
+    });
+    project_command_identity(result, &mut event["item"], runtime_id);
+    emit(&event)?;
     *item_index += 1;
     Ok(())
+}
+
+fn project_command_identity(result: &Value, item: &mut Value, runtime_id: Option<&str>) {
+    // Preserve scheduled order when a batch is flattened into wire events.
+    // These are existing command identities, not arrival-order evidence.
+    for key in ["command_type", "step", "command_index", "command_id", "command_run_id", "provider_tool_call_id"] {
+        if let Some(value) = result.get(key) { item[key] = value.clone(); }
+    }
+    if let Some(runtime_id) = runtime_id { item["runtime_id"] = json!(runtime_id); }
 }
 
 fn file_changes(result: &Value, cwd: &Path) -> Vec<Value> {
@@ -729,8 +852,17 @@ fn flatten_command_results(output: &Value, input: &Value) -> Vec<Value> {
     if let Some(runs) = output.get("results").and_then(Value::as_array) {
         for (index, run) in runs.iter().enumerate() {
             let mut run = run.clone();
+            // Router preflight can reject a whole batch without identifying the denied command.
+            let input_command = if input_commands.len() != 1
+                && run.get("command_type").and_then(Value::as_str) == Some("jspace")
+                && run.get("operation").and_then(Value::as_str) == Some("read")
+            {
+                identified_source_read_command(&run, input, output).cloned()
+            } else {
+                input_commands.get(index).cloned()
+            };
             if let (Some(object), Some(input_command)) =
-                (run.as_object_mut(), input_commands.get(index))
+                (run.as_object_mut(), input_command)
             {
                 if let Some(command_type) = input_command
                     .get("command_type")
@@ -745,6 +877,11 @@ fn flatten_command_results(output: &Value, input: &Value) -> Vec<Value> {
                     object
                         .entry("command_line".to_string())
                         .or_insert(command_line);
+                }
+                for key in ["step", "command_index", "command_id", "command_run_id", "provider_tool_call_id"] {
+                    if let Some(value) = input_command.get(key) {
+                        object.entry(key.to_string()).or_insert_with(|| value.clone());
+                    }
                 }
             }
             if let Some(nested) = run.get("results").and_then(Value::as_array) {
@@ -858,31 +995,6 @@ fn shell_display_output(text: &str) -> &str {
         return after_output;
     }
     text
-}
-
-fn clean_agent_message(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || looks_like_tool_payload(trimmed) {
-        return String::new();
-    }
-    if let Some(index) = trimmed.find("{\"commands\"") {
-        let (prefix, suffix) = trimmed.split_at(index);
-        if looks_like_tool_payload(suffix) {
-            return prefix.trim().to_string();
-        }
-    }
-    trimmed.to_string()
-}
-
-fn looks_like_tool_payload(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    if !trimmed.starts_with('{') {
-        return false;
-    }
-    trimmed.contains("\"commands\"")
-        || trimmed.contains("\"step_summary\"")
-        || trimmed.contains("\"tool_calls\"")
-        || trimmed.contains("\"reply_message\"")
 }
 
 pub(crate) fn emit_jsonl(value: &Value) -> Result<(), String> {
@@ -1078,6 +1190,23 @@ mod tests {
     }
 
     #[test]
+    fn opening_command_run_emits_only_the_models_own_step_summary() {
+        let agent_messages = |input: Value| {
+            let records = vec![json!({"type":"tool_result", "tool_name":"command_run", "success":true,
+                "input":input, "output":{"results":[]}}).to_string()];
+            let mut events = Vec::new();
+            super::project_context_log_with(&records, "s", &PathBuf::from("/workspace"), true, true,
+                &mut |event: &Value| { events.push(event.clone()); Ok(()) }).expect("projection");
+            events.into_iter().filter(|event| event["item"]["type"] == "agent_message")
+                .map(|event| event["item"]["text"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(agent_messages(json!({"commands":[]})).is_empty());
+        assert!(agent_messages(json!({"commands":[], "step_summary":"  "})).is_empty());
+        assert_eq!(agent_messages(json!({"commands":[], "step_summary":" Read main.py "})), vec!["Read main.py"]);
+    }
+
+    #[test]
     fn terminal_evidence_projects_exact_persisted_record_from_context_and_execution_pages() {
         let mut records = terminal_projection_records();
         records.push(terminal_marker().to_string());
@@ -1193,7 +1322,7 @@ mod tests {
         assert_eq!(one["runtime_count"], 1);
         assert_eq!(one["service_tier"]["value"], "priority");
         assert_eq!(
-            aggregate_provider_observations(&[default.clone()])["service_tier"]["value"],
+            aggregate_provider_observations(std::slice::from_ref(&default))["service_tier"]["value"],
             "default"
         );
         let mixed = aggregate_provider_observations(&[priority.clone(), default]);
@@ -1235,7 +1364,7 @@ mod tests {
             "input":{"commands":[]}, "output":{"results":[{"command_type":kind,
                 "command_line":text, "success":true, "output":{"stdout":text},
                 "changes":[{"path":"early.rs","kind":"update"}]}]}}).to_string();
-        let records = vec![command("shell_command", "EARLY_COMMAND"),
+        let records = [command("shell_command", "EARLY_COMMAND"),
             command("apply_patch", "EARLY_PATCH"),
             json!({"type":"context_compaction","content":"first checkpoint"}).to_string(),
             command("shell_command", "AFTER_FIRST_COMPACTION"),
@@ -1345,7 +1474,7 @@ mod tests {
             "usage": {"input_tokens": 2, "output_tokens": 3, "reasoning_tokens": 4}
         })
         .to_string()]);
-        assert_eq!(derived["total_tokens"], 9);
+        assert_eq!(derived["total_tokens"], 5);
         assert_eq!(derived["coverage"]["status"], "unknown");
     }
 
@@ -1385,6 +1514,54 @@ mod tests {
         );
         assert_eq!(event["usage"]["coverage"], usage["coverage"]);
         assert_eq!(event["status"], "completed");
+    }
+
+    #[test]
+    fn aggregate_runtime_usage_forwards_failed_attempts_separately_on_success() {
+        let log = vec![
+            json!({"type":"runtime_usage","runtime_id":"a",
+                "usage":{"input_tokens":20,"output_tokens":4,"total_tokens":24}}).to_string(),
+            json!({"type":"runtime_provider_observation","runtime_id":"a",
+                "provider_observation":{"schema_version":"provider_observation_v1","source":"provider_response",
+                    "failed_attempts":[{"usage":{"input_tokens":10,"output_tokens":2,
+                        "total_tokens":12,"invalid_fields":[]}}]}}).to_string(),
+        ];
+        let usage = aggregate_runtime_usage(&log);
+        let config = CliConfig::parse(vec!["exec".to_string(), "inspect".to_string()]).expect("config");
+        let event = turn_completed_event(&config, "session", usage, aggregate_provider_observations(&log), "completed", None);
+        assert_eq!(event["usage"]["total_tokens"], 24);
+        assert_eq!(event["usage"]["reported_failed_attempt_usage"]["totals"]["total_tokens"], 12);
+        assert_eq!(event["usage"]["reported_failed_attempt_usage"]["billing"], "UNKNOWN");
+        assert_eq!(event["usage"]["reported_failed_attempt_usage"]["included_in_reported_usage_totals"], false);
+    }
+
+    #[test]
+    fn aggregate_model_usage_keeps_pre_model_failure_separate_from_missing_usage() {
+        let auth = json!({"type":"runtime_provider_observation", "runtime_id":"auth",
+            "session_id":"session", "status":"Failed", "error_code":"CALL_FAILED",
+            "provider_observation":null, "provider_call_observation":{
+                "schema_version":"provider_call_observation_v1", "scope":"runtime_provider_call",
+                "stage":"authentication", "model_provider_invoked":false}});
+        let mut log = vec![auth.to_string(),
+            json!({"type":"runtime_usage", "runtime_id":"model",
+                "usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}).to_string()];
+        let usage = aggregate_runtime_usage(&log);
+        assert_eq!(usage["total_tokens"], 10);
+        assert_eq!(usage["coverage"]["known_runtime_count"], 2);
+        assert_eq!(usage["coverage"]["status"], "incomplete");
+        assert_eq!(usage["model_usage_coverage"]["status"], "complete");
+        assert_eq!(usage["model_usage_coverage"]["verified_pre_model_failure_count"], 1);
+        let config = CliConfig::parse(vec!["exec".into(), "inspect".into()]).expect("CLI");
+        let event = turn_completed_event(&config, "session", usage.clone(),
+            aggregate_provider_observations(&log), "completed", None);
+        assert_eq!(event["usage"]["model_usage_coverage"], usage["model_usage_coverage"]);
+
+        // An actual unmeasured invocation must remain visible beside an auth failure.
+        log.push(json!({"type":"runtime_provider_observation", "runtime_id":"missing"}).to_string());
+        let partial = aggregate_runtime_usage(&log);
+        assert_eq!(partial["model_usage_coverage"]["status"], "incomplete");
+        assert_eq!(partial["model_usage_coverage"]["missing_usage_count"], 1);
+        assert_eq!(partial["total_tokens"], 10);
     }
 
     #[test]
@@ -1568,6 +1745,82 @@ mod tests {
     }
 
     #[test]
+    fn clean_agent_message_preserves_fenced_command_examples() {
+        for (open, nested, close) in [
+            ("```rust", "", "```"),
+            ("````rust", "```\n", "`````"),
+            ("~~~rust", "```\n", "~~~~"),
+            ("~~~~text", "~~~\n````\n~~~~not a closer\n", "~~~~"),
+            ("   `````rust", "   ````\n", "   `````"),
+        ] {
+            let text = format!(
+                "regression:\n{open}\n{nested}let args = json!({{\"commands\":[]}});\n{close}\nEND_ANSWER"
+            );
+            assert_eq!(clean_agent_message(&text), text);
+            for payload in [r#"{"commands":[]}"#, r#"{"commands":["#] {
+                let leaked = format!("{text}\n{payload}");
+                assert_eq!(clean_agent_message(&leaked), text);
+            }
+        }
+    }
+
+    #[test]
+    fn clean_agent_message_preserves_inline_command_examples() {
+        for text in [
+            r#"`{"commands":[]}`"#,
+            r#"Use `{"commands":[]}` inline. END_ANSWER"#,
+            r#"Use ``json!({"commands":[]})`` inline. END_ANSWER"#,
+            r#"Use ``a ` tick; {"commands":[]} `` inline. END_ANSWER"#,
+            r#"Use ```json!({"commands":[]})``` inline. END_ANSWER"#,
+            "Use ``json!(\n{\"commands\":[]}\n)`` inline. END_ANSWER",
+            "Unicode λ `{\"commands\":[]}` retained. END_ANSWER",
+        ] {
+            assert_eq!(clean_agent_message(text), text);
+            for payload in [r#"{"commands":[]}"#, r#"{"commands":["#] {
+                let leaked = format!("{text}\n{payload}");
+                assert_eq!(clean_agent_message(&leaked), text);
+            }
+        }
+    }
+
+    #[test]
+    fn clean_agent_message_still_filters_unfenced_malformed_payloads() {
+        for payload in [
+            r#"{"commands":[]}"#,
+            r#"{"commands":["#,
+            r#"{"commands":[{"command_type":"source_read""#,
+            r#"{"commands":[]} trailing non-JSON text"#,
+        ] {
+            assert_eq!(clean_agent_message(payload), "");
+            for prefix in [
+                "Done.",
+                "Unmatched ` delimiter.",
+                "Mismatched ` delimiters ``.",
+                r"Escaped \` delimiter.",
+                "Not a fence: ~~~ prose.",
+            ] {
+                let text = format!("{prefix}\n{payload}");
+                assert_eq!(clean_agent_message(&text), prefix);
+            }
+        }
+    }
+
+    #[test]
+    fn clean_agent_message_keeps_raw_envelope_classification() {
+        assert_eq!(clean_agent_message(r#"{"task_group":"g","steps":[]}"#), "");
+        let answer = "```rust\nlet args = json!({\"commands\":[]});\n```\nEND_ANSWER";
+        for payload in [
+            json!({"reply_message": answer}),
+            json!({"tool_calls": []}),
+            json!({"step_summary": "hidden"}),
+        ] {
+            assert_eq!(clean_agent_message(&payload.to_string()), "");
+        }
+        // Runtime decodes reply_message envelopes before the CLI cleans the answer.
+        assert_eq!(clean_agent_message(answer), answer);
+    }
+
+    #[test]
     fn turn_log_summary_reports_only_current_turn_usage_timing_tools_and_text() {
         let log = vec![
             json!({"role": "user", "content": "old", "created_at": 1000}).to_string(),
@@ -1641,6 +1894,344 @@ mod tests {
             streamed,
             vec![json!({"command_type": "shell_command", "output": "ok"})]
         );
+    }
+
+    fn source_read_denial_fixture() -> Value {
+        json!({
+            "runtime_id": "runtime-policy-denial",
+            "input": {"commands": [{
+                "command_type": "source_read",
+                "command_line": "{\"path\":\"task_a/test_source_sections_extension.py\",\"start_line\":1,\"end_line\":80}",
+                "step": 1, "command_index": 3,
+                "command_id": "runtime-policy-denial.tool.command_run:call_denied:3",
+                "command_run_id": "runtime-policy-denial.tool.command_run",
+                "provider_tool_call_id": "call_denied"
+            }]},
+            "output": {"results": [{
+                "success": false, "command_type": "jspace",
+                "error": "JSPACE_SOURCE_READ_PATH_DENIED: operation=read target=task_a/test_source_sections_extension.py detail=SOURCE_READ_TARGET_INVALID: No such file or directory (os error 2)",
+                "jspace_error_code": "JSPACE_SOURCE_READ_PATH_DENIED",
+                "operation": "read", "target": "task_a/test_source_sections_extension.py",
+                "effect_state": "not_started", "mutation_count": 0,
+                "authority_effect": "none", "delivery_state": "deterministic_policy_denial",
+                "replayable": true
+            }]}
+        })
+    }
+
+    fn emit_source_read_denial_fixture(value: &Value) -> Value {
+        let mut events = Vec::new();
+        let mut index = 11;
+        super::emit_command_run_events(value, &mut index, &PathBuf::from("/workspace"),
+            &mut |event: &Value| { events.push(event.clone()); Ok(()) }).expect("projection");
+        assert_eq!(index, 12);
+        assert_eq!(events.len(), 1);
+        events.remove(0)
+    }
+
+    #[test]
+    fn source_read_policy_denial_preserves_typed_witness_and_command_identity() {
+        let fixture = source_read_denial_fixture();
+        let event = emit_source_read_denial_fixture(&fixture);
+        let input = &fixture["input"]["commands"][0];
+        let result = &fixture["output"]["results"][0];
+        assert_eq!(event, json!({"type": "item.completed", "item": {
+            "id": "item_11", "type": "command_execution", "command": input["command_line"],
+            "aggregated_output": result["error"], "exit_code": null, "status": "failed",
+            "command_type": "jspace", "runtime_id": "runtime-policy-denial", "step": 1,
+            "command_index": 3, "command_id": input["command_id"],
+            "command_run_id": input["command_run_id"], "provider_tool_call_id": "call_denied",
+            "policy_denial": {
+                "jspace_error_code": "JSPACE_SOURCE_READ_PATH_DENIED", "operation": "read",
+                "target": "task_a/test_source_sections_extension.py", "effect_state": "not_started",
+                "mutation_count": 0, "authority_effect": "none",
+                "delivery_state": "deterministic_policy_denial", "replayable": true
+            }
+        }}));
+        let mut streamed = fixture.clone();
+        streamed["output"] = json!({"streamed_command_run_result": fixture["output"]});
+        assert_eq!(emit_source_read_denial_fixture(&streamed), event);
+        println!("NOKIY_POLICY_DENIAL_FIXTURE={event}");
+    }
+
+    #[test]
+    fn source_read_policy_denial_rejects_incomplete_malformed_and_other_results() {
+        let fixture = source_read_denial_fixture();
+        for key in ["success", "command_type", "jspace_error_code", "operation", "target",
+            "effect_state", "mutation_count", "authority_effect", "delivery_state", "replayable"] {
+            let mut missing = fixture.clone();
+            missing["output"]["results"][0].as_object_mut().unwrap().remove(key);
+            let event = emit_source_read_denial_fixture(&missing);
+            assert!(event["item"].get("policy_denial").is_none(), "missing {key}");
+            assert_eq!(event["item"]["aggregated_output"], fixture["output"]["results"][0]["error"]);
+        }
+        for (key, invalid) in [
+            ("success", json!(true)), ("success", json!(0)),
+            ("command_type", json!("source_read")), ("command_type", json!("shell_command")),
+            ("jspace_error_code", json!(false)), ("jspace_error_code", json!("")),
+            ("operation", json!("write")), ("target", Value::Null), ("target", json!("")),
+            ("effect_state", json!("unknown")), ("mutation_count", json!(1)),
+            ("mutation_count", json!(false)), ("mutation_count", json!(0.0)),
+            ("authority_effect", json!("write")), ("delivery_state", json!("unknown")),
+            ("replayable", json!(false)), ("replayable", json!(1)),
+        ] {
+            let mut malformed = fixture.clone();
+            malformed["output"]["results"][0][key] = invalid;
+            let event = emit_source_read_denial_fixture(&malformed);
+            assert!(event["item"].get("policy_denial").is_none(), "invalid {key}");
+            assert_eq!(event["item"]["aggregated_output"], fixture["output"]["results"][0]["error"]);
+        }
+        let mut prior = fixture.clone();
+        prior["output"]["results"][0] = json!({"success": false, "command_type": "jspace",
+            "error": fixture["output"]["results"][0]["error"]});
+        let event = emit_source_read_denial_fixture(&prior);
+        assert!(event["item"].get("policy_denial").is_none());
+        assert_eq!(event["item"]["aggregated_output"], fixture["output"]["results"][0]["error"]);
+    }
+
+    #[test]
+    fn source_read_policy_denial_requires_exact_command_identity() {
+        let fixture = source_read_denial_fixture();
+        for key in ["step", "command_index", "command_id", "command_run_id", "provider_tool_call_id"] {
+            let mut missing = fixture.clone();
+            missing["input"]["commands"][0].as_object_mut().unwrap().remove(key);
+            assert!(emit_source_read_denial_fixture(&missing)["item"].get("policy_denial").is_none(), "missing {key}");
+        }
+        let mut missing_runtime = fixture.clone();
+        missing_runtime.as_object_mut().unwrap().remove("runtime_id");
+        assert!(emit_source_read_denial_fixture(&missing_runtime)["item"].get("policy_denial").is_none());
+
+        let mut batch = fixture.clone();
+        let mut earlier = fixture["input"]["commands"][0].clone();
+        earlier["command_line"] = json!("{\"path\":\"earlier.py\",\"start_line\":1,\"end_line\":1}");
+        earlier["command_index"] = json!(2);
+        earlier["command_id"] = json!("runtime-policy-denial.tool.command_run:call_denied:2");
+        batch["input"]["commands"].as_array_mut().unwrap().insert(0, earlier);
+        let event = emit_source_read_denial_fixture(&batch);
+        assert!(event["item"].get("policy_denial").is_none());
+        for key in ["step", "command_index", "command_id", "command_run_id", "provider_tool_call_id"] {
+            assert!(event["item"].get(key).is_none(), "batch denial must not borrow {key}");
+            batch["output"]["results"][0][key] = fixture["input"]["commands"][0][key].clone();
+        }
+        assert_eq!(event["item"]["command"], "command_run");
+        assert_eq!(event["item"]["status"], "failed");
+        assert_eq!(event["item"]["aggregated_output"], fixture["output"]["results"][0]["error"]);
+
+        let identified = emit_source_read_denial_fixture(&batch);
+        assert_eq!(identified["item"]["command_id"], fixture["input"]["commands"][0]["command_id"]);
+        assert_eq!(identified["item"]["policy_denial"], emit_source_read_denial_fixture(&fixture)["item"]["policy_denial"]);
+        batch["output"]["results"][0]["command_id"] = json!("unmatched-command");
+        assert!(emit_source_read_denial_fixture(&batch)["item"].get("policy_denial").is_none());
+    }
+
+    fn scheduler_source_read_denial_fixture() -> Value {
+        let mut value = source_read_denial_fixture();
+        let mut command = value["input"]["commands"][0].clone();
+        command["command_index"] = json!(0);
+        command["command_id"] = json!("runtime-policy-denial.tool.command_run:call_denied:0");
+        command["command_line"] = json!("[\"task_a/test_source_sections_extension.py\",1,80]");
+        let mut status = command.clone();
+        status["command_type"] = json!("task_status");
+        status["command_line"] = json!("{}");
+        status["command_index"] = json!(1);
+        status["command_id"] = json!("runtime-policy-denial.tool.command_run:call_denied:1");
+        value["input"]["commands"] = json!([
+            {"command_type": "source_read", "command_line": command["command_line"], "step": 1},
+            {"command": "task_status", "command_type": "task_status", "command_line": "{}", "step": 1}
+        ]);
+        value["output"]["commands"] = json!([command, status]);
+        let denied = &mut value["output"]["results"][0];
+        denied["command"] = command.clone();
+        for key in ["step", "command_index", "command_id", "command_run_id", "provider_tool_call_id"] {
+            denied[key] = command[key].clone();
+        }
+        let mut result = status.clone();
+        result["command"] = status;
+        result["success"] = json!(true);
+        result["output"] = json!({"task_status": {}});
+        value["output"]["results"].as_array_mut().unwrap().push(result);
+        value
+    }
+
+    fn project_scheduler_denial(value: &Value) -> Value {
+        let mut events = Vec::new();
+        let mut index = 18;
+        super::emit_command_run_events(value, &mut index, &PathBuf::from("/workspace"),
+            &mut |event: &Value| { events.push(event.clone()); Ok(()) }).expect("projection");
+        assert_eq!(events.len(), 2);
+        events.remove(0)
+    }
+
+    #[test]
+    fn scheduler_identified_denial_uses_canonical_command_not_unenriched_input() {
+        let fixture = scheduler_source_read_denial_fixture();
+        let event = project_scheduler_denial(&fixture);
+        assert_eq!(event["item"]["command"], fixture["output"]["commands"][0]["command_line"]);
+        assert_eq!(event["item"]["command_id"], fixture["output"]["commands"][0]["command_id"]);
+        assert_eq!(event["item"]["status"], "failed");
+        assert_eq!(event["item"]["exit_code"], Value::Null);
+        assert_eq!(event["item"]["aggregated_output"], fixture["output"]["results"][0]["error"]);
+        assert_eq!(event["item"]["policy_denial"]["effect_state"], "not_started");
+        let mut streamed = fixture.clone();
+        streamed["output"] = json!({"streamed_command_run_result": fixture["output"]});
+        assert_eq!(project_scheduler_denial(&streamed), event);
+
+        if let Ok(path) = std::env::var("NOKIY_POLICY_DENIAL_REAL_FIXTURE") {
+            let observed: Value = serde_json::from_slice(&std::fs::read(path).expect("real fixture")).expect("JSON fixture");
+            let actual = project_scheduler_denial(&observed);
+            assert_eq!(actual["item"]["command"], observed["output"]["commands"][0]["command_line"]);
+            assert_eq!(actual["item"]["command_id"], observed["output"]["commands"][0]["command_id"]);
+            assert_eq!(actual["item"]["aggregated_output"], observed["output"]["results"][0]["error"]);
+            assert_eq!(actual["item"]["policy_denial"]["effect_state"], "not_started");
+            println!("NOKIY_REAL_POLICY_DENIAL_EVENT={actual}");
+        }
+    }
+
+    #[test]
+    fn scheduler_denial_rejects_missing_duplicate_conflicting_or_tampered_identity() {
+        let fixture = scheduler_source_read_denial_fixture();
+        let assert_rejected = |value: &Value| {
+            let event = project_scheduler_denial(value);
+            assert!(event["item"].get("policy_denial").is_none());
+            assert_eq!(event["item"]["command"], "command_run");
+            assert_eq!(event["item"]["status"], "failed");
+            assert_eq!(event["item"]["aggregated_output"], fixture["output"]["results"][0]["error"]);
+        };
+        for key in ["step", "command_index", "command_id", "command_run_id", "provider_tool_call_id"] {
+            for location in ["result", "canonical", "nested"] {
+                let mut missing = fixture.clone();
+                let target = match location {
+                    "result" => &mut missing["output"]["results"][0],
+                    "canonical" => &mut missing["output"]["commands"][0],
+                    _ => &mut missing["output"]["results"][0]["command"],
+                };
+                target.as_object_mut().unwrap().remove(key);
+                assert_rejected(&missing);
+            }
+        }
+        for duplicate in [true, false] {
+            let mut value = fixture.clone();
+            let mut extra = value["output"]["commands"][0].clone();
+            if !duplicate { extra["command_line"] = json!("[\"other.py\",1,80]"); }
+            value["output"]["commands"].as_array_mut().unwrap().push(extra);
+            assert_rejected(&value);
+        }
+        for (key, invalid) in [
+            ("step", json!(0)), ("command_index", json!(true)),
+            ("command_id", json!("foreign")), ("command_run_id", json!("runtime-other.tool.command_run")),
+            ("provider_tool_call_id", json!("call_foreign")),
+        ] {
+            let mut value = fixture.clone();
+            value["output"]["results"][0][key] = invalid;
+            assert_rejected(&value);
+        }
+        for location in ["canonical", "nested"] {
+            let mut value = fixture.clone();
+            let target = if location == "canonical" { &mut value["output"]["commands"][0] }
+                else { &mut value["output"]["results"][0]["command"] };
+            target["command_line"] = json!("[\"other.py\",1,80]");
+            assert_rejected(&value);
+        }
+        let mut missing_canonical = fixture.clone();
+        missing_canonical["output"].as_object_mut().unwrap().remove("commands");
+        assert_rejected(&missing_canonical);
+    }
+
+    fn structured_command_fixture() -> Value {
+        let command = json!({"command_type": "task_status", "command_line": "",
+            "arguments": {"status": "done", "final_reply": {"result": "complete"}},
+            "step": 3, "command_index": 2,
+            "command_id": "runtime-structured.tool.command_run:call_structured:2",
+            "command_run_id": "runtime-structured.tool.command_run",
+            "provider_tool_call_id": "call_structured"});
+        let mut result = command.clone();
+        result.as_object_mut().unwrap().remove("arguments");
+        result.as_object_mut().unwrap().remove("command_line");
+        result["command"] = command.clone();
+        result["success"] = json!(true);
+        result["output"] = json!({"task_status": {"status": "done",
+            "final_reply": "{\"result\":\"complete\"}", "final_reply_format": "json"}});
+        json!({"runtime_id": "runtime-structured",
+            "input": {"commands": [{"command_type": "task_status", "command_line": "",
+                "arguments": command["arguments"], "step": 3}]},
+            "output": {"commands": [command], "results": [result]}})
+    }
+
+    fn project_structured_command(value: &Value, command_id: &str) -> Value {
+        let mut events = Vec::new();
+        let mut index = 9;
+        super::emit_command_run_events(value, &mut index, &PathBuf::from("/workspace"),
+            &mut |event: &Value| { events.push(event.clone()); Ok(()) }).expect("projection");
+        let mut matching = events.into_iter().filter(|event| event["item"]["command_id"] == command_id);
+        let event = matching.next().expect("command event");
+        assert!(matching.next().is_none());
+        event
+    }
+
+    #[test]
+    fn structured_command_preserves_canonical_arguments_as_request_evidence() {
+        let fixture = structured_command_fixture();
+        let id = fixture["output"]["commands"][0]["command_id"].as_str().unwrap();
+        let event = project_structured_command(&fixture, id);
+        assert_eq!(event["item"]["command"], fixture["input"]["commands"][0]["arguments"].to_string());
+        assert_eq!(event["item"]["aggregated_output"], fixture["output"]["results"][0]["output"].to_string());
+        let mut streamed = fixture.clone();
+        streamed["output"] = json!({"streamed_command_run_result": fixture["output"]});
+        assert_eq!(project_structured_command(&streamed, id), event);
+        if let Ok(path) = std::env::var("NOKIY_STRUCTURED_COMMAND_REAL_FIXTURE") {
+            let observed: Value = serde_json::from_slice(&std::fs::read(path).expect("real fixture")).expect("JSON fixture");
+            let id = observed["output"]["commands"][2]["command_id"].as_str().unwrap();
+            let actual = project_structured_command(&observed, id);
+            assert_eq!(actual["item"]["command"], observed["input"]["commands"][2]["arguments"].to_string());
+            assert_eq!(actual["item"]["aggregated_output"], observed["output"]["results"][2]["output"].to_string());
+            println!("NOKIY_REAL_STRUCTURED_COMMAND_EVENT={actual}");
+        }
+    }
+
+    #[test]
+    fn structured_command_never_infers_arguments_or_accepts_conflicting_identity() {
+        let fixture = structured_command_fixture();
+        let assert_rejected = |value: &Value| {
+            let id = value["output"]["results"][0]["command_id"].as_str().unwrap();
+            let event = project_structured_command(value, id);
+            assert_eq!(event["item"]["command"], "");
+            assert_eq!(event["item"]["aggregated_output"], fixture["output"]["results"][0]["output"].to_string());
+        };
+        for arguments in [Value::Null, json!({}), json!(""), json!([])] {
+            let mut value = fixture.clone();
+            value["output"]["commands"][0]["arguments"] = arguments.clone();
+            value["output"]["results"][0]["command"]["arguments"] = arguments;
+            assert_rejected(&value);
+        }
+        let mut missing = fixture.clone();
+        missing["output"]["commands"][0].as_object_mut().unwrap().remove("arguments");
+        missing["output"]["results"][0]["command"].as_object_mut().unwrap().remove("arguments");
+        assert_rejected(&missing);
+        for key in ["step", "command_index", "command_id", "command_run_id", "provider_tool_call_id"] {
+            for location in ["canonical", "nested"] {
+                let mut missing = fixture.clone();
+                let target = if location == "canonical" { &mut missing["output"]["commands"][0] }
+                    else { &mut missing["output"]["results"][0]["command"] };
+                target.as_object_mut().unwrap().remove(key);
+                assert_rejected(&missing);
+            }
+        }
+        let mut duplicate = fixture.clone();
+        duplicate["output"]["commands"].as_array_mut().unwrap().push(fixture["output"]["commands"][0].clone());
+        assert_rejected(&duplicate);
+        for (key, invalid) in [("command_id", json!("foreign")), ("step", json!(0)),
+            ("command_run_id", json!("runtime-other.tool.command_run")),
+            ("provider_tool_call_id", json!("call_other")), ("command_index", json!(3))] {
+            let mut value = fixture.clone();
+            value["output"]["results"][0][key] = invalid;
+            assert_rejected(&value);
+        }
+        let mut conflicting_arguments = fixture.clone();
+        conflicting_arguments["output"]["results"][0]["command"]["arguments"]["status"] = json!("doing");
+        assert_rejected(&conflicting_arguments);
+        let mut foreign_runtime = fixture.clone();
+        foreign_runtime["runtime_id"] = json!("runtime-other");
+        assert_rejected(&foreign_runtime);
     }
 
     #[test]

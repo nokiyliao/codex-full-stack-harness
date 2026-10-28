@@ -327,11 +327,15 @@ class VerifiedGapProjectionTests(unittest.TestCase):
         terminal, _, _ = self.complete_fixture(self.long_answer(self.capability_text(self.capability_handoff())))
         projected = self.project_capability(terminal)
         baseline = {key: value for key, value in projected.items() if key != "capability_gap"}
-        limit = (len(caller._canonical_bytes(baseline)) + 32 +
-                 len(caller._canonical_bytes(inspector._gap_diagnostic("CAPABILITY_GAP_PROJECTION_TOO_LARGE"))))
+        # Projection reserves the metadata appended by read-only CLI recovery.
+        delivery_metadata = {"inspection_summary": None, "inspection_summary_omission": "READ_ONLY_RECOVERY"}
+        diagnostic = inspector._gap_diagnostic("CAPABILITY_GAP_PROJECTION_TOO_LARGE")
+        limit = len(caller._canonical_bytes({**baseline, "capability_gap": diagnostic, **delivery_metadata}))
+        self.assertGreater(len(caller._canonical_bytes({**projected, **delivery_metadata})), limit)
         with patch.object(inspector, "MAX_PROJECTED_BYTES", limit):
             bounded = self.assert_unavailable(terminal, blocker="CAPABILITY_GAP_PROJECTION_TOO_LARGE")
         self.assertLessEqual(len(caller._canonical_bytes(bounded)), limit)
+        self.assertLessEqual(len(caller._canonical_bytes({**bounded, **delivery_metadata})), limit)
         self.assertEqual(bounded["result_inspection"]["first_blocker"], projected["result_inspection"]["first_blocker"])
         self.assertEqual({key: bounded[key] for key in terminal}, terminal)
 

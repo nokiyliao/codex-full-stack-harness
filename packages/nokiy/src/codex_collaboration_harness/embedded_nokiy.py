@@ -10,6 +10,7 @@ uncertain prior attempt is never re-executed automatically.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import re
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -33,6 +35,28 @@ LEGACY_REQUEST_SCHEMA_VERSION = "tura_embedded_request_v1"
 TERMINAL_SCHEMA_VERSION = "tura_embedded_terminal_v1"
 PREFLIGHT_SCHEMA_VERSION = "tura_embedded_preflight_v1"
 FAILURE_SCHEMA_VERSION = "tura_embedded_failure_v1"
+# navigation.invalid() messages are fixed literals with no workspace content, so they are safe
+# to return; any other detail stays hashed (test_navigation checks the two stay in sync).
+_NAVIGATION_STATIC_DETAILS = frozenset({
+    "read_paths requires distinct exact files or directories",
+    "read_paths must stay within explicit non-hidden source scopes",
+    "read_paths cannot traverse links",
+    "read_paths must exist",
+    "directory identity changed during navigation",
+    "invalid query or offset",
+    "projection must be full or locations",
+    "queries requires 1..32 strings and an empty scalar query",
+    "queries requires nonempty strings",
+    "queries must be valid UTF-8",
+    "each query must be at most 256 UTF-8 bytes",
+    "ref: query requires a nonempty reference term",
+    "continuation requires expected_map_sha256",
+    "expected navigation identity must be a lowercase SHA-256",
+    "source snapshot unavailable; narrow scope or resolve unreadable sources",
+    "source snapshot changed; refresh navigation before reusing locations",
+    "navigation changed; restart from offset zero",
+    "offset exceeds result",
+})
 DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_REASONING_EFFORT = "max"
 DEFAULT_SERVICE_TIER = "default"
@@ -47,6 +71,7 @@ MAX_TRAJECTORY_BYTES = 64 * 1024 * 1024
 REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
 AUTHORITY_EFFECTS = {"none", "workspace"}
 REQUEST_ID_PATTERN = re.compile(r"^tura_embedded_[0-9a-f]{64}$")
+EXECUTION_LOCK_FILE = "execution.lock"
 THREAD_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -94,10 +119,12 @@ FILE_IDENTITY_KEYS = {"path", "sha256"}
 class EmbeddedNokiyError(RuntimeError):
     """Typed fail-closed boundary for one embedded runtime request."""
 
-    def __init__(self, code: str, detail: str, *, issues: object = None) -> None:
+    def __init__(self, code: str, detail: str, *, issues: object = None,
+                 diagnostics: object = None) -> None:
         self.code = code
         self.detail = detail
         self.issues = issues
+        self.diagnostics = diagnostics
         super().__init__(f"{code}: {detail}")
 
 
@@ -719,7 +746,7 @@ def _check_exact_write_readiness(workspace: Path, jspace: dict[str, Any]) -> Non
                 os.close(directory)
 
 
-def _verify_context(request: EmbeddedNokiyRequest) -> tuple[dict[str, str], dict[str, Any], dict[str, Any]]:
+def _verify_context(request: EmbeddedNokiyRequest, *, post_batch_verifier: bool = False) -> tuple[dict[str, str], dict[str, Any], dict[str, Any]]:
     context = _bound_json(request.context_capsule, code="NOKIY_EMBEDDED_CONTEXT_DRIFT")
     jspace = _bound_json(request.jspace_contract, code="NOKIY_EMBEDDED_JSPACE_DRIFT")
     if context.get("schema_version") != "task_context_capsule_v1":
@@ -751,8 +778,10 @@ def _verify_context(request: EmbeddedNokiyRequest) -> tuple[dict[str, str], dict
         )
     age = (datetime.now(timezone.utc) - generated_at.astimezone(timezone.utc)).total_seconds()
     local_context = generation.get("context_mode") == "local_workspace_jspace"
+    from .inspect_context import MODE as INSPECT_MODE
+    inspect_context = generation.get("context_mode") == INSPECT_MODE
     action_scoped = (jspace.get("schema_version") == "jspace_contract_v2"
-                     and not local_context
+                     and not local_context and not inspect_context
                      and "action_freshness" in generation)
     if age < -300 or (not action_scoped and age > request.max_context_age_seconds):
         raise EmbeddedNokiyError(
@@ -810,12 +839,24 @@ def _verify_context(request: EmbeddedNokiyRequest) -> tuple[dict[str, str], dict
             authorization_payload["command_effect_policy"] = policy
         if "read_commands" in jspace:
             authorization_payload["read_commands"] = jspace["read_commands"]
+        if "inspect_shell" in jspace:
+            authorization_payload["inspect_shell"] = jspace["inspect_shell"]
+        if "parent_shell" in jspace:
+            authorization_payload["parent_shell"] = jspace["parent_shell"]
         if "source_read" in jspace:
             if jspace["source_read"] is not True:
                 raise EmbeddedNokiyError(
                     "NOKIY_EMBEDDED_JSPACE_INVALID", "source_read requires an explicit true opt-in"
                 )
             authorization_payload["source_read"] = True
+        if "mapped_source_reads" in jspace:
+            bindings = jspace["mapped_source_reads"]
+            if (jspace.get("source_read") is not True or type(bindings) is not list
+                    or len(bindings) != 1 or type(bindings[0]) is not dict):
+                raise EmbeddedNokiyError(
+                    "NOKIY_EMBEDDED_JSPACE_INVALID", "mapped reads require one explicit source_read binding"
+                )
+            authorization_payload["mapped_source_reads"] = bindings
         if "verifier_commands" in jspace or "verifier_artifact_root" in jspace:
             if "verifier_commands" not in jspace or "verifier_artifact_root" not in jspace:
                 raise EmbeddedNokiyError(
@@ -866,13 +907,22 @@ def _verify_context(request: EmbeddedNokiyRequest) -> tuple[dict[str, str], dict
     verify_context_excerpt(request.workspace, context, jspace)
     if local_context:
         from .local_context import verify_context
-        verify_context(request.workspace, context, jspace, artifact_root=request.artifact_root)
+        verify_context(request.workspace, context, jspace, artifact_root=request.artifact_root,
+                       **({"post_batch_verifier": True} if post_batch_verifier else {}))
+    elif inspect_context:
+        from .inspect_context import verify_context as verify_inspect_context
+        verify_inspect_context(request.workspace, context, jspace, artifact_root=request.artifact_root)
+    if "parent_shell" in jspace and not local_context:
+        # local_context verifies its own; DCF contexts carry the caller's same bound policy.
+        from .parent_shell import verify_policy
+        verify_policy(jspace, request.artifact_root)
     _check_exact_write_readiness(request.workspace, jspace)
     return ({
         "context_semantic_sha256": str(context_semantic),
         "jspace_semantic_sha256": semantic,
         "dcf_generation_id": str(generation.get("generation_id", "")),
-        "context_mode": "local_workspace_jspace" if local_context else "dcf_jspace_required",
+        "context_mode": ("local_workspace_jspace" if local_context
+                         else INSPECT_MODE if inspect_context else "dcf_jspace_required"),
     }, context, jspace)
 
 
@@ -987,8 +1037,8 @@ def _prepare(request: EmbeddedNokiyRequest) -> tuple[dict[str, Any], RuntimeIden
 
 def preflight(request: EmbeddedNokiyRequest) -> dict[str, Any]:
     if request.execution_profile is not None:
-        from .full_core import prepare
-        return prepare(request)[0]
+        from .full_core import preflight as full_core_preflight
+        return full_core_preflight(request)
     return _prepare(request)[0]
 
 
@@ -1323,6 +1373,45 @@ def execute(request: EmbeddedNokiyRequest) -> dict[str, Any]:
     return receipt
 
 
+@contextmanager
+def execution_lock(run: Path):
+    """Hold the run's execution lock until its terminal is sealed.
+
+    The kernel releases a flock when its holder exits, so a held lock always means a live
+    process that will still write terminal.json; it can never outlive that process.
+    """
+    fd = os.open(run / EXECUTION_LOCK_FILE,
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def await_live_execution(run: Path) -> bool:
+    """Wait while a live original execution still holds the run; True when it waited.
+
+    An observing cell can be interrupted while its worker keeps running. Reading such a run
+    must wait for its own terminal instead of reporting an interrupted or unreadable run.
+    """
+    if run.is_symlink():
+        return False
+    try:
+        fd = os.open(run / EXECUTION_LOCK_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False  # runs from releases before the lock carry none
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            return True
+    finally:
+        os.close(fd)
+
+
 def read_terminal(artifact_root: Path, request_id: str) -> dict[str, Any]:
     """Read a completed result without revalidating expired execution inputs."""
 
@@ -1348,13 +1437,122 @@ def read_terminal(artifact_root: Path, request_id: str) -> dict[str, Any]:
     return receipt
 
 
-# Keep this static preparation vocabulary in sync with nokiy-native-host.py.
+# Only explicitly known, bounded preparation field/reason pairs may reach failure JSON.
+# Native-host consumers maintain their own vocabulary for publication.
 _ACTION_ISSUE_PAIRS = {
     ("action.read_scopes", "input_missing"),
+    ("action.read_scopes", "exact_file_scope_required"),
+    ("action.read_scopes", "exact_file_unavailable"),
+    ("action.read_scopes", "exact_file_too_large"),
+    ("action.read_scopes", "directory_grant_required"),
+    ("action.read_scopes", "unsupported_glob"),
+    ("action.read_scopes", "unsafe_path"),
+    ("action.read_scopes", "read_scope_missing"),
+    ("action.write_scopes", "unsafe_path"),
+    ("action.write_scopes", "exact_file_unavailable"),
+    ("action.write_scopes", "exact_file_too_large"),
+    ("action.write_scopes", "not_in_target_paths"),
+    ("action.write_scopes", "write_scope_missing"),
+    ("action.target_paths", "unsafe_path"),
+    ("action.target_paths", "exact_file_unavailable"),
+    ("action.target_paths", "exact_file_too_large"),
+    ("action.read_directories", "unsupported_root"),
+    ("action.read_directories", "unsafe_path"),
+    ("action.read_directories", "directory_missing"),
+    ("action.operations", "scope_mismatch"),
+    ("action.operations", "unsupported_operation"),
+    ("action.operations", "read_operation_missing"),
+    ("action.operations", "write_operation_missing"),
+    ("action.operations", "command_operation_missing"),
+    ("action.operations", "command_without_templates"),
+    ("action.forbidden_effects", "scope_mismatch"),
+    ("action.source_read", "invalid_shape"),
+    ("action.source_read", "scope_mismatch"),
     ("action.command_templates", "invalid_shape"),
     ("action.command_templates", "unsupported_command"),
     ("action.command_templates", "invalid_bindings"),
+    ("surface_id", "surface_required"),
+    ("action", "invalid_shape"),
+    ("action", "scope_mismatch"),
+    ("action.read_search_scopes", "unsupported_operation"),
+    ("action.read_directories", "invalid_shape"),
+    ("action.read_directories", "executable_unavailable"),
+    ("action.source_sections", "invalid_shape"),
+    ("action.source_sections", "exact_file_unavailable"),
+    ("request.artifact_root", "invalid_shape"),
+    ("action.verifier_commands", "invalid_shape"),
+    ("action.verifier_commands.argv", "invalid_shape"),
+    ("action.verifier_commands.argv", "shell_metacharacter"),
+    ("action.verifier_commands.argv", "unsafe_path"),
+    ("action.verifier_commands.argv", "unsupported_command"),
+    ("action.verifier_commands.argv", "exact_file_unavailable"),
+    ("action.verifier_commands.executable_sha256", "invalid_shape"),
+    ("action.verifier_commands.executable_sha256", "sha256_mismatch"),
+    ("action.verifier_commands.pinned_files", "invalid_shape"),
+    ("action.verifier_commands.pinned_files", "input_missing"),
+    ("action.verifier_commands.pinned_files", "unsafe_path"),
+    ("action.verifier_commands.pinned_files", "unsupported_command"),
+    ("action.verifier_commands.pinned_files", "exact_file_unavailable"),
+    ("action.verifier_commands.pinned_files", "sha256_mismatch"),
+    ("action.verifier_commands.pinned_files", "scope_mismatch"),
+    ("action.verifier_commands.pinned_files", "invalid_bindings"),
+    ("action.verifier_commands.scratch_root", "invalid_shape"),
+    ("action.verifier_commands.scratch_root", "unsafe_path"),
+    ("action.verifier_commands.scratch_root", "directory_missing"),
+    ("action.verifier_commands.scratch_root", "invalid_bindings"),
+    ("action.verifier_commands.python_import_roots", "invalid_shape"),
+    ("action.verifier_commands.python_import_roots", "unsafe_path"),
+    ("action.verifier_commands.python_import_roots", "exact_file_unavailable"),
+    ("action.verifier_commands.python_import_roots", "scope_mismatch"),
+    ("action.verifier_commands.cwd", "invalid_shape"),
+    ("action.verifier_commands.cwd", "unsafe_path"),
+    ("action.verifier_commands.cwd", "exact_file_unavailable"),
+    ("action.verifier_commands.timeout_seconds", "invalid_shape"),
+    ("action.verifier_commands.network", "invalid_shape"),
+} | {("action." + field, "invalid_string_list") for field in (
+    "operations", "read_scopes", "write_scopes", "target_paths", "read_directories", "forbidden_effects",
+)} | {(field, reason) for field in (
+    "action.mission", "action.mission.mission_id", "action.mission.task_id", "action.mission.mode",
+    "action.mission.objective", "action.mission.current_predicate", "action.context_summary",
+) for reason in ("input_missing", "invalid_shape")}
+
+_PREPARATION_CHILD_CODE = re.compile(r"(?:JSPACE|TASK_CONTEXT|MAPPED_SOURCE_READ)_[A-Z][A-Z0-9_]{0,95}")
+_PREPARATION_ISSUES = {
+    "JSPACE_READ_SCOPE_MISSING": ("action.read_scopes", "input_missing"),
+    "JSPACE_SOURCE_READ_SCOPE_INVALID": ("action.read_scopes", "exact_file_scope_required"),
+    "JSPACE_SOURCE_READ_FILE_INVALID": ("action.read_scopes", "exact_file_unavailable"),
 }
+
+
+def _safe_preparation_diagnostics(value: object) -> dict[str, Any] | None:
+    required = {"stage", "returncode", "stdout_bytes", "stderr_bytes",
+                "stdout_sha256", "stderr_sha256"}
+    if (type(value) is not dict or not required <= set(value)
+            or set(value) - required - {"child_error_code", "capability_diagnostic"}):
+        return None
+    if (type(value["stage"]) is not str
+            or value["stage"] not in {"dcf_compile", "dcf_navigated_prepare", "dcf_surface_query"}
+            or type(value["returncode"]) is not int or not -255 <= value["returncode"] <= 255):
+        return None
+    for key in ("stdout_bytes", "stderr_bytes"):
+        if type(value[key]) is not int or not 0 <= value[key] <= 2**63 - 1:
+            return None
+    for key in ("stdout_sha256", "stderr_sha256"):
+        if type(value[key]) is not str or not re.fullmatch(r"[0-9a-f]{64}", value[key]):
+            return None
+    if "child_error_code" in value and (
+            type(value["child_error_code"]) is not str
+            or not _PREPARATION_CHILD_CODE.fullmatch(value["child_error_code"])
+            or value["returncode"] == 0):
+        return None
+    result = dict(value)
+    if "capability_diagnostic" in value:
+        from .dcf_prepare import safe_capability_diagnostic
+        diagnostic = safe_capability_diagnostic(value["capability_diagnostic"], value.get("child_error_code"))
+        if diagnostic is None:
+            return None
+        result["capability_diagnostic"] = diagnostic
+    return result
 
 
 def _safe_action_issues(value: object) -> list[dict[str, str]] | None:
@@ -1383,9 +1581,43 @@ def _failure(error: EmbeddedNokiyError) -> dict[str, Any]:
         "fallback_used": False,
     }
     issues = (_safe_action_issues(error.issues)
-              if error.code == "NOKIY_LOCAL_CONTEXT_INVALID" else None)
+              if error.code in {"NOKIY_LOCAL_CONTEXT_INVALID", "NOKIY_FULL_STACK_PREPARATION_FAILED"}
+              else None)
     if issues is not None:
         failure["issues"] = issues
+    if (error.code == "NOKIY_BATCH_INVALID"
+            and error.detail == "cross-member read/write or write/write overlap"):
+        failure["batch_recovery"] = {
+            "reason": "cross_member_scope_overlap",
+            "next_action": "Keep writes exact. Narrow discovery/read scopes that include another member's writes, or serialize dependent members. Preserve grants and the original plan; do not reconstruct unrelated draft fields.",
+            "automatic_retry": False,
+        }
+    if error.code == "NOKIY_NAVIGATION_INVALID":
+        if error.detail in _NAVIGATION_STATIC_DETAILS:
+            failure["navigation_detail"] = error.detail
+        recovery = {
+            "navigation changed; restart from offset zero":
+                "Same-view pagination requires its own expected_map_sha256; to change query/projection, restart at offset zero with expected_source_snapshot_sha256.",
+            "continuation requires expected_map_sha256":
+                "Use the same query/projection and expected_map_sha256 for pagination; a source snapshot alone is not a cursor.",
+            "source snapshot unavailable; narrow scope or resolve unreadable sources":
+                "Narrow the read scope or resolve unreadable sources before source-snapshot reuse; partial navigation remains available without a reuse claim.",
+            "source snapshot changed; refresh navigation before reusing locations":
+                "Refresh navigation from offset zero and inspect changed source/scope identities before reusing locations.",
+        }.get(error.detail)
+        if recovery is not None:
+            failure["navigation_recovery"] = recovery
+    if error.code in {"NOKIY_FULL_STACK_PREPARATION_FAILED", "NOKIY_FULL_STACK_NAVIGATION_UNVERIFIED",
+                      "NOKIY_FULL_STACK_SURFACE_UNVERIFIED", "NOKIY_FULL_STACK_DCF_GENERATION_UNAVAILABLE"}:
+        diagnostics = _safe_preparation_diagnostics(error.diagnostics)
+        if diagnostics is not None:
+            failure["diagnostics"] = diagnostics
+            child = diagnostics.get("child_error_code")
+            pair = _PREPARATION_ISSUES.get(child) or (
+                ("action.read_scopes", "exact_file_unavailable")
+                if isinstance(child, str) and child.startswith("MAPPED_SOURCE_READ_") else None)
+            if pair is not None:
+                failure["issues"] = [{"path": pair[0], "reason": pair[1]}]
     return failure
 
 
@@ -1397,6 +1629,20 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    navigation = commands.add_parser("navigate", help="Build or incrementally reuse a task-scoped DCF source map")
+    navigation.add_argument("--workspace", required=True)
+    navigation.add_argument("--read-path", action="append", required=True)
+    navigation.add_argument("--query", default="")
+    navigation.add_argument("--query-any", action="append",
+                            help="Literal path or FQN substring; repeat for OR selection")
+    navigation.add_argument("--projection", choices=("full", "locations"), default="full")
+    navigation.add_argument("--offset", type=int, default=0)
+    navigation.add_argument("--expected-map-sha256")
+    navigation.add_argument("--expected-source-snapshot-sha256")
+    surfaces = commands.add_parser("query-surfaces", help="Query current DCF candidates without preparing or running")
+    surfaces.add_argument("--workspace", required=True, help="Absolute existing DCF workspace root")
+    surfaces.add_argument("--target", action="append", required=True,
+                          help="Exact workspace-relative physical file; repeat for 1..4 distinct targets")
     prepare = commands.add_parser("prepare", help="Compile fresh DCF + J-Space for a new Direct request")
     prepare.add_argument("--request", required=True, help="New request draft without context identities")
     prepare.add_argument("--action", required=True, help="Bounded DCF action JSON, including mission")
@@ -1406,75 +1652,192 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Bind worker selection; does not activate a native root topology")
     prepare.add_argument("--worker-family", choices=("luna", "sol", "astra"),
                          help="Nokiy worker family, at max; requires topology-model")
+    prepare.add_argument("--run", action="store_true",
+                         help="Execute this freshly prepared request once, retaining all execution checks")
+    prepare.add_argument("--summary", action="store_true", help="Compact terminal return; requires --run")
+    prepare.add_argument("--require-verified-evidence", action="store_true",
+                         help="Require --run; exit 3 for available but unverified evidence, not parent acceptance")
+    gate_prepare = commands.add_parser("prepare-post-batch-verifier",
+                                      help="Prepare one read-only postgate without model dispatch")
+    gate_prepare.add_argument("--request", required=True)
+    gate_prepare.add_argument("--action", required=True)
+    gate_prepare.add_argument("--output-dir", required=True)
+    gate_prepare.add_argument("--surface-id")
     for name in ("preflight", "run"):
         command = commands.add_parser(name)
         command.add_argument("--request", required=True)
         if name == "run":
             command.add_argument("--summary", action="store_true", help="Compact return; original terminal remains available")
+            command.add_argument("--require-verified-evidence", action="store_true",
+                                 help="Exit 3 when terminal is available but evidence is incomplete")
     read = commands.add_parser("read-result")
     read.add_argument("--artifact-root", required=True)
     read.add_argument("--request-id", required=True)
     read.add_argument("--summary", action="store_true", help="Compact return; original terminal remains available")
+    read.add_argument("--require-verified-evidence", action="store_true",
+                      help="Inspect the original result; never rerun it when evidence is incomplete")
     for name in ("run-batch", "read-batch"):
-        batch = commands.add_parser(name, help="Coordinate exact Ultra requests within host capacity")
+        batch = commands.add_parser(name, help="Coordinate exact Ultra requests within host capacity",
+            description="A plan may optionally bind one separately prepared post_batch_verifier; "
+                        "run-batch executes its typed verifier after successful member join. "
+                        "read-batch only reads the original receipt. Parent acceptance remains required.")
         batch.add_argument("--plan", required=True)
         batch.add_argument("--plan-sha256", required=True)
         batch.add_argument("--summary", action="store_true", help="Bounded native output; raw results remain in read-result")
-    for name in ("check-deployment", "deploy"):
-        deploy = commands.add_parser(name, help="Execute exact parent-admitted deployment commands without a model")
+    parent = commands.add_parser("complete-batch-parent",
+        help="Seal the original batch's completed parent source snapshot; never run a worker or verifier")
+    parent.add_argument("--plan", required=True)
+    parent.add_argument("--plan-sha256", required=True)
+    for name in ("check-deployment", "deploy", "check-closeout", "closeout"):
+        deploy = commands.add_parser(name, help="Execute exact parent-admitted deployment or closeout without a model")
         deploy.add_argument("--plan", required=True)
         deploy.add_argument("--approved-plan-sha256", required=True)
-    deployed = commands.add_parser("read-deployment-result")
-    deployed.add_argument("--artifact-root", required=True)
-    deployed.add_argument("--action-id", required=True)
+    for name in ("read-deployment-result", "read-closeout-result"):
+        deployed = commands.add_parser(name)
+        deployed.add_argument("--artifact-root", required=True)
+        deployed.add_argument("--action-id", required=True)
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    arguments = build_parser().parse_args(argv)
+def _prepared_adaptations(request_path: Path) -> list[dict[str, Any]]:
+    """The preparation's reported input adaptations, so the parent sees how its action ran.
+
+    Context only: a routed or previewed action already passed preparation; nothing here grants."""
     try:
-        if arguments.command in {"check-deployment", "deploy", "read-deployment-result"}:
+        preparation = json.loads((request_path.parent / "preparation.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    adaptations = preparation.get("input_adaptations") if isinstance(preparation, dict) else None
+    if not isinstance(adaptations, list):
+        return []
+    return [item for item in adaptations[:16] if isinstance(item, dict)]
+
+
+def _emit_json(value: object) -> None:
+    """Print one JSON delivery line for the native observer and the coordinator.
+
+    UTF-8 text and compact separators: ASCII escapes made Chinese results cost several tokens per
+    character in every later coordinator call. Bytes go out as UTF-8 whatever the locale says.
+    """
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream is None:
+        sys.stdout.write(text)
+        return
+    sys.stdout.flush()
+    stream.write(text.encode("utf-8"))
+    stream.flush()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    arguments = parser.parse_args(argv)
+    combined = arguments.command == "prepare" and arguments.run
+    if arguments.command == "prepare" and not combined and (
+            arguments.summary or arguments.require_verified_evidence):
+        parser.error("prepare --summary/--require-verified-evidence require --run")
+    is_run = arguments.command == "run" or combined
+    request, prepared, execution_entered = None, None, False
+    request_path = Path(arguments.request) if arguments.command in {"run", "preflight"} else None
+    try:
+        if arguments.command == "navigate":
+            from .navigation import navigate
+            result = navigate(Path(arguments.workspace), arguments.read_path, query=arguments.query,
+                              queries=arguments.query_any, projection=arguments.projection,
+                              offset=arguments.offset, expected_map_sha256=arguments.expected_map_sha256,
+                              expected_source_snapshot_sha256=arguments.expected_source_snapshot_sha256)
+        elif arguments.command == "query-surfaces":
+            from .full_stack import query_surface_candidates
+            result = query_surface_candidates(Path(arguments.workspace), arguments.target)
+        elif arguments.command in {"check-deployment", "deploy", "read-deployment-result",
+                                   "check-closeout", "closeout", "read-closeout-result"}:
             from . import deployment
-            result = (deployment.read_result(Path(arguments.artifact_root), arguments.action_id)
-                      if arguments.command == "read-deployment-result" else
-                      deployment.execute(Path(arguments.plan), arguments.approved_plan_sha256,
-                                         check_only=arguments.command == "check-deployment"))
+            if arguments.command.startswith("read-"):
+                result = deployment.read_result(Path(arguments.artifact_root), arguments.action_id,
+                                                 closeout_only=arguments.command == "read-closeout-result")
+            else:
+                execute_delivery = (deployment.execute_closeout if arguments.command.endswith("closeout")
+                                    else deployment.execute)
+                result = execute_delivery(Path(arguments.plan), arguments.approved_plan_sha256,
+                                          check_only=arguments.command.startswith("check-"))
+        elif arguments.command == "prepare-post-batch-verifier":
+            from .post_batch_verifier import prepare_request
+            result = prepare_request(Path(arguments.request), Path(arguments.action),
+                                     arguments.surface_id, Path(arguments.output_dir))
         elif arguments.command == "prepare":
             from .full_stack import prepare_request
             result = prepare_request(Path(arguments.request), Path(arguments.action),
                                      arguments.surface_id, Path(arguments.output_dir),
                                      topology_model=arguments.topology_model,
                                      worker_family=arguments.worker_family)
+            if combined:
+                prepared = result
+                request_path = Path(arguments.output_dir) / "request.json"
+                reference = prepared.get("request")
+                if (prepared.get("status") != "PREPARED" or not isinstance(reference, dict)
+                        or reference.get("path") != str(request_path)):
+                    raise EmbeddedNokiyError("NOKIY_PREPARED_REQUEST_DRIFT", "preparation did not bind its exact request")
         elif arguments.command == "read-result":
-            result = read_terminal(Path(arguments.artifact_root), arguments.request_id)
+            root = _plain_path(Path(arguments.artifact_root), name="artifact_root", directory=True)
+            if not REQUEST_ID_PATTERN.fullmatch(arguments.request_id):
+                raise EmbeddedNokiyError("NOKIY_EMBEDDED_REQUEST_ID_INVALID", "request_id is malformed")
+            if not os.path.lexists(root / arguments.request_id / "terminal.json"):
+                # A still-running original execution seals its own terminal; read that one.
+                await_live_execution(root / arguments.request_id)
+            if not os.path.lexists(root / arguments.request_id / "terminal.json"):
+                from .durable_recovery import inspect_interrupted
+                from .result_inspection import InspectionError
+                try:
+                    result = inspect_interrupted(root, arguments.request_id, os.environ.get("CODEX_THREAD_ID"))
+                except InspectionError as error:
+                    result = {"schema_version": "nokiy_interrupted_recovery_v1",
+                              "status": "EXECUTION_UNCERTAIN", "request_id": arguments.request_id,
+                              "first_typed_blocker": str(error), "automatic_retry_allowed": False,
+                              "execution_replayed": False, "task_success": False}
+                    if error.diagnostic is not None:
+                        result["first_blocker_detail"] = error.diagnostic
+                _emit_json(result)
+                return 2  # A useful recovery snapshot is not successful task completion.
+            result = read_terminal(root, arguments.request_id)
+        elif arguments.command == "complete-batch-parent":
+            from .post_batch_verifier import acknowledge_parent_plan
+            result = acknowledge_parent_plan(Path(arguments.plan), arguments.plan_sha256)
+            _emit_json(result)
+            return 0
         elif arguments.command in {"run-batch", "read-batch"}:
             from . import batch
             result = (batch.run_batch if arguments.command == "run-batch" else batch.read_batch)(
                 Path(arguments.plan), arguments.plan_sha256)
             if arguments.summary:
                 result = batch.summarize(result)
-        else:
+        if request_path is not None:
             from .model_topology import load_prepared_request
-            request, _ = load_prepared_request(Path(arguments.request))
+            request, _ = load_prepared_request(request_path)
+            if prepared is not None and (
+                    request.request_id != prepared.get("request_id")
+                    or _file_sha256(request_path) != prepared["request"].get("sha256")):
+                raise EmbeddedNokiyError("NOKIY_PREPARED_REQUEST_DRIFT", "prepared request changed before execution")
             run = request.artifact_root / request.request_id
-            new_run = arguments.command == "run" and not (run.exists() or run.is_symlink())
-            result = (
-                preflight(request)
-                if arguments.command == "preflight"
-                else execute(request)
-            )
-        if arguments.command in {"run", "read-result"}:
+            new_run = is_run and not (run.exists() or run.is_symlink())
+            if is_run:
+                # execute owns fresh authority/source checks and create-only consumption.
+                # Do not call preflight again here, skip its internal checks, or retry.
+                execution_entered = True
+                result = execute(request)
+            else:
+                result = preflight(request)
+        if is_run or arguments.command == "read-result":
             from .result_inspection import project_terminal, retain_inspection_summary, summarize_terminal
-            artifact_root = request.artifact_root if arguments.command == "run" else Path(arguments.artifact_root)
-            request_id = request.request_id if arguments.command == "run" else arguments.request_id
+            artifact_root = request.artifact_root if is_run else Path(arguments.artifact_root)
+            request_id = request.request_id if is_run else arguments.request_id
             result = project_terminal(
                 result,
                 artifact_root,
                 request_id,
-                request_thread_id=request.native_thread_id if arguments.command == "run" else None,
-                require_request_binding=arguments.command == "run",
+                request_thread_id=request.native_thread_id if is_run else None,
+                require_request_binding=is_run,
             )
-            if arguments.command == "run" and new_run:
+            if is_run and new_run:
                 result = retain_inspection_summary(result, artifact_root, request_id,
                                                     expected_thread_id=request.native_thread_id)
             else:
@@ -1482,15 +1845,77 @@ def main(argv: list[str] | None = None) -> int:
                           "inspection_summary_omission": "READ_ONLY_RECOVERY"}
             if arguments.summary:
                 result = summarize_terminal(result, artifact_root, request_id)
-    except (OSError, ValueError) as error:
-        print(json.dumps(_failure(EmbeddedNokiyError("NOKIY_EMBEDDED_INPUT_ERROR", str(error))),
-                         ensure_ascii=True, sort_keys=True))
+            if prepared is not None:
+                # A locator for original-ID recovery, not another copy of context or authority.
+                result = {**result, "prepared_request": prepared["request"]}
+            if is_run:
+                adaptations = _prepared_adaptations(request_path)
+                if adaptations:
+                    result = {**result, "input_adaptations": adaptations}
+    except (OSError, ValueError, EmbeddedNokiyError) as error:
+        failure = _failure(error if isinstance(error, EmbeddedNokiyError) else
+                           EmbeddedNokiyError("NOKIY_EMBEDDED_INPUT_ERROR", str(error)))
+        if arguments.command in {"check-closeout", "closeout", "read-closeout-result"}:
+            # A consumed closeout with missing/corrupt terminal may already have effects.
+            # Inspect only a validated current-parent plan, never infer an owner from paths.
+            try:
+                from . import deployment
+                if arguments.command == "read-closeout-result":
+                    root = deployment.absolute(arguments.artifact_root, directory=True)
+                    action_id = arguments.action_id
+                    if not deployment.ID.fullmatch(action_id):
+                        raise ValueError("Invalid original closeout action")
+                    plan_path = root / ("closeout-" + action_id) / "plan.json"
+                    digest = _canonical_sha256(deployment.document(plan_path))
+                else:
+                    plan_path, digest = Path(arguments.plan), arguments.approved_plan_sha256
+                plan = deployment.document(plan_path)
+                thread = plan.get("native_thread_id")
+                action_id = plan.get("action_id")
+                root = plan.get("artifact_root")
+                if (_canonical_sha256(plan) != digest
+                        or plan.get("schema_version") != deployment.CLOSEOUT_SCHEMA
+                        or not isinstance(thread, str) or not THREAD_ID_PATTERN.fullmatch(thread)
+                        or thread != os.environ.get("CODEX_THREAD_ID")
+                        or not isinstance(action_id, str) or not deployment.ID.fullmatch(action_id)
+                        or not isinstance(root, str) or not Path(root).is_absolute()
+                        or ".." in Path(root).parts
+                        or (arguments.command == "read-closeout-result" and
+                            (action_id != arguments.action_id or root != arguments.artifact_root))):
+                    raise ValueError("Original closeout identity unverified")
+                # Historical identity must not depend on mutable lease/receipt paths.
+                run = Path(plan["artifact_root"]) / ("closeout-" + plan["action_id"])
+                if run.exists() or run.is_symlink():
+                    failure.update(status="EFFECT_UNCERTAIN", authority_effect="unknown",
+                                   native_mutation_count=None, effect_state="unverified",
+                                   artifact_root=plan["artifact_root"], action_id=plan["action_id"],
+                                   recovery_command="read-closeout-result", automatic_retry_allowed=False)
+            except (OSError, ValueError, EmbeddedNokiyError):
+                pass
+        if prepared is not None:
+            failure["prepared_request"] = prepared.get("request")
+        if request is not None and execution_entered:
+            run = request.artifact_root / request.request_id
+            try:
+                attempted = run.exists() or run.is_symlink()
+            except OSError:
+                attempted = True
+            if attempted:
+                # An exception after consumption is not proof that no effects occurred.
+                failure.update(status="EXECUTION_UNCERTAIN", authority_effect=request.authority_effect,
+                               native_mutation_count=None, effect_state="unverified", request_id=request.request_id,
+                               artifact_root=str(request.artifact_root),
+                               recovery_command="read-result", automatic_retry_allowed=False)
+        _emit_json(failure)
         return 2
-    except EmbeddedNokiyError as error:
-        print(json.dumps(_failure(error), ensure_ascii=True, sort_keys=True))
+    _emit_json(result)
+    if result.get("status") not in {"PREPARED", "READY", "RESULT_AVAILABLE", "VERIFIED", "SURFACE_CANDIDATES", "CONTEXT_ROUTE_AVAILABLE", "NAVIGATION_AVAILABLE"}:
         return 2
-    print(json.dumps(result, ensure_ascii=True, sort_keys=True))
-    return 0 if result.get("status") in {"PREPARED", "READY", "RESULT_AVAILABLE", "VERIFIED"} else 2
+    inspection = result.get("result_inspection")
+    if (getattr(arguments, "require_verified_evidence", False)
+            and (not isinstance(inspection, dict) or inspection.get("status") != "EVIDENCE_VERIFIED")):
+        return 3
+    return 0
 
 
 if __name__ == "__main__":

@@ -133,7 +133,10 @@ class InitialTaskStateRuntimeTests(unittest.TestCase):
         for profile in ("direct", "balanced"):
             baseline = self.fixture._request(profile)
             request = caller.decode_request(dict(baseline.to_wire(include_identity=False), initial_task_state=STATE))
-            with self.subTest(profile=profile), patch.object(core, "_provider_prompt") as prompt, \
+            # Isolate image readiness after native-scope admission; this unit test
+            # must stop before starting any executor or provider process.
+            with self.subTest(profile=profile), patch.object(core, "inherited_root_parent", return_value=None) as scope, \
+                    patch.object(core, "_provider_prompt") as prompt, \
                     patch.object(core, "subprocess", SimpleNamespace(**vars(core.subprocess))) as process_api, \
                     patch.object(process_api, "Popen") as process:
                 self.assertEqual(caller.preflight(baseline)["status"], "READY")
@@ -143,6 +146,7 @@ class InitialTaskStateRuntimeTests(unittest.TestCase):
                 with self.assertRaises(caller.EmbeddedNokiyError) as raised:
                     core.execute_full_core(request)
                 self.assertEqual(raised.exception.code, "NOKIY_FULL_CORE_INITIAL_TASK_STATE_REQUIRED")
+                scope.assert_called_once()
                 prompt.assert_not_called()
                 process.assert_not_called()
                 self.assertFalse((request.artifact_root / request.request_id).exists())
@@ -157,6 +161,15 @@ class InitialTaskStatePreparationTests(unittest.TestCase):
         self.fixture = stack_fixtures.FullStackTests()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.action = {"mission": {"mission_id": "initial-task-state", "task_id": "test", "mode": "DELIVERY",
+            "objective": "Prepare the caller with optional startup state",
+            "current_predicate": "startup state is bound only when supplied"},
+            "context_summary": "Prepare a synthetic request without executing a provider call.",
+            "operations": ["read"]}
+        self.fixture.action.write_text(json.dumps(self.action))
+        jspace = self.fixture.f.workspace / "scripts/ops/dcf/jspace.py"
+        jspace.parent.mkdir(parents=True, exist_ok=True)
+        jspace.write_text("# synthetic J-Space compiler\n")
 
     def test_action_state_is_removed_before_compilation_and_bound_to_prepared_request(self):
         advertise_state(self.fixture.core)
@@ -164,8 +177,7 @@ class InitialTaskStatePreparationTests(unittest.TestCase):
         for profile in ("direct", "balanced"):
             self.fixture.output = self.fixture.f.root / ("prepared-" + profile)
             self.fixture.draft["execution_profile"] = profile
-            action = {"mission": {"task_id": "test"}, "operations": ["read"],
-                      "initial_task_state": PADDED_STATE, "terminal_delivery": "evidence_only"}
+            action = dict(self.action, initial_task_state=PADDED_STATE, terminal_delivery="evidence_only")
             self.fixture.action.write_text(json.dumps(action))
             with self.subTest(profile=profile), self.fixture.compiler() as compiler, \
                     patch.object(stack, "_compile_dcf", wraps=stack._compile_dcf) as compile_dcf, \
@@ -187,8 +199,10 @@ class InitialTaskStatePreparationTests(unittest.TestCase):
             self.assertFalse(result["provider_execution_started"])
 
     def test_absent_preparation_omits_state_and_preserves_identity_on_old_image(self):
-        with self.fixture.compiler():
+        with self.fixture.compiler() as compiler:
             result = self.fixture.run_prepare()
+        compiler.assert_called_once()
+        self.assertEqual(result["context_mode"], "dcf_jspace_required")
         request = caller.load_request(self.fixture.output / "request.json")
         self.assertIsNone(request.initial_task_state)
         self.assertNotIn("initial_task_state", request.to_wire())
@@ -197,8 +211,9 @@ class InitialTaskStatePreparationTests(unittest.TestCase):
         self.assertFalse(result["provider_execution_started"])
 
     def test_invalid_action_and_draft_state_never_compile_or_publish(self):
-        action = {"mission": {"task_id": "test"}, "operations": ["read"]}
-        for state in (None, {}, dict(STATE, unknown=1), dict(STATE, task_group="\tx"),
+        action = dict(self.action)
+        # A null state is omission (test_full_stack.test_null_blank_and_empty_fields_state_omission).
+        for state in ({}, dict(STATE, unknown=1), dict(STATE, task_group="\tx"),
                       dict(STATE, task_type=["x", " x "])):
             self.fixture.action.write_text(json.dumps(dict(action, initial_task_state=state)))
             with self.subTest(state=state), self.fixture.compiler() as compiler:
@@ -216,8 +231,7 @@ class InitialTaskStatePreparationTests(unittest.TestCase):
                 self.assertFalse(self.fixture.output.exists())
 
     def test_preparation_rejects_old_schema_native_once_and_graph_before_compile(self):
-        self.fixture.action.write_text(json.dumps({"mission": {"task_id": "test"}, "operations": ["read"],
-                                                  "initial_task_state": STATE}))
+        self.fixture.action.write_text(json.dumps(dict(self.action, initial_task_state=STATE)))
         baseline = dict(self.fixture.draft)
         changes = [{"schema_version": schema} for schema in (caller.LEGACY_REQUEST_SCHEMA_VERSION,
                                                              caller.PREVIOUS_REQUEST_SCHEMA_VERSION)]

@@ -8,7 +8,7 @@ use crate::tool_flow::command_run_result::{
     apply_task_attribution_to_streamed_result, record_streamed_command_events,
 };
 use crate::tool_flow::task_status::apply_tool_result_session_state_update;
-use crate::tool_router::execute_tool::{ExecuteToolInput, ToolExecutionResult, execute_tool};
+use crate::tool_router::execute_tool::{ExecuteToolInput, ToolExecutionResult};
 use lifecycle::RuntimeAggregate;
 use lifecycle::SessionManagement;
 
@@ -26,14 +26,19 @@ use crate::manas::tool_catalog::{
 
 use super::permission::{permission_denial_for_tool, request_command_run_sandbox_bypass};
 
-pub(crate) fn execute_tool_calls(
+pub(crate) fn execute_tool_calls_with_source_binding(
     tool_calls: &[ToolCallData],
     agent: Option<&AgentManagement>,
     session: &mut SessionManagement,
     runtime: &RuntimeAggregate,
     _redis_url: &str,
     publisher: Option<&RuntimeFeedPublisher>,
+    capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
 ) -> Result<Vec<ToolExecutionResult>, String> {
+    let capsule_source_read_binding = crate::provider_flow::call::reconcile_source_binding(
+        capsule_source_read_binding, crate::provider_flow::call::captured_source_binding(runtime)?,
+        session.jspace_contract.as_ref(), &session.session_directory,
+    )?;
     let mut results = Vec::new();
     let project_directory = project_directory_with_tools()?;
     let tools_directory = project_directory.join("crates").join("tools").join("src");
@@ -178,7 +183,8 @@ pub(crate) fn execute_tool_calls(
 
         let mut result = tokio::runtime::Runtime::new()
             .map_err(|e| format!("failed to create runtime: {e}"))?
-            .block_on(execute_tool(execute_input.clone()));
+            .block_on(crate::tool_router::execute_tool::execute_tool_with_source_binding(
+                execute_input.clone(), capsule_source_read_binding.clone()));
         if command_run_hit_workspace_sandbox(&tool_call.tool_name, &result)
             && !session.disable_permission_restrictions
         {
@@ -193,7 +199,8 @@ pub(crate) fn execute_tool_calls(
                     approved_input.disable_permission_restrictions = true;
                     result = tokio::runtime::Runtime::new()
                         .map_err(|e| format!("failed to create runtime: {e}"))?
-                        .block_on(execute_tool(approved_input));
+                        .block_on(crate::tool_router::execute_tool::execute_tool_with_source_binding(
+                            approved_input, capsule_source_read_binding.clone()));
                 }
                 Ok(false) => {
                     result = Ok(ToolExecutionResult {

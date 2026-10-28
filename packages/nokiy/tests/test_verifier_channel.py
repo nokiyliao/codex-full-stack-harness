@@ -213,5 +213,61 @@ class VerifierChannelTests(unittest.TestCase):
         self.assertIn("disconnected", channel.failure)
 
 
+def shell_request(call_id="shell-1", line="git diff --check", workdir=None, timeout=5, binding=BINDING):
+    return dict(version=1, binding=binding, call_id=call_id,
+                shell={"line": line, "workdir": workdir, "timeout_seconds": timeout})
+
+
+class ParentShellChannelTests(unittest.TestCase):
+    """V431: parent_shell lines share the inherited channel with focused verifiers."""
+
+    def test_shell_requests_reach_the_shell_handler_and_reply_with_shell_identity(self):
+        seen = []
+        def shell_handler(shell, call_id, _cancel):
+            seen.append((shell, call_id))
+            return {"success": True, "exit_code": 0, "stdout": "x" * 300_000, "stderr": "",
+                    "process_reaped": True, "process_group_empty": True, "outcome": "known"}
+        channel = VerifierChannel(BINDING, 0, None, timeout_seconds=2, shell_handler=shell_handler)
+        with channel, client_for(channel) as client:
+            send(client, shell_request(line="rg -n needle src | head", workdir="/tmp", timeout=7))
+            answer = reply(client)
+        self.assertIsNone(channel.failure)
+        self.assertEqual(seen, [({"line": "rg -n needle src | head", "workdir": "/tmp", "timeout_seconds": 7},
+                                 "shell-1")])
+        self.assertEqual(set(answer), {"version", "binding", "call_id", "shell", "result"})
+        self.assertIs(answer["shell"], True)
+        self.assertEqual(len(answer["result"]["stdout"]), 300_000)
+
+    def test_verifier_and_shell_requests_share_one_sequential_channel(self):
+        channel = VerifierChannel(BINDING, 1, lambda index, call_id, _c: {"index": index},
+                                  timeout_seconds=2, shell_handler=lambda shell, call_id, _c: {"line": shell["line"]})
+        with channel, client_for(channel) as client:
+            send(client, request(call_id="verify"))
+            self.assertEqual(reply(client)["verifier_index"], 0)
+            send(client, shell_request(call_id="shell"))
+            self.assertEqual(reply(client)["result"], {"line": "git diff --check"})
+        self.assertIsNone(channel.failure)
+
+    def test_shell_requests_are_refused_without_a_shell_handler_or_with_bad_fields(self):
+        with self.assertRaises(ValueError):
+            VerifierChannel(BINDING, 0, lambda *_: {})
+        cases = [
+            (VerifierChannel(BINDING, 1, lambda *_: {}, timeout_seconds=1), shell_request()),
+            (VerifierChannel(BINDING, 0, None, timeout_seconds=1, shell_handler=lambda *_: {}),
+             shell_request(timeout=0)),
+            (VerifierChannel(BINDING, 0, None, timeout_seconds=1, shell_handler=lambda *_: {}),
+             shell_request(line="x" * 60_001)),
+            (VerifierChannel(BINDING, 0, None, timeout_seconds=1, shell_handler=lambda *_: {}),
+             dict(shell_request(), extra=1)),
+            (VerifierChannel(BINDING, 0, None, timeout_seconds=1, shell_handler=lambda *_: {}),
+             request()),
+        ]
+        for channel, message in cases:
+            with channel, client_for(channel) as client:
+                send(client, message)
+                self.assertEqual(client.recv(1), b"")
+            self.assertIsNotNone(channel.failure, message)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,18 +11,16 @@ use crate::provider_flow::errors::{
     finish_provider_call_failure, finish_runtime_failure, finish_runtime_failure_with_retry_policy,
     runtime_timeout,
 };
-use crate::provider_flow::official_codex::{
-    OfficialCodexRuntimeInput, call_runtime_official_codex,
-};
+use crate::provider_flow::official_codex::OfficialCodexRuntimeInput;
 use crate::provider_flow::provider_response::apply_provider_response;
-use crate::provider_flow::provider_streaming::{RuntimeStreamingInput, call_runtime_streaming};
+use crate::provider_flow::provider_streaming::RuntimeStreamingInput;
 pub use crate::provider_flow::request_options::route_by_name;
 use crate::provider_flow::request_options::{
     normalize_provider_messages, parallel_tool_calls_enabled, prompt_cache_key,
     route_for_provider_name, session_max_tokens, session_model_override_route,
     session_reasoning_effort, session_service_tier, stream_options,
 };
-use crate::provider_flow::usage::{provider_observation, usage_report_from_metrics};
+use crate::provider_flow::usage::{response_observation, usage_report_from_metrics};
 use crate::runtime::types::RuntimeQueueItem;
 use crate::runtime_event_writer::RuntimeEventWriter;
 use lifecycle::RuntimeAggregate;
@@ -59,9 +57,23 @@ pub(crate) async fn call_runtime_with_writer(
     input: CallRuntimeInput,
     tura_settings: Arc<tura_llm_rust::Settings>,
     tura_config: Arc<tura_llm_rust::TuraConfig>,
+    runtime_event_writer: Option<&mut RuntimeEventWriter>,
+) -> Result<RuntimeAggregate, String> {
+    call_runtime_with_source_binding(input, tura_settings, tura_config, runtime_event_writer, None).await
+}
+
+pub(crate) async fn call_runtime_with_source_binding(
+    input: CallRuntimeInput,
+    tura_settings: Arc<tura_llm_rust::Settings>,
+    tura_config: Arc<tura_llm_rust::TuraConfig>,
     mut runtime_event_writer: Option<&mut RuntimeEventWriter>,
+    capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
 ) -> Result<RuntimeAggregate, String> {
     let mut runtime = input.runtime;
+    let capsule_source_read_binding = reconcile_source_binding(
+        capsule_source_read_binding, captured_source_binding(&runtime)?,
+        input.jspace_contract.as_ref(), &input.session_directory,
+    )?;
     tura_config.reload();
     let now = Utc::now();
     let profiling = profile_timings::enabled();
@@ -248,9 +260,7 @@ pub(crate) async fn call_runtime_with_writer(
         ..Default::default()
     };
     let set_input_start = Instant::now();
-    pre_provider_or_failed_runtime!(
-        "provider_input_capture",
-        runtime.set_input(serde_json::json!({
+    let mut captured_input = serde_json::json!({
             "messages": input_messages,
             "tools": input_tools,
             "options": {
@@ -266,7 +276,14 @@ pub(crate) async fn call_runtime_with_writer(
                 "context_window": call_options.context_window,
                 "execution_budget": execution_budget.as_ref().map(|b| b.observation()),
             }
-        }))
+        });
+    if let Some(binding) = capsule_source_read_binding.as_ref() {
+        captured_input["capsule_source_read_context"] = serde_json::to_value(runtime_contract::CapsuleSourceReadContext {
+            session_id: runtime.session_id.clone(), runtime_id: runtime.runtime_id.clone(), binding: binding.clone(),
+        }).map_err(|_| "CAPSULE_SOURCE_READ_CONTEXT_ENCODING_FAILED".to_string())?;
+    }
+    pre_provider_or_failed_runtime!(
+        "provider_input_capture", runtime.set_input(captured_input)
     );
     pre_provider_or_failed_runtime!(
         "provider_input_flush",
@@ -311,7 +328,7 @@ pub(crate) async fn call_runtime_with_writer(
             .as_deref()
             .and_then(RuntimeEventWriter::commander_continuation)
             .cloned();
-        call_runtime_official_codex(
+        crate::provider_flow::official_codex::call_runtime_official_codex_with_source_binding(
             &mut runtime,
             provider,
             OfficialCodexRuntimeInput {
@@ -327,10 +344,11 @@ pub(crate) async fn call_runtime_with_writer(
                 service_tier: model_service_tier,
             },
             runtime_event_writer.as_deref_mut(),
+            capsule_source_read_binding,
         )
         .await
     } else if input.stream || !input_tools.is_empty() {
-        call_runtime_streaming(
+        crate::provider_flow::provider_streaming::call_runtime_streaming_with_source_binding(
             &mut runtime,
             route_config,
             &tura_config,
@@ -343,6 +361,7 @@ pub(crate) async fn call_runtime_with_writer(
                 require_startup_task_state: input.require_startup_task_state,
             },
             runtime_event_writer.as_deref_mut(),
+            capsule_source_read_binding,
         )
         .await
     } else {
@@ -532,7 +551,7 @@ async fn call_runtime_non_streaming(
                     &response.raw,
                     &runtime.provider,
                 ),
-                Some(provider_observation(&response.raw)),
+                Some(response_observation(&response)),
             )?;
             apply_provider_response(runtime, &response.content, finished_at)?;
 
@@ -552,9 +571,10 @@ async fn call_runtime_non_streaming(
         Ok(Err(e)) => {
             let finished_at = Utc::now();
             error!(error = %e, "runtime call failed");
-            runtime.set_output(serde_json::json!({
-                "error": e.to_string()
-            }))?;
+            runtime.set_output_with_provider_observation(
+                super::errors::provider_failure_output(&e),
+                super::errors::provider_failure_observation(&e),
+            )?;
             flush_runtime_events(&mut runtime_event_writer, runtime)?;
             finish_provider_call_failure(runtime, finished_at, &e, RuntimeState::Failed)?;
             flush_runtime_events(&mut runtime_event_writer, runtime)?;
@@ -572,6 +592,40 @@ pub(crate) fn flush_runtime_events(
         writer.flush(runtime)?;
     }
     Ok(())
+}
+
+pub(crate) fn captured_source_binding(
+    runtime: &RuntimeAggregate,
+) -> Result<Option<runtime_contract::CapsuleSourceReadBinding>, String> {
+    let Some(value) = runtime.input.as_ref().and_then(|input| input.get("capsule_source_read_context"))
+        .filter(|value| !value.is_null()) else { return Ok(None); };
+    let context: runtime_contract::CapsuleSourceReadContext = serde_json::from_value(value.clone())
+        .map_err(|_| "CAPSULE_SOURCE_READ_RECOVERY_MALFORMED".to_string())?;
+    if context.session_id != runtime.session_id || context.runtime_id != runtime.runtime_id
+        || context.session_id.trim().is_empty() || context.runtime_id.trim().is_empty()
+    {
+        return Err("CAPSULE_SOURCE_READ_RECOVERY_ORIGIN_MISMATCH".into());
+    }
+    Ok(Some(context.binding))
+}
+
+pub(crate) fn reconcile_source_binding(
+    current: Option<runtime_contract::CapsuleSourceReadBinding>,
+    captured: Option<runtime_contract::CapsuleSourceReadBinding>,
+    contract: Option<&serde_json::Value>,
+    root: &std::path::Path,
+) -> Result<Option<runtime_contract::CapsuleSourceReadBinding>, String> {
+    if let (Some(current), Some(captured)) = (&current, &captured)
+        && current != captured
+    {
+        return Err("CAPSULE_SOURCE_READ_RECOVERY_BINDING_MISMATCH".into());
+    }
+    let binding = captured.or(current);
+    if let Some(binding) = binding.as_ref() {
+        let contract = contract.ok_or_else(|| "CAPSULE_SOURCE_READ_RECOVERY_CONTRACT_MISSING".to_string())?;
+        binding.validate_against(contract, root)?;
+    }
+    Ok(binding)
 }
 
 pub async fn dequeue_runtime(
@@ -605,7 +659,7 @@ pub async fn dequeue_runtime(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         CallRuntimeInput, call_runtime, provider_for_execution, taskcore_context_admitted,
     };
@@ -644,6 +698,59 @@ mod tests {
             },
             Utc::now(),
         )
+    }
+
+    pub(crate) fn capsule_source_fixture(root: &std::path::Path) -> (serde_json::Value, runtime_contract::CapsuleSourceReadBinding) {
+        use runtime_contract::{TaskContextCapsule, READONLY_SOURCE_OUTLINE_MARKER,
+            READONLY_SOURCE_OUTLINE_NOTICE, task_context_semantic_sha256_v1};
+        let contract = json!({"repo_root":root, "source_read":true,
+            "read_scopes":["src/one.py"],"write_scopes":[],
+            "allowed_operations":["read","command"],"denied_operations":["modify"],
+            "dcf_generation":{"generation_id":"source-generation","repo_root":root},
+            "authorization_semantic_sha256":"a".repeat(64)});
+        let outline = json!({"kind":"readonly_source_outline", "notice":READONLY_SOURCE_OUTLINE_NOTICE,
+            "files":[{"path":"src/one.py", "source_sha256":"b".repeat(64), "definitions":[]}]});
+        let mut capsule = json!({"schema_version":"task_context_capsule_v1",
+            "mission":{"mission_id":"source-test","mode":"RESEARCH","objective":"read","current_predicate":"preimage"},
+            "context_summary":format!("Original verified capsule{READONLY_SOURCE_OUTLINE_MARKER}{outline}"),
+            "dcf_generation":contract["dcf_generation"], "surface":{"repo_root":root},"authority":{},
+            "evidence_refs":[],"focused_verifiers":[],"jspace_semantic_sha256":"a".repeat(64)});
+        capsule["semantic_sha256"] = json!(task_context_semantic_sha256_v1(&capsule).unwrap());
+        let capsule = TaskContextCapsule::from_value(capsule).unwrap();
+        let binding = capsule.readonly_source_read_binding(&contract, root).unwrap().unwrap();
+        (contract, binding)
+    }
+
+    #[test]
+    fn capsule_source_recovery_preserves_original_pins_and_fails_closed() {
+        use super::{captured_source_binding, reconcile_source_binding};
+        let root = std::path::Path::new("/workspace");
+        let (contract, binding) = capsule_source_fixture(root);
+        let mut runtime = runtime();
+        let context = runtime_contract::CapsuleSourceReadContext {
+            session_id:runtime.session_id.clone(), runtime_id:runtime.runtime_id.clone(), binding:binding.clone(),
+        };
+        runtime.set_input(json!({"messages":[],"tools":[],"capsule_source_read_context":context})).unwrap();
+        let recovered = captured_source_binding(&runtime).unwrap();
+        assert_eq!(reconcile_source_binding(None, recovered, Some(&contract), root).unwrap(), Some(binding.clone()));
+        let mut foreign = runtime.clone();
+        foreign.input.as_mut().unwrap()["capsule_source_read_context"]["runtime_id"] = json!("foreign");
+        assert!(captured_source_binding(&foreign).is_err());
+        let mut malformed = runtime.clone();
+        malformed.input.as_mut().unwrap()["capsule_source_read_context"]["binding"]["source_sha256"]["src/one.py"] = json!("bad");
+        assert!(reconcile_source_binding(None, captured_source_binding(&malformed).unwrap(), Some(&contract), root).is_err());
+        let mut changed = contract.clone();
+        changed["dcf_generation"]["generation_id"] = json!("new-generation");
+        assert!(reconcile_source_binding(None, Some(binding.clone()), Some(&changed), root).is_err());
+        assert!(reconcile_source_binding(None, Some(binding.clone()), Some(&contract), std::path::Path::new("/foreign")).is_err());
+        let mut changed_pin = serde_json::to_value(&binding).unwrap();
+        changed_pin["source_sha256"]["src/one.py"] = json!("c".repeat(64));
+        let changed_pin = serde_json::from_value(changed_pin).unwrap();
+        assert!(reconcile_source_binding(Some(changed_pin), Some(binding), Some(&contract), root).is_err());
+        let mut legacy = runtime;
+        legacy.input = Some(json!({"messages":[],"tools":[]}));
+        assert!(captured_source_binding(&legacy).unwrap().is_none());
+        assert!(reconcile_source_binding(None, None, Some(&contract), root).unwrap().is_none());
     }
 
     fn missing_key_settings() -> Arc<Settings> {

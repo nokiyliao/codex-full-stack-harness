@@ -37,14 +37,14 @@ worker are in-process test doubles for their contracts.
 
 ## Preferred Native Codex Deployment
 
-The packaged Native Nokiy role removes the external lifecycle boundary from a
+The packaged Native Tura role removes the external lifecycle boundary from a
 Codex deployment:
 
 ```text
 operator / parent mission
   -> Native Codex task runtime
        owns persistence, child lifecycle, tools, effects and callback
-  -> Nokiy agent role
+  -> Tura agent role
        contributes first-false routing and bounded execution policy only
   -> Native Codex direct-parent callback
   -> parent mission verification or route selection
@@ -53,7 +53,7 @@ operator / parent mission
 The role is selected explicitly for a child task; ordinary Codex roles do not
 inherit it. It does not start a Gateway, Router, Session DB, provider runtime,
 daemon, queue, MCP relay, or second callback transport. This is a single-owner
-architecture: Nokiy changes executor behavior without acquiring storage,
+architecture: Tura changes executor behavior without acquiring storage,
 lifecycle, or thread ownership.
 
 The external worker graph above remains the portable reference contract and an

@@ -9,6 +9,79 @@ from codex_collaboration_harness import full_core as core
 
 
 class EvidenceOnlyCompletionPromptTests(unittest.TestCase):
+    def test_applied_delta_readback_rule_requires_existing_read_write_capability(self):
+        marker = "Verified execution capability (caller projection):\n"
+        rule = "Complete source_delta: readback per apply_patch rules; else source_read."
+        for name, grant in self._grants().items():
+            before = copy.deepcopy(grant)
+            for mode in ("assistant_reply", "evidence_only"):
+                with self.subTest(shape=name, mode=mode):
+                    text = core._provider_prompt("original", grant, terminal_delivery=mode)
+                    expected = name in {"source_write", "source_write_verifier"}
+                    self.assertEqual(text.count(rule), int(expected))
+                    if expected:
+                        self.assertIn("Task-required reads prevail.", text)
+                        self.assertIn("not preimage SHA", text)
+                        projection = json.loads(text.split(marker, 1)[1].splitlines()[0])
+                        self.assertNotIn("source_delta", projection)
+                        for key in ("read_scopes", "allowed_operations", "denied_operations"):
+                            self.assertEqual(projection[key], grant[key])
+                    self.assertEqual(grant, before)
+
+    def test_delta_reuse_does_not_override_explicit_reads_or_required_verification(self):
+        prompt = "After every patch explicitly read the full changed function and run required tests."
+        for name in ("source_write", "source_write_verifier"):
+            text = core._provider_prompt(prompt, self._grants()[name])
+            self.assertTrue(text.startswith(prompt + "\n\nVerified execution capability"))
+            self.assertIn("Task-required reads prevail.", text)
+            if name == "source_write":
+                self.assertIn("still-required bounded postimage source_read", text)
+                self.assertIn("Keep required verification, readback, status updates and terminal fences", text)
+            else:
+                self.assertIn("run required focused post-edit verification", text)
+                self.assertIn("mandatory task_status done", text)
+
+    def test_delta_readback_replaces_conflicting_generic_rule_without_a_grant(self):
+        for with_verifier in (False, True):
+            name = "source_write_verifier" if with_verifier else "source_write"
+            grant = self._grants()[name]
+            text = core._provider_prompt("original", grant)
+            self.assertIn("Complete source_delta: readback per apply_patch rules; else source_read.", text)
+            self.assertIn("not preimage SHA", text)
+            for denied in ("read", "command", "modify"):
+                invalid = copy.deepcopy(grant)
+                invalid["denied_operations"].append(denied)
+                self.assertNotIn("Complete source_delta", core._provider_prompt("original", invalid))
+            disjoint = copy.deepcopy(grant)
+            disjoint["write_scopes"] = ["src/other.py"]
+            self.assertNotIn("Complete source_delta", core._provider_prompt("original", disjoint))
+
+    def test_range_example_matches_existing_compact_selector_contract(self):
+        from codex_collaboration_harness.result_inspection import _normalized_source_read
+
+        for with_verifier in (False, True):
+            grant = self._grants()["source"]
+            grant.update(repo_root="/workspace", verifier_commands=[{
+                "argv": ["python", "tests/verify.py"],
+                "pinned_files": [{"path": "/workspace/src/answer.py", "sha256": "a" * 64}],
+            }])
+            if not with_verifier:
+                grant.pop("verifier_commands")
+            before = copy.deepcopy(grant)
+            text = core._provider_prompt("original", grant)
+            projection = json.loads(text.split("Verified execution capability (caller projection):\n", 1)[1].splitlines()[0])
+            command = projection["source_read_example"]["commands"][0]
+            actual = json.loads(command["command_line"])
+            expected = ["src/answer.py", 1, 80] + (["a" * 64] if with_verifier else [])
+            self.assertEqual(actual, expected)
+            named = {"path": expected[0], "start_line": 1, "end_line": 80}
+            if with_verifier:
+                named["expected_sha256"] = expected[3]
+                self.assertEqual(_normalized_source_read(command["command_line"]),
+                                 _normalized_source_read(json.dumps(named)))
+            self.assertLess(len(command["command_line"]), len(json.dumps(named, separators=(",", ":"))))
+            self.assertEqual(grant, before)
+
     def _grants(self):
         source = {
             "authorization_semantic_sha256": "a" * 64,
@@ -202,8 +275,7 @@ class DirectoryReadCapabilityProjectionTests(unittest.TestCase):
         projection = self._projection()
         self.assertIn("read_commands", projection)
         self.assertEqual(json.loads(projection["source_read_example"]["commands"][0]["command_line"]),
-                         {"path": "src/known.py", "start_line": 1, "end_line": 80,
-                          "expected_sha256": "d" * 64})
+                         ["src/known.py", 1, 80, "d" * 64])
         del projection["read_commands"]
         self.assertEqual(projection, self._projection(original))
         self.assertEqual(self.grant, before)
@@ -383,6 +455,131 @@ class DirectoryReadCapabilityProjectionTests(unittest.TestCase):
         self.assertEqual(projection["read_scopes"], ["src/**", "tests/**"])
         self.assertIn("source_read requires source_read:true and an exact read_scopes path",
                       core._provider_prompt("original", self.grant))
+
+    def _local_directory_source_read_grant(self):
+        grant = copy.deepcopy(self.grant)
+        grant.update(schema_version="jspace_contract_v2", source_read=True,
+                     dcf_generation={"context_mode": "local_workspace_jspace",
+                                     "dcf_available": False})
+        return grant
+
+    def test_local_v2_directory_source_read_changes_only_the_exact_only_hint(self):
+        old_hint = ("source_read requires source_read:true and an exact "
+                    "read_scopes path; directory scopes never qualify. ")
+        new_hint = ("Use ranged source_read on discovered regular files under these roots; "
+                    "runtime pinned cat/file/root checks must pass. Resume with "
+                    "expected_sha256=returned SHA, start_line=next_line. ")
+        for exact in (False, True):
+            for with_verifier in (False, True):
+                with self.subTest(exact=exact, with_verifier=with_verifier):
+                    grant = self._local_directory_source_read_grant()
+                    if exact:
+                        grant["read_scopes"].insert(1, "src/known.py")
+                    if with_verifier:
+                        grant.update(repo_root="/workspace", verifier_commands=[{
+                            "argv": ["python", "tests/verify.py"],
+                            "pinned_files": [{"path": "/workspace/src/known.py",
+                                              "sha256": "d" * 64}],
+                        }])
+                    before = copy.deepcopy(grant)
+                    legacy = copy.deepcopy(grant)
+                    del legacy["dcf_generation"]
+                    projection = self._projection(grant)
+                    self.assertEqual(projection, self._projection(legacy))
+                    self.assertEqual(projection["read_commands"],
+                                     core._directory_read_presentation(grant))
+                    self.assertIs(projection["source_read"], True)
+                    if exact:
+                        arguments = ["src/known.py", 1, 80]
+                        if with_verifier:
+                            arguments.append("d" * 64)
+                        self.assertEqual(json.loads(projection["source_read_example"][
+                            "commands"][0]["command_line"]), arguments)
+                    else:
+                        self.assertNotIn("source_read_example", projection)
+                        self.assertNotIn("known_source_sha256_by_path", projection)
+                    for mode in ("assistant_reply", "evidence_only"):
+                        expected = core._provider_prompt("original", legacy, terminal_delivery=mode)
+                        text = core._provider_prompt("original", grant, terminal_delivery=mode)
+                        self.assertEqual(expected.count(old_hint), 1)
+                        self.assertEqual(text.count(new_hint), 1)
+                        self.assertNotIn("directory scopes never qualify", text)
+                        self.assertEqual(text.encode("utf-8"),
+                                         expected.replace(old_hint, new_hint, 1).encode("utf-8"))
+                    self.assertEqual(grant, before)
+
+    def test_directory_source_read_nonqualifying_markers_preserve_legacy_prompt_bytes(self):
+        local = self._local_directory_source_read_grant()
+        generation = local["dcf_generation"]
+        changes = [{"source_read": value} for value in (False, None, 0, 1, "true", [], {})]
+        changes += [{"schema_version": value} for value in
+                    ("jspace_contract_v3", "jspace_contract_v1", None, False, 2, [], {})]
+        changes += [{"dcf_generation": value} for value in
+                    (None, False, 0, [], "local_workspace_jspace", {},
+                     {"context_mode": "local_workspace_jspace"}, {"dcf_available": False})]
+        changes += [{"dcf_generation": dict(generation, context_mode=value)} for value in
+                    ("dcf", "local_workspace", None, False, 0, [], {})]
+        changes += [{"dcf_generation": dict(generation, dcf_available=value)} for value in
+                    (True, None, 0, 1, "false", [], {})]
+        grants = []
+        for change in changes:
+            grant = copy.deepcopy(local)
+            grant.update(change)
+            grants.append(grant)
+        for field in ("source_read", "schema_version", "dcf_generation"):
+            grant = copy.deepcopy(local)
+            del grant[field]
+            grants.append(grant)
+        for grant in grants:
+            with self.subTest(grant=grant):
+                before = copy.deepcopy(grant)
+                legacy = copy.deepcopy(grant)
+                legacy.pop("dcf_generation", None)
+                for mode in ("assistant_reply", "evidence_only"):
+                    text = core._provider_prompt("original", grant, terminal_delivery=mode)
+                    expected = core._provider_prompt("original", legacy, terminal_delivery=mode)
+                    self.assertIn("directory scopes never qualify", text)
+                    self.assertNotIn("Use ranged source_read", text)
+                    self.assertEqual(text.encode("utf-8"), expected.encode("utf-8"))
+                self.assertEqual(grant, before)
+
+    def test_local_directory_source_read_requires_valid_undenied_directory_presentation(self):
+        local = self._local_directory_source_read_grant()
+        policy = local["read_commands"]
+        changes = [
+            {"read_commands": None}, {"read_commands": {}},
+            {"read_commands": dict(policy, extra=True)},
+            {"read_commands": dict(policy, roots=[])},
+            {"read_commands": dict(policy, roots=["src", "src"])},
+            {"read_commands": dict(policy, roots=["src/.hidden"]),
+             "read_scopes": ["src/.hidden/**"]},
+            {"read_scopes": ["src/known.py"]},
+            {"allowed_operations": ["read"]}, {"allowed_operations": ["command"]},
+            {"allowed_operations": ["command", "read", None]},
+            {"denied_operations": ["read"]}, {"denied_operations": ["command"]},
+            {"denied_operations": None},
+        ]
+        for name in ("rg", "cat"):
+            changes += [{"read_commands": dict(policy, **{name: pin})} for pin in (
+                None, {"path": "/bin/" + name},
+                {"path": name, "sha256": "b" * 64},
+                {"path": "/bin/" + name, "sha256": "g" * 64},
+            )]
+        for change in changes:
+            with self.subTest(change=change):
+                grant = copy.deepcopy(local)
+                grant.update(change)
+                before = copy.deepcopy(grant)
+                legacy = copy.deepcopy(grant)
+                del legacy["dcf_generation"]
+                self.assertIsNone(core._directory_read_presentation(grant))
+                self._assert_omitted(grant)
+                for mode in ("assistant_reply", "evidence_only"):
+                    text = core._provider_prompt("original", grant, terminal_delivery=mode)
+                    expected = core._provider_prompt("original", legacy, terminal_delivery=mode)
+                    self.assertNotIn("Use ranged source_read", text)
+                    self.assertEqual(text.encode("utf-8"), expected.encode("utf-8"))
+                self.assertEqual(grant, before)
 
     def test_ordinary_exact_file_prompt_is_unchanged_without_directory_policy(self):
         grant = copy.deepcopy(self.grant)
@@ -593,12 +790,12 @@ class ReadCapabilityProjectionTests(unittest.TestCase):
         projection = json.loads(text.splitlines()[3])
         self.assertEqual(projection["source_read_example"], {
             "commands": [{"command_type": "source_read",
-                          "command_line": '{"end_line":80,"path":"src/first.py","start_line":1}',
+                          "command_line": '["src/first.py",1,80]',
                           "step": 1}],
         })
         command = projection["source_read_example"]["commands"][0]
         self.assertEqual(json.loads(command["command_line"]),
-                         {"path": "src/first.py", "start_line": 1, "end_line": 80})
+                         ["src/first.py", 1, 80])
         self.assertIn("exactly 64 hexadecimal characters copied verbatim", text)
         self.assertIn("not shortened or reconstructed", text)
         self.assertEqual(len(text.splitlines()), 6)
@@ -640,7 +837,7 @@ class ReadCapabilityProjectionTests(unittest.TestCase):
                 else:
                     command = projection["source_read_example"]["commands"][0]
                     self.assertEqual(json.loads(command["command_line"]),
-                                     {"path": path, "start_line": 1, "end_line": 80})
+                                     [path, 1, 80])
                 self.assertEqual(len(text.splitlines()), 6)
                 self.assertEqual(text.splitlines()[-1], core.CAPABILITY_GAP_GUIDANCE)
                 self.assertEqual(grant, before)
@@ -664,9 +861,9 @@ class ReadCapabilityProjectionTests(unittest.TestCase):
                 self.assertEqual(projection["known_source_sha256_by_path"],
                                  {path: hashes[path] for path in paths})
                 command = projection["source_read_example"]["commands"][0]
-                expected = {"path": "src/first.py", "start_line": 1, "end_line": 80}
+                expected = ["src/first.py", 1, 80]
                 if "src/first.py" in paths:
-                    expected["expected_sha256"] = hashes["src/first.py"]
+                    expected.append(hashes["src/first.py"])
                 self.assertEqual(json.loads(command["command_line"]), expected)
                 self.assertEqual(grant, before)
 
@@ -734,6 +931,23 @@ class KnownSourceHashProjectionTests(unittest.TestCase):
         before = copy.deepcopy(self.grant)
         self.assertEqual(self._projection()["known_source_sha256_by_path"], self.hashes)
         self.assertEqual(self.grant, before)
+
+    def test_verifier_only_pins_never_supply_source_read_digest_evidence(self):
+        grant = copy.deepcopy(self.grant)
+        pins = grant["verifier_commands"][0]["pinned_files"]
+        pins[0]["scope"] = "verifier_only"
+        pins.append({"path": "/acceptance/verify.py", "sha256": "c" * 64,
+                     "scope": "verifier_only"})
+        before = copy.deepcopy(grant)
+        projection = self._projection(grant)
+        self.assertEqual(projection["known_source_sha256_by_path"],
+                         {self.test: self.hashes[self.test]})
+        grant["schema_version"] = "jspace_contract_v2"
+        self.assertEqual(core._admitted_digest_paths(grant), [self.test])
+        self.assertEqual(projection["read_scopes"], self.grant["read_scopes"])
+        self.assertIn("focused_verifier", projection)
+        grant.pop("schema_version")
+        self.assertEqual(grant, before)
 
     def test_conflicts_including_malformed_hashes_omit_the_path_in_every_order(self):
         for other_hash in ("c" * 64, None, "invalid"):
@@ -1208,18 +1422,19 @@ class FocusedVerifierProjectionTests(unittest.TestCase):
         self.assertIn("After mutation: fresh scoped readback, not preimage SHA", text)
         self.assertIn("Reuse verified unchanged ranges; reread for missing/changed evidence "
                       "or explicit task requirements", text)
-        self.assertNotIn("Verifier success + semantically reviewed", text)
+        self.assertNotIn("Passing verification after the final patches", text)
         self.assertNotIn("focused_verifier", json.loads(text.splitlines()[3]))
 
-    def test_unchanged_postimage_reuse_requires_success_and_fresh_scoped_readback(self):
+    def test_passing_verifier_after_final_patches_needs_no_readback_round(self):
         for read_allowed in (False, True):
             with self.subTest(read_allowed=read_allowed):
                 grant = copy.deepcopy(self.grant)
                 grant["source_read"] = read_allowed
                 text = core._provider_prompt("Inspect source.", grant)
                 for rule in (
-                    "Verifier success + semantically reviewed fresh scoped postimage readback "
-                    "covers only the exact unchanged state",
+                    "tests are not the specification.",
+                    "Cover required interactions before patching",
+                    "no extra review round",
                     "no redundant tests/reads/status polls",
                     "Reuse evidence, never ownership/permission clearance",
                 ):
@@ -1282,15 +1497,15 @@ class FocusedVerifierProjectionTests(unittest.TestCase):
         text = core._provider_prompt("Modify source.", self.grant)
         for rule in (
             "known exit0/reaped/group-empty success only",
-            "Semantically review complete definitions/bindings + support",
+            "When the task requires review, semantically review complete definitions/bindings + support",
             "or all-text delta on definition-size overflow (not complete definitions)",
             "No dependency/file proof; exact paths/postimage SHA/lines only",
             "Missing/overflow/stale/uncovered evidence: ordinary granted source_read",
             "Preserve raw stdout/stderr, verifier/receipt/cleanup facts",
             "no new authority, acceptance or automatic done",
-            "If post-edit evidence is present, review",
+            "If task-required post-edit review remains",
             "Mandatory status updates and terminal fences",
-            "no failed/unknown-effect closure or expanded grants",
+            "No failed/unknown-effect closure; keep publication fences",
         ):
             with self.subTest(rule=rule):
                 self.assertIn(rule, text)
@@ -1298,13 +1513,18 @@ class FocusedVerifierProjectionTests(unittest.TestCase):
         self.assertEqual(self.grant, before)
 
     def test_representative_prompt_guidance_size_deltas(self):
-        # Keep the original ceilings: compact context guidance, not larger budgets.
+        # Keep exact route ceilings; non-writing grants retain their original budgets.
         # Projection JSON (including examples and known SHAs) is measured separately.
+        # v316 spends 122 bytes on writing grants so a passing verifier ends the worker
+        # without a readback round.
+        # Writing ceilings match the pre-change evidence-only guidance, not v316.
+        # v422 adds the verifier sandbox facts (cwd, TMPDIR scratch, test-relative fixtures) to
+        # every verifier grant: an I23 Ultra worker spent two corrective rounds learning them.
         cases = (
             ("read_only", True, False, False, False, 895, 99),
-            ("verifier_only", False, True, False, False, 866, 0),
-            ("mixed", True, True, True, False, 2253, 99),
-            ("mixed_with_sha", True, True, True, True, 2340, 99),
+            ("verifier_only", False, True, False, False, 908, 0),
+            ("mixed", True, True, True, False, 3040, 0),
+            ("mixed_with_sha", True, True, True, True, 3127, 0),
         )
         for name, read_allowed, verifier_allowed, modify_allowed, pinned, starting_bytes, delta in cases:
             with self.subTest(case=name):
@@ -1350,35 +1570,63 @@ class VerifierFinishingGuidanceProjectionTests(unittest.TestCase):
             "verifier_commands": [{"argv": ["python", "tests/verify.py"]}],
         }
 
+    def test_known_terminal_pipeline_uses_one_array_without_a_required_model_turn(self):
+        for mode in ("assistant_reply", "evidence_only"):
+            for source_read in (False, True):
+                with self.subTest(mode=mode, source_read=source_read):
+                    grant = {**self.grant, "source_read": source_read}
+                    before = copy.deepcopy(grant)
+                    text = core._provider_prompt("Complete known work.", grant, terminal_delivery=mode)
+                    for rule in (
+                        "exact-write patches precede the admitted focused_verifier",
+                        "strictly later positive step in the same command_run response",
+                        "task_status done alone at a strictly later final positive step",
+                        "in that SAME commands array",
+                        "Required checks/readbacks and conclusions must be known, not result-dependent",
+                        "Failed/timed-out/unknown results block done",
+                        "interpretation requires a later model turn",
+                    ):
+                        self.assertIn(rule, text)
+                    self.assertEqual(grant, before)
+
+    def test_postimage_presence_does_not_mandate_review_but_user_review_survives(self):
+        task = "Review the final diff and interpret test output before completing."
+        for mode in ("assistant_reply", "evidence_only"):
+            with self.subTest(mode=mode):
+                text = core._provider_prompt(task, self.grant, terminal_delivery=mode)
+                self.assertTrue(text.startswith(task))
+                self.assertIn("When the task requires review, semantically review", text)
+                self.assertIn("If task-required post-edit review remains:", text)
+                self.assertIn("Task-required reads prevail.", text)
+                self.assertIn("result-dependent review needs a later model round", text)
+                self.assertNotIn("If post-edit evidence is present, review:", text)
+                self.assertIn("no new authority, acceptance or automatic done", text)
+
     def assert_no_finishing_guidance(self, grant):
         before = copy.deepcopy(grant)
         text = core._provider_prompt("original", grant)
-        self.assertNotIn("If post-edit evidence is present, review:", text)
+        self.assertNotIn("If task-required post-edit review remains:", text)
         self.assertEqual(grant, before)
 
     def test_successful_verifier_finish_batches_only_output_independent_readbacks_and_done(self):
         before = copy.deepcopy(self.grant)
         text = core._provider_prompt("Modify source.", self.grant)
         for rule in (
-            "If post-edit evidence is present, review:",
-            "Else propose fully-known mechanical checks/readbacks "
-            "in strict later steps per guidance.",
+            "If task-required post-edit review remains:",
             "Mechanical missing readbacks only; mandatory task_status done",
-            "at a strictly later positive step",
-            "in the same existing command_run",
-            "No output-dependent decisions",
-            "safe exact read+write paths only",
-            "Result-dependent review: later model round",
-            "Keep publication fences",
-            "no failed/unknown-effect closure or expanded grants",
-            "After mutation: fresh scoped readback, not preimage SHA",
+            "in later positive steps of the same command_run",
+            "exact read+write paths only",
+            "Batch only fully-known mechanical work",
+            "result-dependent review needs a later model round",
+            "No failed/unknown-effect closure; keep publication fences",
+            "Complete source_delta: readback per apply_patch rules; else source_read.",
             "No dependent same-step verification or missing-evidence edits",
             "no redundant tests/reads/status polls",
             "Mandatory status updates and terminal fences",
         ):
             with self.subTest(rule=rule):
                 self.assertIn(rule, text)
-        self.assertEqual(text.count("If post-edit evidence is present, review:"), 1)
+        self.assertEqual(text.count("If task-required post-edit review remains:"), 1)
         self.assertEqual(text.count("Once final patches are fully known"), 1)
         self.assertNotIn("Source-read-only final edits:", text)
         projection = json.loads(text.splitlines()[3])
@@ -1417,7 +1665,7 @@ class VerifierFinishingGuidanceProjectionTests(unittest.TestCase):
                 grant = copy.deepcopy(self.grant)
                 del grant[field]
                 if field == "denied_operations":
-                    self.assertIn("If post-edit evidence is present, review:",
+                    self.assertIn("If task-required post-edit review remains:",
                                   core._provider_prompt("original", grant))
                 else:
                     self.assert_no_finishing_guidance(grant)
@@ -1460,8 +1708,8 @@ class VerifierFinishingGuidanceProjectionTests(unittest.TestCase):
         grant["read_scopes"] = ["src/read_only.py", 'src/a"b.py']
         before = copy.deepcopy(grant)
         text = core._provider_prompt("Modify source.", grant)
-        self.assertIn("If post-edit evidence is present, review:", text)
-        self.assertIn("safe exact read+write paths only", text)
+        self.assertIn("If task-required post-edit review remains:", text)
+        self.assertIn("exact read+write paths only", text)
         self.assertEqual(grant, before)
 
     def test_task_instructions_stay_first_and_mixed_finishing_is_conditional(self):
@@ -1473,7 +1721,7 @@ class VerifierFinishingGuidanceProjectionTests(unittest.TestCase):
                 self.assertTrue(text.startswith(
                     prompt + "\n\nVerified execution capability (caller projection):\n"))
                 self.assertIn("Task-permitted mixed responses", text)
-                self.assertIn("Result-dependent review: later model round", text)
+                self.assertIn("result-dependent review needs a later model round", text)
 
 
 class SourceOnlyOrderedReadbackProjectionTests(unittest.TestCase):
@@ -1497,13 +1745,13 @@ class SourceOnlyOrderedReadbackProjectionTests(unittest.TestCase):
         text = core._provider_prompt("Modify source.", self.grant)
         for rule in (
             "when task instructions permit a mixed response",
-            "fully-known admitted final patches in earlier positive steps",
-            "fully-known bounded fresh postimage source_read requests",
-            "at a strictly later positive step in the same command_run response",
-            "safe exact write paths also granted for read",
-            "Never use preimage SHA after mutation",
+            "fully-known admitted patches in earlier positive steps",
+            "still-required bounded postimage source_read",
+            "at a strictly later positive step in the same command_run",
+            "Exact read+write paths only",
+            "no preimage SHA after mutation",
             "same-step dependent reads, speculative ranges or scope expansion",
-            "Do not skip required verification, readback, status updates or terminal fences",
+            "Keep required verification, readback, status updates and terminal fences",
         ):
             with self.subTest(rule=rule):
                 self.assertIn(rule, text)

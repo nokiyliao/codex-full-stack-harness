@@ -88,6 +88,8 @@ async fn create_runtime_business_flow_builds_runtime_queue_and_provider_config_f
         "http://127.0.0.1:2222/v1"
     );
     assert_eq!(runtime.provider.model_name, "beta-runtime");
+    // The session override, not the agent config default, is the reported current model.
+    assert_eq!(runtime.provider.base.current_model.as_deref(), Some("localbeta/beta-runtime"));
     assert!(runtime.provider.thinking);
     assert_eq!(runtime.provider.base.tura_llm_name, "business_runtime");
     assert!(runtime.provider.base.stream);
@@ -304,6 +306,7 @@ async fn runtime_latency_uses_selected_model_tier_not_agent_default_tier() {
 
     assert_eq!(provider.llm_provider_name, "codex");
     assert_eq!(provider.model_name, "gpt-5.5");
+    assert_eq!(provider.base.current_model.as_deref(), Some("codex/gpt-5.5"));
     assert_eq!(
         provider.base.time_out_ms, 1_200_000,
         "gpt-5.5 belongs to thinking, so latency must be x-high even through fast agent"

@@ -159,7 +159,7 @@ fn sanitize_command_run_output(value: &Value, commands: Option<&[Value]>) -> Val
         return sanitize_value(value, None);
     };
     if value.get("results").is_none() {
-        let map = value.as_object().unwrap();
+        let map = value.as_object().expect("a value carrying a command_run channel is an object");
         return Value::Object(map.iter().map(|(field, item)| {
             let sanitized = if field == "streamed_command_run_result" {
                 sanitize_command_run_output(channel, commands)
@@ -169,7 +169,7 @@ fn sanitize_command_run_output(value: &Value, commands: Option<&[Value]>) -> Val
             (field.clone(), sanitized)
         }).collect());
     }
-    let map = channel.as_object().unwrap();
+    let map = channel.as_object().expect("a command_run results channel is an object");
     let commands = command_run_context_commands(channel, commands);
     let mut index = 0;
     Value::Object(map.iter().map(|(field, item)| {
@@ -187,7 +187,7 @@ fn sanitize_command_results(
     commands: Option<&[Value]>,
     index: &mut usize,
 ) -> Vec<Value> {
-    results.iter().map(|result| {
+    let sanitized: Vec<Value> = results.iter().map(|result| {
         let Some(map) = result.as_object() else {
             *index += 1;
             return sanitize_value(result, None);
@@ -202,13 +202,143 @@ fn sanitize_command_results(
         let commands = if command_run_tool_identity(result) { commands } else { Some(&[][..]) };
         Value::Object(map.iter().map(|(field, item)| {
             let sanitized = if field == "results" {
-                Value::Array(sanitize_command_results(item.as_array().unwrap(), commands, index))
+                Value::Array(sanitize_command_results(
+                    item.as_array().expect("a batch result carries a results array"), commands, index))
             } else {
                 sanitize_object_field(map, field, item)
             };
             (field.clone(), sanitized)
         }).collect())
-    }).collect()
+    }).collect();
+    // Canonical batch results must match their individually streamed results.
+    // Cross-result deduplication belongs only in the provider context projection.
+    sanitized
+}
+
+// Only remove the optional projection, after sanitization has retained the
+// actual read pages. Never skip commands or replace the raw execution receipt.
+pub(crate) fn omit_readback_covered_deltas(results: &mut [Value], inputs: Option<&[Value]>) {
+    if results.len() > 256 || inputs.is_some_and(|inputs| inputs.len() != results.len()
+        || inputs.iter().zip(results.iter()).any(|(input, result)| !command_identities_agree(input, result)))
+    { return; }
+    for index in 0..results.len() {
+        let (prefix, reads) = results.split_at_mut(index + 1);
+        let patch = &mut prefix[index];
+        if !command_run_tool_identity(patch)
+            || patch["command_type"] != "apply_patch" || patch["success"] != true
+            || patch.get("error").is_some_and(|error| !error.is_null())
+            || patch.pointer("/output/exit_code").and_then(Value::as_i64) != Some(0)
+            || reads.is_empty() || reads.iter().any(|read| read["command_type"] != "source_read")
+        { continue; }
+        let Some(step) = patch["step"].as_u64().filter(|step| *step > 0) else { continue; };
+        let Some(run_id) = patch["command_run_id"].as_str().filter(|id| !id.is_empty()).map(str::to_owned)
+            else { continue; };
+        let Some(changes) = patch.pointer_mut("/output/changes").and_then(Value::as_array_mut)
+            else { continue; };
+        if changes.len() > 4 { continue; }
+        for change in changes {
+            if let Some(replacement) = readback_delta_reference(change, reads, step, &run_id, index + 1) {
+                change["source_delta"] = replacement;
+            }
+        }
+    }
+}
+
+fn readback_delta_reference(change: &Value, reads: &[Value], step: u64, run_id: &str, first_read_index: usize) -> Option<Value> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let delta = change.get("source_delta")?;
+    if delta["schema_version"] != "nokiy_applied_source_delta_v1"
+        || delta["coverage"] != "all_text_changes"
+        || !json_within_byte_budget(delta, SOURCE_POSTIMAGE_MAX_JSON_BYTES)
+    { return None; }
+    let path = change["path"].as_str()?;
+    let hash = source_digest(&change["postimage_sha256"])?;
+    let hunks = delta["hunks"].as_array()?;
+    if hunks.is_empty() || hunks.len() > SOURCE_POSTIMAGE_MAX_LINES as usize { return None; }
+    let mut required = BTreeMap::new();
+    for hunk in hunks {
+        let start = hunk["after_start_line"].as_u64()?.checked_sub(1)?;
+        let text = hunk["after_text"].as_str()?;
+        let lines: Vec<_> = text.split_inclusive('\n').collect();
+        // A read of the postimage alone does not show deleted text.
+        if lines.is_empty() || hunk["after_line_count"].as_u64()? != lines.len() as u64 { return None; }
+        for (offset, line) in lines.into_iter().enumerate() {
+            if required.insert(start.checked_add(offset as u64)?.checked_add(1)?, line).is_some()
+                || required.len() > SOURCE_POSTIMAGE_MAX_LINES as usize { return None; }
+        }
+    }
+    let mut covered = BTreeSet::new();
+    let mut result_indexes = BTreeSet::new();
+    for (read_index, read) in reads.iter().enumerate() {
+        if bounded_source_read_page(read, None).is_none()
+            || read["command_run_id"].as_str() != Some(run_id)
+            || read["step"].as_u64().is_none_or(|read_step| read_step <= step)
+        { continue; }
+        let output = &read["output"];
+        if output["path"].as_str() != Some(path) || source_digest(&output["source_sha256"])? != hash { continue; }
+        let start = output["start_line"].as_u64()?;
+        let numbered = output["line_numbers"].as_bool() == Some(true);
+        for (offset, line) in output["stdout"].as_str()?.split_inclusive('\n').enumerate() {
+            let number = start.checked_add(offset as u64)?;
+            if let Some(expected) = required.get(&number) {
+                let text = if numbered { line.split_once(": ")?.1 } else { line };
+                if text != *expected { return None; }
+                covered.insert(number);
+                result_indexes.insert(first_read_index + read_index);
+            }
+        }
+    }
+    if covered.len() != required.len() { return None; }
+    let reference = serde_json::json!({"omitted_from_context": true,
+        "reason": "Optional applied delta omitted: all nonempty postimage hunks are present verbatim in these later source_read results (zero-based indexes) at the same SHA. Original patch and receipts are unchanged; this is not verifier acceptance.",
+        "represented_by_result_indexes": result_indexes});
+    (serde_json::to_vec(&reference).ok()?.len() < serde_json::to_vec(delta).ok()?.len()).then_some(reference)
+}
+
+pub(crate) fn bounded_applied_delta(change: &serde_json::Map<String, Value>) -> Option<Value> {
+    let delta = change.get("source_delta")?;
+    let path = change.get("path")?.as_str()?;
+    if path.is_empty() || path.len() > 512 || path.contains(['\\', '\0'])
+        || path.split('/').any(|part| matches!(part, "" | "." | "..")) { return None; }
+    source_digest(change.get("preimage_sha256")?)?;
+    source_digest(change.get("postimage_sha256")?)?;
+    if delta["omitted_from_context"] == true {
+        // Only bounded, text-free references survive an earlier projection.
+        let map = delta.as_object()?;
+        let indexes = delta["represented_by_result_indexes"].as_array()?;
+        return (map.len() == 3 && !indexes.is_empty() && indexes.len() <= 256
+            && indexes.iter().all(|index| index.as_u64().is_some_and(|index| index < 256))
+            && delta["reason"].as_str().is_some_and(|text| text.len() <= 512))
+            .then(|| delta.clone());
+    }
+    if delta["schema_version"] != "nokiy_applied_source_delta_v1"
+        || delta["coverage"] != "all_text_changes"
+        || !json_within_byte_budget(delta, SOURCE_POSTIMAGE_MAX_JSON_BYTES)
+    { return None; }
+    let hunks = delta["hunks"].as_array()?;
+    if hunks.is_empty() || hunks.len() > SOURCE_POSTIMAGE_MAX_LINES as usize { return None; }
+    let mut lines = 0u64;
+    let mut before_end = 1u64;
+    let mut after_end = 1u64;
+    for hunk in hunks {
+        let before = hunk["before_text"].as_str()?;
+        let after = hunk["after_text"].as_str()?;
+        let before_count = hunk["before_line_count"].as_u64()?;
+        let after_count = hunk["after_line_count"].as_u64()?;
+        let before_start = hunk["before_start_line"].as_u64()?;
+        let after_start = hunk["after_start_line"].as_u64()?;
+        if before_start < before_end || after_start < after_end
+            || before_start - before_end != after_start - after_end
+            || before_count != before.split_inclusive('\n').count() as u64
+            || after_count != after.split_inclusive('\n').count() as u64
+            || before == after
+        { return None; }
+        before_end = before_start.checked_add(before_count)?;
+        after_end = after_start.checked_add(after_count)?;
+        lines = lines.checked_add(before_count)?.checked_add(after_count)?;
+        if lines > SOURCE_POSTIMAGE_MAX_LINES { return None; }
+    }
+    (delta["line_count"].as_u64()? == lines).then(|| delta.clone())
 }
 
 fn sanitize_command_result(result: &Value, input: Option<&Value>) -> Value {
@@ -216,11 +346,22 @@ fn sanitize_command_result(result: &Value, input: Option<&Value>) -> Value {
     let preserve_source_page = result.pointer("/output/stdout").and_then(Value::as_str)
         .is_some_and(|stdout| stdout.len() > TOOL_CALLBACK_OUTPUT_MAX_BYTES
             && bounded_source_read_page(result, input).is_some());
+    let preserve_final_reply = terminal_reply_result(result, input);
     Value::Object(map.iter().map(|(field, item)| {
         let sanitized = if field == "output" && let Some(output) = item.as_object() {
             Value::Object(output.iter().map(|(key, value)| {
                 let sanitized = if key == "stdout" && preserve_source_page {
                     value.clone()
+                } else if key == "task_status" && preserve_final_reply {
+                    let status = value.as_object().expect("a final-reply task_status is an object");
+                    Value::Object(status.iter().map(|(field, item)| {
+                        let sanitized = if field == "final_reply" {
+                            item.clone()
+                        } else {
+                            sanitize_object_field(status, field, item)
+                        };
+                        (field.clone(), sanitized)
+                    }).collect())
                 } else if key == "source_postimages" {
                     bounded_source_postimages_for_context(value, Some(result), input)
                 } else if key == "verification_evidence"
@@ -245,6 +386,22 @@ fn sanitize_command_result(result: &Value, input: Option<&Value>) -> Value {
     }).collect())
 }
 
+// The explicit answer is a delivery payload, not a tool log. Preserve only its
+// canonical successful output; the turn loop still decides whether to finish.
+fn terminal_reply_result(result: &Value, input: Option<&Value>) -> bool {
+    command_run_tool_identity(result)
+        && result.get("command_type").and_then(Value::as_str) == Some("task_status")
+        && result.get("step").and_then(Value::as_u64).is_some_and(|step| step > 0)
+        && result.get("success").and_then(Value::as_bool) == Some(true)
+        && result.get("error").is_none_or(Value::is_null)
+        && input.is_none_or(|input| command_identities_agree(result, input))
+        && result.pointer("/output/task_status").is_some_and(|status|
+            status.get("status").and_then(Value::as_str) == Some("done")
+                && status.get("compact_context").is_none()
+                && status.get("final_reply").and_then(Value::as_str)
+                    .is_some_and(|reply| !reply.trim().is_empty()))
+}
+
 fn source_read_command_identity(value: &Value) -> bool {
     value.get("command_type").and_then(Value::as_str) == Some("source_read")
         && command_run_tool_identity(value)
@@ -263,6 +420,8 @@ fn source_read_command_identity(value: &Value) -> bool {
 // These lexical checks preserve producer pagination; they prove neither source
 // freshness nor authority. Search pages have a smaller budget and need no bypass.
 pub(crate) fn bounded_source_read_page(result: &Value, input: Option<&Value>) -> Option<()> {
+    use code_tools::commands::source_read::SourceReadContentEvidence;
+
     if !source_read_command_identity(result)
         || input.is_some_and(|input| !source_read_command_identity(input) || !command_identities_agree(result, input))
         || result.get("success").and_then(Value::as_bool) != Some(true)
@@ -279,11 +438,11 @@ pub(crate) fn bounded_source_read_page(result: &Value, input: Option<&Value>) ->
     ];
     if !required.iter().all(|key| map.contains_key(*key))
         || !map.keys().all(|key| required.contains(&key.as_str())
-            || matches!(key.as_str(), "line_numbers" | "terminal_receipt" | "terminal_receipt_path" | "changes"))
+            || matches!(key.as_str(), "line_numbers" | "terminal_receipt" | "terminal_receipt_path" | "changes" | "source_read_evidence" | "admitted_digest_reference" | "observed_digest_reference"))
         || output["exit_code"].as_i64() != Some(0)
         || output["stderr"].as_str() != Some("")
         || output.get("changes").is_some_and(|changes| !changes.as_array().is_some_and(Vec::is_empty))
-        || output.get("terminal_receipt_path").is_some_and(|path| !path.as_str().is_some_and(|path| !path.is_empty()))
+        || output.get("terminal_receipt_path").is_some_and(|path| path.as_str().is_none_or(|path| path.is_empty()))
     {
         return None;
     }
@@ -318,7 +477,7 @@ pub(crate) fn bounded_source_read_page(result: &Value, input: Option<&Value>) ->
     let mut lines = 0;
     for line in stdout.split_inclusive('\n') {
         let number = start.checked_add(lines)?;
-        if numbered && !line.split_once(": ").is_some_and(|(label, _)| label == number.to_string()) {
+        if numbered && line.split_once(": ").is_none_or(|(label, _)| label != number.to_string()) {
             return None;
         }
         lines += 1;
@@ -351,10 +510,66 @@ pub(crate) fn bounded_source_read_page(result: &Value, input: Option<&Value>) ->
             || receipt["reconcile_required"] != false || receipt["authority_effect"] != "none"
             || receipt["staging_authority"] != "none"
             || !matches!(receipt["failure_class"].as_str(), Some("none" | "workload"))
-            || !receipt["call_id"].as_str().is_some_and(|id| !id.is_empty())
+            || receipt["call_id"].as_str().is_none_or(|id| id.is_empty())
             || receipt.get("error").is_some_and(|error| !error.is_null())
             || ["timed_out", "cancelled"].iter().any(|key| receipt.get(*key).is_some_and(|value| value.as_bool() != Some(false)))
             || receipt.get("unresolved_effects").is_some_and(|effects| !effects.is_null() && !effects.as_array().is_some_and(Vec::is_empty))
+        {
+            return None;
+        }
+    }
+    let evidence = output.get("source_read_evidence");
+    let bound_evidence = output.get("terminal_receipt")
+        .and_then(|receipt| receipt.get("source_read_evidence"));
+    let references: Vec<_> = ["admitted", "observed"].into_iter().filter_map(|kind|
+        output.get(format!("{kind}_digest_reference")).map(|value| (kind, value))).collect();
+    if !references.is_empty() {
+        if references.len() != 1 || evidence.is_some() || bound_evidence.is_some() { return None; }
+        let (kind, value) = references[0];
+        let reference = code_tools::commands::source_read::SourceReadDigestReference::parse_bounded(value, kind)?;
+        let call_id = output["terminal_receipt"]["call_id"].as_str()?;
+        if output["source_sha256"] != reference.expected_sha256
+            || !reference.matches_range(path, start, requested, numbered)
+            || input.and_then(|command| command.get("command_line")).is_some_and(|line|
+                !line.as_str().is_some_and(|line| reference.matches_command(line)))
+            || result.get("command_line").is_some_and(|line|
+                !line.as_str().is_some_and(|line| reference.matches_command(line)))
+            || call_id.trim().is_empty() || call_id.len() > 256
+            || result.get("command_id").and_then(Value::as_str).is_some_and(|id|
+                call_id != id && !call_id.strip_suffix(id).is_some_and(|prefix| prefix.ends_with(".tool.command_run:")))
+            || result.get("runtime_id").is_some_and(|runtime|
+                !runtime.as_str().is_some_and(|runtime| !runtime.is_empty()
+                    && call_id.strip_prefix(runtime).is_some_and(|suffix| suffix.starts_with(".tool.command_run:")))) {
+            return None;
+        }
+    }
+    if evidence.is_some() || bound_evidence.is_some() {
+        let evidence = evidence?;
+        // Authenticate the untouched witness before parsing it. A receipt-only
+        // proof, or a partial page carrying an exact-selector proof, is invalid.
+        if bound_evidence != Some(evidence) { return None; }
+        let proof = SourceReadContentEvidence::parse_bounded(evidence)?;
+        let request = &evidence["request"];
+        let call_id = output["terminal_receipt"]["call_id"].as_str()?;
+        // The public validator enforces the pin and normalized request schema.
+        // Exact range coordinates also exclude search/projection selectors.
+        if !proof.content_satisfied || truncated
+            || proof.request.path() != path || output["source_sha256"] != proof.source_sha256
+            || request["start_line"].as_u64() != Some(start)
+            || request["end_line"].as_u64() != Some(end)
+            || request["line_numbers"].as_bool() != Some(numbered)
+            || input.and_then(|command| command.get("command_line")).is_some_and(|line|
+                !line.as_str().is_some_and(|line| proof.matches_command(line)))
+            || result.get("command_line").is_some_and(|line|
+                !line.as_str().is_some_and(|line| proof.matches_command(line)))
+            || call_id.trim().is_empty() || call_id.len() > 256
+            || result.get("command_id").and_then(Value::as_str).is_some_and(|id|
+                call_id != id && !call_id.strip_suffix(id)
+                    .is_some_and(|prefix| prefix.ends_with(".tool.command_run:")))
+            || result.get("runtime_id").is_some_and(|runtime|
+                !runtime.as_str().is_some_and(|runtime| !runtime.is_empty()
+                    && call_id.strip_prefix(runtime)
+                        .is_some_and(|suffix| suffix.starts_with(".tool.command_run:"))))
         {
             return None;
         }
@@ -391,7 +606,7 @@ pub(crate) struct TerminalVerifierProof {
     pub(crate) verifier_index: usize,
     pub(crate) verifier_sha256: String,
     pub(crate) call_id: String,
-    pub(crate) source_postimages: std::collections::BTreeMap<String, TerminalSourcePostimage>,
+    pub(crate) source_postimages: std::collections::BTreeMap<String, Option<TerminalSourcePostimage>>,
 }
 
 impl TerminalVerifierProof {
@@ -412,15 +627,16 @@ impl TerminalVerifierProof {
         let images = value["source_postimages"].as_object()?;
         if images.len() > Self::MAX_SOURCE_TARGETS || !images.iter().all(|(path, image)|
             !path.is_empty() && path.len() <= 256
-                && exact_object(image, &["sha256", "bytes", "mode"]).is_some()
-                && source_digest(&image["sha256"]).is_some())
+                && (image.is_null()
+                    || (exact_object(image, &["sha256", "bytes", "mode"]).is_some()
+                        && source_digest(&image["sha256"]).is_some())))
         {
             return None;
         }
         // Bound every allocating field before deserializing. This schema is
         // shared with the tracker; preservation alone authenticates nothing.
         let proof: Self = serde::Deserialize::deserialize(value).ok()?;
-        proof.source_postimages.values().all(|image|
+        proof.source_postimages.values().flatten().all(|image|
             image.mode <= 0o177777 && image.bytes <= i64::MAX as u64).then_some(proof)
     }
 }
@@ -553,9 +769,12 @@ fn source_digest(value: &Value) -> Option<&str> {
     (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(digest)
 }
 
-fn source_path(value: &Value) -> Option<&str> {
+fn source_path(value: &Value, text_delta_v1: bool) -> Option<&str> {
     let path = value.as_str()?;
-    (!path.is_empty() && path.ends_with(".py")
+    let supported_extension = path.ends_with(".py")
+        || (text_delta_v1 && path.rsplit_once('.').is_some_and(|(_, extension)|
+            matches!(extension, "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "rs")));
+    (!path.is_empty() && supported_extension
         && !path.chars().any(|ch| ch < ' ' || ch == '\u{7f}' || matches!(ch, '\\' | ':' | '*' | '?' | '[' | ']'))
         && path.split('/').all(|part| !matches!(part, "" | "." | "..")))
         .then_some(path)
@@ -649,7 +868,8 @@ fn valid_source_postimages(projection: &Value) -> Option<()> {
             &["path", "preimage_sha256", "postimage_sha256", "locators", "spans"]
         };
         let file = exact_object(file, keys)?;
-        if !paths.insert(source_path(&file["path"])?)
+        // Non-Python is supported only for v1 text deltas, not AST schemas.
+        if !paths.insert(source_path(&file["path"], delta && !navigation)?)
             || source_digest(&file["preimage_sha256"])?
                 .eq_ignore_ascii_case(source_digest(&file["postimage_sha256"])?)
         {
@@ -799,6 +1019,16 @@ fn sanitize_object(map: &serde_json::Map<String, Value>) -> Value {
 
 fn sanitize_object_field(map: &serde_json::Map<String, Value>, field: &str, item: &Value) -> Value {
     match field {
+        "source_delta" => {
+            let sanitized = sanitize_value(item, None);
+            if sanitized == *item {
+                sanitized
+            } else {
+                // Never retain complete-coverage metadata over altered source bytes.
+                serde_json::json!({"omitted_from_record": true,
+                    "reason": "Applied source delta did not survive output sanitization losslessly; use granted source reads."})
+            }
+        }
         "source_postimages" => bounded_source_postimages_for_context(item, None, None),
         "visual_previews" => media_channel_summary(map, field, "visual_preview_count", item),
         "audio_previews" => media_channel_summary(map, field, "audio_preview_count", item),
@@ -929,10 +1159,274 @@ pub(crate) mod tests {
     use super::{
         SOURCE_POSTIMAGE_MAX_JSON_BYTES, SOURCE_READ_RANGE_MAX_RESULT_BYTES,
         SOURCE_READ_RANGE_MAX_TEXT_BYTES, TOOL_CALLBACK_OUTPUT_MAX_BYTES,
-        json_within_byte_budget, producer_json_bytes, sanitize_tool_callback_output,
+        bounded_source_read_page, json_within_byte_budget, producer_json_bytes, sanitize_tool_callback_output,
         sanitize_tool_callback_result, truncate_middle,
     };
+    use code_tools::commands::source_read::SourceReadContentEvidence;
     use serde_json::json;
+
+    #[test]
+    fn applied_source_delta_is_lossless_or_omitted_without_dropping_edit_identity() {
+        for text in ["short\n".to_owned(), "x".repeat(TOOL_CALLBACK_OUTPUT_MAX_BYTES + 1),
+                     "data:image/png;base64,AAAA".to_owned()] {
+            let delta = json!({"schema_version":"nokiy_applied_source_delta_v1",
+                "coverage":"all_text_changes", "hunks":[{"after_text":text}]});
+            let input = json!({"command_type":"apply_patch", "success":true, "output":{
+                "changes":[{"path":"file", "postimage_sha256":"a".repeat(64), "source_delta":delta}]}});
+            let output = sanitize_tool_callback_output(&input);
+            let change = &output["output"]["changes"][0];
+            assert_eq!(change["postimage_sha256"], "a".repeat(64));
+            if text.len() <= TOOL_CALLBACK_OUTPUT_MAX_BYTES {
+                assert_eq!(change["source_delta"], delta);
+            } else {
+                assert_eq!(change["source_delta"]["omitted_from_record"], true);
+                assert!(change["source_delta"].get("coverage").is_none());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires recorded apply_patch output from the offline acceptance fixture"]
+    fn applied_source_delta_recorded_callback_is_lossless() {
+        let change: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            std::env::var("NOKIY_PATCH_REPLAY_RESULT").unwrap()).unwrap()).unwrap();
+        assert_eq!(change["source_delta"]["coverage"], "all_text_changes");
+        let result = json!({"command_type":"apply_patch", "success":true,
+            "command_index":0, "step":1, "output":{"changes":[change]}});
+        let command = json!({"command_type":"apply_patch", "command_index":0, "step":1});
+        let streamed = crate::provider_flow::streamed_command_run::streamed_command_result_record(
+            "completed", "runtime", 0, &result, chrono::Utc::now());
+        let event = crate::provider_flow::streamed_command_run::streamed_command_event_record(
+            "completed", "runtime", "call", 0, &command, Some(&result), chrono::Utc::now());
+        for value in [result, streamed, event.clone(),
+            json!({"streamed_command_run_result":{"results":[event["result"].clone()]}})] {
+            assert_eq!(sanitize_tool_callback_output(&value), value);
+        }
+    }
+
+    fn delta_readback_batch() -> serde_json::Value {
+        let mut read = source_read_result();
+        read["step"] = json!(2);
+        read["command_run_id"] = json!("run");
+        read["command_id"] = json!("read");
+        let after = read["output"]["stdout"].as_str().unwrap().split_inclusive('\n')
+            .take(20).map(|line| line.split_once(": ").unwrap().1).collect::<String>();
+        json!({"results":[{
+            "command_type":"apply_patch", "command_id":"patch", "command_run_id":"run",
+            "step":1, "success":true, "output":{"exit_code":0, "changes":[{
+                "path":"tests/test_graph_process.py", "postimage_sha256":"a".repeat(64),
+                "preimage_sha256":"b".repeat(64), "source_delta":{
+                    "schema_version":"nokiy_applied_source_delta_v1", "coverage":"all_text_changes",
+                    "hunks":[{"after_start_line":69, "after_line_count":20,
+                        "before_text":"old\n".repeat(20), "after_text":after}]}}]}}, read]})
+    }
+
+    #[test]
+    fn covered_delta_omits_only_optional_copy_and_is_idempotent() {
+        let batch = delta_readback_batch();
+        let mut output = sanitize_tool_callback_output(&batch);
+        super::omit_readback_covered_deltas(output["results"].as_array_mut().unwrap(), None);
+        let delta = &output["results"][0]["output"]["changes"][0]["source_delta"];
+        assert_eq!(delta["omitted_from_context"], true);
+        assert_eq!(delta["represented_by_result_indexes"], json!([1]));
+        assert!(delta.get("coverage").is_none());
+        assert_eq!(output["results"][1], batch["results"][1]);
+        assert_eq!(output["results"][0]["output"]["changes"][0]["postimage_sha256"], "a".repeat(64));
+        assert_eq!(sanitize_tool_callback_output(&output), output);
+        assert!(serde_json::to_vec(&output).unwrap().len() < serde_json::to_vec(&batch).unwrap().len());
+    }
+
+    #[test]
+    fn canonical_batch_preserves_individually_streamed_result_identity() {
+        let batch = delta_readback_batch();
+        let output = sanitize_tool_callback_output(&batch);
+        for (index, result) in batch["results"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(output["results"][index], sanitize_tool_callback_output(result));
+        }
+        assert_eq!(output["results"][0]["output"]["changes"][0]["source_delta"],
+            batch["results"][0]["output"]["changes"][0]["source_delta"]);
+    }
+
+    #[test]
+    fn covered_delta_keeps_original_on_incomplete_mismatched_or_failed_read() {
+        let original = delta_readback_batch();
+        for (pointer, value) in [
+            ("/results/1/output/source_sha256", json!("c".repeat(64))),
+            ("/results/1/output/path", json!("other.py")),
+            ("/results/1/step", json!(1)),
+            ("/results/1/command_run_id", json!("other")),
+            ("/results/1/success", json!(false)),
+            ("/results/1/output/truncated", json!(true)),
+            ("/results/1/output/stdout", json!("69: wrong\n")),
+            ("/results/0/success", json!(false)),
+            ("/results/0/output/changes/0/source_delta/hunks/0/after_start_line", json!(1)),
+            ("/results/0/output/changes/0/source_delta/hunks/0/after_line_count", json!(0)),
+        ] {
+            let mut input = original.clone();
+            *input.pointer_mut(pointer).unwrap() = value;
+            let mut output = sanitize_tool_callback_output(&input);
+            super::omit_readback_covered_deltas(output["results"].as_array_mut().unwrap(), None);
+            assert_eq!(output["results"][0]["output"]["changes"][0]["source_delta"],
+                input["results"][0]["output"]["changes"][0]["source_delta"], "{pointer}");
+        }
+        let mut input = original.clone();
+        input["results"][1]["output"]["stdout"] = json!(input["results"][1]["output"]["stdout"]
+            .as_str().unwrap().replacen("abcdef", "ABCDEF", 1));
+        assert_eq!(sanitize_tool_callback_output(&input)["results"][0], original["results"][0]);
+        input = original.clone();
+        input["commands"] = json!([{"command_type":"wrong"}, {"command_type":"source_read"}]);
+        assert_eq!(sanitize_tool_callback_output(&input)["results"][0], original["results"][0]);
+        input = original.clone();
+        input["results"].as_array_mut().unwrap().push(original["results"][0].clone());
+        assert_eq!(sanitize_tool_callback_output(&input)["results"][0], original["results"][0]);
+    }
+
+    #[test]
+    fn applied_delta_provider_projection_requires_bounded_complete_text() {
+        let change = json!({"path":"src/file.py", "preimage_sha256":"a".repeat(64),
+            "postimage_sha256":"b".repeat(64), "source_delta":{
+                "schema_version":"nokiy_applied_source_delta_v1", "coverage":"all_text_changes",
+                "line_count":2, "hunks":[{"before_start_line":1, "before_line_count":1,
+                    "after_start_line":1, "after_line_count":1, "before_text":"old\r\n", "after_text":"\u{65b0}\r\n"}]}});
+        assert_eq!(super::bounded_applied_delta(change.as_object().unwrap()), Some(change["source_delta"].clone()));
+        for (pointer, value) in [
+            ("/preimage_sha256", json!("bad")), ("/path", json!("../outside.py")),
+            ("/source_delta/schema_version", json!("unknown")), ("/source_delta/line_count", json!(1)),
+            ("/source_delta/hunks/0/after_line_count", json!(2)),
+            ("/source_delta/hunks/0/after_start_line", json!(2)),
+            ("/source_delta/hunks/0/after_text", json!("x".repeat(40_000))),
+        ] {
+            let mut invalid = change.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(super::bounded_applied_delta(invalid.as_object().unwrap()).is_none(), "{pointer}");
+        }
+        let mut deletion = change.clone();
+        deletion["source_delta"]["line_count"] = json!(1);
+        deletion["source_delta"]["hunks"][0]["after_line_count"] = json!(0);
+        deletion["source_delta"]["hunks"][0]["after_text"] = json!("");
+        assert!(super::bounded_applied_delta(deletion.as_object().unwrap()).is_some());
+    }
+
+    #[test]
+    #[ignore = "requires one recorded completed worker batch, no provider execution"]
+    fn covered_delta_recorded_batch_reduces_callback_without_changing_reads() {
+        let path = std::env::var("NOKIY_READBACK_BATCH_FIXTURE").unwrap();
+        let batch: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        // Disable only the new optional-delta rule to obtain the old projection.
+        let mut prior = batch.clone();
+        prior["results"][0]["output"]["changes"][0]["source_delta"]["schema_version"] = json!("preimage-probe");
+        let mut expected = sanitize_tool_callback_output(&prior);
+        expected["results"][0]["output"]["changes"][0]["source_delta"]["schema_version"] = json!("nokiy_applied_source_delta_v1");
+        let mut output = sanitize_tool_callback_output(&batch);
+        super::omit_readback_covered_deltas(output["results"].as_array_mut().unwrap(), None);
+        assert_eq!(output["results"][0]["output"]["changes"][0]["source_delta"]["omitted_from_context"], true);
+        let mut restored = output.clone();
+        restored["results"][0]["output"]["changes"][0]["source_delta"] =
+            expected["results"][0]["output"]["changes"][0]["source_delta"].clone();
+        assert_eq!(restored, expected);
+        assert_eq!(sanitize_tool_callback_output(&output), output);
+        let before = serde_json::to_vec(&expected).unwrap().len();
+        let after = serde_json::to_vec(&output).unwrap().len();
+        assert!(after < before);
+        println!("READBACK_DEDUP_JSON_BYTES before={before} after={after} saved={}", before-after);
+    }
+
+    fn terminal_reply_result() -> serde_json::Value {
+        let answer = serde_json::to_string_pretty(&json!({
+            "findings": (0..12).map(|id| json!({
+                "id": id, "answer": "caf\u{e9} \u{8b49}\u{64da} ".repeat(128),
+            })).collect::<Vec<_>>(),
+        })).unwrap();
+        assert!(answer.len() > 16_384);
+        json!({
+            "command_type": "task_status", "command_index": 0, "step": 1,
+            "success": true, "error": null,
+            "output": {"task_status": {"status": "done", "final_reply": answer}},
+        })
+    }
+
+    #[test]
+    fn explicit_terminal_reply_survives_all_callback_channels_losslessly() {
+        let result = terminal_reply_result();
+        let command = json!({"command_type": "task_status", "step": 1, "command_index": 0});
+        let streamed = crate::provider_flow::streamed_command_run::streamed_command_result_record(
+            "completed", "runtime", 0, &result, chrono::Utc::now());
+        let event = crate::provider_flow::streamed_command_run::streamed_command_event_record(
+            "completed", "runtime", "call", 0, &command, Some(&result), chrono::Utc::now());
+        assert_eq!(streamed["result"], result);
+        assert_eq!(event["result"], result);
+        for value in [
+            result.clone(), streamed, event,
+            json!({"results": [result]}),
+            json!({"results": [{"mode": "batch", "results": [result]}]}),
+            json!({"streamed_command_run_result": {"results": [result]}}),
+            json!({"tool_name": "command_run", "input": {"commands": [command]},
+                "output": {"commands": [command], "results": [result]}}),
+        ] {
+            for _ in 0..3 {
+                assert_eq!(sanitize_tool_callback_result(&value), value);
+                assert_eq!(sanitize_tool_callback_output(&value), value);
+            }
+        }
+        let mut logs = result.clone();
+        logs["output"]["stdout"] = json!("x".repeat(20_000));
+        logs["output"]["task_status"]["task_group"] = json!("x".repeat(20_000));
+        let sanitized = sanitize_tool_callback_result(&logs);
+        assert_eq!(sanitized["output"]["task_status"]["final_reply"],
+                   result["output"]["task_status"]["final_reply"]);
+        for value in [&sanitized["output"]["stdout"], &sanitized["output"]["task_status"]["task_group"]] {
+            assert!(value.as_str().unwrap().len() <= TOOL_CALLBACK_OUTPUT_MAX_BYTES);
+            assert!(value.as_str().unwrap().contains("characters truncated"));
+        }
+        assert_eq!(sanitize_tool_callback_result(&sanitized), sanitized);
+    }
+
+    #[test]
+    fn final_reply_key_does_not_exempt_generic_or_invalid_output() {
+        fn assert_reply_bounded(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, item) in map {
+                        if key == "final_reply" {
+                            assert!(item.as_str().unwrap().len() <= TOOL_CALLBACK_OUTPUT_MAX_BYTES);
+                        }
+                        assert_reply_bounded(item);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(assert_reply_bounded),
+                _ => {}
+            }
+        }
+        let result = terminal_reply_result();
+        for (path, value) in [
+            ("/command_type", json!("shell")), ("/step", json!(0)),
+            ("/success", json!(false)), ("/error", json!("failed")),
+            ("/output/task_status/status", json!("doing")),
+        ] {
+            let mut invalid = result.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            let sanitized = sanitize_tool_callback_result(&invalid);
+            assert!(sanitized["output"]["task_status"]["final_reply"].as_str().unwrap()
+                .contains("characters truncated"), "{path}");
+        }
+        let mut compact = result.clone();
+        compact["output"]["task_status"]["compact_context"] = json!("pending");
+        let command = json!({"command_type": "task_status", "step": 1, "command_index": 0});
+        for invalid in [
+            compact, json!({"advisory": result}), result["output"].clone(),
+            json!({"tool_name": "other", "output": {"results": [result]}}),
+            json!({"tool_name": "command_run", "input": {"commands": [{"command_type": "shell"}]},
+                "output": {"results": [result]}}),
+            json!({"commands": [{"command_type": "task_status", "step": 2}], "results": [result]}),
+            json!({"commands": [{"command_type": "task_status", "command_index": 1}], "results": [result]}),
+            json!({"tool_name": "command_run", "input": {"commands": [command]},
+                "output": {"commands": [{"command_type": "shell"}], "results": [result]}}),
+        ] {
+            let sanitized = sanitize_tool_callback_result(&invalid);
+            assert!(sanitized.to_string().contains("characters truncated"));
+            assert_reply_bounded(&sanitized);
+        }
+    }
 
     pub(crate) fn source_read_result() -> serde_json::Value {
         let stdout = (69..=248).map(|line| format!("{line}: {}{}\n",
@@ -1068,6 +1562,241 @@ pub(crate) mod tests {
         assert!(projected["output"]["stdout"].as_str().unwrap().len() <= TOOL_CALLBACK_OUTPUT_MAX_BYTES);
         assert_ne!(projected["output"]["stdout"], result["output"]["stdout"]);
         assert_eq!(sanitize_tool_callback_result(&projected), projected);
+    }
+
+    fn sha_pinned_source_read_result(numbered: bool) -> (serde_json::Value, serde_json::Value) {
+        let mut result = source_read_result();
+        if !numbered {
+            result["output"].as_object_mut().unwrap().remove("line_numbers");
+            result["output"]["stdout"] = json!(format!("{}\n", "é".repeat(30)).repeat(180));
+        }
+        let request = json!({
+            "path": result["output"]["path"], "start_line": 69, "end_line": 248,
+            "expected_sha256": result["output"]["source_sha256"], "line_numbers": numbered,
+        });
+        let proof = json!({
+            "schema_version": "nokiy_source_read_content_v1", "request": request,
+            "source_sha256": result["output"]["source_sha256"], "content_satisfied": true,
+        });
+        result["command_id"] = json!("source-page");
+        result["runtime_id"] = json!("runtime");
+        result["output"]["source_read_evidence"] = proof.clone();
+        result["output"]["terminal_receipt"]["source_read_evidence"] = proof;
+        result["output"]["terminal_receipt"]["call_id"] = json!("runtime.tool.command_run:source-page");
+        result["output"]["terminal_receipt"]["pid"] = json!(null);
+        let mut arguments = request;
+        arguments["expected_sha256"] = json!("A".repeat(64));
+        if numbered {
+            arguments.as_object_mut().unwrap().remove("line_numbers");
+        }
+        let command = json!({
+            "command_type": "source_read", "step": 1, "command_index": 0,
+            "command_id": "source-page", "command_line": arguments.to_string(),
+        });
+        (result, command)
+    }
+
+    #[test]
+    fn digest_reference_pages_remain_complete_without_becoming_retry_proofs() {
+        for kind in ["admitted", "observed"] {
+            let (mut result, mut command) = sha_pinned_source_read_result(true);
+            let mut request = result["output"]["source_read_evidence"]["request"].clone();
+            request.as_object_mut().unwrap().remove("expected_sha256");
+            request["expected_sha256_ref"] = json!(kind);
+            command["command_line"] = json!(request.to_string());
+            result["output"].as_object_mut().unwrap().remove("source_read_evidence");
+            result["output"]["terminal_receipt"].as_object_mut().unwrap().remove("source_read_evidence");
+            let key = format!("{kind}_digest_reference");
+            result["output"][&key] = json!({"schema_version":format!("nokiy_{kind}_source_digest_v1"),
+                "request": request, "expected_sha256":result["output"]["source_sha256"]});
+            assert!(bounded_source_read_page(&result, Some(&command)).is_some());
+            assert_eq!(sanitize_tool_callback_result(&result), result);
+            let mut partial = result.clone();
+            partial["output"]["requested_end_line"] = json!(300);
+            partial["output"]["truncated"] = json!(true);
+            partial["output"]["truncation_reason"] = json!("response_limit");
+            partial["output"][&key]["request"]["end_line"] = json!(300);
+            let mut paged_command = command.clone();
+            paged_command["command_line"] = json!(partial["output"][&key]["request"].to_string());
+            assert!(bounded_source_read_page(&partial, Some(&paged_command)).is_some());
+            assert_eq!(sanitize_tool_callback_result(&partial), partial);
+            for (field, value) in [("expected_sha256", json!("b".repeat(64))),
+                ("schema_version", json!("unknown")), ("unknown", json!(true))] {
+                let mut invalid = result.clone();
+                invalid["output"][&key][field] = value;
+                assert!(bounded_source_read_page(&invalid, Some(&command)).is_none());
+            }
+            let mut wrong = command.clone();
+            request["end_line"] = json!(249);
+            wrong["command_line"] = json!(request.to_string());
+            assert!(bounded_source_read_page(&result, Some(&wrong)).is_none());
+            let mut foreign = result.clone();
+            foreign["output"]["terminal_receipt"]["call_id"] = json!("foreign.tool.command_run:source-page");
+            assert!(bounded_source_read_page(&foreign, Some(&command)).is_none());
+            let mut no_receipt = result.clone();
+            no_receipt["output"].as_object_mut().unwrap().remove("terminal_receipt");
+            assert!(bounded_source_read_page(&no_receipt, Some(&command)).is_none());
+        }
+    }
+
+    #[test]
+    fn sha_pinned_raw_and_numbered_source_pages_remain_byte_complete() {
+        for numbered in [false, true] {
+            let (result, command) = sha_pinned_source_read_result(numbered);
+            assert!(result["output"]["stdout"].as_str().unwrap().len() > TOOL_CALLBACK_OUTPUT_MAX_BYTES);
+            assert!(json_within_byte_budget(&result["output"]["stdout"], SOURCE_READ_RANGE_MAX_TEXT_BYTES));
+            assert!(json_within_byte_budget(&result["output"], SOURCE_READ_RANGE_MAX_RESULT_BYTES));
+            assert!(SourceReadContentEvidence::parse_bounded(&result["output"]["source_read_evidence"]).is_some());
+            assert!(bounded_source_read_page(&result, None).is_some());
+            assert!(bounded_source_read_page(&result, Some(&command)).is_some());
+            assert_eq!(sanitize_tool_callback_result(&result), result);
+            assert_eq!(sanitize_tool_callback_output(&result), result);
+            let mut with_command_line = result.clone();
+            with_command_line["command_line"] = command["command_line"].clone();
+            assert_eq!(sanitize_tool_callback_result(&with_command_line), with_command_line);
+            let event = crate::provider_flow::streamed_command_run::streamed_command_result_record(
+                "completed", "runtime", 0, &result, chrono::Utc::now());
+            assert_eq!(sanitize_tool_callback_result(&event), event);
+            for batch in [
+                json!({"results": [result]}),
+                json!({"streamed_command_run_result": {"commands": [command], "results": [result]}}),
+                json!({"tool_name": "command_run", "input": {"commands": [command]},
+                    "output": {"commands": [command], "results": [result]}}),
+            ] {
+                let projected = sanitize_tool_callback_output(&batch);
+                assert_eq!(projected, batch);
+                assert_eq!(sanitize_tool_callback_output(&projected), projected);
+            }
+        }
+    }
+
+    #[test]
+    fn sha_pinned_source_pages_reject_tampered_incomplete_and_wrong_selector_proofs() {
+        for numbered in [false, true] {
+            let (result, _) = sha_pinned_source_read_result(numbered);
+            let evidence = &result["output"]["source_read_evidence"];
+            let reject = |proof: serde_json::Value| {
+                let mut invalid = result.clone();
+                invalid["output"]["source_read_evidence"] = proof.clone();
+                invalid["output"]["terminal_receipt"]["source_read_evidence"] = proof;
+                assert!(bounded_source_read_page(&invalid, None).is_none());
+                assert_source_page_rejected(&invalid);
+            };
+            for (pointer, replacement) in [
+                ("/schema_version", json!("unknown")), ("/content_satisfied", json!(false)),
+                ("/source_sha256", json!("b".repeat(64))),
+                ("/request/path", json!("other.rs")), ("/request/start_line", json!(70)),
+                ("/request/end_line", json!(249)), ("/request/line_numbers", json!(!numbered)),
+                ("/request/expected_sha256", json!("b".repeat(64))),
+            ] {
+                let mut proof = evidence.clone();
+                *proof.pointer_mut(pointer).unwrap() = replacement;
+                reject(proof);
+            }
+            for (site, key) in [
+                ("", "schema_version"), ("", "request"), ("", "source_sha256"), ("", "content_satisfied"),
+                ("/request", "path"), ("/request", "start_line"), ("/request", "end_line"),
+                ("/request", "expected_sha256"), ("/request", "line_numbers"),
+            ] {
+                let mut proof = evidence.clone();
+                proof.pointer_mut(site).unwrap().as_object_mut().unwrap().remove(key);
+                reject(proof);
+            }
+            for site in ["", "/request"] {
+                let mut proof = evidence.clone();
+                proof.pointer_mut(site).unwrap()["unknown"] = json!(true);
+                reject(proof);
+            }
+            reject(json!(null));
+            reject(json!("not an evidence object"));
+            let mut wrong_source = evidence.clone();
+            wrong_source["source_sha256"] = json!("b".repeat(64));
+            wrong_source["request"]["expected_sha256"] = json!("b".repeat(64));
+            assert!(SourceReadContentEvidence::parse_bounded(&wrong_source).is_some());
+            reject(wrong_source);
+            let mut mismatch = evidence.clone();
+            mismatch["request"]["expected_sha256"] = json!("b".repeat(64));
+            mismatch["content_satisfied"] = json!(false);
+            assert!(SourceReadContentEvidence::parse_bounded(&mismatch).is_some());
+            reject(mismatch);
+            for request in [
+                json!({"path": evidence["request"]["path"], "search_terms": ["x"],
+                    "start_line": 69, "context_lines": 0, "line_numbers": true,
+                    "expected_sha256": evidence["source_sha256"]}),
+                json!({"path": evidence["request"]["path"], "json_pointer": "/selected",
+                    "expected_sha256": evidence["source_sha256"]}),
+            ] {
+                let mut proof = evidence.clone();
+                proof["request"] = request;
+                assert!(SourceReadContentEvidence::parse_bounded(&proof).is_some());
+                reject(proof);
+            }
+            // Each partial-page shape is otherwise accepted without a proof.
+            for (requested, reason, total) in [(300, "response_limit", 300), (400, "end_of_file", 248)] {
+                let mut partial = result.clone();
+                partial["output"]["requested_end_line"] = json!(requested);
+                partial["output"]["truncated"] = json!(true);
+                partial["output"]["truncation_reason"] = json!(reason);
+                partial["output"]["total_lines"] = json!(total);
+                if reason == "end_of_file" {
+                    partial["output"]["at_eof"] = json!(true);
+                    partial["output"]["next_line"] = json!(null);
+                }
+                assert!(bounded_source_read_page(&partial, None).is_none());
+                assert_source_page_rejected(&partial);
+                partial["output"].as_object_mut().unwrap().remove("source_read_evidence");
+                partial["output"]["terminal_receipt"].as_object_mut().unwrap().remove("source_read_evidence");
+                assert!(bounded_source_read_page(&partial, None).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn sha_pinned_source_pages_reject_receipt_and_command_mismatches() {
+        for numbered in [false, true] {
+            let (result, command) = sha_pinned_source_read_result(numbered);
+            for (site, field, replacement) in [
+                ("/output", "terminal_receipt", json!(null)),
+                ("/output/terminal_receipt", "source_read_evidence", json!(null)),
+                ("/output/terminal_receipt", "call_id", json!("another-call")),
+                ("/output/terminal_receipt", "call_id", json!("other-runtime.tool.command_run:source-page")),
+                ("/output/terminal_receipt", "terminal_state", json!("failed")),
+                ("/output/terminal_receipt", "process_reaped", json!(false)),
+                ("/output/terminal_receipt", "timed_out", json!(true)),
+                ("/output/terminal_receipt/source_read_evidence", "unknown", json!(true)),
+            ] {
+                let mut invalid = result.clone();
+                invalid.pointer_mut(site).unwrap()[field] = replacement;
+                assert!(bounded_source_read_page(&invalid, None).is_none());
+                assert_source_page_rejected(&invalid);
+            }
+            for (site, field) in [
+                ("/output", "source_read_evidence"), ("/output", "terminal_receipt"),
+                ("/output/terminal_receipt", "source_read_evidence"), ("/output/terminal_receipt", "call_id"),
+            ] {
+                let mut invalid = result.clone();
+                invalid.pointer_mut(site).unwrap().as_object_mut().unwrap().remove(field);
+                assert!(bounded_source_read_page(&invalid, None).is_none());
+                assert_source_page_rejected(&invalid);
+            }
+            let mut other_selector = result["output"]["source_read_evidence"]["request"].clone();
+            other_selector["start_line"] = json!(70);
+            for replacement in [json!(null), json!("not JSON"), json!(other_selector.to_string())] {
+                let mut wrong = command.clone();
+                wrong["command_line"] = replacement.clone();
+                assert!(bounded_source_read_page(&result, Some(&wrong)).is_none());
+                let batch = json!({"tool_name": "command_run", "input": {"commands": [wrong]},
+                    "output": {"results": [result]}});
+                let projected = sanitize_tool_callback_output(&batch);
+                let rejected = &projected["output"]["results"][0];
+                assert!(rejected["output"]["stdout"].as_str().unwrap().len() <= TOOL_CALLBACK_OUTPUT_MAX_BYTES);
+                assert_ne!(rejected["output"]["stdout"], result["output"]["stdout"]);
+                assert_eq!(sanitize_tool_callback_output(&projected), projected);
+                let mut direct = result.clone();
+                direct["command_line"] = replacement;
+                assert_source_page_rejected(&direct);
+            }
+        }
     }
 
     #[test]
@@ -1289,6 +2018,204 @@ pub(crate) mod tests {
         })
     }
 
+    fn source_postimage_projection(path: &str, delta: bool) -> serde_json::Value {
+        let mut file = json!({
+            "path": path, "preimage_sha256": "1".repeat(64), "postimage_sha256": "2".repeat(64),
+        });
+        if delta {
+            file["coverage"] = json!("all_text_changes");
+            file["hunks"] = json!([{
+                "before_start_line": 7, "before_line_count": 1,
+                "after_start_line": 7, "after_line_count": 1,
+                "before_text": "value = 171\r\n", "after_text": "value = 172\r\n",
+            }]);
+        } else {
+            file["locators"] = json!([{
+                "qualified_name": "value", "kind": "binding", "line": 7,
+                "start_line": 7, "end_line": 7, "complete": true,
+            }]);
+            file["spans"] = json!([{
+                "start_line": 7, "end_line": 7, "text": "value = 172\r\n",
+            }]);
+        }
+        json!({
+            "schema_version": if delta { "nokiy_source_postimage_delta_v1" } else { "nokiy_source_postimages_v1" },
+            "kind": if delta { "verifier_postimage_delta" } else { "verifier_postimage_context" },
+            "jspace_semantic_sha256": "3".repeat(64),
+            "notice": if delta { super::SOURCE_POSTIMAGE_DELTA_NOTICE } else { super::SOURCE_POSTIMAGES_NOTICE },
+            "files": [file],
+        })
+    }
+
+    fn source_postimage_projections(path: &str) -> [serde_json::Value; 3] {
+        let delta = source_postimage_projection(path, true);
+        let mut navigation = delta.clone();
+        navigation["schema_version"] = json!("nokiy_source_postimage_delta_v2");
+        navigation["notice"] = json!(format!("{}{}",
+            super::SOURCE_POSTIMAGE_DELTA_NOTICE, super::SOURCE_POSTIMAGE_DELTA_V2_NOTICE_SUFFIX));
+        navigation["files"][0]["locators"] = json!([{
+            "qualified_name": "value", "kind": "binding", "line": 7, "start_line": 7, "end_line": 7,
+        }]);
+        [source_postimage_projection(path, false), delta, navigation]
+    }
+
+    fn verifier_postimage_result(projection: serde_json::Value) -> serde_json::Value {
+        let mut result = verifier_proof_result();
+        result["output"]["source_postimages"] = projection;
+        result["output"]["terminal_receipt"] = json!({
+            "schema_version": "tura_command_terminal_receipt_v1",
+            "exit_code": 0, "outcome": "known", "terminal_state": "completed",
+            "process_reaped": true, "process_group_empty": true,
+            "termination_proven": true, "reconcile_required": false,
+            "termination_origin": "parent_verifier", "failure_class": "workload",
+            "authoritative_publication": "unproven", "authority_effect": "none",
+            "auto_retry_allowed": false, "call_id": "proof-call", "pid": null,
+            "replay_semantics": "diagnosed_replay_only_after_no_authoritative_publication_or_idempotent_cas_proof",
+            "retry_safe": false, "staging_authority": "none", "stall_timeout_ms": null,
+            "wall_time_ms": 491, "wall_timeout_ms": 30000,
+        });
+        result
+    }
+
+    #[test]
+    fn sanitizer_preserves_v1_text_deltas_for_supported_extensions() {
+        for extension in ["py", "js", "mjs", "cjs", "jsx", "ts", "tsx", "rs"] {
+            let path = format!("src/answer.{extension}");
+            let projection = source_postimage_projection(&path, true);
+            let result = verifier_postimage_result(projection.clone());
+            assert_eq!(sanitize_tool_callback_output(&result)["output"]["source_postimages"], projection, "{path}");
+            let batch = json!({
+                "tool_name": "command_run",
+                "input": {"commands": [{"command_type": "focused_verifier", "step": 1}]},
+                "output": {"results": [result]},
+            });
+            assert_eq!(sanitize_tool_callback_result(&batch), batch, "{path}");
+            assert_eq!(sanitize_tool_callback_output(&sanitize_tool_callback_output(&batch)), batch, "{path}");
+        }
+    }
+
+    #[test]
+    fn sanitizer_preserves_mixed_v1_text_delta_files() {
+        let mut projection = source_postimage_projection("src/example.py", true);
+        for path in ["src/answer.rs", "web/app.jsx", "web/app.tsx"] {
+            let mut file = projection["files"][0].clone();
+            file["path"] = json!(path);
+            if path.ends_with(".rs") {
+                file["hunks"][0]["before_text"] = json!("fn answer() -> u32 { 171 }\r\n");
+                file["hunks"][0]["after_text"] = json!("fn answer() -> u32 { 172 }\r\n");
+            }
+            projection["files"].as_array_mut().unwrap().push(file);
+        }
+        let result = verifier_postimage_result(projection.clone());
+        assert_eq!(sanitize_tool_callback_output(&result)["output"]["source_postimages"], projection);
+    }
+
+    #[test]
+    fn sanitizer_keeps_definition_and_navigation_postimages_python_only() {
+        for projection in source_postimage_projections("src/example.py") {
+            let result = verifier_postimage_result(projection.clone());
+            assert_eq!(sanitize_tool_callback_output(&result)["output"]["source_postimages"], projection);
+        }
+        for extension in ["js", "mjs", "cjs", "jsx", "ts", "tsx", "rs"] {
+            let path = format!("src/example.{extension}");
+            for (schema, projection) in source_postimage_projections(&path).into_iter().enumerate() {
+                if schema == 1 { continue; }
+                let result = verifier_postimage_result(projection.clone());
+                assert_eq!(sanitize_tool_callback_output(&result)["output"]["source_postimages"]["omitted_from_context"], true, "{path}, schema {schema}");
+                let mut mixed = projection.clone();
+                mixed["files"][0]["path"] = json!("src/example.py");
+                mixed["files"].as_array_mut().unwrap().push(projection["files"][0].clone());
+                let result = verifier_postimage_result(mixed);
+                assert_eq!(sanitize_tool_callback_output(&result)["output"]["source_postimages"]["omitted_from_context"], true, "mixed {path}, schema {schema}");
+            }
+        }
+    }
+
+    #[test]
+    fn sanitizer_omits_unsupported_or_aliased_v1_text_delta_paths() {
+        for path in [
+            "", "rs", "src/answer", "src/answer.go", "src/answer.txt", "src/answer.pyc",
+            "src/answer.pyi", "src/answer.mts", "src/answer.cts", "src/answer.rss",
+            "src/answer.rs.bak", "src/answer.RS", "src/answer.Js", "src/answer.rs ",
+            "/src/answer.rs", "./src/answer.rs", "src/./answer.rs", "src/../answer.rs",
+            "src//answer.rs", "src/answer.rs/", "src\\answer.rs", "C:/answer.rs",
+            "src/*/answer.rs", "src/ans?wer.rs", "src/[answer].rs",
+            "src/answer\u{0}.rs", "src/answer\u{7f}.rs",
+        ] {
+            let result = verifier_postimage_result(source_postimage_projection(path, true));
+            assert_eq!(sanitize_tool_callback_output(&result)["output"]["source_postimages"]["omitted_from_context"], true, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn sanitizer_keeps_non_python_v1_text_delta_bounds() {
+        let base = source_postimage_projection("src/answer.rs", true);
+        for scenario in 0..14 {
+            let mut projection = base.clone();
+            match scenario {
+                0 => projection["kind"] = json!("verifier_postimage_context"),
+                1 => projection["notice"] = json!("changed notice"),
+                2 => projection["jspace_semantic_sha256"] = json!("invalid"),
+                3 => projection["files"][0]["preimage_sha256"] = json!("invalid"),
+                4 => projection["files"][0]["postimage_sha256"] = json!("1".repeat(64)),
+                5 => projection["files"][0]["coverage"] = json!("partial"),
+                6 => projection["files"][0]["locators"] = json!([]),
+                7 => projection["files"][0]["hunks"][0]["after_line_count"] = json!(2),
+                8 => projection["files"][0]["hunks"][0]["after_start_line"] = json!(8),
+                9 => projection["files"][0]["hunks"][0]["after_text"] = json!("🦀".repeat(3_000)),
+                10 => {
+                    let hunk = &mut projection["files"][0]["hunks"][0];
+                    hunk["after_line_count"] = json!(super::SOURCE_POSTIMAGE_MAX_LINES);
+                    hunk["after_text"] = json!("x\n".repeat(super::SOURCE_POSTIMAGE_MAX_LINES as usize));
+                }
+                11 => {
+                    let file = projection["files"][0].clone();
+                    projection["files"].as_array_mut().unwrap().push(file);
+                }
+                12 => {
+                    let template = projection["files"][0].clone();
+                    projection["files"] = serde_json::Value::Array(
+                        (0..=super::SOURCE_POSTIMAGE_MAX_FILES).map(|index| {
+                            let mut file = template.clone();
+                            file["path"] = json!(format!("src/{index}.rs"));
+                            file
+                        }).collect());
+                }
+                _ => projection["unexpected"] = json!(true),
+            }
+            let result = verifier_postimage_result(projection);
+            assert_eq!(sanitize_tool_callback_output(&result)["output"]["source_postimages"]["omitted_from_context"], true, "scenario {scenario}");
+        }
+    }
+
+    #[test]
+    fn sanitizer_keeps_non_python_v1_text_delta_verifier_guards() {
+        let base = verifier_postimage_result(source_postimage_projection("src/answer.rs", true));
+        for (pointer, value) in [
+            ("/command_type", json!("source_read")), ("/success", json!(false)),
+            ("/error", json!("denied_authority")), ("/output/exit_code", json!(1)),
+            ("/output/terminal_receipt/outcome", json!("unknown")),
+            ("/output/terminal_receipt/process_reaped", json!(false)),
+            ("/output/terminal_receipt/process_group_empty", json!(false)),
+            ("/output/terminal_receipt/termination_proven", json!(false)),
+            ("/output/terminal_receipt/reconcile_required", json!(true)),
+            ("/output/terminal_receipt/failure_class", json!("denied_authority")),
+            ("/output/terminal_receipt", json!(null)),
+        ] {
+            let mut result = base.clone();
+            *result.pointer_mut(pointer).unwrap() = value;
+            assert_eq!(sanitize_tool_callback_output(&result)["output"]["source_postimages"]["omitted_from_context"], true, "{pointer}");
+        }
+        let advisory = sanitize_tool_callback_output(&json!({"advisory": base}));
+        assert_eq!(advisory["advisory"]["output"]["source_postimages"]["omitted_from_context"], true);
+        let mismatched_input = json!({
+            "tool_name": "command_run",
+            "input": {"commands": [{"command_type": "source_read", "step": 1}]},
+            "output": {"results": [base]},
+        });
+        assert_eq!(sanitize_tool_callback_result(&mismatched_input)["output"]["results"][0]["output"]["source_postimages"]["omitted_from_context"], true);
+    }
+
     #[test]
     fn sanitizer_preserves_verifier_proof_only_at_typed_canonical_sites() {
         let result = verifier_proof_result();
@@ -1308,6 +2235,22 @@ pub(crate) mod tests {
         let mut wrong_tool = result.clone();
         wrong_tool["command_type"] = json!("source_read");
         assert_eq!(sanitize_tool_callback_output(&wrong_tool)["output"]["verification_evidence"]["source_postimages"]["omitted_from_context"], true);
+    }
+
+    #[test]
+    fn sanitizer_preserves_explicit_null_verifier_postimages_without_accepting_other_shapes() {
+        let mut result = verifier_proof_result();
+        result["output"]["verification_evidence"]["source_postimages"]["src/optional.rs"] = serde_json::Value::Null;
+        assert_eq!(sanitize_tool_callback_output(&result), result);
+        let batch = json!({"results": [result]});
+        assert_eq!(sanitize_tool_callback_output(&batch), batch);
+        assert_eq!(sanitize_tool_callback_output(&sanitize_tool_callback_output(&batch)), batch);
+        for malformed in [json!(false), json!({}), json!([]), json!(""), json!({"sha256": "c".repeat(64)})] {
+            let mut malformed_result = result.clone();
+            malformed_result["output"]["verification_evidence"]["source_postimages"]["src/optional.rs"] = malformed;
+            let sanitized = sanitize_tool_callback_output(&malformed_result);
+            assert_eq!(sanitized["output"]["verification_evidence"]["source_postimages"]["omitted_from_context"], true);
+        }
     }
 
     #[test]

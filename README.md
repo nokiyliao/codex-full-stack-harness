@@ -1,105 +1,84 @@
-# Nokiy v157 - Codex Full Stack Harness
+# Nokiy Full-Stack Harness
 
-This repository publishes the source of the local **Nokiy execution pipeline**.
-The current aggregate release is `v157` (`nokiy-20261007-v157`, 2026-10-07).
-It supersedes the 2026-09-22 `v9` snapshot. The caller source tree still records
-package version `0.3.21.dev0`; the installed wheel built from that tree is stamped
-`0.3.157.dev0`. No binary is renamed or rebuilt just to align version numbers.
-This is a **source snapshot**, not a portable binary release.
+Current source surface: **V456 caller + V455 Rust payload + switchboard c975ad8**, synchronized on 2026-10-28.
+
+This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. Version numbers identify different components: V456 did not rebuild or rename the V455 Rust binaries.
 
 ```text
-Parent Codex task -> Nokiy prepare -> DCF/local context + J-Space
-  -> direct/balanced Rust runtime -> tools -> terminal result -> parent acceptance
+Native Codex thread / Goal / UI
+  -> switchboard model topology and native capability projection
+  -> Nokiy caller: scoped context, DCF navigation and J-Space preparation
+  -> modified Tura-derived Rust worker execution and tools
+  -> bound receipts, combined verification, parent acceptance and recovery
 ```
 
-The default prepared `direct` profile uses execution-local Router and Session DB
-processes; Codex retains the user's task, Goal and UI ownership. The separate
-native-once path is not the default full runtime. The deterministic deploy lane
-carries an already-authorized plan, not model-generated authority.
+| Component | Published directory | Source identity | License |
+| --- | --- | --- | --- |
+| Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `1101c58096f42e6299002a9f1fceba2f021c7d0d` | MIT |
+| Modified Tura-derived execution engine | [runtime](runtime) | `d66a81c966aade525ec5f2ae2316c3236d62c68d` | AGPL-3.0-or-later |
+| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `c975ad840b08b24a1788b17f7de830e73dc928ec` | Repository AGPL-3.0-or-later |
 
-| Source | Purpose | License |
-| --- | --- | --- |
-| [packages/nokiy](packages/nokiy) | Python caller, context preparation, recovery, deployment, tests and skill | MIT |
-| [runtime](runtime) | Modified Tura-derived Rust execution engine and build inputs | AGPL-3.0-or-later |
-| [releases/v9.json](releases/v9.json) | Unified release identity, per-file source hashes and installed artifact identities | Repository license |
+[Current source manifest](releases/v456.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
 
-## Verify and build
+## What Is Included
+
+- Current coordinator/worker routing and bounded parallel execution.
+- DCF navigation extraction and resolution, local context, J-Space preparation and preserved license notices.
+- Original-request recovery, complete reported usage accounting and explicit parent acceptance.
+- Bound verifier-output pointers, settled-failure handling and same-batch verifier input identities.
+- Missing-exec coordinator fallback with advertised-tool diagnostics.
+- Supervised hot reload, immutable host generations and exact cross-release dispatch-result binding.
+- Compact final-acceptance defaults for intent, ordinary and shared/delta batch members, using their existing read grants.
+- Typed intake validation rejections return correctable diagnostics without starting a worker; they are not worker success or permission grants.
+
+Native Codex retains session, Goal, UI and permission ownership. No retired Tura Skill, private App database writer or second general messaging authority is activated by publishing this source.
+
+## Verify Source
+
+Python 3.11+:
 
 ```sh
 python3 scripts/verify_release.py
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+These commands verify the publication manifest and its verifier, without model calls or service installation. They do not prove runtime installation, provider access or binary reproducibility.
+
+## Build Components
+
+```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install ./packages/nokiy
-.venv/bin/nokiy-embedded-run --help
 cd runtime
 cargo build --locked --release --bin tura_router --bin tura_runtime --bin tura_session_db --bin tura_exec
 ```
 
-Python 3.11+ and the Rust toolchain pinned in `runtime/rust-toolchain.toml` are
-required. Building is not live installation: execution also needs a machine-local
-frozen runtime image, native Codex identity and a scoped prepared request.
-See [v157 boundaries](docs/nokiy-v157.md). Do not copy credentials or reuse another
-machine's absolute installation paths. DCF remains an external integration.
+The Rust names preserve their actual source lineage. The caller source package version remains `0.3.21.dev0`; the installed release wheel was stamped `0.3.456.dev0` by its existing release process. No version-only rebuild is claimed.
 
-Source-to-binary reproducibility and clean-machine runtime installation have not
-been established by this publication. Installed binary hashes are observations,
-not proof that the source snapshot rebuilds byte-identically. No credentials,
-session DBs, execution logs, build caches or installed binaries are published.
+Switchboard source requires Node.js 22.15+ and Python 3.11+ for its host/tests:
 
-## Historical architecture proposal
-
-The following section is retained as historical design intent. The v9 description
-and manifest above supersede its distribution status and proposed plugin topology.
-
-Codex Full Stack Harness is the integration home for a local-first Codex
-collaboration stack. It is evolving from a separate Tura runtime into a native
-Codex plugin kernel backed by explicit context, execution, and continuity
-contracts.
-
-> **Status:** architecture and migration boundary published; the native plugin
-> distribution is still under development. This repository does not yet claim
-> a generally installable release.
-
-## Architecture
-
-```mermaid
-flowchart TD
-    C[Codex] --> P[Full Stack Plugin]
-    P --> K[Collaboration Kernel]
-    P --> D[Deep Context Federation]
-    P --> G[Session Governor]
-    K --> E[Mission, lease, CAS and effects]
-    K --> R[Receipts, recovery, callbacks and ACK]
-    T[Tura source lineage] -. migration .-> K
+```sh
+cd packages/switchboard
+npm ci
+npm test
 ```
 
-The native Codex process is the runtime owner. The extracted collaboration
-kernel supplies durable execution semantics without installing a second general
-agent runtime beside Codex.
+Do not start or admit a service by copying another machine's configuration. Installation identities, authentication, provider credentials, local ports and protected project contracts are site-specific and intentionally excluded. Managed-workspace DCF contracts remain external integrations; this publication does not expose private workspace maps or policy data.
 
-## Repository roles
+## Measured Results and Limits
 
-| Repository | Responsibility |
-| --- | --- |
-| **codex-full-stack-harness** | Installable product boundary and native Codex integration. |
-| [codex-collaboration-harness](https://github.com/nokiyliao/codex-collaboration-harness) | Public specifications, adapter contracts, examples, and benchmark evidence. |
-| [deep-context-federation](https://github.com/nokiyliao/deep-context-federation) | Read-only context and evidence federation. |
-| [codex-session-governor](https://github.com/nokiyliao/codex-session-governor) | Same-ID compaction and bounded session continuity. |
-| [tura](https://github.com/nokiyliao/tura) | Historical AGPL source lineage for the extracted collaboration kernel. |
+[Benchmark summary](docs/benchmark-summary.md) includes positive and negative controls. One current fixed-quality pair observed Efficient at 279.3s / $0.2746386 versus native Sol at 357.1s / $0.5229860, including reported coordinator, worker and native-child usage. These are API-equivalent estimates, not subscription charges, universal speedups or causal proof of every change.
 
-## Invariants
+The source export matches all 48 non-cache files in the installed caller package, all 602 recorded Rust build-source inputs, and the current switchboard commit except explicitly excluded operator-only diagnostics and compiled caches. Recorded binary hashes are provenance, not a byte-reproducible-build claim. Clean-machine installation and cross-platform service operation have not been established by this publication.
 
-- Codex remains the single primary runtime and model-session owner.
-- Context projection cannot silently increase execution authority.
-- Effects bind to exact identities, leases, and CAS preconditions.
-- Ambiguous effects are not retried blindly.
-- Completion, callbacks, and Commander acknowledgement converge exactly once.
-- Source, candidate, installed, running, and live-verified states remain distinct.
+## Related Projects
 
-See [architecture](docs/architecture.md), [migration criteria](docs/migration.md),
-and [source provenance](PROVENANCE.md).
+- [Collaboration contracts](https://github.com/nokiyliao/codex-collaboration-harness)
+- [Deep Context Federation](https://github.com/nokiyliao/deep-context-federation)
+- [Session Governor](https://github.com/nokiyliao/codex-session-governor)
 
-## License
+Their published revisions and local deployments are separate. This update does not silently claim companion repositories were synchronized as well.
 
-This integration repository is licensed under `AGPL-3.0-or-later` because the
-planned kernel includes modified Tura-derived code. Component repositories retain
-their own licenses. See [PROVENANCE.md](PROVENANCE.md).
+## License and Provenance
+
+The integration repository is AGPL-3.0-or-later. The caller retains MIT and third-party notices; modified Tura-derived code retains its upstream authorship and AGPL obligations. See [PROVENANCE.md](PROVENANCE.md).

@@ -45,6 +45,29 @@ pub fn normalize_output(
     let task_group = string_field(object, &["task_group"]);
     let task_type = task_type_field(object, "task_type")?;
     let compact_context = string_field(object, &["compact_context"]);
+    let mut structured_reply = false;
+    let final_reply = match object.get("final_reply") {
+        None => None,
+        Some(value) => {
+            // question carries its blocker/question inline, so no extra turn regenerates it.
+            if !matches!(status.as_deref(), Some("done" | "question")) || compact_context.is_some() {
+                return Err("task_status final_reply requires done or question without compact_context".into());
+            }
+            let reply = match value {
+                Value::String(reply) if !reply.trim().is_empty() => reply.clone(),
+                Value::Object(fields) if !fields.is_empty() => {
+                    structured_reply = true;
+                    value.to_string()
+                }
+                Value::Array(items) if !items.is_empty() => {
+                    structured_reply = true;
+                    value.to_string()
+                }
+                _ => return Err("task_status final_reply must be nonempty text or JSON object/array".into()),
+            };
+            Some(reply)
+        }
+    };
     let mut task_status = serde_json::Map::new();
     if let Some(status) = status {
         task_status.insert("status".to_string(), Value::String(status));
@@ -63,6 +86,12 @@ pub fn normalize_output(
             "compact_context".to_string(),
             Value::String(compact_context),
         );
+    }
+    if let Some(final_reply) = final_reply {
+        task_status.insert("final_reply".to_string(), Value::String(final_reply));
+        if structured_reply {
+            task_status.insert("final_reply_format".to_string(), json!("json"));
+        }
     }
     Ok(json!({ "task_status": task_status }))
 }
@@ -346,6 +375,75 @@ mod tests {
         );
         assert!(out.pointer("/task_status/reply_message").is_none());
         assert!(out.pointer("/task_status/message").is_none());
+    }
+
+    #[test]
+    fn final_reply_is_explicit_and_preserves_the_answer() {
+        let reply = "{\"answer\":\"Complete.\"}\n";
+        let input = json!({"status":"done", "final_reply":reply});
+        for output in [
+            normalize_output(Some(&input), ""),
+            normalize_output(None, &input.to_string()),
+        ] {
+            assert_eq!(output.expect("explicit delivery"), json!({"task_status":input}));
+        }
+    }
+
+    #[test]
+    fn structured_final_reply_serializes_once_and_preserves_json_values() {
+        for reply in [
+            json!({"answer":"Quote: \" and slash: \\ and newline: \n", "label":"\u{4f60}\u{597d}", "verified":true, "count":42}),
+            json!([{"answer":"Complete"}, null, false, 3]),
+        ] {
+            let input = json!({"status":"done", "final_reply":reply});
+            for output in [normalize_output(Some(&input), ""), normalize_output(None, &input.to_string())] {
+                let output = output.expect("structured delivery");
+                let text = output["task_status"]["final_reply"].as_str().unwrap();
+                assert_eq!(serde_json::from_str::<Value>(text).unwrap(), reply);
+                assert_eq!(text, reply.to_string());
+                assert_eq!(output["task_status"]["status"], "done");
+                assert_eq!(output["task_status"]["final_reply_format"], "json");
+            }
+        }
+    }
+
+    #[test]
+    fn string_final_reply_cannot_self_grant_structured_publication() {
+        let reply = "{\"value\":0.123456789123456789123456789}";
+        let output = normalize_output(Some(&json!({"status":"done", "final_reply":reply,
+            "final_reply_format":"json"})), "").unwrap();
+        assert_eq!(output["task_status"]["final_reply"], reply);
+        assert!(output["task_status"].get("final_reply_format").is_none());
+    }
+
+    #[test]
+    fn final_reply_rejects_invalid_or_nonterminal_delivery() {
+        for input in [
+            json!({"final_reply":"Answer"}),
+            json!({"status":"doing", "final_reply":"Answer"}),
+            json!({"status":"done", "final_reply":"Answer", "compact_context":"handoff"}),
+            json!({"status":"done", "final_reply":" \n\t"}),
+            json!({"status":"done", "final_reply":null}),
+            json!({"status":"done", "final_reply":{}}),
+            json!({"status":"done", "final_reply":[]}),
+            json!({"status":"done", "final_reply":true}),
+            json!({"status":"done", "final_reply":42}),
+            json!({"status":"doing", "final_reply":{"answer":42}}),
+            json!({"status":"question", "final_reply":"Blocked", "compact_context":"handoff"}),
+            json!({"status":"question", "final_reply":" "}),
+            json!({"status":"done", "final_reply":{"answer":42}, "compact_context":"handoff"}),
+        ] {
+            assert!(normalize_output(Some(&input), "").is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn question_final_reply_is_delivered_inline() {
+        for reply in [json!("Need write access to a.py"), json!(["blocked"])] {
+            let output = normalize_output(Some(&json!({"status":"question", "final_reply":reply})), "").unwrap();
+            assert_eq!(output["task_status"]["status"], "question");
+            assert!(output["task_status"]["final_reply"].as_str().is_some_and(|text| !text.is_empty()));
+        }
     }
 
     #[test]

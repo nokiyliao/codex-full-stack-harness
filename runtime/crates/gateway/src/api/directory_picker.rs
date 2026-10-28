@@ -99,6 +99,12 @@ fn selected_path_from_stdout(stdout: &[u8]) -> anyhow::Result<Option<String>> {
     Ok((!path.is_empty()).then_some(path))
 }
 
+#[cfg(target_os = "macos")]
+fn applescript_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 #[cfg(target_os = "windows")]
 fn windows_directory_picker_script(title: &str) -> String {
     let escaped_title = title.replace('\'', "''");
@@ -144,10 +150,4 @@ mod tests {
             "Windows directory picker must keep PowerShell pipeline encoding aligned with Console.OutputEncoding: {script}"
         );
     }
-}
-
-#[cfg(target_os = "macos")]
-fn applescript_string(value: &str) -> String {
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
 }

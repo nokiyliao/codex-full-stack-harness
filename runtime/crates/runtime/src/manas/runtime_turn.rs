@@ -1,5 +1,5 @@
 use crate::prompt_style::{PromptBuilder, agent_identity, compact_context, self_reflection};
-use crate::provider_flow::call::{CallRuntimeInput, call_runtime_with_writer};
+use crate::provider_flow::call::CallRuntimeInput;
 use crate::runtime::create_runtime::{
     CreateRuntimeInput, create_runtime, generate_runtime_id, runtime_provider_config_from_tura,
 };
@@ -29,6 +29,7 @@ const PROMPT_INJECTION_CONTEXT_TOKEN_CAP: u64 = 240_000;
 pub(crate) struct RetryProviderInput {
     pub(crate) messages: Vec<serde_json::Value>,
     pub(crate) tools: Vec<serde_json::Value>,
+    pub(crate) capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -45,7 +46,30 @@ pub(crate) fn execute_turn(
     runtime_id: Option<RuntimeId>,
     fallback_from_id: Option<RuntimeId>,
     retry_provider_input: Option<RetryProviderInput>,
+    runtime_event_writer: Option<&mut RuntimeEventWriter>,
+) -> Result<(RuntimeAggregate, Vec<ToolCallData>), String> {
+    execute_turn_with_source_binding(agents, session, current_messages, original_user_task,
+        extra_tail_system_prompt, _redis_url, _is_first_llm_call, is_final_turn,
+        force_no_tools, runtime_id, fallback_from_id, retry_provider_input,
+        runtime_event_writer, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_turn_with_source_binding(
+    agents: &[AgentManagement],
+    session: &mut SessionManagement,
+    current_messages: &[serde_json::Value],
+    original_user_task: &str,
+    extra_tail_system_prompt: Option<&'static str>,
+    _redis_url: &str,
+    _is_first_llm_call: bool,
+    is_final_turn: bool,
+    force_no_tools: bool,
+    runtime_id: Option<RuntimeId>,
+    fallback_from_id: Option<RuntimeId>,
+    retry_provider_input: Option<RetryProviderInput>,
     mut runtime_event_writer: Option<&mut RuntimeEventWriter>,
+    capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
 ) -> Result<(RuntimeAggregate, Vec<ToolCallData>), String> {
     let agent = agents
         .first()
@@ -63,7 +87,7 @@ pub(crate) fn execute_turn(
     let disable_tool_invocation = is_final_turn || force_no_tools;
     let require_startup_task_state = startup_task_state_required(session, &provider_commands);
     let tools = if let Some(retry_input) = retry_provider_input.as_ref() {
-        retry_input.tools.clone()
+        retry_provider_tools_for_turn(retry_input, is_final_turn, force_no_tools)
     } else {
         let mut tools = load_agent_capabilities_with_commands(agent, session, &provider_commands)?;
         if planning_tool_disabled() {
@@ -85,6 +109,11 @@ pub(crate) fn execute_turn(
     } else {
         allowed_tool_names.clone()
     };
+    let capsule_source_read_binding = crate::provider_flow::call::reconcile_source_binding(
+        capsule_source_read_binding,
+        retry_provider_input.as_ref().and_then(|input| input.capsule_source_read_binding.clone()),
+        session.jspace_contract.as_ref(), &session.session_directory,
+    )?;
     let mut retry_messages = retry_provider_input.map(|input| input.messages);
     if debug_runtime_enabled() {
         eprintln!(
@@ -178,7 +207,7 @@ pub(crate) fn execute_turn(
 
         let config = std::sync::Arc::new(tura_llm_rust::TuraConfig::default());
 
-        let runtime = call_runtime_with_writer(
+        let runtime = crate::provider_flow::call::call_runtime_with_source_binding(
             CallRuntimeInput {
                 runtime,
                 messages: queue_item.messages,
@@ -186,7 +215,7 @@ pub(crate) fn execute_turn(
                 provider_name: queue_item.provider_name,
                 stream: agent.provider.stream,
                 max_tokens: agent.provider.max_tokens,
-                tool_choice: tool_choice_for_turn(),
+                tool_choice: tool_choice_for_turn(disable_tool_invocation),
                 session_directory: session.session_directory.clone(),
                 allowed_command_run_commands: Some(agent_commands),
                 disable_permission_restrictions: session.disable_permission_restrictions,
@@ -196,6 +225,7 @@ pub(crate) fn execute_turn(
             settings,
             config,
             runtime_event_writer.as_deref_mut(),
+            capsule_source_read_binding,
         )
         .await?;
         sync_context_tokens_from_provider_usage(session, &runtime, compact_limit_tokens);
@@ -389,8 +419,12 @@ fn debug_runtime_timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn tool_choice_for_turn() -> Option<serde_json::Value> {
-    Some(serde_json::json!("auto"))
+fn tool_choice_for_turn(disable_tool_invocation: bool) -> Option<serde_json::Value> {
+    Some(serde_json::json!(if disable_tool_invocation {
+        "none"
+    } else {
+        "auto"
+    }))
 }
 
 fn turn_identity(
@@ -432,6 +466,16 @@ fn append_self_reflection_tail_prompt(
     );
 }
 
+fn retry_provider_tools_for_turn(
+    retry_input: &RetryProviderInput,
+    _is_final_turn: bool,
+    _force_no_tools: bool,
+) -> Vec<serde_json::Value> {
+    // An exact retry keeps its schema and ordering even on a terminal turn.
+    // tool_choice and executable_tool_names disable invocation, not the prefix.
+    retry_input.tools.clone()
+}
+
 fn move_command_run_to_end(tools: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     let (mut others, mut command_run): (Vec<_>, Vec<_>) = tools
         .into_iter()
@@ -449,8 +493,81 @@ mod tests {
     use std::ffi::OsString;
 
     #[test]
-    fn turns_use_auto_tool_choice_for_prompt_cache_stability() {
-        assert_eq!(tool_choice_for_turn(), Some(serde_json::json!("auto")));
+    fn disabled_turns_retain_retry_provider_tools_with_none_tool_choice() {
+        let retry_input = RetryProviderInput {
+            messages: Vec::new(),
+            capsule_source_read_binding: None,
+            tools: vec![
+                serde_json::json!({
+                    "type": "function",
+                    "function": { "name": COMMAND_RUN_TOOL }
+                }),
+                serde_json::json!({
+                    "type": "function",
+                    "function": { "name": "web_search" }
+                }),
+            ],
+        };
+
+        for (is_final_turn, force_no_tools) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                retry_provider_tools_for_turn(&retry_input, is_final_turn, force_no_tools),
+                retry_input.tools,
+                "is_final_turn={is_final_turn}, force_no_tools={force_no_tools}"
+            );
+            assert_eq!(
+                tool_choice_for_turn(is_final_turn || force_no_tools),
+                Some(serde_json::json!("none"))
+            );
+        }
+    }
+
+    #[test]
+    fn normal_and_terminal_retries_preserve_provider_tool_order_and_bytes() {
+        let retry_input = RetryProviderInput {
+            messages: Vec::new(),
+            capsule_source_read_binding: None,
+            tools: vec![
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": COMMAND_RUN_TOOL,
+                        "description": "preserve command metadata",
+                        "parameters": { "type": "object", "additionalProperties": false }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "preserve non-command_run retry schema",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "query": { "type": "string" } },
+                            "required": ["query"]
+                        }
+                    }
+                }),
+            ],
+        };
+        let expected_bytes =
+            serde_json::to_vec(&retry_input.tools).expect("retry tools should serialize");
+        for (is_final_turn, force_no_tools) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let tools = retry_provider_tools_for_turn(&retry_input, is_final_turn, force_no_tools);
+            assert_eq!(tools, retry_input.tools);
+            assert_eq!(
+                serde_json::to_vec(&tools).expect("provider tools should serialize"),
+                expected_bytes,
+                "is_final_turn={is_final_turn}, force_no_tools={force_no_tools}"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_turns_keep_auto_tool_choice() {
+        assert_eq!(tool_choice_for_turn(false), Some(serde_json::json!("auto")));
     }
 
     #[test]

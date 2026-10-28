@@ -37,20 +37,43 @@ class NokiyDirectSkillTests(unittest.TestCase):
         self.assertIn("formerly Nokiy Direct", section)
         self.assertIn("internal workflow ID is still `nokiy-direct`", skill)
 
+    def test_native_host_binding_replaces_only_duplicate_parent_probes(self):
+        skill = (ROOT / "skills/nokiy/SKILL.md").read_text()
+        route = skill.split("2. Select the identity-binding route.", 1)[1].split("\n3.", 1)[0]
+        for contract in (
+            "verified native-host caller/runtime/native identity binding",
+            "do not repeat manual CLI entry resolution",
+            "Both routes retain mandatory preparation",
+            "fresh source/authority checks",
+            "Missing or mismatched binding blocks dispatch",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, route)
+
+    def test_manual_cli_keeps_identity_discovery_and_native_home(self):
+        text = (ROOT / "skills/nokiy/references/invocation.md").read_text()
+        section = text.split("## Bind current identities\n", 1)[1].split("\n## ", 1)[0]
+        for contract in (
+            "identity discovery is for **manual CLI invocation**",
+            "Missing or mismatched binding blocks dispatch",
+            "Read `caller-binding.json`",
+            "verify the actual image digest",
+            "Preserve HOME/CODEX_HOME and current CODEX_THREAD_ID",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, section)
+
 
 class TaskScopedParentReviewRecipeTests(unittest.TestCase):
     REQUEST_ID = "tura_embedded_" + "a" * 64
     THREAD_ID = "12345678-1234-1234-1234-123456789abc"
 
-    @classmethod
-    def setUpClass(cls):
-        path = ROOT / "skills/nokiy/references/invocation.md"
-        section = path.read_text(encoding="utf-8").split(
+    def test_documented_recipe_routes_to_production_api_and_cli(self):
+        section = (ROOT / "skills/nokiy/references/invocation.md").read_text(encoding="utf-8").split(
             "### Compact parent review declaration\n", 1)[1].split("\n## ", 1)[0]
-        snippet = section.split("```python\n", 1)[1].split("\n```", 1)[0]
-        namespace = {}
-        exec(compile(snippet, str(path), "exec"), namespace)
-        cls.declare_review = staticmethod(namespace["declare_task_review"])
+        self.assertIn("result_inspection.declare_task_review(packet, review_path)", section)
+        self.assertIn(
+            "python -m codex_collaboration_harness.result_inspection parent-review", section)
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -92,19 +115,21 @@ class TaskScopedParentReviewRecipeTests(unittest.TestCase):
         reference = inspector.publish_inspection_summary(
             projected, artifact_root, self.REQUEST_ID, expected_thread_id=self.THREAD_ID)
         self.inputs = {
+            "schema_version": "nokiy_parent_review_input_v1",
             "summary_reference": reference, "request_id": self.REQUEST_ID,
             "thread_id": self.THREAD_ID, "terminal_reference": self.terminal_reference,
-            "required_check_paths": (self.quality_check["path"],),
+            "required_check_paths": [self.quality_check["path"]],
             "task_checks": [self.quality_check],
             "expected_postimages": {str(self.target): self.target_sha},
             "review_complete": True, "semantic_decision": "accepted",
             "note": "Parent reviewed the original task's full quality, semantics and scope.",
-            "review_path": str(self.root / "review.json"),
         }
+        self.review_path = str(self.root / "review.json")
 
-    def declare(self, **overrides):
-        inputs = {**self.inputs, **overrides}
-        return self.declare_review(**inputs)
+    def declare(self, *, review_path=None, **overrides):
+        return inspector.declare_task_review(
+            {**self.inputs, **overrides},
+            self.review_path if review_path is None else review_path)
 
     def test_arbitrary_task_accepts_only_explicit_full_semantic_review(self):
         record = self.declare()
@@ -116,7 +141,7 @@ class TaskScopedParentReviewRecipeTests(unittest.TestCase):
         self.assertEqual(record["scope"]["authority_effect"], "none")
         self.assertFalse(record["scope"]["permission_grant"])
         self.assertFalse(record["scope"]["deployment_or_lease_grant"])
-        output = Path(self.inputs["review_path"])
+        output = Path(self.review_path)
         self.assertEqual(json.loads(output.read_text(encoding="utf-8")), record)
         self.assertEqual(list(self.root.glob("review*.json")), [output])
 
@@ -132,38 +157,45 @@ class TaskScopedParentReviewRecipeTests(unittest.TestCase):
             with self.subTest(status=status), self.assertRaisesRegex(
                     ValueError, "acceptance requires complete successful checks"):
                 self.declare(task_checks=[{**self.quality_check, "check_status": status}])
-            self.assertFalse(Path(self.inputs["review_path"]).exists())
+            self.assertFalse(Path(self.review_path).exists())
 
-    def test_fresh_postimage_mismatch_cannot_accept_and_pending_keeps_actual_digest(self):
+    def test_fresh_postimage_mismatch_cannot_accept_and_pending_requires_actual_digest(self):
         self.target.write_bytes(b"changed since the retained delivery\n")
         actual_sha = hashlib.sha256(self.target.read_bytes()).hexdigest()
-        with self.assertRaisesRegex(ValueError, "acceptance requires complete successful checks"):
-            self.declare()
-        self.assertFalse(Path(self.inputs["review_path"]).exists())
-        record = self.declare(review_complete=False)
+        cases = ({}, {"review_complete": False},
+                 {"semantic_decision": "pending"}, {"semantic_decision": "rejected"})
+        for overrides in cases:
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                    inspector.InspectionError, "^PARENT_REVIEW_HASH_MISMATCH$"):
+                self.declare(**overrides)
+            self.assertFalse(Path(self.review_path).exists())
+        # Pending publication also requires the parent to bind the actual content hash.
+        record = self.declare(review_complete=False,
+                              expected_postimages={str(self.target): actual_sha})
         self.assertEqual(record["decision"], "pending")
         self.assertEqual(record["task_evidence"][-1], {
-            "path": str(self.target), "sha256": actual_sha, "check_status": "failed"})
+            "path": str(self.target), "sha256": actual_sha, "check_status": "passed"})
 
     def test_unreadable_required_postimage_stops_publication(self):
         self.target.unlink()
         with self.assertRaises(FileNotFoundError):
             self.declare()
-        self.assertFalse(Path(self.inputs["review_path"]).exists())
+        self.assertFalse(Path(self.review_path).exists())
 
     def test_explicit_rejection_needs_no_intermediate_pending_record(self):
         record = self.declare(semantic_decision="rejected",
                               task_checks=[{**self.quality_check, "check_status": "failed"}],
                               note="Parent completed review and rejected the task's quality.")
         self.assertEqual(record["decision"], "rejected")
-        self.assertEqual(list(self.root.glob("review*.json")), [Path(self.inputs["review_path"])])
+        self.assertEqual(list(self.root.glob("review*.json")), [Path(self.review_path)])
 
     def test_foreign_or_missing_independent_bindings_are_rejected(self):
         for key in ("request_id", "thread_id", "terminal_reference"):
             inputs = dict(self.inputs)
             del inputs[key]
-            with self.subTest(missing=key), self.assertRaises(TypeError):
-                self.declare_review(**inputs)
+            with self.subTest(missing=key), self.assertRaisesRegex(
+                    inspector.InspectionError, "^PARENT_REVIEW_INPUT_INVALID$"):
+                inspector.declare_task_review(inputs, self.review_path)
         cases = (
             {"request_id": None}, {"request_id": "tura_embedded_" + "b" * 64},
             {"thread_id": None}, {"thread_id": "87654321-4321-4321-4321-cba987654321"},
@@ -177,7 +209,7 @@ class TaskScopedParentReviewRecipeTests(unittest.TestCase):
         for overrides in cases:
             with self.subTest(overrides=overrides), self.assertRaises(inspector.InspectionError):
                 self.declare(**overrides)
-        self.assertFalse(Path(self.inputs["review_path"]).exists())
+        self.assertFalse(Path(self.review_path).exists())
 
     def test_missing_summary_identity_is_rejected_even_with_its_exact_hash(self):
         path = Path(self.inputs["summary_reference"]["path"])
@@ -190,23 +222,24 @@ class TaskScopedParentReviewRecipeTests(unittest.TestCase):
             reference = {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
             with self.subTest(missing=key), self.assertRaises(inspector.InspectionError):
                 self.declare(summary_reference=reference)
-        self.assertFalse(Path(self.inputs["review_path"]).exists())
+        self.assertFalse(Path(self.review_path).exists())
 
     def test_retained_summary_hash_drift_is_rejected(self):
         path = Path(self.inputs["summary_reference"]["path"])
         path.write_bytes(path.read_bytes() + b" ")
         with self.assertRaises(inspector.InspectionError):
             self.declare()
-        self.assertFalse(Path(self.inputs["review_path"]).exists())
+        self.assertFalse(Path(self.review_path).exists())
 
     def test_unbound_check_evidence_cannot_substitute_for_task_requirements(self):
         foreign = {**self.quality_check, "path": str(self.root / "irrelevant-check.json")}
-        with self.assertRaisesRegex(ValueError, "not bound to this task"):
+        with self.assertRaisesRegex(
+                inspector.InspectionError, "^PARENT_REVIEW_EVIDENCE_SCOPE_INVALID$"):
             self.declare(task_checks=[foreign])
-        self.assertFalse(Path(self.inputs["review_path"]).exists())
+        self.assertFalse(Path(self.review_path).exists())
 
     def test_existing_output_is_not_overwritten(self):
-        output = Path(self.inputs["review_path"])
+        output = Path(self.review_path)
         original = b"conflicting existing parent declaration\n"
         output.write_bytes(original)
         before = output.stat()

@@ -47,7 +47,7 @@ pub(crate) fn attach_reasoning(
     let mut ids = std::collections::HashSet::new();
     if items
         .iter()
-        .any(|item| !ids.insert(item["id"].as_str().unwrap()))
+        .any(|item| !ids.insert(item["id"].as_str().expect("is_opaque_reasoning admits only string ids")))
     {
         return Err("RESPONSES_REASONING_DUPLICATE_ID".into());
     }

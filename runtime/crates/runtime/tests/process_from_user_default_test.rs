@@ -21,7 +21,9 @@ fn default_agent_registry_loads_coding_agent() {
         planning_mode_override: None,
     };
 
-    let session = create_session(PathBuf::from("sessions"), input.clone())
+    // A temporary root keeps the session repository out of the crate directory.
+    let root = tempfile::tempdir().expect("session root");
+    let session = create_session(root.path().join("sessions"), input.clone())
         .expect("session should be created");
     let agents = activate_agents_by_session_type(&session).expect("agent registry should load");
 
@@ -76,7 +78,8 @@ fn default_directory_session_loads_coding_agent() {
         planning_mode_override: None,
     };
 
-    let session = activate_session_with_directory(PathBuf::from("."), input)
+    let root = tempfile::tempdir().expect("session root");
+    let session = activate_session_with_directory(root.path().to_path_buf(), input)
         .expect("session should be created");
     let agents = activate_agents_by_session_type(&session).expect("agent registry should load");
 

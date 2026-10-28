@@ -61,16 +61,15 @@ impl NativeCodexProviderProfile {
         ) {
             return Err("NATIVE_CODEX_PROVIDER_EFFORT_INVALID".into());
         }
-        if let Some(provider) = &self.model_provider {
-            if provider.is_empty()
+        if let Some(provider) = &self.model_provider
+            && (provider.is_empty()
                 || provider.len() > 128
                 || !provider
                     .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c)))
             {
                 return Err("NATIVE_CODEX_MODEL_PROVIDER_INVALID".into());
             }
-        }
         let mut identity = serde_json::json!({
             "schema_version": "tura_native_execution_profile_v1",
             "model": self.model,

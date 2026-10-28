@@ -10,7 +10,11 @@ use crate::runtime::tool::{
 };
 use crate::shell_executor;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+
+mod postimage;
+mod failure_context;
 
 #[derive(Clone, Debug)]
 struct PatchChange {
@@ -54,7 +58,7 @@ impl ToolHandler for ApplyPatchHandler {
         let response = shell_executor::run_in_process_command_with_terminal_receipt(
             &ctx,
             "in_process_apply_patch",
-            || execute(&patch_text, &ctx.session_dir),
+            || execute_with_readback(&patch_text, &ctx.session_dir, ctx.patch_readback_paths()),
         );
         let success = response.success;
         Ok(FunctionToolOutput::from_value(
@@ -255,15 +259,51 @@ mod physical_marker_tests {
         assert!(extract_apply_patch_body("*** Begin Patch suffix\n*** End Patch").is_none());
         assert!(parse_patch("*** Begin Patch\n*** Add File: x\n+x\n*** End Patch suffix").is_err());
     }
+
+    // 2026-10-22 i8: a Luna worker sent five id-only apply_patch entries as labels next to the
+    // real patches; each was reported as a malformed patch failure.
+    #[test]
+    fn empty_entry_changes_nothing_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        for text in ["", "  \n"] {
+            let response = execute(text, dir.path());
+            assert!(response.success);
+            assert!(response.changes.is_empty());
+            assert_eq!(response.output["no_effect"], serde_json::json!(true));
+            assert!(response.output["message"].as_str().unwrap().contains("nothing changed"));
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(!execute("*** Begin Patch\n*** Update File: missing.txt\n@@\n-a\n+b\n*** End Patch", dir.path()).success);
+    }
 }
 
 pub fn execute(patch_text: &str, session_dir: &Path) -> CommandResponse {
+    execute_with_readback(patch_text, session_dir, &[])
+}
+
+fn execute_with_readback(patch_text: &str, session_dir: &Path, read_paths: &[PathBuf]) -> CommandResponse {
+    if patch_text.trim().is_empty() {
+        // Models label patches with id-only entries next to the real ones. Reporting those as
+        // failed patches made workers resend edits that had already applied; say plainly that
+        // the entry changed nothing so a genuinely omitted patch is still visible.
+        return CommandResponse {
+            success: true,
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            output: json!({
+                "no_effect": true,
+                "message": "This apply_patch entry has no command_line, so nothing changed. Entries are commands, not labels: to edit files, put the complete patch from *** Begin Patch to *** End Patch in command_line.",
+            }),
+            changes: Vec::new(),
+        };
+    }
     match parse_patch(patch_text) {
         Ok(changes) => {
             let mut applied_changes = Vec::new();
             let mut failed_changes = Vec::new();
             for change in &changes {
-                match apply_change(change, session_dir) {
+                match apply_change(change, session_dir, read_paths) {
                     Ok(applied_change) => applied_changes.push(applied_change),
                     Err(err) => {
                         let mut failure = json!({
@@ -279,6 +319,11 @@ pub fn execute(patch_text: &str, session_dir: &Path) -> CommandResponse {
                 }
             }
             if !failed_changes.is_empty() {
+                for change in &mut applied_changes {
+                    if let Some(change) = change.as_object_mut() {
+                        change.remove("source_delta");
+                    }
+                }
                 let first_failure = failed_changes.first();
                 let first_kind = first_failure
                     .and_then(|failure| failure["error_type"].as_str())
@@ -313,6 +358,7 @@ pub fn execute(patch_text: &str, session_dir: &Path) -> CommandResponse {
                     changes: applied_changes,
                 };
             }
+            postimage::bound_batch(&mut applied_changes);
             CommandResponse {
                 success: true,
                 exit_code: 0,
@@ -539,7 +585,11 @@ fn parse_patch(patch_text: &str) -> Result<Vec<PatchChange>, String> {
         }
     }
     if !started {
-        return Err("invalid patch: missing *** Begin Patch".to_string());
+        return Err(if patch_text.trim().is_empty() {
+            "invalid patch: command_line is empty; put the complete patch text, from *** Begin Patch to *** End Patch, in command_line".to_string()
+        } else {
+            "invalid patch: missing *** Begin Patch".to_string()
+        });
     }
     if !ended {
         return Err("invalid patch: missing *** End Patch".to_string());
@@ -602,14 +652,19 @@ fn validate_changes(changes: &[PatchChange]) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_change(change: &PatchChange, session_dir: &Path) -> Result<Value, PatchError> {
+fn apply_change(change: &PatchChange, session_dir: &Path, read_paths: &[PathBuf]) -> Result<Value, PatchError> {
     let path = safe_path(session_dir, &change.path).map_err(PatchError::path)?;
-    match change.kind.as_str() {
+    let mut source_delta = None;
+    // Bind identities to the operation's exact read/write buffers, never a later
+    // filesystem reread. Publish them only after the entire change succeeds.
+    let (preimage_sha256, postimage_sha256) = match change.kind.as_str() {
         "delete" => {
             if !path.exists() {
                 return Err(PatchError::missing_file("DeleteFileNotFound", change));
             }
+            let original = std::fs::read(&path).map_err(PatchError::io)?;
             std::fs::remove_file(path).map_err(PatchError::io)?;
+            (Some(format!("{:x}", Sha256::digest(&original))), None)
         }
         "add" => {
             if path.exists() {
@@ -622,14 +677,16 @@ fn apply_change(change: &PatchChange, session_dir: &Path) -> Result<Value, Patch
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(PatchError::io)?;
             }
-            std::fs::write(path, updated).map_err(PatchError::io)?;
+            std::fs::write(path, updated.as_bytes()).map_err(PatchError::io)?;
+            (None, Some(format!("{:x}", Sha256::digest(updated.as_bytes()))))
         }
         "update" => {
             if !path.exists() {
                 return Err(PatchError::missing_file("UpdateFileNotFound", change));
             }
             let original = std::fs::read_to_string(&path).map_err(PatchError::io)?;
-            let updated = apply_hunks(&original, &change.hunks)
+            let (updated, delta) = apply_hunks_with_delta(&original, &change.hunks,
+                change.move_path.is_none() && read_paths.contains(&path))
                 .map_err(|message| PatchError::context_mismatch(message, change))?;
             let destination = match change.move_path.as_deref() {
                 Some(move_path) => safe_path(session_dir, move_path).map_err(PatchError::path)?,
@@ -638,10 +695,15 @@ fn apply_change(change: &PatchChange, session_dir: &Path) -> Result<Value, Patch
             if let Some(parent) = destination.parent() {
                 std::fs::create_dir_all(parent).map_err(PatchError::io)?;
             }
-            std::fs::write(&destination, updated).map_err(PatchError::io)?;
+            std::fs::write(&destination, updated.as_bytes()).map_err(PatchError::io)?;
             if destination != path && path.exists() {
                 std::fs::remove_file(path).map_err(PatchError::io)?;
             }
+            source_delta = delta;
+            (
+                Some(format!("{:x}", Sha256::digest(original.as_bytes()))),
+                Some(format!("{:x}", Sha256::digest(updated.as_bytes()))),
+            )
         }
         _ => {
             return Err(PatchError {
@@ -650,11 +712,15 @@ fn apply_change(change: &PatchChange, session_dir: &Path) -> Result<Value, Patch
                 failed_change: Some(patch_change_value(change)),
             });
         }
-    }
-    Ok(patch_change_value(change))
+    };
+    let mut applied_change = patch_change_value(change);
+    applied_change["preimage_sha256"] = json!(preimage_sha256);
+    applied_change["postimage_sha256"] = json!(postimage_sha256);
+    if let Some(delta) = source_delta { applied_change["source_delta"] = delta; }
+    Ok(applied_change)
 }
 
-fn apply_hunks(original: &str, hunks: &[Vec<String>]) -> Result<String, String> {
+fn apply_hunks_with_delta(original: &str, hunks: &[Vec<String>], readback: bool) -> Result<(String, Option<Value>), String> {
     let mut lines = original
         .lines()
         .map(ToString::to_string)
@@ -686,17 +752,30 @@ fn apply_hunks(original: &str, hunks: &[Vec<String>]) -> Result<String, String> 
             replacements.push((start, end, new));
             search_start = end;
         } else {
-            return Err(format!(
+            let mut message = format!(
                 "patch context not found: {}",
                 old.join("\n").chars().take(120).collect::<String>()
-            ));
+            );
+            if readback {
+                if let Some((start_line, text)) = old.first()
+                    .and_then(|expected| failure_context::excerpt(original, expected))
+                {
+                    let evidence = json!({"kind": "diagnostic_candidate_not_patch_match",
+                        "preimage_sha256": format!("{:x}", Sha256::digest(original.as_bytes())),
+                        "start_line": start_line, "text": text});
+                    message.push_str(&format!("\nRead-only preimage context: {evidence}"));
+                }
+            }
+            return Err(message);
         }
     }
 
-    for (start, end, new) in replacements.into_iter().rev() {
-        lines.splice(start..end, new);
+    for (start, end, new) in replacements.iter().rev() {
+        lines.splice(*start..*end, new.iter().cloned());
     }
-    Ok(join_lines(&lines, line_ending, original_had_final_newline))
+    let updated = join_lines(&lines, line_ending, original_had_final_newline);
+    let delta = readback.then(|| postimage::from_applied_buffers(original, &updated, &replacements)).flatten();
+    Ok((updated, delta))
 }
 
 fn replacement_lines_for_hunk(hunk: &[String], actual_old_lines: &[String]) -> Vec<String> {
@@ -839,10 +918,10 @@ impl PatchError {
 fn apply_patch_failure_guidance(kind: &str, partial: bool) -> &'static str {
     match (kind, partial) {
         ("ContextMismatch", true) => {
-            "apply_patch failed because expected context was not found after earlier changes were applied; read the current file and retry smaller hunks. Subsequent commands run against a partially changed tree."
+            "apply_patch failed because expected context was not found after earlier changes were applied. Use any attached preimage context to correct smaller hunks; read the exact missing range only if context is insufficient or the file may have changed. The excerpt is diagnostic, not a patch match or authority to replay the whole batch. Subsequent commands run against a partially changed tree."
         }
         ("ContextMismatch", false) => {
-            "apply_patch failed because expected context was not found; read the current file and retry with a smaller hunk."
+            "apply_patch failed because expected context was not found. Use any attached preimage context to correct a smaller hunk; read the exact missing range only if context is absent, insufficient, or the file may have changed. The excerpt is diagnostic, not a patch match or authority to replay the whole batch."
         }
         (_, true) => {
             "apply_patch failed after earlier changes were applied; inspect changes before retrying."

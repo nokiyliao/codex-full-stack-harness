@@ -2439,7 +2439,7 @@ fn runtime_lifecycle_enrichment_rejects_active_terminal_and_identity_drift() {
                 lease_id: "lease-active-enrichment".to_string(),
             })
             .expect("activate runtime lease"),
-        RuntimeLeaseOutcome::Activated { .. }
+        RuntimeLeaseOutcome::Activated
     ));
     assert_eq!(
         store

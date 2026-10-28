@@ -1,10 +1,12 @@
 """Offline summary contract: metadata compaction never grants result acceptance."""
 import copy
+import hashlib
 import json
 import unittest
 from unittest.mock import patch
 from codex_collaboration_harness import batch
 from codex_collaboration_harness.embedded_nokiy import EmbeddedNokiyError
+from codex_collaboration_harness.result_inspection import MAX_PROJECTED_BYTES
 
 
 def fixture(count=5):
@@ -48,12 +50,116 @@ class SummaryCompactionTests(unittest.TestCase):
     def encoded(self, value):
         return json.dumps(value, ensure_ascii=True, sort_keys=True).encode()
 
+    def review_fixture(self, count=2):
+        result = fixture(count)
+        answers = []
+        for index, row in enumerate(result["members"]):
+            text = json.dumps({"findings": [
+                {"id": question, "answer": f"source-{index}-{question}: " + "checked evidence " * 55}
+                for question in range(12)
+            ]})
+            answers.append(text)
+            terminal = row["terminal"]
+            terminal.update(result_text=text[:600], result_truncated=True, result_artifact={
+                "path": f"/answers/{index}.txt", "bytes": len(text.encode()),
+                "sha256": hashlib.sha256(text.encode()).hexdigest()})
+            terminal["result_inspection"]["parent_review_answer"] = {
+                "schema_version": "nokiy_parent_review_answer_v1", "text": text,
+                "artifact": terminal["result_artifact"], "parent_acceptance_required": True,
+                "terminal_content_sha256": f"{index + 40:064x}",
+            }
+        return result, answers
+
+    def test_verified_batch_answers_need_no_followup_reads(self):
+        result, answers = self.review_fixture()
+        before = copy.deepcopy(result)
+        with patch.object(batch.caller, "execute", side_effect=AssertionError("model execution")), \
+             patch.object(batch, "project_terminal", side_effect=AssertionError("second inspection")), \
+             patch.object(batch.caller, "read_terminal", side_effect=AssertionError("second read")), \
+             patch.object(batch.Path, "open", side_effect=AssertionError("file I/O")):
+            summary = batch.summarize(result)
+        self.assertLessEqual(len(self.encoded(summary)), MAX_PROJECTED_BYTES)
+        for row, text, original in zip(batch.expand_summary(summary)["members"], answers, before["members"]):
+            self.assertEqual(row["result_text"], text)
+            self.assertFalse(row["result_truncated"])
+            self.assertEqual(row["result_text_source"], "verified_final_artifact")
+            self.assertTrue(row["terminal_result_truncated"])
+            self.assertEqual(json.loads(row["result_text"])["findings"][-1]["id"], 11)
+            self.assertEqual(row["result_artifact"], original["terminal"]["result_artifact"])
+            self.assertEqual(row["terminal_sha256"], original["terminal"]["result_inspection"]["terminal_sha256"])
+            self.assertEqual(row["usage"], original["terminal"]["usage"])
+            self.assertNotIn("parent_review_answer", row)
+        self.assertEqual(summary["mission_acceptance"], "parent_owned")
+        self.assertEqual(result, before)
+
+    def test_incomplete_inspection_never_promotes_an_answer(self):
+        result, _ = self.review_fixture(1)
+        terminal = result["members"][0]["terminal"]
+        terminal["result_inspection"].update(status="INCOMPLETE_EVIDENCE", first_blocker="COMMAND_FAILURE")
+        result.update(status="BLOCKED", first_typed_blocker="COMMAND_FAILURE")
+        result["members"][0].update(status="BLOCKED", first_typed_blocker="COMMAND_FAILURE")
+        summary = batch.summarize(result)
+        row = batch.expand_summary(summary)["members"][0]
+        self.assertEqual(row["result_text"], terminal["result_text"])
+        self.assertTrue(row["result_truncated"])
+        self.assertNotIn("result_text_source", row)
+        self.assertEqual(summary["first_typed_blocker"], "COMMAND_FAILURE")
+
+    def test_resolved_verifier_failure_survives_without_reinspection(self):
+        result = fixture(1)
+        inspection = result["members"][0]["terminal"]["result_inspection"]
+        inspection["counts"]["failed"] = 1
+        inspection["command_success"] = "known_failure"
+        inspection["verifier_failure_resolution"] = {
+            "schema_version": "nokiy_focused_verifier_resolution_v1",
+            "resolved_count": 1, "unresolved_count": 0,
+            "effective_command_success": "known_success",
+        }
+        before = copy.deepcopy(result)
+        with patch.object(batch, "project_terminal", side_effect=AssertionError("second inspection")), \
+             patch.object(batch.caller, "read_terminal", side_effect=AssertionError("second read")), \
+             patch.object(batch.Path, "open", side_effect=AssertionError("file I/O")):
+            row = batch.expand_summary(batch.summarize(result))["members"][0]
+        self.assertEqual(row["verifier_failure_resolution"], inspection["verifier_failure_resolution"])
+        self.assertEqual(row["evidence_counts"]["failed"], 1)
+        self.assertEqual(row["evidence_status"], "EVIDENCE_VERIFIED")
+        self.assertEqual(result, before)
+
+    def test_unresolved_verifier_failure_is_not_promoted_by_projection(self):
+        result = fixture(5)
+        terminal = result["members"][4]["terminal"]
+        terminal["result_inspection"]["verifier_failure_resolution"] = {
+            "schema_version": "nokiy_focused_verifier_resolution_v1",
+            "resolved_count": 1, "unresolved_count": 1,
+            "effective_command_success": "known_failure",
+        }
+        row = batch.expand_summary(batch.summarize(result))["members"][4]
+        self.assertEqual(row["verifier_failure_resolution"]["unresolved_count"], 1)
+        self.assertEqual(row["evidence_status"], "INCOMPLETE_EVIDENCE")
+        self.assertEqual(row["evidence_first_blocker"], "COMMAND_FAILURE")
+        self.assertNotIn("delivery_binding", row)
+
+    def test_absent_verifier_resolution_is_not_invented(self):
+        row = batch.expand_summary(batch.summarize(fixture(1)))["members"][0]
+        self.assertNotIn("verifier_failure_resolution", row)
+
+    def test_batch_delivery_budget_still_marks_partial_answers(self):
+        result, _ = self.review_fixture(6)
+        summary = batch.summarize(result)
+        self.assertLessEqual(len(self.encoded(summary)), MAX_PROJECTED_BYTES)
+        rows = batch.expand_summary(summary)["members"]
+        self.assertEqual(len(rows), 6)
+        self.assertTrue(any(row["result_truncated"] for row in rows))
+        for row, original in zip(rows, result["members"]):
+            self.assertEqual(row["request_id"], original["request_id"])
+            self.assertEqual(row["result_artifact"], original["terminal"]["result_artifact"])
+
     def test_five_members_keep_all_identity_proof_usage_and_failure(self):
         result = fixture()
         original = copy.deepcopy(result)
         summary = batch.summarize(result)
         self.assertEqual(summary["schema_version"], "nokiy_direct_batch_summary_v2")
-        self.assertLessEqual(len(self.encoded(summary)), 8000)
+        self.assertLessEqual(len(self.encoded(summary)), MAX_PROJECTED_BYTES)
         self.assertEqual(len(summary["members"]), 5)
         expanded = batch.expand_summary(summary)
         for actual, row in zip(expanded["members"], result["members"]):
@@ -85,6 +191,79 @@ class SummaryCompactionTests(unittest.TestCase):
             compact = batch._compact_summary(summary)
             self.assertEqual(batch.expand_summary(compact), summary)
 
+    def test_handoff_fields_survive_v1_v2_expansion_and_trimming_without_io(self):
+        fields = ("observed_model", "wall_time_seconds", "result_artifact")
+        cases = ((1, False), (5, False), (5, True))
+        with patch.object(batch.caller, "execute", side_effect=AssertionError("model execution")), \
+             patch.object(batch, "project_terminal", side_effect=AssertionError("new inspection")), \
+             patch.object(batch.caller, "read_terminal", side_effect=AssertionError("terminal read")), \
+             patch.object(batch, "retain_inspection_summary", side_effect=AssertionError("publication")), \
+             patch("builtins.open", side_effect=AssertionError("file I/O")), \
+             patch.object(batch.Path, "open", side_effect=AssertionError("path I/O")):
+            for count, trim in cases:
+                with self.subTest(count=count, trim=trim):
+                    result = fixture(count)
+                    for i, member in enumerate(result["members"]):
+                        terminal = member["terminal"]
+                        terminal["result_text"] = "\U0001f680" * 20000 if trim else "bounded answer"
+                        terminal.update({
+                            "observed_model": f"provider-model-{i}",
+                            "wall_time_seconds": i * 1.25,
+                            "result_artifact": {
+                                "path": f"/answers/{i}.txt", "sha256": f"{i + 90:064x}",
+                                "bytes": len(terminal["result_text"].encode("utf-8"))},
+                        })
+                    original = copy.deepcopy(result)
+                    summary = batch.summarize(result)
+                    self.assertEqual(summary["schema_version"],
+                                     f"nokiy_direct_batch_summary_v{1 if count == 1 else 2}")
+                    summary_before = copy.deepcopy(summary)
+                    compact = (batch._compact_summary(summary) if count == 1 else summary)
+                    compact_before = copy.deepcopy(compact)
+                    expanded = batch.expand_summary(compact)
+                    for projection in (summary, compact, expanded):
+                        self.assertEqual(len(projection["members"]), count)
+                        self.assertNotIn("wall_time_seconds", projection)
+                        for actual, member in zip(projection["members"], original["members"]):
+                            for key in fields:
+                                self.assertEqual(actual[key], member["terminal"][key])
+                    self.assertTrue(set(fields).isdisjoint(compact["member_defaults"]))
+                    for projection in (summary, compact):
+                        self.assertLessEqual(len(self.encoded(projection)), MAX_PROJECTED_BYTES)
+                    if trim:
+                        self.assertTrue(any(row["result_truncated"] for row in expanded["members"]))
+                    else:
+                        self.assertTrue(all(row["result_text"] == "bounded answer"
+                                            for row in expanded["members"]))
+                    self.assertEqual(summary, summary_before)
+                    self.assertEqual(compact, compact_before)
+                    self.assertEqual(result, original)
+
+    def test_missing_and_unknown_handoff_fields_stay_unknown(self):
+        fields = ("observed_model", "wall_time_seconds", "result_artifact")
+        result = fixture(3)
+        for key in fields:
+            result["members"][0]["terminal"].pop(key, None)
+        result["members"][1]["terminal"].update(dict.fromkeys(fields))
+        result["members"][1]["terminal"]["usage"] = None
+        result["members"][2]["terminal"] = None
+        original = copy.deepcopy(result)
+        summary = batch.summarize(result)
+        self.assertEqual(summary["schema_version"], "nokiy_direct_batch_summary_v1")
+        compact = batch._compact_summary(summary)
+        expanded = batch.expand_summary(compact)
+        for projection in (summary, compact, expanded):
+            for row in projection["members"]:
+                for key in fields:
+                    self.assertIn(key, row)
+                    self.assertIsNone(row[key])
+            self.assertIsNone(projection["members"][1]["usage"])
+            self.assertIsNone(projection["members"][2]["usage"])
+            self.assertNotIn("wall_time_seconds", projection)
+        for projection in (summary, compact):
+            self.assertLessEqual(len(self.encoded(projection)), MAX_PROJECTED_BYTES)
+        self.assertEqual(result, original)
+
     def test_different_routes_tiers_and_coverage_never_share(self):
         result = fixture()
         for i, row in enumerate(result["members"]):
@@ -114,7 +293,7 @@ class SummaryCompactionTests(unittest.TestCase):
         for row in result["members"]:
             row["terminal"]["result_text"] = "\U0001f680" * 20000
         summary = batch.summarize(result)
-        self.assertLessEqual(len(self.encoded(summary)), 8000)
+        self.assertLessEqual(len(self.encoded(summary)), MAX_PROJECTED_BYTES)
         self.assertEqual(len(summary["members"]), 5)
         self.assertTrue(any(row["result_truncated"] for row in summary["members"]))
         for row in batch.expand_summary(summary)["members"]:
@@ -141,8 +320,8 @@ class SummaryCompactionTests(unittest.TestCase):
     def test_irreducible_metadata_remains_typed_failure_not_success(self):
         result = fixture()
         for i, row in enumerate(result["members"]):
-            row["terminal"]["model_route"] = {"unique": str(i) * 10000}
+            row["terminal"]["model_route"] = {"unique": str(i) * MAX_PROJECTED_BYTES}
         summary = batch.summarize(result)
         self.assertEqual(summary["status"], "COMPACT_METADATA_TOO_LARGE")
         self.assertEqual(summary["first_typed_blocker"], "NOKIY_BATCH_SUMMARY_TOO_LARGE")
-        self.assertLessEqual(len(self.encoded(summary)), 8000)
+        self.assertLessEqual(len(self.encoded(summary)), MAX_PROJECTED_BYTES)

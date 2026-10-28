@@ -7,6 +7,8 @@
 //! provider quirk layer.
 
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use super::common::{
@@ -33,7 +35,20 @@ pub(crate) async fn codex_oauth_call(
     let client = reqwest::Client::builder()
         .build()
         .map_err(|err| provider_transport_error(ProviderTransportPhase::ClientBuild, &err))?;
-    let payload = build_codex_oauth_payload(model, messages, options);
+    let mut payload = build_codex_oauth_payload(model, messages, options);
+    let base = codex_base_instructions(model);
+    if let Some(base) = &base {
+        payload["instructions"] = Value::String(base.text.to_string());
+    }
+    let header_profile = std::env::var("TURA_CODEX_HEADER_PROFILE")
+        .unwrap_or_else(|_| "tura".to_string())
+        .to_ascii_lowercase();
+    let affinity = (header_profile != "official").then(|| codex_session_affinity(options));
+    let request_profile = codex_request_profile(
+        &payload,
+        base.as_ref(),
+        affinity.as_ref().map_or("none", |(_, source)| *source),
+    );
 
     let mut request = client
         .post(openai_codex_endpoint())
@@ -42,11 +57,8 @@ pub(crate) async fn codex_oauth_call(
         .header("User-Agent", codex_cli_user_agent())
         .json(&payload);
 
-    let header_profile = std::env::var("TURA_CODEX_HEADER_PROFILE")
-        .unwrap_or_else(|_| "tura".to_string())
-        .to_ascii_lowercase();
-    if header_profile != "official" {
-        request = request.header("session_id", "tura-codex-validation");
+    if let Some((session, _)) = &affinity {
+        request = request.header("session_id", session.as_str());
     }
 
     if let Ok(account_id) = std::env::var("OPENAI_ACCOUNT_ID")
@@ -55,7 +67,9 @@ pub(crate) async fn codex_oauth_call(
         request = request.header("ChatGPT-Account-Id", account_id);
     }
 
+    let request_started = Instant::now();
     let resp = send_provider_request_first_response(request).await?;
+    let response_headers_ms = elapsed_ms(request_started);
     let status = resp.status();
     let req_id = resp
         .headers()
@@ -73,8 +87,10 @@ pub(crate) async fn codex_oauth_call(
         });
     }
 
-    let data = parse_codex_response_stream(resp, stream_events).await?;
-    validate_responses_status("codex", &data)?;
+    let (data, timing) = parse_codex_response_chunks_timed(
+        resp.bytes_stream(), stream_events, request_started, response_headers_ms,
+    ).await.map_err(|error| error.with_stream_request_id(req_id.as_deref()))?;
+    validate_responses_status_with_usage("codex", model, req_id.as_deref(), &data)?;
     let mut content = normalize_codex_response_content(&data);
     if let Some(text) = content.as_str() {
         content = Value::String(strip_json_fence(text));
@@ -82,10 +98,13 @@ pub(crate) async fn codex_oauth_call(
     let mut metrics = extract_openapi_metrics(&data, options.context_window);
     metrics.cost = CostDetails::default();
     metrics.provider_request_id = req_id;
+    metrics.transport_timing = Some(timing);
+    metrics.request_profile = Some(request_profile);
     Ok(ProviderResponse {
         content,
         raw: data,
         metrics: Some(metrics),
+        failed_attempts: Vec::new(),
     })
 }
 
@@ -130,8 +149,9 @@ pub(crate) async fn responses_api_key_call(
         });
     }
 
-    let data = parse_codex_response_stream(resp, stream_events).await?;
-    validate_responses_status(profile.provider, &data)?;
+    let data = parse_codex_response_stream(resp, stream_events)
+        .await.map_err(|error| error.with_stream_request_id(req_id.as_deref()))?;
+    validate_responses_status_with_usage(profile.provider, model, req_id.as_deref(), &data)?;
     let mut content = normalize_codex_response_content(&data);
     if let Some(text) = content.as_str() {
         content = Value::String(strip_json_fence(text));
@@ -142,11 +162,157 @@ pub(crate) async fn responses_api_key_call(
         content,
         raw: data,
         metrics: Some(metrics),
+        failed_attempts: Vec::new(),
     })
 }
 
 fn codex_cli_user_agent() -> String {
     "codex_cli_rs/0.0.0 (Windows 10.0; x86_64)".to_string()
+}
+
+/// Official base instructions for one model plus where they were found.
+#[derive(Clone)]
+struct BaseInstructions {
+    text: Arc<str>,
+    /// `model_catalog` (config.toml `model_catalog_json`) or `models_cache`.
+    source: &'static str,
+    catalog: Arc<str>,
+}
+
+fn generic_instructions_requested() -> bool {
+    std::env::var("TURA_CODEX_BASE_INSTRUCTIONS")
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("generic"))
+}
+
+/// Every Nokiy worker sends the same official instructions and tool schemas, a
+/// prefix no other client shares. One affinity key for all workers keeps it warm
+/// across workers and runs: a per-session key (V248) measured 0 cached tokens on
+/// every first call versus 7808 with this shared key, while follow-up misses
+/// under the shared key were 1 of 49 calls.
+const WORKER_SESSION_AFFINITY: &str = "tura-codex-validation";
+
+fn codex_session_affinity(_options: &CallOptions) -> (String, &'static str) {
+    (WORKER_SESSION_AFFINITY.to_string(), "shared")
+}
+
+/// Local provenance of the instructions a Codex request carried, so each
+/// worker call can be traced to its catalog entry or the generic fallback.
+fn codex_request_profile(
+    payload: &Value,
+    base: Option<&BaseInstructions>,
+    session_affinity: &str,
+) -> Value {
+    let instructions = payload
+        .get("instructions")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let source = match base {
+        Some(base) => base.source,
+        None if generic_instructions_requested() => "generic_requested",
+        None => "generic_no_catalog_entry",
+    };
+    json!({
+        "schema_version": "provider_request_profile_v1",
+        "instructions_source": source,
+        "instructions_catalog": base.map(|base| base.catalog.as_ref()),
+        "instructions_bytes": instructions.len(),
+        "instructions_sha256_16": sha256_prefix(instructions),
+        "session_affinity": session_affinity,
+    })
+}
+
+/// Native Codex sends each model's official base instructions as
+/// `instructions`, taken from its model catalog: `model_catalog_json` in
+/// `CODEX_HOME/config.toml` when configured, else `CODEX_HOME/models_cache.json`.
+/// With only the generic line instead, gpt-6.1-sol at max effort spends a
+/// ~516-token reasoning block (~10 s) on every exploratory call.
+/// `TURA_CODEX_BASE_INSTRUCTIONS=generic` keeps the generic line.
+fn codex_base_instructions(model: &str) -> Option<BaseInstructions> {
+    if generic_instructions_requested() {
+        return None;
+    }
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<BaseInstructions>>>> = OnceLock::new();
+    let slug = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    let mut cache = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .entry(slug.clone())
+        .or_insert_with(|| {
+            let home = crate::tura_llm::codex_home_dir()?;
+            let config = std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+            let catalogs = configured_model_catalog(&config, &home)
+                .map(|path| ("model_catalog", path))
+                .into_iter()
+                .chain([("models_cache", home.join("models_cache.json"))]);
+            for (source, path) in catalogs {
+                let Some(text) = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| base_instructions_from_catalog(&bytes, &slug))
+                else {
+                    continue;
+                };
+                tracing::info!(
+                    model = %slug,
+                    catalog = %path.display(),
+                    chars = text.len(),
+                    sha256 = %sha256_prefix(&text),
+                    "codex base instructions loaded from model catalog"
+                );
+                return Some(BaseInstructions {
+                    text: Arc::from(text),
+                    source,
+                    catalog: Arc::from(path.display().to_string()),
+                });
+            }
+            None
+        })
+        .clone()
+}
+
+/// Top-level `model_catalog_json` of a Codex config.toml (relative paths are
+/// resolved against CODEX_HOME). Table sections end the top-level scope.
+fn configured_model_catalog(config: &str, codex_home: &std::path::Path) -> Option<std::path::PathBuf> {
+    for line in config.lines().map(str::trim) {
+        if line.starts_with('[') {
+            return None;
+        }
+        let Some(rest) = line.strip_prefix("model_catalog_json") else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let quote = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+        let path = value[1..].split(quote).next().filter(|path| !path.is_empty())?;
+        return Some(codex_home.join(path));
+    }
+    None
+}
+
+fn base_instructions_from_catalog(bytes: &[u8], slug: &str) -> Option<String> {
+    let catalog: Value = serde_json::from_slice(bytes).ok()?;
+    let entry = catalog
+        .get("models")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("slug").and_then(Value::as_str) == Some(slug))?;
+    ["/base_instructions", "/model_messages/instructions_template"]
+        .iter()
+        .filter_map(|pointer| entry.pointer(pointer).and_then(Value::as_str))
+        .find(|text| !text.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn sha256_prefix(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Per-provider behaviour of the shared Responses-API payload builder. Codex
@@ -225,7 +391,7 @@ fn build_responses_payload(
 ) -> Value {
     let mut input = Vec::new();
     let instructions =
-        "Follow the user request and Operation Manual, and answer concisely.".to_string();
+        "Follow the user request and Operation Manual. Provide the requested deliverable, coverage, format, and detail; be concise when requested.".to_string();
     for message in messages {
         if message.get("type").and_then(Value::as_str) == Some("reasoning")
             && message.get("role").is_none()
@@ -373,6 +539,39 @@ async fn parse_codex_response_stream(
     parse_codex_response_chunks(resp.bytes_stream(), stream_events).await
 }
 
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+async fn parse_codex_response_chunks_timed<S, B>(
+    stream: S,
+    downstream: Option<ProviderStreamEventSink>,
+    started: Instant,
+    response_headers_ms: u64,
+) -> Result<(Value, crate::TransportTiming), TuraError>
+where
+    S: futures_util::Stream<Item = Result<B, reqwest::Error>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let first = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed = first.clone();
+    let sink: ProviderStreamEventSink = std::sync::Arc::new(move |event| {
+        if matches!(event, ProviderStreamEvent::ProviderOutputStarted) {
+            observed.lock().unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(|| elapsed_ms(started));
+        }
+        if let Some(sink) = &downstream {
+            sink(event);
+        }
+    });
+    let data = parse_codex_response_chunks(stream, Some(sink)).await?;
+    let first_output_event_ms = *first.lock().unwrap_or_else(|e| e.into_inner());
+    Ok((data, crate::TransportTiming {
+        transport: "http_sse".into(), response_headers_ms,
+        first_output_event_ms, completed_ms: elapsed_ms(started),
+    }))
+}
+
 pub(crate) async fn parse_codex_response_chunks<S, B>(
     mut stream: S,
     stream_events: Option<ProviderStreamEventSink>,
@@ -388,17 +587,43 @@ where
     let mut command_collector = CodexCommandRunCommandCollector::default();
     let mut saw_output = false;
     let mut last_output_at = Instant::now();
+    let mut completed_frame_ended = false;
+
+    // Record only parser predicates, never event bodies or undecoded bytes.
+    macro_rules! observe_stream_failure {
+        ($result:expr) => {
+            $result.map_err(|source| TuraError::StreamFailure {
+                source: Box::new(source),
+                snapshot: crate::tura_llm::ProviderStreamFailureSnapshot {
+                    schema_version: "provider_stream_failure_snapshot_v1".into(),
+                    event_count: events.len(),
+                    completed_seen: events.iter().any(|event: &Value| event["type"] == "response.completed"),
+                    completion_valid: valid_codex_stream_completion(completed.as_ref(), &events),
+                    completed_frame_ended,
+                    pending_bytes: pending.len(),
+                    request_id: None,
+                    runtime_id: None,
+                    command_effect_started: None,
+                },
+            })
+        };
+    }
 
     while let Some(chunk) =
-        next_provider_stream_chunk(&mut stream, saw_output, last_output_at).await?
+        observe_stream_failure!(next_provider_stream_chunk(&mut stream, saw_output, last_output_at).await)?
     {
-        let chunk = chunk
-            .map_err(|err| provider_transport_error(ProviderTransportPhase::ResponsesSse, &err))?;
+        let chunk = observe_stream_failure!(chunk
+            .map_err(|err| provider_transport_error(ProviderTransportPhase::ResponsesSse, &err)))?;
         pending.extend_from_slice(chunk.as_ref());
 
         while let Some(line_end) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = decode_codex_sse_line(&pending[..line_end])?;
+            completed_frame_ended |= line.is_empty()
+                && events
+                    .last()
+                    .is_some_and(|event: &Value| event["type"] == "response.completed");
             let output_event = process_codex_sse_line(
-                decode_codex_sse_line(&pending[..line_end])?,
+                line,
                 &mut output_text,
                 &mut completed,
                 &mut events,
@@ -410,6 +635,16 @@ where
                 saw_output = true;
                 last_output_at = Instant::now();
             }
+        }
+
+        // Commit at a framed terminal event, not transport EOF. Drain the whole
+        // delivered chunk first so contradictions and undecoded partial tails
+        // cannot be discarded just because response.completed appeared.
+        if completed_frame_ended
+            && pending.is_empty()
+            && valid_codex_stream_completion(completed.as_ref(), &events)
+        {
+            return Ok(build_codex_stream_root(output_text, completed, events));
         }
     }
 
@@ -431,35 +666,80 @@ where
         .and_then(|response| response.get("status"))
         .and_then(Value::as_str)
         .is_some_and(|status| !matches!(status, "completed" | "in_progress" | "queued"));
-    let valid_completion = completed.as_ref().is_some_and(|response| {
-        response.is_object()
-            && response.get("status").is_none_or(|status| status == "completed")
-            && response.get("error").is_none_or(Value::is_null)
-            && events.iter().any(|event| {
-                event["type"] == "response.completed" && event.get("response") == Some(response)
-            })
-    }) && !events.iter().any(|event| {
-        matches!(
-            event.get("type").and_then(Value::as_str),
-            Some("response.failed" | "response.incomplete" | "error")
-        )
-    });
-    if !provider_failure && !valid_completion {
-        return Err(TuraError::Network {
+    if !provider_failure && !valid_codex_stream_completion(completed.as_ref(), &events) {
+        return observe_stream_failure!(Err(TuraError::Network {
             message: "provider stream failure: phase=responses-sse category=protocol cause=missing-completed"
                 .to_string(),
-        });
+        }));
     }
 
     Ok(build_codex_stream_root(output_text, completed, events))
+}
+
+fn valid_codex_stream_completion(completed: Option<&Value>, events: &[Value]) -> bool {
+    let Some(response) = completed else {
+        return false;
+    };
+    if !response.is_object()
+        || response
+            .get("status")
+            .is_some_and(|status| status != "completed")
+        || response.get("error").is_some_and(|error| !error.is_null())
+        || response
+            .get("id")
+            .is_some_and(|id| id.as_str().is_none_or(str::is_empty))
+    {
+        return false;
+    }
+
+    // Completion is authoritative only for a consistent, failure-free history.
+    // Missing IDs remain compatible, but an observed ID must match the terminal
+    // response. A terminal event cannot be followed by a reopened response.
+    let mut saw_completed = false;
+    for event in events {
+        let event_type = event.get("type").and_then(Value::as_str);
+        if matches!(
+            event_type,
+            Some("response.failed" | "response.incomplete" | "error")
+        ) || (saw_completed && event_type != Some("response.completed"))
+            || event
+                .get("response_id")
+                .is_some_and(|id| Some(id) != response.get("id"))
+        {
+            return false;
+        }
+        if let Some(snapshot) = event.get("response")
+            && (!snapshot.is_object()
+                || snapshot.get("error").is_some_and(|error| !error.is_null())
+                || snapshot.get("status").is_some_and(|status| {
+                    !matches!(
+                        status.as_str(),
+                        Some("completed" | "in_progress" | "queued")
+                    )
+                })
+                || snapshot
+                    .get("id")
+                    .is_some_and(|id| Some(id) != response.get("id")))
+            {
+                return false;
+            }
+        if event_type == Some("response.completed") {
+            if event.get("response") != Some(response) {
+                return false;
+            }
+            saw_completed = true;
+        }
+    }
+    saw_completed
 }
 
 fn decode_codex_sse_line(bytes: &[u8]) -> Result<&str, TuraError> {
     std::str::from_utf8(bytes)
         .map(|line| line.trim_end_matches('\r'))
         .map_err(|_| TuraError::Network {
-            message: "provider stream failure: phase=responses-sse category=decode cause=invalid-utf8"
-                .to_string(),
+            message:
+                "provider stream failure: phase=responses-sse category=decode cause=invalid-utf8"
+                    .to_string(),
         })
 }
 
@@ -576,11 +856,10 @@ fn completed_stream_output(final_response: &Value, events: &[Value]) -> Option<V
     {
         return None;
     }
-    if let Some(output) = final_response.get("output") {
-        if !output.as_array().is_some_and(Vec::is_empty) {
+    if let Some(output) = final_response.get("output")
+        && !output.as_array().is_some_and(Vec::is_empty) {
             return None;
         }
-    }
     let response_id = final_response["id"].as_str().filter(|id| !id.is_empty())?;
     let mut created = false;
     let mut finished = false;
@@ -660,6 +939,14 @@ fn completed_stream_output(final_response: &Value, events: &[Value]) -> Option<V
     Some(done.into_values().collect())
 }
 
+fn validate_responses_status_with_usage(
+    provider: &str, model: &str, request_id: Option<&str>, data: &Value,
+) -> Result<(), TuraError> {
+    validate_responses_status(provider, data).map_err(|error| error.with_failed_attempts(vec![
+        crate::failure_usage::FailedProviderAttempt::from_response(provider, model, request_id, data),
+    ]))
+}
+
 fn validate_responses_status(provider: &str, data: &Value) -> Result<(), TuraError> {
     let Some(status) = data.get("status").and_then(Value::as_str) else {
         return Ok(());
@@ -670,7 +957,8 @@ fn validate_responses_status(provider: &str, data: &Value) -> Result<(), TuraErr
 
     let detail = data
         .get("incomplete_details")
-        .or_else(|| data.get("error"))
+        .filter(|value| !value.is_null())
+        .or_else(|| data.get("error").filter(|value| !value.is_null()))
         .map(|value| value.to_string())
         .unwrap_or_else(|| "no detail".to_string());
     Err(TuraError::ProviderRequest {
@@ -704,6 +992,26 @@ pub(crate) fn normalize_codex_response_content(data: &Value) -> Value {
 
 pub(crate) fn normalize_codex_response_event_content(data: &Value) -> Option<Value> {
     let tool_calls = complete_codex_tool_calls(data);
+    if let Some(messages) = codex_public_messages(data) {
+        // Keep each public message's phase associated with its text. A blank
+        // final_answer must not turn another message's commentary into a final.
+        let text = messages
+            .iter()
+            .filter_map(|message| message.get("text").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = if tool_calls.is_empty() {
+            strip_json_fence(&text)
+        } else {
+            text
+        };
+        let mut content = json!({ "text": text, "public_messages": messages });
+        if !tool_calls.is_empty() {
+            content["tool_calls"] = Value::Array(tool_calls);
+        }
+        return Some(content);
+    }
     if !tool_calls.is_empty() {
         let mut object = serde_json::Map::new();
         if let Some(text) = data.get("output_text").and_then(Value::as_str)
@@ -739,6 +1047,67 @@ pub(crate) fn normalize_codex_response_event_content(data: &Value) -> Option<Val
         return Some(Value::String(text.to_string()));
     }
     None
+}
+
+fn codex_public_messages(data: &Value) -> Option<Vec<Value>> {
+    let is_public_message = |item: &&Value| {
+        item.get("type").and_then(Value::as_str) == Some("message")
+            && item
+                .get("role")
+                .and_then(Value::as_str)
+                .is_none_or(|role| role == "assistant")
+    };
+    let mut items: Vec<&Value> = data
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(is_public_message)
+        .collect();
+    if items.is_empty() {
+        items = data
+            .get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+            })
+            .filter_map(|event| event.get("item"))
+            .filter(is_public_message)
+            .collect();
+    }
+    if !items
+        .iter()
+        .any(|item| codex_public_message_phase(item).is_some())
+    {
+        // Leave legacy/unphased normalization, including its content shape,
+        // unchanged. Only recognized public phases opt into this projection.
+        return None;
+    }
+    Some(
+        items
+            .into_iter()
+            .map(|item| {
+                // Never copy raw items, reasoning, summaries, or encrypted data.
+                let text: String = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect();
+                json!({ "phase": codex_public_message_phase(item), "text": text })
+            })
+            .collect(),
+    )
+}
+
+fn codex_public_message_phase(item: &Value) -> Option<&str> {
+    item.get("phase")
+        .and_then(Value::as_str)
+        .filter(|phase| matches!(*phase, "commentary" | "final_answer"))
 }
 
 fn codex_tool_schema(tool: &Value) -> Value {
@@ -901,9 +1270,175 @@ fn dedupe_tool_calls(calls: Vec<Value>) -> Vec<Value> {
     unique
 }
 
+fn tool_call_argument_score(call: &Value) -> usize {
+    let Some(arguments) = call
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+    else {
+        return 0;
+    };
+    match arguments {
+        Value::String(text) => text.trim().len(),
+        Value::Object(object) => object.len().max(1),
+        Value::Array(array) => array.len().max(1),
+        _ => 0,
+    }
+}
+
+use crate::tura_llm::CallOptions;
+
 #[cfg(test)]
 mod continuity_tests {
     use super::*;
+
+    #[test]
+    fn base_instructions_come_from_the_matching_models_cache_entry() {
+        let cache = json!({"models": [
+            {"slug": "gpt-6-astra", "model_messages": {"instructions_template": "astra base"}},
+            {"slug": "gpt-6.1-sol", "model_messages": {"instructions_template": "sol base"}},
+            {"slug": "gpt-6-luna", "base_instructions": "luna base",
+             "model_messages": {"instructions_template": "luna template"}},
+            {"slug": "blank", "model_messages": {"instructions_template": "  "}},
+            {"slug": "bare"}
+        ]})
+        .to_string();
+        let read = |slug| base_instructions_from_catalog(cache.as_bytes(), slug);
+        assert_eq!(read("gpt-6.1-sol").as_deref(), Some("sol base"));
+        assert_eq!(read("gpt-6-astra").as_deref(), Some("astra base"));
+        assert_eq!(read("gpt-6-luna").as_deref(), Some("luna base"));
+        assert_eq!(read("blank"), None);
+        assert_eq!(read("bare"), None);
+        assert_eq!(read("missing"), None);
+        assert_eq!(base_instructions_from_catalog(b"not json", "gpt-6.1-sol"), None);
+    }
+
+    #[test]
+    fn model_catalog_path_is_read_from_top_level_config_only() {
+        let home = std::path::Path::new("/codex-home");
+        let read = |config: &str| configured_model_catalog(config, home);
+        assert_eq!(
+            read("model = \"x\"\nmodel_catalog_json = \"/abs/unified.json\"\n"),
+            Some("/abs/unified.json".into())
+        );
+        assert_eq!(read("model_catalog_json='rel/c.json'"), Some("/codex-home/rel/c.json".into()));
+        assert_eq!(read("# model_catalog_json = \"/commented.json\"\n"), None);
+        assert_eq!(read("model_catalog_json_extra = \"/other.json\"\n"), None);
+        assert_eq!(read("[profiles.a]\nmodel_catalog_json = \"/scoped.json\"\n"), None);
+        assert_eq!(read("model_catalog_json = \"\"\n"), None);
+        assert_eq!(read(""), None);
+    }
+
+    #[test]
+    fn request_profile_names_the_instruction_source_and_digest() {
+        let base = BaseInstructions {
+            text: Arc::from("sol base"),
+            source: "model_catalog",
+            catalog: Arc::from("/m/unified.json"),
+        };
+        let profile = codex_request_profile(&json!({"instructions": "sol base"}), Some(&base), "prompt_cache_key");
+        assert_eq!(profile["instructions_source"], "model_catalog");
+        assert_eq!(profile["instructions_catalog"], "/m/unified.json");
+        assert_eq!(profile["instructions_bytes"], 8);
+        assert_eq!(profile["instructions_sha256_16"], sha256_prefix("sol base"));
+        assert_eq!(profile["instructions_sha256_16"].as_str().unwrap().len(), 16);
+        assert_eq!(profile["session_affinity"], "prompt_cache_key");
+        let generic = codex_request_profile(&json!({"instructions": "generic line"}), None, "fixed");
+        assert!(generic["instructions_catalog"].is_null());
+        assert!(generic["instructions_source"].as_str().unwrap().starts_with("generic_"));
+    }
+
+    #[test]
+    fn workers_share_one_affinity_key_regardless_of_session() {
+        for key in [None, Some("turaosv2:direct:full-abc:0123456789abcdef".to_string())] {
+            let options = CallOptions { prompt_cache_key: key, ..CallOptions::default() };
+            assert_eq!(codex_session_affinity(&options), ("tura-codex-validation".to_string(), "shared"));
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_timing_preserves_completed_stream_and_callback_delivery() {
+        let (_, events, _) = completed_item_stream();
+        let bytes = events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>().into_bytes();
+        let expected = parse_codex_response_chunks(
+            futures_util::stream::iter(vec![Ok(bytes.clone())]), None,
+        ).await.unwrap();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = seen.clone();
+        let sink: ProviderStreamEventSink = std::sync::Arc::new(move |event| {
+            if matches!(event, ProviderStreamEvent::ProviderOutputStarted) {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let started = Instant::now() - std::time::Duration::from_millis(20);
+        let (actual, timing) = parse_codex_response_chunks_timed(
+            futures_util::stream::iter(vec![Ok(bytes)]), Some(sink), started, 10,
+        ).await.unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(timing.transport, "http_sse");
+        assert_eq!(timing.response_headers_ms, 10);
+        assert!(timing.first_output_event_ms.unwrap() >= 20);
+        assert!(timing.first_output_event_ms.unwrap() <= timing.completed_ms);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn transport_timing_keeps_missing_output_unknown_and_rejects_truncated_stream() {
+        let bytes = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n".to_vec();
+        let (_, timing) = parse_codex_response_chunks_timed(
+            futures_util::stream::iter(vec![Ok(bytes)]), None, Instant::now(), 0,
+        ).await.unwrap();
+        assert_eq!(timing.first_output_event_ms, None);
+        let invalid = b"data: {\"type\":\"response.created\"}\n\n".to_vec();
+        assert!(parse_codex_response_chunks_timed(
+            futures_util::stream::iter(vec![Ok(invalid)]), None, Instant::now(), 0,
+        ).await.is_err());
+    }
+
+    #[test]
+    fn transport_timing_old_metrics_remain_deserializable() {
+        let mut old = serde_json::to_value(crate::CallMetrics::default()).unwrap();
+        old.as_object_mut().unwrap().remove("transport_timing");
+        let restored: crate::CallMetrics = serde_json::from_value(old).unwrap();
+        assert!(restored.transport_timing.is_none());
+    }
+
+    #[test]
+    fn failure_usage_does_not_change_errors_or_retry_policy() {
+        let data = json!({"status":"failed", "error":{"code":"billing_error"},
+            "usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}});
+        let plain = validate_responses_status("codex", &data).unwrap_err();
+        let observed = validate_responses_status_with_usage("codex", "requested", Some("req-1"), &data).unwrap_err();
+        assert_eq!(plain.to_string(), observed.to_string());
+        assert_eq!(plain.is_non_retryable_provider_failure(), observed.is_non_retryable_provider_failure());
+        assert_eq!(observed.failed_attempts()[0].request_id.as_deref(), Some("req-1"));
+        assert_eq!(observed.failed_attempts()[0].usage.as_ref().unwrap().total_tokens, Some(12));
+    }
+
+    #[test]
+    fn failed_response_null_incomplete_details_preserves_provider_error() {
+        let error = validate_responses_status("codex", &json!({
+            "status": "failed", "incomplete_details": null,
+            "error": {"code": "server_error", "message": "fixture failure"}
+        })).unwrap_err().to_string();
+        assert!(error.contains("server_error"), "{error}");
+        assert!(error.contains("fixture failure"), "{error}");
+    }
+
+    #[test]
+    fn failed_response_missing_detail_is_explicit_and_incomplete_reason_is_retained() {
+        for data in [json!({"status": "failed"}),
+                     json!({"status": "failed", "incomplete_details": null, "error": null})] {
+            assert!(validate_responses_status("codex", &data).unwrap_err().to_string().contains("no detail"));
+        }
+        let error = validate_responses_status("codex", &json!({
+            "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+            "error": null
+        })).unwrap_err().to_string();
+        assert!(error.contains("max_output_tokens"));
+        for status in ["completed", "in_progress", "queued"] {
+            assert!(validate_responses_status("codex", &json!({"status": status})).is_ok());
+        }
+    }
 
     fn completed_item_stream() -> (Value, Vec<Value>, Vec<Value>) {
         let items = vec![
@@ -1064,20 +1599,3 @@ mod continuity_tests {
         );
     }
 }
-
-fn tool_call_argument_score(call: &Value) -> usize {
-    let Some(arguments) = call
-        .get("function")
-        .and_then(|function| function.get("arguments"))
-    else {
-        return 0;
-    };
-    match arguments {
-        Value::String(text) => text.trim().len(),
-        Value::Object(object) => object.len().max(1),
-        Value::Array(array) => array.len().max(1),
-        _ => 0,
-    }
-}
-
-use crate::tura_llm::CallOptions;

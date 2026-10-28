@@ -9,7 +9,7 @@
     "status": {
       "type": "string",
       "enum": ["doing", "question", "done"],
-      "description": "Update only when there is a real task-state transition. doing only when more command_run calls are required; question when blocked on user feedback; done only when the task is complete, verified, and any media to send/show has been read and inspected."
+      "description": "Update only when there is a real task-state transition. doing only when more command_run calls are required; question when blocked on user feedback; done only when assigned work is complete, executor-owned verification has passed, and any media to send/show has been read and inspected. Verification defaults to this executor; explicitly parent-owned checks remain pending and are not a worker completion requirement. Missing tools alone do not transfer verification ownership."
     },
     "task_type": {
       "type": "array",
@@ -19,10 +19,18 @@
       "uniqueItems": true,
       "description": "Complete set of prompt and Operation Manual types needed by the current task. Update it as soon as the task type is identified, keep it paired with task_group, and include multiple ids when multiple manuals apply. Runtime injects the current available task types from runtime prompt identities."
     },
+    "final_reply": {
+      "anyOf": [
+        {"type": "string", "minLength": 1},
+        {"type": "object", "minProperties": 1},
+        {"type": "array", "minItems": 1}
+      ],
+      "description": "Complete answer as unchanged text or compact JSON object/array. Status done, observed executor-owned checks, no compact_context; or status question carrying the complete question or blocker, so no further turn is needed. A pre-authored reply may instead follow fully-known mechanical work as the sole command in a strictly later final step, only after every earlier result succeeds and with no earlier task_status or compact_context; failed, cancelled, unknown or ambiguous results forbid delivery. Output-dependent conclusions require another model turn. Report explicitly parent-owned checks as pending, never passed; worker delivery is not overall acceptance. Omission retains normal assistant delivery."
+    },
     "compact_context": {
       "type": "string",
       "maxLength": 60000,
-      "description": "Optional context handoff summary. Use only when a new task no longer depends on the current main context or when a context checkpoint is needed. Include only details not already present in the current task conversation or prior summary."
+      "description": "Replaces the model's active working context with a handoff summary; not a status or notes field. Omit for routine progress, recording plans or decision fields, a failed read, or a phase transition while the same task still needs its current source context. Use only for actual context pressure or a genuine task handoff where earlier context can be discarded. Preserve the unresolved task, exact evidence references, and necessary source context."
     }
   }
 }

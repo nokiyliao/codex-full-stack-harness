@@ -285,7 +285,10 @@ fn command_update_payloads(
     updated_at: i64,
 ) -> Vec<SessionFeedCommandUpdate> {
     let mut updates = Vec::new();
-    for command in commands {
+    // Progress rows name only their new results; the terminal row lists every
+    // command once more, so a command_run's rows stay linear in its results.
+    let listed: &[Value] = if status == "completed" || status == "error" { commands } else { &[] };
+    for command in listed {
         let command_id =
             command_identity(command, command_run_id).unwrap_or_else(|| command_run_id.to_string());
         updates.push(SessionFeedCommandUpdate {
@@ -400,11 +403,25 @@ fn status_event_rank(status: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_run_live_delta_result, command_run_stream_event_command,
+        command_run_live_delta_result, command_run_stream_event_command, command_update_payloads,
         command_run_stream_events_from_provider_content, streamed_command_event_record,
         streamed_command_result_record,
     };
     use chrono::Utc;
+
+    #[test]
+    fn progress_updates_carry_only_new_results_and_terminal_lists_every_command() {
+        let commands = vec![
+            serde_json::json!({"command_id": "run:p:0", "command_index": 0, "command_line": "one"}),
+            serde_json::json!({"command_id": "run:p:1", "command_index": 1, "command_line": "two"}),
+        ];
+        let fresh = vec![serde_json::json!({"command_id": "run:p:0", "success": true, "command": commands[0]})];
+        let progress = command_update_payloads("runtime", "run", &commands, &fresh, "running", 1, 2);
+        assert_eq!(progress.len(), fresh.len(), "progress rows name only their new results");
+        assert!(progress.iter().all(|update| !update.result.is_null()));
+        let terminal = command_update_payloads("runtime", "run", &commands, &fresh, "completed", 1, 2);
+        assert_eq!(terminal.len(), commands.len() + fresh.len(), "the terminal row lists every command");
+    }
 
     #[test]
     fn final_response_command_run_events_extract_for_replay() {

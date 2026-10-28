@@ -114,7 +114,8 @@ fn run_terminal_evidence_fixture(
         initial_runtime_id,
         initial_lease_id,
         SessionInput {
-            user_input: if matches!(scenario, TerminalEvidenceScenario::Ordered(_)) {
+            user_input: if matches!(scenario, TerminalEvidenceScenario::Ordered(_)
+                | TerminalEvidenceScenario::OrderedFinalReply(_)) {
                 format!("Execute the predetermined offline fixture patch and exact source predicate check. Only after success, explicitly mark the worker done; failed or uncertain results require model review. All artifacts and checks are planned and no successful-result interpretation is needed. Deliver {} with parent acceptance still required.",
                     if evidence_only { "evidence_only" } else { "assistant_reply" })
             } else {
@@ -263,6 +264,55 @@ fn assert_ordered_handoff_requires_model_review(run: &TerminalEvidenceRun) {
     assert!(!run.records.iter().any(|record| record["type"] == "nokiy.terminal_evidence"));
     assert!(run.records.iter().any(|record| record["role"] == "assistant"
         && record["content"] == TERMINAL_EVIDENCE_FINAL_REPLY));
+}
+
+#[test]
+fn ordered_final_reply_complete_loop_saves_regeneration_and_persists_once() {
+    let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
+    let baseline = run_terminal_evidence_fixture("ordered-reply-default",
+        TerminalEvidenceScenario::Ordered(OrderedEvidenceScenario::Done), false, true);
+    let delivered = run_terminal_evidence_fixture("ordered-reply-preauthored",
+        TerminalEvidenceScenario::OrderedFinalReply(OrderedEvidenceScenario::Done), false, true);
+    assert_eq!(baseline.calls, 3, "start, patch/check/done, assistant regeneration");
+    assert_eq!(delivered.calls, 2, "start, successful patch/check/done with explicit reply");
+    let mut expected = baseline.outcomes.clone();
+    let status = expected.last_mut().expect("original terminal status");
+    assert_eq!(status["input_command_line"], serde_json::json!({"status":"done"}).to_string());
+    status["input_command_line"] = serde_json::json!(serde_json::json!({
+        "status":"done", "final_reply":ORDERED_PREAUTHORED_REPLY,
+    }).to_string());
+    assert_eq!(expected, delivered.outcomes, "only the explicit reply field changes");
+    assert_eq!(delivered.outcomes.len(), 4);
+    assert!(delivered.outcomes.iter().all(|outcome| outcome["success"] == true));
+    assert_eq!(delivered.records.iter().filter(|record| record["type"] == "tool_result").count(), 2);
+    let work = ordered_evidence_work_record(&delivered);
+    assert_eq!(work["output"]["results"].as_array().unwrap().len(), 3);
+    assert_eq!(work["output"]["results"][2]["output"]["task_status"]["final_reply"],
+        ORDERED_PREAUTHORED_REPLY);
+    assert_eq!(delivered.records.iter().filter(|record| record["role"] == "assistant"
+        && record["content"] == ORDERED_PREAUTHORED_REPLY).count(), 1);
+    assert!(!delivered.records.iter().any(|record| record["role"] == "assistant"
+        && record["content"] == TERMINAL_EVIDENCE_FINAL_REPLY));
+    assert!(!delivered.records.iter().any(|record| record["type"] == "nokiy.terminal_evidence"));
+    assert_eq!(delivered.usage.len(), delivered.calls);
+}
+
+#[test]
+fn ordered_final_reply_failed_unknown_or_unordered_work_still_returns_to_model() {
+    let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
+    for (index, scenario) in [
+        OrderedEvidenceScenario::FailedCheck, OrderedEvidenceScenario::TimedOutCheck,
+        OrderedEvidenceScenario::UnknownOutcome, OrderedEvidenceScenario::UnresolvedEffect,
+        OrderedEvidenceScenario::SameStep, OrderedEvidenceScenario::DoneBeforeCheck,
+        OrderedEvidenceScenario::ReversedSteps,
+    ].into_iter().enumerate() {
+        let run = run_terminal_evidence_fixture(&format!("ordered-reply-veto-{index}"),
+            TerminalEvidenceScenario::OrderedFinalReply(scenario), false, true);
+        assert_ordered_handoff_requires_model_review(&run);
+        assert!(!run.records.iter().any(|record| record["role"] == "assistant"
+            && record["content"] == ORDERED_PREAUTHORED_REPLY),
+            "{scenario:?} must not publish the pre-authored success");
+    }
 }
 
 #[test]
@@ -452,6 +502,51 @@ fn evidence_only_blocked_complete_loop_skips_only_recap_and_preserves_first_bloc
 }
 
 #[test]
+fn settled_terminal_compaction_uses_only_the_existing_tool_free_delivery_turn() {
+    let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
+    for (index, scenario) in [TerminalEvidenceScenario::PendingCompact,
+        TerminalEvidenceScenario::AutoCompact, TerminalEvidenceScenario::QuestionAutoCompact,
+    ].into_iter().enumerate() {
+        // No evidence-only shortcut is available. Compaction still must not
+        // reopen executable work or change the accepted done/question status.
+        let run = run_terminal_evidence_fixture(&format!("settled-compaction-{index}"), scenario, false, true);
+        assert_eq!(run.calls, 4);
+        assert!(run.records.iter().any(|record| record["type"] == "context_compaction"));
+        assert!(!run.records.iter().any(|record| record["type"] == "nokiy.terminal_evidence"));
+        assert_eq!(run.outcomes.len(), 4, "start, patch, read, terminal status only; the post-compact tool attempt must not execute");
+        let status = if matches!(scenario, TerminalEvidenceScenario::QuestionAutoCompact) {
+            "question"
+        } else { "done" };
+        assert_eq!(run.outcomes.last().expect("terminal outcome")["terminal_status"], status);
+    }
+
+    let ongoing = run_terminal_evidence_fixture("ongoing-compaction",
+        TerminalEvidenceScenario::DoingAutoCompact, false, true);
+    assert_eq!(ongoing.calls, 4);
+    assert!(ongoing.records.iter().any(|record| record["type"] == "context_compaction"));
+    assert_eq!(ongoing.outcomes.len(), 5, "doing still needs an executable continuation");
+    assert_eq!(ongoing.outcomes[3]["terminal_status"], "doing");
+    assert_eq!(ongoing.outcomes[4]["terminal_status"], "done",
+        "the next legitimate task-status command must execute only for ongoing work");
+}
+
+#[test]
+fn evidence_only_terminal_auto_pressure_needs_neither_compaction_nor_a_recap() {
+    let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
+    let baseline = run_terminal_evidence_fixture("auto-pressure-default", TerminalEvidenceScenario::AutoCompact, false, true);
+    let evidence = run_terminal_evidence_fixture("auto-pressure-evidence", TerminalEvidenceScenario::AutoCompact, true, true);
+    assert_eq!(baseline.calls, 4);
+    assert_eq!(evidence.calls, 3);
+    assert_eq!(baseline.outcomes, evidence.outcomes);
+    assert_eq!(&baseline.usage[..evidence.calls], evidence.usage.as_slice());
+    assert!(!evidence.records.iter().any(|record| record["type"] == "context_compaction"));
+    assert!(!evidence.records.iter().any(|record| record["role"] == "assistant"
+        && record["content"] == TERMINAL_EVIDENCE_FINAL_REPLY));
+    assert_eq!(evidence.records.iter().filter(|record| record["type"] == "nokiy.terminal_evidence"
+        && record["terminal_status"] == "done" && record["parent_acceptance_required"] == true).count(), 1);
+}
+
+#[test]
 fn evidence_only_terminal_requires_both_flags_and_preserves_negative_complete_loops() {
     let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
     let unbounded = run_terminal_evidence_fixture("terminal-evidence-not-bounded", TerminalEvidenceScenario::Done, true, false);
@@ -460,7 +555,7 @@ fn evidence_only_terminal_requires_both_flags_and_preserves_negative_complete_lo
     for (index, scenario) in [
         TerminalEvidenceScenario::Question, TerminalEvidenceScenario::MissingTerminalStatus,
         TerminalEvidenceScenario::UnsafeTerminalBatch,
-        TerminalEvidenceScenario::PendingCompact, TerminalEvidenceScenario::AutoCompact,
+        TerminalEvidenceScenario::PendingCompact,
         TerminalEvidenceScenario::ForeignMarker,
     ].into_iter().enumerate() {
         let baseline = run_terminal_evidence_fixture(&format!("terminal-negative-default-{index}"), scenario, false, true);
@@ -476,7 +571,7 @@ fn evidence_only_terminal_requires_both_flags_and_preserves_negative_complete_lo
             TerminalEvidenceScenario::Question => assert!(evidence.outcomes.iter().any(|outcome| outcome["terminal_status"] == "question")),
             TerminalEvidenceScenario::MissingTerminalStatus => assert!(!evidence.outcomes.iter().any(|outcome| outcome["terminal_status"] == "done")),
             TerminalEvidenceScenario::UnsafeTerminalBatch => assert!(evidence.records.iter().any(|record| record["output"]["results"].as_array().is_some_and(|results| results.iter().any(|result| result["output"]["outcome"] == "unknown")))),
-            TerminalEvidenceScenario::PendingCompact | TerminalEvidenceScenario::AutoCompact => assert!(evidence.records.iter().any(|record| record["type"] == "context_compaction")),
+            TerminalEvidenceScenario::PendingCompact => assert!(evidence.records.iter().any(|record| record["type"] == "context_compaction")),
             TerminalEvidenceScenario::ForeignMarker => {
                 assert_eq!(evidence.summary_usage["evidence_read_error"],
                     "execution evidence record 0 has wrong session identity");
@@ -487,7 +582,10 @@ fn evidence_only_terminal_requires_both_flags_and_preserves_negative_complete_lo
             }
             TerminalEvidenceScenario::Done | TerminalEvidenceScenario::FailedCommand
                 | TerminalEvidenceScenario::UnknownOutcome | TerminalEvidenceScenario::UnresolvedEffect
-                | TerminalEvidenceScenario::Ordered(_) => unreachable!(),
+                | TerminalEvidenceScenario::AutoCompact | TerminalEvidenceScenario::QuestionAutoCompact
+                | TerminalEvidenceScenario::DoingAutoCompact
+                | TerminalEvidenceScenario::Ordered(_)
+                | TerminalEvidenceScenario::OrderedFinalReply(_) => unreachable!(),
         }
     }
 }
@@ -592,6 +690,35 @@ fn coding_agent_can_call_command_run_tool_e2e() {
         .requests
         .lock()
         .expect("mock provider requests lock");
+    // This fixture selects debug in response 1. Inspect wire input, not a source
+    // string or session-only projection, to prove the next call receives it.
+    assert!(requests.len() >= 3);
+    for (index, request) in requests.iter().take(3).enumerate() {
+        let tools = serde_json::to_string(request.get("tools").expect("provider tools"))
+            .expect("serialize provider tools");
+        assert!(tools.contains("Verification defaults to this executor"));
+        assert!(tools.contains("explicitly assigns checks to the parent"));
+        assert!(tools.contains("report parent-owned checks as pending, never passed"));
+        assert!(tools.contains("verification owned by this executor failed"));
+        assert!(!tools.contains("after all work and verification results"));
+        assert!(!tools.contains("the task is complete, verified"));
+        assert!(tools.contains("executor-owned verification has passed"));
+        assert!(tools.contains("explicitly parent-owned checks remain pending"));
+        let input = request.get("input").or_else(|| request.get("messages"))
+            .expect("captured provider input");
+        let text = serde_json::to_string(input).expect("serialize captured input");
+        assert_eq!(
+            text.contains("Worker delivery is not overall task acceptance"),
+            index == 2,
+            "verification ownership must reach the provider after task_status, request {index}"
+        );
+        if index == 2 {
+            assert!(text.contains("Missing tools alone do not"));
+            assert!(text.contains("keep unexecuted checks pending"));
+            assert!(text.contains("Do not skip required worker checks or bypass scope"));
+            assert!(!text.contains("Only claim completion when"));
+        }
+    }
     let first_tools = requests
         .iter()
         .find(|request| request.get("tools").and_then(Value::as_array).is_some())
@@ -1678,6 +1805,208 @@ fn single_done_task_status_with_short_visible_reply_completes_without_backfill_t
                 && entry["provider_metadata"]["call_id"] == "call_task_status_done_short"
         }),
         "command_run result should retain the original provider call id; results={results:#?}"
+    );
+}
+
+struct RequestedCompactionRun {
+    requests: usize,
+    retained: Vec<Value>,
+    persisted: Vec<Value>,
+    projected_visible_replies: usize,
+}
+
+// The caller holds ENV_LOCK through SessionDbTestService for the whole run.
+fn run_requested_compaction_fixture(status: &'static str) -> RequestedCompactionRun {
+    let workspace = create_rust_workspace();
+    let provider = MockProvider::start_task_status_with_visible_reply_and_compact_context(status);
+    let llm_config = write_llm_config(&workspace, provider.addr);
+    let router_addr = mock_command_run_router_addr();
+    let _env = EnvGuard::set(&[
+        (
+            "TURA_PROVIDER_CONFIG",
+            llm_config.to_string_lossy().as_ref(),
+        ),
+        ("OPENAI_API_KEY", "test-key"),
+        ("TURA_SESSION_MODEL_OVERRIDE", "openai/mock-coder"),
+        ("TURA_ROUTER_ADDR", router_addr.as_str()),
+        ("TURA_GATEWAY_CALLBACKS", "0"),
+        ("TURA_RUNTIME_AUTO_GIT_COMMIT", "0"),
+        ("TURA_MANAS_MAX_TURNS", "4"),
+        ("TURA_NO_TOOL_RETRY_LIMIT", "0"),
+        ("TURA_PROVIDER_TOTAL_TIMEOUT_MS", MOCK_PROVIDER_TIMEOUT_MS),
+        (
+            "TURA_PROVIDER_FIRST_OUTPUT_TIMEOUT_MS",
+            MOCK_PROVIDER_STREAM_TIMEOUT_MS,
+        ),
+        (
+            "TURA_PROVIDER_IDLE_OUTPUT_TIMEOUT_MS",
+            MOCK_PROVIDER_STREAM_TIMEOUT_MS,
+        ),
+    ]);
+    let session_id = format!("e2e-requested-compaction-{status}");
+    let result = mano::process_from_gateway_session_in_directory(
+        session_id.clone(),
+        SessionInput {
+            user_input:
+                "Report the blocker visibly, then settle task_status with a compact handoff."
+                    .to_string(),
+            file_input: vec![],
+            agent: Some("direct".to_string()),
+            runtime_context: None,
+            planning_mode_override: None,
+        },
+        workspace,
+    )
+    .expect("requested compaction fixture should complete");
+    assert_eq!(result.session.state, SessionState::Completed);
+    assert!(result.final_error.is_none(), "{:?}", result.final_error);
+    let requests = provider
+        .requests
+        .lock()
+        .expect("mock provider requests lock")
+        .len();
+    RequestedCompactionRun {
+        requests,
+        retained: result
+            .session
+            .session_log
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect(),
+        persisted: persisted_context_records(&session_id),
+        projected_visible_replies: projected_messages_with_text(
+            &session_id,
+            COMPACTION_VISIBLE_REPLY,
+        ),
+    }
+}
+
+fn persisted_context_records(session_id: &str) -> Vec<Value> {
+    use session_log_contract::ReadExecutionEvidenceRequest;
+    let request = ReadExecutionEvidenceRequest {
+        session_id: session_id.to_string(),
+        snapshot: None,
+        from_sequence: 0,
+        max_records: 2,
+        max_bytes: session_log_contract::EXECUTION_EVIDENCE_PAGE_BYTES,
+        include_summary: true,
+    };
+    let head = match session_log_contract::client::call_service(
+        &SessionLogCommand::ReadExecutionEvidence(request.clone()),
+    )
+    .expect("persisted execution evidence head")
+    {
+        SessionLogResponse::ExecutionEvidence { evidence } => {
+            evidence.validate(&request).expect("bound durable evidence");
+            evidence
+        }
+        other => panic!("unexpected execution evidence: {other:?}"),
+    };
+    let mut records = Vec::new();
+    session_log_contract::visit_execution_evidence(
+        &head.snapshot,
+        |request| match session_log_contract::client::call_service(
+            &SessionLogCommand::ReadExecutionEvidence(request),
+        )
+        .map_err(|error| error.to_string())?
+        {
+            SessionLogResponse::ExecutionEvidence { evidence } => Ok(evidence),
+            other => Err(format!("unexpected evidence page: {other:?}")),
+        },
+        |record| {
+            records.push(
+                serde_json::from_str::<Value>(&record.raw_record).expect("raw persisted record"),
+            );
+            Ok(())
+        },
+    )
+    .expect("persisted context replay");
+    records
+}
+
+fn projected_messages_with_text(session_id: &str, text: &str) -> usize {
+    match session_log_contract::client::call_service(&SessionLogCommand::ListSessionRecords(
+        session_log_contract::ListSessionRecordsRequest {
+            session_id: session_id.to_string(),
+            page: 0,
+            page_size: 500,
+        },
+    ))
+    .expect("session message projection")
+    {
+        SessionLogResponse::Records { records, .. } => records
+            .iter()
+            .filter(|record| {
+                record.record["parts"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["text"] == text))
+            })
+            .count(),
+        other => panic!("unexpected session records: {other:?}"),
+    }
+}
+
+fn assert_final_reply_after_compaction(run: &RequestedCompactionRun, reply: &str) {
+    for (label, records) in [("retained", &run.retained), ("persisted", &run.persisted)] {
+        let compaction = records
+            .iter()
+            .rposition(|record| record["type"] == "context_compaction")
+            .unwrap_or_else(|| panic!("{label}: requested compaction must apply: {records:#?}"));
+        let final_reply = records
+            .iter()
+            .rposition(|record| record["role"] == "assistant")
+            .unwrap_or_else(|| panic!("{label}: final assistant text must exist: {records:#?}"));
+        assert!(
+            final_reply > compaction,
+            "{label}: final assistant text must follow compaction: {records:#?}"
+        );
+        assert_eq!(records[final_reply]["content"], reply, "{label}");
+    }
+    assert_eq!(
+        run.projected_visible_replies, 1,
+        "the published reply must stay one projected message"
+    );
+}
+
+#[test]
+fn requested_compaction_keeps_published_question_reply_without_another_provider_turn() {
+    let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
+    // I17 shape: the settled question already delivered its visible reply.
+    let run = run_requested_compaction_fixture("question");
+    assert_eq!(run.requests, 1, "compaction must not add a provider turn");
+    assert_final_reply_after_compaction(&run, COMPACTION_VISIBLE_REPLY);
+}
+
+#[test]
+fn requested_compaction_keeps_published_done_reply_without_final_response_turn() {
+    let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
+    let run = run_requested_compaction_fixture("done");
+    assert_eq!(
+        run.requests, 1,
+        "a published done reply needs no tool-free recap turn"
+    );
+    assert_final_reply_after_compaction(&run, COMPACTION_VISIBLE_REPLY);
+}
+
+#[test]
+fn requested_compaction_for_doing_still_continues_with_next_provider_turn() {
+    let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
+    let run = run_requested_compaction_fixture("doing");
+    assert_eq!(
+        run.requests, 2,
+        "non-terminal compaction keeps its continuation turn"
+    );
+    assert_final_reply_after_compaction(&run, COMPACTION_FOLLOW_UP_REPLY);
+    let compaction = run
+        .retained
+        .iter()
+        .rposition(|record| record["type"] == "context_compaction")
+        .expect("requested compaction");
+    assert!(
+        !run.retained[compaction..].iter().any(|record| {
+            record["role"] == "assistant" && record["content"] == COMPACTION_VISIBLE_REPLY
+        }),
+        "an unsettled turn does not re-record its compacted progress reply"
     );
 }
 

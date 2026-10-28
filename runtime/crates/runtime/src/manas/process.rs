@@ -14,7 +14,6 @@ use crate::prompt_style::{
 use crate::tool_callback_sanitizer::{
     COMMAND_EVENTS_OMISSION_REASON, TerminalVerifierProof, sanitize_tool_callback_output,
 };
-use crate::tool_flow::execute::execute_tool_calls;
 use chrono::Utc;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -27,7 +26,7 @@ use tura_llm_rust::{
 
 use crate::checkpoint::session_snapshot::{SessionDeltaWriter, persist_session_checkpoint};
 use crate::context::{
-    CompactContextAgentMessage, ContextInput, accumulate_tool_result_with_provider_metadata,
+    CompactContextAgentMessage, ContextInput, accumulate_message, accumulate_tool_result_with_provider_metadata,
     build_context, compact_session_context_automatically_with_capabilities,
     compact_session_context_with_agent_message_and_capabilities, estimated_tokens_from_bytes_u64,
 };
@@ -42,11 +41,13 @@ use crate::turn_loop::no_tool_policy::no_tool_retry_limit;
 use crate::turn_loop::provider_step::accumulate_session_from_runtime;
 use crate::turn_loop::retry_policy::env_flag;
 use crate::turn_loop::task_progress::{
-    active_doing_task_user_message, active_task_user_message, command_run_result_has_command,
+    active_doing_task_user_message, active_task_user_message, command_run_result_final_reply, command_run_result_has_command,
     command_run_result_is_single_task_status, command_run_result_terminal_task_status,
     record_task_focus_message, record_task_focus_message_for_terminal_done,
 };
-use crate::turn_loop::tool_step::{command_run_results_empty, extract_compact_context_results};
+use crate::turn_loop::tool_step::{
+    PendingCompactContext, command_run_results_empty, extract_compact_context_results,
+};
 use lifecycle::RuntimeAggregate;
 use lifecycle::SessionManagement;
 use lifecycle::{PlanStatus, RuntimeId, RuntimeState, SessionState};
@@ -91,6 +92,7 @@ pub(crate) struct ManasInput<'a> {
     pub(crate) initial_retry_provider_input: Option<RetryProviderInput>,
     pub(crate) runtime_event_writer: Option<RuntimeEventWriter>,
     pub(crate) session_delta_writer: Option<SessionDeltaWriter>,
+    pub(crate) capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
 }
 
 pub(crate) struct ManasResult {
@@ -113,6 +115,7 @@ pub(crate) fn process_manas_internal(
         mut initial_retry_provider_input,
         mut runtime_event_writer,
         mut session_delta_writer,
+        capsule_source_read_binding,
     } = input;
     let mut loaded_agents;
     let agents = if agents.is_empty() {
@@ -154,20 +157,21 @@ pub(crate) fn process_manas_internal(
     let supports_planning = agent_commands
         .as_ref()
         .is_some_and(|commands| commands.contains(PLANNING_TOOL));
-    let evidence_only_requested =
-        std::env::var("TURA_NOKIY_EVIDENCE_ONLY_TERMINAL").as_deref() == Ok("1")
-            && std::env::var("TURA_NOKIY_BOUNDED_ONE_TURN").as_deref() == Ok("1")
-            && agents.len() == 1
-            && agents.first().is_some_and(|agent| {
-                matches!(agent.agent_name.as_str(), "direct" | "balanced")
-            });
+    let evidence_only_requested = std::env::var("TURA_NOKIY_EVIDENCE_ONLY_TERMINAL").as_deref()
+        == Ok("1")
+        && std::env::var("TURA_NOKIY_BOUNDED_ONE_TURN").as_deref() == Ok("1")
+        && agents.len() == 1
+        && agents
+            .first()
+            .is_some_and(|agent| matches!(agent.agent_name.as_str(), "direct" | "balanced"));
     // Delivery fences remain sticky, independently of workload outcome proof.
     // A blocked handoff cannot recover failures or authorize effects/retries.
     let mut evidence_only_delivery_proven = evidence_only_requested
         && session_delta_writer.is_some()
         && runtime_event_writer.is_some()
         && !env_flag("TURA_RUNTIME_AUTO_GIT_COMMIT");
-    let mut terminal_outcomes = evidence_only_delivery_proven.then(|| TerminalOutcomeTracker::new(session));
+    let mut terminal_outcomes =
+        evidence_only_delivery_proven.then(|| TerminalOutcomeTracker::new(session));
     loop {
         turn = turn.saturating_add(1);
         if turn > manas_max_turns() {
@@ -198,7 +202,7 @@ pub(crate) fn process_manas_internal(
         );
         append_active_runtime_prompt_manual_context(session, &mut current_messages)?;
 
-        let runtime_result = match execute_turn(
+        let runtime_result = match super::runtime_turn::execute_turn_with_source_binding(
             agents,
             session,
             &current_messages,
@@ -212,6 +216,7 @@ pub(crate) fn process_manas_internal(
             fallback_from_id.take(),
             initial_retry_provider_input.take(),
             runtime_event_writer.as_mut(),
+            capsule_source_read_binding.clone(),
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -235,9 +240,8 @@ pub(crate) fn process_manas_internal(
 
         let runtime = runtime_result.0;
         let tool_calls = runtime_result.1;
-        evidence_only_delivery_proven &= runtime.state == RuntimeState::Finished
-            && runtime.session_id == session.session_id
-            && runtime.tool_call.len() == tool_calls.len();
+        evidence_only_delivery_proven &=
+            runtime_preserves_terminal_delivery(session, &runtime, tool_calls.len());
 
         last_runtime_id = Some(runtime.runtime_id.clone());
 
@@ -256,7 +260,7 @@ pub(crate) fn process_manas_internal(
         }
         publish_runtime_usage_record(session, &runtime, feed_publisher.as_ref());
 
-        if runtime.state == RuntimeState::TimedOut || runtime_failure_allows_retry(&runtime) {
+        if runtime_failure_allows_retry(&runtime) {
             let error_text = runtime_failure_text(&runtime)
                 .unwrap_or_else(|| "Provider runtime failed before producing output.".to_string());
             if let Some(wait_duration) = provider_timeout_retry_wait(provider_timeout_retries) {
@@ -365,7 +369,7 @@ pub(crate) fn process_manas_internal(
             final_session_state = SessionState::Failed;
             break;
         }
-        if runtime.state == RuntimeState::Failed {
+        if matches!(runtime.state, RuntimeState::Failed | RuntimeState::TimedOut) {
             let error_text = runtime_failure_text(&runtime)
                 .unwrap_or_else(|| "Provider runtime failed before producing output.".to_string());
             warn!(
@@ -420,19 +424,34 @@ pub(crate) fn process_manas_internal(
                 || visible_reply_published_before_terminal_status;
             provider_timeout_retries = 0;
             no_tool_retries = 0;
-            let tool_results = execute_tool_calls(
+            let tool_results = crate::tool_flow::execute::execute_tool_calls_with_source_binding(
                 &tool_calls,
                 agents.first(),
                 session,
                 &runtime,
                 redis_url,
                 feed_publisher.as_ref(),
+                capsule_source_read_binding.clone(),
             );
+            // Explicit delivery is model-authored, not a guess from commentary.
+            // Publish only after successful, ordered terminal delivery, while its feed is open.
+            let terminal_reply = tool_results.as_ref().ok()
+                .and_then(|results| explicit_terminal_task_reply(session, &runtime, results))
+                .map(|reply| {
+                    publish_agent_message_from_runtime(
+                        &session.session_id, &runtime, reply.clone(), String::new(),
+                        feed_publisher.as_ref(),
+                    ).map(|()| reply)
+                }).transpose();
             seal_runtime_feed(&mut runtime_event_writer, &runtime.runtime_id)?;
             let mut tool_results = tool_results?;
+            let terminal_reply = terminal_reply?;
             evidence_only_delivery_proven &= tool_results.len() == tool_calls.len();
             if let Some(outcomes) = terminal_outcomes.as_mut()
-                && tool_results.iter().any(|result| command_run_results_empty(&result.result)) {
+                && tool_results
+                    .iter()
+                    .any(|result| command_run_results_empty(&result.result))
+            {
                 // Empty results are omitted from the context log below, not
                 // evidence that an accepted command had no uncertain outcome.
                 outcomes.hard_veto = true;
@@ -466,9 +485,14 @@ pub(crate) fn process_manas_internal(
                         .and_then(|tool_call| tool_call.provider_metadata.clone()),
                 )?;
             }
+            if let Some(reply) = &terminal_reply {
+                accumulate_message(session, "assistant", Value::String(reply.clone()))?;
+            }
             persist_session_checkpoint(&mut session_delta_writer, session, "tool_results")?;
 
-            if let Some(outcomes) = terminal_outcomes.as_mut() { outcomes.observe_session(session); }
+            if let Some(outcomes) = terminal_outcomes.as_mut() {
+                outcomes.observe_session(session);
+            }
             if terminal_evidence_boundary_proven(
                 evidence_only_delivery_proven,
                 session,
@@ -476,8 +500,10 @@ pub(crate) fn process_manas_internal(
                 &tool_results,
                 terminal_task_status.as_deref(),
                 !pending_compact_contexts.is_empty(),
-                visible_reply_before_tool.is_none() || visible_reply_published_before_terminal_status,
-            ) && let Some(terminal_status) = terminal_outcomes.as_ref()
+                visible_reply_before_tool.is_none()
+                    || visible_reply_published_before_terminal_status,
+            ) && let Some(terminal_status) = terminal_outcomes
+                .as_ref()
                 .and_then(|outcomes| outcomes.delivery_status(session, &runtime, &tool_results))
             {
                 let evidence = TerminalEvidenceRecord {
@@ -504,67 +530,71 @@ pub(crate) fn process_manas_internal(
                 // succeed before this record, and this checkpoint must succeed
                 // before omitting the provider turn. Normal completion/cleanup
                 // below is still required; parent acceptance remains pending.
-                persist_session_checkpoint(&mut session_delta_writer, session, "terminal_evidence")?;
+                persist_session_checkpoint(
+                    &mut session_delta_writer,
+                    session,
+                    "terminal_evidence",
+                )?;
                 terminal_evidence_sealed = true;
                 info!(session_id = %session.session_id, runtime_id = %runtime.runtime_id,
                     "durable evidence-only terminal delivery sealed; parent acceptance required");
                 break;
             }
 
-            if pending_compact_contexts.is_empty()
-                && should_end_turn_without_task_status_backfill(
-                    &tool_results,
-                    terminal_task_status.as_deref(),
-                    visible_reply_before_tool.as_deref(),
-                    visible_reply_published_before_terminal_status,
-                )
-            {
+            let ends_without_backfill = should_end_turn_without_task_status_backfill(
+                &tool_results,
+                terminal_task_status.as_deref(),
+                visible_reply_before_tool.as_deref(),
+                visible_reply_published_before_terminal_status,
+                runtime.output.as_ref(),
+            );
+            if terminal_reply.is_some() && pending_compact_contexts.is_empty() {
+                info!(session_id = %session.session_id, runtime_id = %runtime.runtime_id,
+                    "explicit terminal reply published and persisted without tool-log truncation; no answer-regeneration turn");
+                break;
+            }
+
+            if pending_compact_contexts.is_empty() && ends_without_backfill {
                 info!(
                     session_id = %session.session_id,
                     turn = turn,
                     runtime_id = %runtime.runtime_id,
-                    "single terminal task_status followed a published non-empty assistant reply; ending turn without tool-result backfill"
+                    "single terminal task_status followed a published terminal assistant reply; ending turn without tool-result backfill"
                 );
                 break;
             }
 
+            let mut context_compacted = false;
             if !pending_compact_contexts.is_empty() {
-                for pending in &pending_compact_contexts {
-                    compact_session_context_with_agent_message_and_capabilities(
-                        session,
-                        &pending.summary,
-                        pending.agent_message_content.as_deref().map(|content| {
-                            CompactContextAgentMessage {
-                                content,
-                                timestamp: pending.agent_message_timestamp,
-                            }
-                        }),
-                        &active_agent_capabilities,
-                    )?;
-                }
-                persist_session_checkpoint(&mut session_delta_writer, session, "compact_context")?;
+                // Requested compaction must not change how this turn ends.
+                let reply_retained = compact_tool_turn_retaining_delivered_reply(
+                    session,
+                    &pending_compact_contexts,
+                    delivered_tool_turn_reply(
+                        terminal_reply.as_deref(),
+                        ends_without_backfill,
+                        visible_reply_before_tool.as_deref(),
+                    ),
+                    &active_agent_capabilities,
+                    &mut session_delta_writer,
+                )?;
                 info!(
                     session_id = %session.session_id,
                     turn = turn,
                     runtime_id = %runtime.runtime_id,
-                    "compact_context applied after persisted tool results; continuing task with rebuilt compacted context"
+                    "compact_context applied after persisted tool results"
                 );
-
-                let context_output = build_context(ContextInput {
-                    session,
-                    runtime: &runtime,
-                    additional_messages: Vec::new(),
-                })?;
-
-                current_messages = messages_with_initial_context_prefix(
-                    &initial_messages,
-                    context_output.messages,
-                    &original_user_task,
-                );
-                continue;
-            }
-
-            if let Some(summary) =
+                if reply_retained {
+                    info!(
+                        session_id = %session.session_id,
+                        turn = turn,
+                        runtime_id = %runtime.runtime_id,
+                        "delivered terminal reply re-recorded after requested compaction; ending turn without another model call"
+                    );
+                    break;
+                }
+                context_compacted = true;
+            } else if let Some(summary) =
                 auto_compact_summary_after_new_context(session, &runtime, &tool_results)
             {
                 compact_session_context_automatically_with_capabilities(
@@ -581,21 +611,9 @@ pub(crate) fn process_manas_internal(
                     session_id = %session.session_id,
                     turn = turn,
                     runtime_id = %runtime.runtime_id,
-                    "automatic context compaction applied after new tool context exceeded active limit; continuing task"
+                    "automatic context compaction applied after new tool context exceeded active limit"
                 );
-
-                let context_output = build_context(ContextInput {
-                    session,
-                    runtime: &runtime,
-                    additional_messages: Vec::new(),
-                })?;
-
-                current_messages = messages_with_initial_context_prefix(
-                    &initial_messages,
-                    context_output.messages,
-                    &original_user_task,
-                );
-                continue;
+                context_compacted = true;
             }
 
             let context_output = build_context(ContextInput {
@@ -609,6 +627,12 @@ pub(crate) fn process_manas_internal(
                 context_output.messages,
                 &original_user_task,
             );
+            if should_continue_after_tool_compaction(
+                context_compacted,
+                terminal_task_status.as_deref(),
+            ) {
+                continue;
+            }
             if should_auto_complete_non_planning_doing_after_tool_turn(
                 session.goal_mode,
                 supports_planning,
@@ -693,9 +717,12 @@ pub(crate) fn process_manas_internal(
                 }
                 result
             });
-            evidence_only_delivery_proven &= !matches!(visible_reply_publication.as_ref(), Some(Err(_)));
+            evidence_only_delivery_proven &=
+                !matches!(visible_reply_publication.as_ref(), Some(Err(_)));
             seal_runtime_feed(&mut runtime_event_writer, &runtime.runtime_id)?;
-            if let Some(outcomes) = terminal_outcomes.as_mut() { outcomes.observe_session(session); }
+            if let Some(outcomes) = terminal_outcomes.as_mut() {
+                outcomes.observe_session(session);
+            }
             let compaction_summary = auto_compact_summary_after_new_context(session, &runtime, &[]);
             if let Some(summary) = &compaction_summary {
                 compact_session_context_automatically_with_capabilities(
@@ -1000,6 +1027,7 @@ fn should_end_turn_without_task_status_backfill(
     terminal_task_status: Option<&str>,
     visible_reply: Option<&str>,
     visible_reply_already_published: bool,
+    runtime_output: Option<&serde_json::Value>,
 ) -> bool {
     if !visible_reply_already_published {
         return false;
@@ -1008,9 +1036,53 @@ fn should_end_turn_without_task_status_backfill(
     let Some(status @ ("done" | "question")) = terminal_task_status else {
         return false;
     };
+    if status == "done" && !runtime_output_has_final_reply(runtime_output) {
+        return false;
+    }
 
     visible_reply.is_some_and(|reply| !reply.trim().is_empty())
         && command_run_has_only_terminal_task_status_result(tool_results, status)
+}
+
+fn explicit_terminal_task_reply(
+    session: &SessionManagement,
+    runtime: &RuntimeAggregate,
+    tool_results: &[crate::tool_router::execute_tool::ToolExecutionResult],
+) -> Option<String> {
+    let [result] = tool_results else {
+        return None;
+    };
+    if runtime.state != RuntimeState::Finished
+        || runtime.session_id != session.session_id
+        || runtime.runtime_id.trim().is_empty()
+        || runtime.tool_call.len() != 1
+        || result.tool_name != crate::manas::COMMAND_RUN_TOOL
+        || !result.success
+        || result.error.is_some()
+    {
+        return None;
+    }
+    if command_run_result_has_command(&result.result)
+        && !terminal_tool_outcome_proven(
+            &result.tool_name,
+            result.success,
+            result.error.as_deref(),
+            &result.arguments,
+            result.result.get("streamed_command_run_result").unwrap_or(&result.result),
+        )
+    {
+        return None;
+    }
+    command_run_result_final_reply(&result.result)
+        .and_then(|(reply, structured)| {
+            if structured {
+                // Explicit JSON is data, not an implicit reply/tool wrapper.
+                Some(reply.to_string())
+            } else {
+                user_visible_runtime_text(reply)
+            }
+        })
+        .filter(|reply| !reply.trim().is_empty())
 }
 
 fn command_run_has_only_terminal_task_status_result(
@@ -1154,6 +1226,105 @@ fn visible_runtime_reply(runtime: &RuntimeAggregate) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+fn runtime_output_has_final_reply(output: Option<&serde_json::Value>) -> bool {
+    let Some(messages) = output
+        // Streamed command execution stores the provider response beside its receipts.
+        .map(|output| output.get("provider_content").unwrap_or(output))
+        .and_then(|output| output.get("public_messages"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        // Providers without public phase metadata keep the legacy shortcut.
+        return true;
+    };
+    messages.iter().any(|message| {
+        matches!(
+            message.get("phase").and_then(serde_json::Value::as_str),
+            None | Some("final_answer")
+        ) && message
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .and_then(user_visible_runtime_text)
+            .is_some_and(|text| !text.trim().is_empty())
+    })
+}
+
+fn should_continue_after_tool_compaction(
+    context_compacted: bool,
+    terminal_task_status: Option<&str>,
+) -> bool {
+    // Compaction rebuilds context, not task state. A settled terminal status
+    // must reach the existing delivery path, never another executable turn.
+    // This does not prove evidence-only delivery or clear its pending/failure
+    // fences; an unproven terminal still uses the tool-free final response.
+    context_compacted && !matches!(terminal_task_status, Some("done" | "question"))
+}
+
+/// Reply that already ends a tool turn without another model call: the
+/// explicit terminal reply, otherwise the published visible reply before a
+/// single terminal task_status that needs no backfill.
+fn delivered_tool_turn_reply<'a>(
+    terminal_reply: Option<&'a str>,
+    ends_without_backfill: bool,
+    visible_reply: Option<&'a str>,
+) -> Option<&'a str> {
+    terminal_reply.or_else(|| visible_reply.filter(|_| ends_without_backfill))
+}
+
+/// Applies explicitly requested compaction after the persisted tool results.
+/// Compaction rebuilds context, not termination: it retains only trailing tool
+/// results, so a reply that already ended this turn is recorded again after the
+/// compact checkpoint. Returns whether the turn must end now.
+fn compact_tool_turn_retaining_delivered_reply(
+    session: &mut SessionManagement,
+    pending_compact_contexts: &[PendingCompactContext],
+    delivered_reply: Option<&str>,
+    active_agent_capabilities: &[String],
+    session_delta_writer: &mut Option<SessionDeltaWriter>,
+) -> Result<bool, String> {
+    let delivered = delivered_reply.map(|reply| (reply, delivered_reply_record(session, reply)));
+    for pending in pending_compact_contexts {
+        compact_session_context_with_agent_message_and_capabilities(
+            session,
+            &pending.summary,
+            pending
+                .agent_message_content
+                .as_deref()
+                .map(|content| CompactContextAgentMessage {
+                    content,
+                    timestamp: pending.agent_message_timestamp,
+                }),
+            active_agent_capabilities,
+        )?;
+    }
+    persist_session_checkpoint(session_delta_writer, session, "compact_context")?;
+    let Some((reply, record)) = delivered else {
+        return Ok(false);
+    };
+    // Re-record the published record itself. Its message identity keeps the
+    // durable projection an upsert of the same message; nothing is republished.
+    match record {
+        Some(record) => session.push_log(record, Utc::now()),
+        None => accumulate_message(session, "assistant", Value::String(reply.to_string()))?,
+    }
+    persist_session_checkpoint(
+        session_delta_writer,
+        session,
+        "terminal_reply_after_compaction",
+    )?;
+    Ok(true)
+}
+
+/// Raw record of the latest retained assistant message carrying `reply`.
+fn delivered_reply_record(session: &SessionManagement, reply: &str) -> Option<String> {
+    let reply = reply.trim();
+    session.session_log.iter().rev().find_map(|entry| {
+        let value = entry.value();
+        let carries_reply = value.get("role").and_then(Value::as_str) == Some("assistant")
+            && value.get("content").and_then(Value::as_str).map(str::trim) == Some(reply);
+        carries_reply.then(|| entry.raw().to_string())
+    })
+}
+
 fn should_continue_after_no_tool_compaction<T, E>(
     context_compacted: bool,
     visible_reply_publication: Option<&Result<T, E>>,
@@ -1231,7 +1402,10 @@ fn terminal_tool_outcome_proven(
         // Opaque/delegated tool effects are not proven by a wrapper bool.
         return false;
     }
-    let Some(commands) = arguments.get("commands").and_then(serde_json::Value::as_array) else {
+    let Some(commands) = arguments
+        .get("commands")
+        .and_then(serde_json::Value::as_array)
+    else {
         return false;
     };
     let Some(results) = output.get("results").and_then(serde_json::Value::as_array) else {
@@ -1239,9 +1413,10 @@ fn terminal_tool_outcome_proven(
     };
     !commands.is_empty()
         && commands.len() == results.len()
-        && commands.iter().zip(results).all(|(command, result)| {
-            terminal_command_outcome_proven(command, result)
-        })
+        && commands
+            .iter()
+            .zip(results)
+            .all(|(command, result)| terminal_command_outcome_proven(command, result))
 }
 
 fn terminal_command_outcome_proven(command: &Value, result: &Value) -> bool {
@@ -1256,6 +1431,10 @@ fn terminal_command_outcome_proven(command: &Value, result: &Value) -> bool {
 }
 
 fn terminal_receipt_closed(value: &Value, state: &str) -> bool {
+    terminal_receipt_closed_with_reconciliation(value, state, false)
+}
+
+fn terminal_receipt_closed_with_reconciliation(value: &Value, state: &str, reconcile: bool) -> bool {
     value.is_object()
         && value["schema_version"] == "tura_command_terminal_receipt_v1"
         && value["outcome"] == "known"
@@ -1263,15 +1442,24 @@ fn terminal_receipt_closed(value: &Value, state: &str) -> bool {
         && value["termination_proven"] == true
         && value["process_reaped"] == true
         && value["process_group_empty"] == true
-        && value["reconcile_required"] == false
+        && value["reconcile_required"] == reconcile
         && value.get("exit_code").is_some()
-        && value.get("error").is_none_or(|error| error.is_null() || error.as_str() == Some(""))
-        && value.get("unresolved_effects").is_none_or(|effects|
-            effects.is_null() || effects.as_array().is_some_and(Vec::is_empty))
-        && value.get("timed_out").is_none_or(|value| value.as_bool() == Some(false))
-        && value.get("cancelled").is_none_or(|value| value.as_bool() == Some(false))
-        && (state != "completed" || value.get("failure_class").is_none_or(|value|
-            matches!(value.as_str(), Some("none" | "workload"))))
+        && value
+            .get("error")
+            .is_none_or(|error| error.is_null() || error.as_str() == Some(""))
+        && value.get("unresolved_effects").is_none_or(|effects| {
+            effects.is_null() || effects.as_array().is_some_and(Vec::is_empty)
+        })
+        && value
+            .get("timed_out")
+            .is_none_or(|value| value.as_bool() == Some(false))
+        && value
+            .get("cancelled")
+            .is_none_or(|value| value.as_bool() == Some(false))
+        && (state != "completed"
+            || value
+                .get("failure_class")
+                .is_none_or(|value| matches!(value.as_str(), Some("none" | "workload"))))
         && (value["authority_effect"] == "none" || value["authoritative_publication"] == "proven")
 }
 
@@ -1280,7 +1468,18 @@ fn terminal_receipt_closed(value: &Value, state: &str) -> bool {
 // reconciliation vetoes the shortcut even when the outer tool reports success.
 fn terminal_payload_proven(value: &serde_json::Value) -> bool {
     match value {
-        Value::Object(object) => object.iter().all(|(key, value)| terminal_payload_field_proven(key, value)),
+        Value::Object(object) => object
+            .iter()
+            .all(|(key, value)| {
+                if object.get("command_type").and_then(Value::as_str) == Some("task_status")
+                    && key == "arguments"
+                {
+                    // Reply content is model-authored text, not execution proof.
+                    return value.as_object().is_some_and(|arguments| arguments.iter().all(
+                        |(key, value)| key == "final_reply" || terminal_payload_field_proven(key, value)));
+                }
+                terminal_payload_field_proven(key, value)
+            }),
         Value::Array(values) => values.iter().all(terminal_payload_proven),
         _ => true,
     }
@@ -1288,7 +1487,9 @@ fn terminal_payload_proven(value: &serde_json::Value) -> bool {
 
 fn terminal_payload_field_proven(key: &str, value: &Value) -> bool {
     // Even authenticated non-execution evidence can never prove success.
-    if key == "pre_execution_rejection" { return false; }
+    if key == "pre_execution_rejection" {
+        return false;
+    }
     if key == "terminal_receipt" {
         // In-process commands may have a null process exit code, not an
         // incomplete outcome or an open effect/cleanup boundary.
@@ -1301,12 +1502,26 @@ fn terminal_payload_field_proven(key: &str, value: &Value) -> bool {
         "exit_code" => value.as_i64() == Some(0),
         "outcome" => value.as_str() == Some("known"),
         "terminal_state" => value.as_str() == Some("completed"),
-        "termination_proven" | "process_reaped" | "process_group_empty" => value.as_bool() == Some(true),
+        "termination_proven" | "process_reaped" | "process_group_empty" => {
+            value.as_bool() == Some(true)
+        }
         "timed_out" | "reconcile_required" | "cancelled" => value.as_bool() == Some(false),
         "unresolved_effects" => value.is_null() || value.as_array().is_some_and(Vec::is_empty),
-        "status" => !matches!(value.as_str(),
-            Some("failed" | "error" | "unknown" | "pending" | "running" | "timed_out"
-                | "cancelled" | "aborted" | "blocked" | "unresolved")),
+        "status" => !matches!(
+            value.as_str(),
+            Some(
+                "failed"
+                    | "error"
+                    | "unknown"
+                    | "pending"
+                    | "running"
+                    | "timed_out"
+                    | "cancelled"
+                    | "aborted"
+                    | "blocked"
+                    | "unresolved"
+            )
+        ),
         _ => true,
     };
     proven && terminal_payload_proven(value)
@@ -1318,16 +1533,24 @@ const MAX_TERMINAL_SOURCE_TARGETS: usize = TerminalVerifierProof::MAX_SOURCE_TAR
 const MAX_TERMINAL_EVIDENCE_BYTES: usize = 256 * 1024;
 
 fn terminal_identity(value: &Value) -> Option<&str> {
-    value.as_str().filter(|text| !text.trim().is_empty() && text.len() <= 256)
+    value
+        .as_str()
+        .filter(|text| !text.trim().is_empty() && text.len() <= 256)
 }
 
 fn terminal_sha256(text: &str) -> bool {
-    text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn terminal_source_target(text: &str) -> bool {
-    !text.is_empty() && text.len() <= 256
-        && !text.chars().any(|ch| matches!(ch, '\\' | '\0' | '*' | '?' | '[' | ']'))
+    !text.is_empty()
+        && text.len() <= 256
+        && !text
+            .chars()
+            .any(|ch| matches!(ch, '\\' | '\0' | '*' | '?' | '[' | ']'))
         && text.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
 
@@ -1340,20 +1563,140 @@ impl serde::Serialize for TerminalCanonicalJson<'_> {
         match self.0 {
             Value::Object(object) => {
                 if object.len() > MAX_TERMINAL_TRACKED_COMMANDS {
-                    return Err(serde::ser::Error::custom("terminal evidence object exceeds tracking bound"));
+                    return Err(serde::ser::Error::custom(
+                        "terminal evidence object exceeds tracking bound",
+                    ));
                 }
-                let sorted = object.iter().map(|(key, value)| (key, TerminalCanonicalJson(value)))
+                let sorted = object
+                    .iter()
+                    .map(|(key, value)| (key, TerminalCanonicalJson(value)))
                     .collect::<BTreeMap<_, _>>();
                 serde::Serialize::serialize(&sorted, serializer)
             }
-            Value::Array(values) => serializer.collect_seq(values.iter().map(TerminalCanonicalJson)),
+            Value::Array(values) => {
+                serializer.collect_seq(values.iter().map(TerminalCanonicalJson))
+            }
             value => serde::Serialize::serialize(value, serializer),
         }
     }
 }
 
+// The router's call id for one command: a command's own binding id (id, command_id, commandId or
+// result_id, as code_tools command_call_id reads them) extends the execution id unless it already
+// names it. The runtime's own relative wire identity is not a binding. A worker-chosen "id"
+// otherwise breaks receipt authentication (paired gate 2026-10-24).
+fn terminal_binding_call_id(execution: &str, relative: &str, command: &Value) -> String {
+    let binding = ["id", "command_id", "commandId", "result_id"].iter().find_map(|name| {
+        match command.get(*name) {
+            Some(Value::String(text)) if !text.trim().is_empty() => Some(text.clone()),
+            Some(value @ (Value::Object(_) | Value::Array(_))) => Some(value.to_string()),
+            _ => None,
+        }
+    });
+    match binding {
+        None => execution.to_owned(),
+        Some(binding) if binding == relative => execution.to_owned(),
+        Some(binding) if binding == execution || binding.starts_with(&format!("{execution}:")) => {
+            binding
+        }
+        Some(binding) => format!("{execution}:{binding}"),
+    }
+}
+
+// The router call id that this command's durable records must carry. Its reported wire identity
+// must be coherent with its position in the batch; otherwise nothing authenticates it.
+fn terminal_command_call_id(batch: &Value, command: &Value, result: &Value, index: usize) -> Option<String> {
+    let runtime = batch["runtime_id"].as_str()?;
+    if result.get("runtime_id").is_some_and(|value| value.as_str() != Some(runtime))
+        || ["workdir", "cwd", "arguments"]
+            .iter()
+            .any(|key| command.get(*key).is_some_and(|value| !value.is_null()))
+    {
+        return None;
+    }
+    let expected = if let (Some(provider), Some(id)) = (
+        result["provider_tool_call_id"].as_str(),
+        result["command_id"].as_str(),
+    ) {
+        let relative = format!("{provider}:{index}");
+        let command_run = format!("{runtime}.tool.command_run");
+        let qualified = format!("{command_run}:{relative}");
+        let expected_run = if id == relative {
+            provider
+        } else if id == qualified {
+            command_run.as_str()
+        } else {
+            return None;
+        };
+        if result["command_index"].as_u64() != Some(index as u64)
+            || result
+                .get("command_run_id")
+                .is_some_and(|value| value.as_str() != Some(expected_run))
+            || batch
+                .get("provider_tool_call_id")
+                .is_some_and(|value| value.as_str() != Some(provider))
+        {
+            return None;
+        }
+        let reported = batch["output"]["commands"].get(index).unwrap_or(command);
+        if ["command_id", "command_run_id", "provider_tool_call_id", "command_index"]
+            .iter()
+            .any(|key| reported.get(*key).is_some_and(|value| Some(value) != result.get(*key)))
+        {
+            return None;
+        }
+        terminal_binding_call_id(&qualified, &relative, command)
+    } else {
+        let execution = batch["input"]["execution_id"].as_str()?;
+        if !execution.starts_with(&format!("{runtime}.tool.command_run:")) {
+            return None;
+        }
+        let (_, calls) = code_tools::command_run::command_run_batch_identity(&batch["input"]).ok()?;
+        calls.get(index)?.clone()
+    };
+    (terminal_command_step(command) == terminal_command_step(result)).then_some(expected)
+}
+
+// The router's typed J-Space refusal of one command: never dispatched, no output or receipt.
+fn terminal_policy_denial_shape(result: &Value) -> bool {
+    result["command_type"] == "jspace"
+        && result["success"] == false
+        && result["delivery_state"] == "deterministic_policy_denial"
+        && result["effect_state"] == "not_started"
+        && result["mutation_count"] == 0
+        && result["authority_effect"] == "none"
+        && result["replayable"] == true
+        && result["jspace_error_code"].as_str().is_some_and(|code| code.starts_with("JSPACE_"))
+        && result["error"].as_str().is_some()
+        && result.get("output").is_none_or(Value::is_null)
+}
+
+// The canonical batch may replace an applied patch's optional source delta with a text-free
+// reference to later reads of the same postimage (readback_delta_reference) while its streamed
+// completion keeps the full delta. Every other field, including paths, digests and receipts,
+// still binds the stream to the canonical result.
+fn terminal_stream_fingerprint(result: &Value) -> Option<String> {
+    let has_delta = result
+        .pointer("/output/changes")
+        .and_then(Value::as_array)
+        .is_some_and(|changes| changes.iter().any(|change| change.get("source_delta").is_some()));
+    if !has_delta {
+        return terminal_fingerprint(result);
+    }
+    let mut bound = result.clone();
+    if let Some(changes) = bound.pointer_mut("/output/changes").and_then(Value::as_array_mut) {
+        for change in changes.iter_mut().filter_map(Value::as_object_mut) {
+            change.remove("source_delta");
+        }
+    }
+    terminal_fingerprint(&bound)
+}
+
 fn terminal_fingerprint(value: &Value) -> Option<String> {
-    struct HashWriter { hash: Sha256, bytes: usize }
+    struct HashWriter {
+        hash: Sha256,
+        bytes: usize,
+    }
     impl std::io::Write for HashWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             if bytes.len() > MAX_TERMINAL_EVIDENCE_BYTES.saturating_sub(self.bytes) {
@@ -1363,9 +1706,14 @@ fn terminal_fingerprint(value: &Value) -> Option<String> {
             self.hash.update(bytes);
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    let mut writer = HashWriter { hash: Sha256::new(), bytes: 0 };
+    let mut writer = HashWriter {
+        hash: Sha256::new(),
+        bytes: 0,
+    };
     serde_json::to_writer(&mut writer, &TerminalCanonicalJson(value)).ok()?;
     Some(format!("{:x}", writer.hash.finalize()))
 }
@@ -1374,6 +1722,7 @@ struct TerminalVerifierBinding {
     authorization: String,
     grants: Vec<String>,
     targets: BTreeSet<String>,
+    absent_creation_targets: BTreeSet<String>,
 }
 
 impl TerminalVerifierBinding {
@@ -1384,42 +1733,95 @@ impl TerminalVerifierBinding {
         let grants = contract["verifier_commands"].as_array()?;
         let declared = contract["declared_targets"].as_array()?;
         let writes = contract["write_scopes"].as_array()?;
-        if !terminal_sha256(authorization) || grants.len() > MAX_TERMINAL_VERIFIERS || !grants.iter().all(Value::is_object)
-            || declared.len() > MAX_TERMINAL_SOURCE_TARGETS || writes.len() > MAX_TERMINAL_SOURCE_TARGETS {
+        if !terminal_sha256(authorization)
+            || grants.len() > MAX_TERMINAL_VERIFIERS
+            || !grants.iter().all(Value::is_object)
+            || declared.len() > MAX_TERMINAL_SOURCE_TARGETS
+            || writes.len() > MAX_TERMINAL_SOURCE_TARGETS
+        {
             return None;
         }
-        let targets = declared.iter().map(|value| {
-            value.as_str().filter(|path| terminal_source_target(path)).map(str::to_owned)
-        }).collect::<Option<BTreeSet<_>>>()?;
-        if targets.len() != declared.len() || !writes.iter().all(|value|
-            value.as_str().is_some_and(|path| targets.contains(path))) {
+        let targets = declared
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|path| terminal_source_target(path))
+                    .map(str::to_owned)
+            })
+            .collect::<Option<BTreeSet<_>>>()?;
+        if targets.len() != declared.len()
+            || !writes
+                .iter()
+                .all(|value| value.as_str().is_some_and(|path| targets.contains(path)))
+        {
             return None;
         }
+        let absent_creation_targets = targets
+            .iter()
+            .filter(|path| {
+                writes.iter().any(|value| value.as_str() == Some(path.as_str()))
+                    && contract["dcf_generation"]["source_snapshot"]
+                        .as_object()
+                        .and_then(|snapshot| snapshot.get(path.as_str()))
+                        .is_some_and(Value::is_null)
+                    && contract["allowed_operations"]
+                        .as_array()
+                        .is_some_and(|ops| ops.iter().any(|op| op == "create"))
+                    && contract["denied_operations"]
+                        .as_array()
+                        .is_some_and(|ops| !ops.iter().any(|op| op == "create"))
+            })
+            .cloned()
+            .collect();
         Some(Self {
             authorization: authorization.to_owned(),
-            grants: grants.iter().map(terminal_fingerprint).collect::<Option<Vec<_>>>()?,
+            grants: grants
+                .iter()
+                .map(terminal_fingerprint)
+                .collect::<Option<Vec<_>>>()?,
             targets,
+            absent_creation_targets,
         })
     }
 }
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TerminalVerifierSelection { verifier_index: usize }
+struct TerminalVerifierSelection {
+    verifier_index: usize,
+}
 
 impl TerminalVerifierProof {
-    fn source_fingerprint(value: &Value, binding: &TerminalVerifierBinding, index: usize, call_id: &str) -> Option<String> {
-        if value["source_postimages"].as_object()?.len() != binding.targets.len() || terminal_fingerprint(value).is_none() {
+    fn source_fingerprint(
+        value: &Value,
+        binding: &TerminalVerifierBinding,
+        index: usize,
+        call_id: &str,
+    ) -> Option<String> {
+        if value["source_postimages"].as_object()?.len() != binding.targets.len()
+            || terminal_fingerprint(value).is_none()
+        {
             return None;
         }
         let proof = Self::parse_bounded(value)?;
         if proof.schema_version != "nokiy_focused_verifier_evidence_v1"
             || proof.authorization_semantic_sha256 != binding.authorization
-            || proof.verifier_index != index || binding.grants.get(index)? != &proof.verifier_sha256
+            || proof.verifier_index != index
+            || binding.grants.get(index)? != &proof.verifier_sha256
             || proof.call_id != call_id
             || !proof.source_postimages.keys().eq(binding.targets.iter())
-            || !proof.source_postimages.values().all(|image|
-                terminal_sha256(&image.sha256) && image.mode <= 0o177777 && image.bytes <= i64::MAX as u64) {
+            || !proof.source_postimages.iter().all(|(path, image)| {
+                image.as_ref().map_or_else(
+                    || binding.absent_creation_targets.contains(path),
+                    |image| {
+                        terminal_sha256(&image.sha256)
+                            && image.mode <= 0o177777
+                            && image.bytes <= i64::MAX as u64
+                    },
+                )
+            })
+        {
             return None;
         }
         terminal_fingerprint(&value["source_postimages"])
@@ -1436,6 +1838,17 @@ struct TerminalStreamBinding {
 // Evidence projection only: no log rewriting, receipt replay, counter changes,
 // persistence, or parent acceptance. Its bounded state survives local compaction;
 // a fresh tracker cannot reconstruct omitted history and therefore vetoes it.
+// Test builds also record the first vetoing line for offline replay diagnosis.
+macro_rules! veto {
+    ($tracker:expr) => {{
+        $tracker.hard_veto = true;
+        #[cfg(test)]
+        if $tracker.veto_line.is_none() {
+            $tracker.veto_line = Some(line!());
+        }
+    }};
+}
+
 struct TerminalOutcomeTracker {
     contract: Option<Value>,
     session_id: String,
@@ -1443,8 +1856,17 @@ struct TerminalOutcomeTracker {
     binding: Option<TerminalVerifierBinding>,
     observed_entries: u64,
     hard_veto: bool,
+    #[cfg(test)]
+    veto_line: Option<u32>,
     mutation_generation: u64,
     failures: BTreeMap<usize, Option<u64>>,
+    own_edits: BTreeMap<String, ((u64, u64), Value)>,
+    failed_reads: Vec<(
+        code_tools::commands::source_read::SourceReadContentEvidence,
+        u64,
+        (u64, u64),
+        bool,
+    )>,
     postimages: Option<(u64, String)>,
     runtimes: BTreeSet<(String, Option<u64>)>,
     receipts: BTreeSet<String>,
@@ -1460,25 +1882,48 @@ impl TerminalOutcomeTracker {
     }
 
     fn unobserved(session: &SessionManagement) -> Self {
-        let bounded_contract = session.jspace_contract.as_ref().is_none_or(|value| terminal_fingerprint(value).is_some());
+        let bounded_contract = session
+            .jspace_contract
+            .as_ref()
+            .is_none_or(|value| terminal_fingerprint(value).is_some());
         Self {
-            contract: bounded_contract.then(|| session.jspace_contract.clone()).flatten(),
+            contract: bounded_contract
+                .then(|| session.jspace_contract.clone())
+                .flatten(),
             session_id: session.session_id.clone(),
             session_directory: session.session_directory.clone(),
-            binding: session.jspace_contract.as_ref().filter(|_| bounded_contract)
+            binding: session
+                .jspace_contract
+                .as_ref()
+                .filter(|_| bounded_contract)
                 .and_then(TerminalVerifierBinding::from_contract),
             observed_entries: 0,
             hard_veto: !bounded_contract,
+            #[cfg(test)]
+            veto_line: None,
             mutation_generation: 0,
-            failures: BTreeMap::new(), postimages: None,
-            runtimes: BTreeSet::new(), receipts: BTreeSet::new(), streamed: BTreeMap::new(),
+            failures: BTreeMap::new(),
+            postimages: None,
+            own_edits: BTreeMap::new(),
+            failed_reads: Vec::new(),
+            runtimes: BTreeSet::new(),
+            receipts: BTreeSet::new(),
+            streamed: BTreeMap::new(),
             streamed_calls: BTreeSet::new(),
         }
     }
 
     fn proven(&self) -> bool {
-        !self.hard_veto && self.streamed.is_empty()
-            && self.failures.values().all(|generation| *generation == Some(self.mutation_generation))
+        !self.hard_veto
+            && self.streamed.is_empty()
+            && self
+                .failures
+                .values()
+                .all(|generation| *generation == Some(self.mutation_generation))
+            && self
+                .failed_reads
+                .iter()
+                .all(|(_, _, _, resolved)| *resolved)
     }
 
     fn delivery_status(
@@ -1487,11 +1932,15 @@ impl TerminalOutcomeTracker {
         runtime: &RuntimeAggregate,
         tool_results: &[crate::tool_router::execute_tool::ToolExecutionResult],
     ) -> Option<&'static str> {
-        if session.jspace_contract != self.contract || session.session_id != self.session_id
-            || session.session_directory != self.session_directory {
+        if session.jspace_contract != self.contract
+            || session.session_id != self.session_id
+            || session.session_directory != self.session_directory
+        {
             return None;
         }
-        if self.proven() { return Some("done"); }
+        if self.proven() {
+            return Some("done");
+        }
         // Missing/foreign history cannot authenticate even a blocked handoff.
         // Never reset the original tracker or rewrite its failures. A separate
         // projection proves ONLY this current terminal batch, not task success,
@@ -1504,16 +1953,23 @@ impl TerminalOutcomeTracker {
         for entry in &session.session_log {
             let value = entry.value();
             let kind = value["type"].as_str();
-            if !value.is_object() || value["schema_version"] == "nokiy_terminal_evidence_v1"
+            if !value.is_object()
+                || value["schema_version"] == "nokiy_terminal_evidence_v1"
                 || kind == Some("nokiy.terminal_evidence")
-                || value.get("session_id").is_some_and(|id| id.as_str() != Some(session.session_id.as_str()))
+                || value
+                    .get("session_id")
+                    .is_some_and(|id| id.as_str() != Some(session.session_id.as_str()))
                 || (matches!(kind, Some("tool_result" | "streamed_command_event"))
-                    && terminal_identity(&value["runtime_id"]).is_none()) {
+                    && terminal_identity(&value["runtime_id"]).is_none())
+            {
                 return None;
             }
             if value["runtime_id"].as_str() == Some(runtime.runtime_id.as_str()) {
                 match kind {
-                    Some("tool_result") => { current.observe_batch(value); batches += 1; }
+                    Some("tool_result") => {
+                        current.observe_batch(value);
+                        batches += 1;
+                    }
                     Some("streamed_command_event") => current.observe_streamed(value),
                     _ => {}
                 }
@@ -1523,22 +1979,34 @@ impl TerminalOutcomeTracker {
     }
 
     fn observe_session(&mut self, session: &SessionManagement) {
-        if self.hard_veto { return; }
+        if self.hard_veto {
+            return;
+        }
         let omitted = session.session_log_retention.omitted_entries;
         let Some(end) = omitted.checked_add(session.session_log.len() as u64) else {
-            self.hard_veto = true; return;
+            veto!(self);
+            return;
         };
-        if session.jspace_contract != self.contract || omitted > self.observed_entries || end < self.observed_entries
-            || session.session_id != self.session_id || session.session_directory != self.session_directory {
-            self.hard_veto = true; return;
+        if session.jspace_contract != self.contract
+            || omitted > self.observed_entries
+            || end < self.observed_entries
+            || session.session_id != self.session_id
+            || session.session_directory != self.session_directory
+        {
+            veto!(self);
+            return;
         }
         let start = (self.observed_entries - omitted) as usize;
         for entry in session.session_log.iter().skip(start) {
             let value = entry.value();
-            if !value.is_object() || value["schema_version"] == "nokiy_terminal_evidence_v1"
+            if !value.is_object()
+                || value["schema_version"] == "nokiy_terminal_evidence_v1"
                 || value["type"] == "nokiy.terminal_evidence"
-                || value.get("session_id").is_some_and(|id| id.as_str() != Some(session.session_id.as_str())) {
-                self.hard_veto = true;
+                || value
+                    .get("session_id")
+                    .is_some_and(|id| id.as_str() != Some(session.session_id.as_str()))
+            {
+                veto!(self);
             } else {
                 match value["type"].as_str() {
                     Some("tool_result") => self.observe_batch(value),
@@ -1546,62 +2014,128 @@ impl TerminalOutcomeTracker {
                     _ => {}
                 }
             }
-            if self.hard_veto { break; }
+            if self.hard_veto {
+                break;
+            }
         }
         self.observed_entries = end;
     }
 
     fn observe_streamed(&mut self, event: &Value) {
-        let Some(runtime) = terminal_identity(&event["runtime_id"]) else { self.hard_veto = true; return; };
-        let Some(kind) = terminal_identity(&event["command_type"]) else { self.hard_veto = true; return; };
-        let Some(step) = event["step"].as_u64().filter(|step| *step > 0) else { self.hard_veto = true; return; };
+        let Some(runtime) = terminal_identity(&event["runtime_id"]) else {
+            veto!(self);
+            return;
+        };
+        let Some(kind) = terminal_identity(&event["command_type"]) else {
+            veto!(self);
+            return;
+        };
+        let Some(step) = event["step"].as_u64().filter(|step| *step > 0) else {
+            veto!(self);
+            return;
+        };
         let ready = event["status"] == "ready";
-        let Some((index, result_index)) = terminal_stream_indices(event) else { self.hard_veto = true; return; };
+        let Some((index, result_index)) = terminal_stream_indices(event) else {
+            veto!(self);
+            return;
+        };
         if !terminal_stream_header_proven(event) {
-            self.hard_veto = true; return;
+            veto!(self);
+            return;
         }
         let key = (runtime.to_owned(), index);
         if ready {
-            let Some(provider_call_id) = terminal_identity(&event["provider_tool_call_id"]) else { self.hard_veto = true; return; };
-            if self.streamed.len() >= MAX_TERMINAL_TRACKED_COMMANDS || self.streamed.contains_key(&key)
-                || self.streamed_calls.iter().any(|(id, call)| id == runtime && call == provider_call_id)
+            let Some(provider_call_id) = terminal_identity(&event["provider_tool_call_id"]) else {
+                veto!(self);
+                return;
+            };
+            if self.streamed.len() >= MAX_TERMINAL_TRACKED_COMMANDS
+                || self.streamed.contains_key(&key)
+                || self
+                    .streamed_calls
+                    .iter()
+                    .any(|(id, call)| id == runtime && call == provider_call_id)
                 || !terminal_stream_identity_matches(event, runtime, provider_call_id)
-                || !terminal_payload_proven(event) {
-                self.hard_veto = true; return;
+                || !terminal_payload_proven(event)
+            {
+                veto!(self);
+                return;
             }
-            self.streamed.insert(key, TerminalStreamBinding {
-                kind: kind.to_owned(), step, provider_call_id: provider_call_id.to_owned(), completed: None,
-            });
+            self.streamed.insert(
+                key,
+                TerminalStreamBinding {
+                    kind: kind.to_owned(),
+                    step,
+                    provider_call_id: provider_call_id.to_owned(),
+                    completed: None,
+                },
+            );
         } else {
-            let Some(result_index) = result_index else { self.hard_veto = true; return; };
-            if self.streamed.iter().any(|((id, _), binding)| id == runtime
-                && binding.completed.as_ref().is_some_and(|(index, _)| *index == result_index)) {
-                self.hard_veto = true; return;
+            let Some(result_index) = result_index else {
+                veto!(self);
+                return;
+            };
+            if self.streamed.iter().any(|((id, _), binding)| {
+                id == runtime
+                    && binding
+                        .completed
+                        .as_ref()
+                        .is_some_and(|(index, _)| *index == result_index)
+            }) {
+                veto!(self);
+                return;
             }
             let result = &event["result"];
-            let Some(fingerprint) = terminal_fingerprint(result) else { self.hard_veto = true; return; };
-            let Some(binding) = self.streamed.get_mut(&key) else { self.hard_veto = true; return; };
+            let Some(fingerprint) = terminal_stream_fingerprint(result) else {
+                veto!(self);
+                return;
+            };
+            let Some(binding) = self.streamed.get_mut(&key) else {
+                veto!(self);
+                return;
+            };
             // Native completed records omit wrapper error. Any supplied copy
             // must agree; the canonical result and receipt remain authoritative.
-            if event["status"] != "completed" || binding.completed.is_some() || binding.kind != kind || binding.step != step
-                || event["success"].as_bool().is_none() || event["success"] != result["success"]
-                || result["command_type"] != kind || result["step"] != step
-                || event.get("error").is_some_and(|error| error != &result["error"])
-                || !terminal_stream_identity_matches(event, runtime, &binding.provider_call_id) {
-                self.hard_veto = true; return;
+            if event["status"] != "completed"
+                || binding.completed.is_some()
+                // A J-Space refusal completes under its own type; the batch authenticates it.
+                || (binding.kind != kind && !(kind == "jspace" && terminal_policy_denial_shape(result)))
+                || binding.step != step
+                || event["success"].as_bool().is_none()
+                || event["success"] != result["success"]
+                || result["command_type"] != kind
+                || result["step"] != step
+                || event
+                    .get("error")
+                    .is_some_and(|error| error != &result["error"])
+                || !terminal_stream_identity_matches(event, runtime, &binding.provider_call_id)
+            {
+                veto!(self);
+                return;
             }
             binding.completed = Some((result_index, fingerprint));
         }
     }
 
     fn observe_batch(&mut self, value: &Value) {
-        let Some(runtime) = terminal_identity(&value["runtime_id"]) else { self.hard_veto = true; return; };
-        let Some(success) = value["success"].as_bool() else { self.hard_veto = true; return; };
+        let Some(runtime) = terminal_identity(&value["runtime_id"]) else {
+            veto!(self);
+            return;
+        };
+        let Some(success) = value["success"].as_bool() else {
+            veto!(self);
+            return;
+        };
         let arguments = &value["input"];
         let output = &value["output"];
         let (Some(commands), Some(results), Some(object)) = (
-            arguments["commands"].as_array(), output["results"].as_array(), output.as_object(),
-        ) else { self.hard_veto = true; return; };
+            arguments["commands"].as_array(),
+            output["results"].as_array(),
+            output.as_object(),
+        ) else {
+            veto!(self);
+            return;
+        };
         let error = value.get("error").filter(|error| !error.is_null());
         if value["tool_name"] != crate::manas::COMMAND_RUN_TOOL || commands.is_empty()
             || commands.len() != results.len() || commands.len() > MAX_TERMINAL_TRACKED_COMMANDS
@@ -1627,84 +2161,712 @@ impl TerminalOutcomeTracker {
                 }
             })
             || (success && !terminal_tool_outcome_proven(crate::manas::COMMAND_RUN_TOOL, true, None, arguments, output)) {
-            self.hard_veto = true; return;
+            veto!(self); return;
         }
         let stream_count = self.streamed.keys().filter(|(id, _)| id == runtime).count();
         if (stream_count != 0 && stream_count != commands.len())
-            || output.get("command_events").is_some_and(|events|
-                !self.streamed_batch_matches(runtime, commands.len(), events)) {
-            self.hard_veto = true; return;
+            || output
+                .get("command_events")
+                .is_some_and(|events| !self.streamed_batch_matches(runtime, commands.len(), events))
+        {
+            veto!(self);
+            return;
         }
+        // Inspect shells run under the bound Seatbelt profile, which confines their writes to the
+        // task-local evidence root: they cannot change anything this worker delivers.
+        let inspect = commands
+            .iter()
+            .any(|command| command["command_type"].as_str().is_some_and(inspect_shell_kind))
+            && self.inspect_contract_admitted();
+        // Parent shells run outside this engine under the parent's bound read-only profile; their
+        // receipts carry the "parent_shell" origin, which only the router's parent route writes.
+        let parent_shell = commands
+            .iter()
+            .any(|command| command["command_type"].as_str().is_some_and(inspect_shell_kind))
+            && self.parent_shell_contract_admitted();
+        let may_mutate = move |kind: &str, output: &Value| {
+            terminal_command_may_mutate(kind, output)
+                && !(inspect
+                    && inspect_shell_kind(kind)
+                    && output
+                        .get("changes")
+                        .is_none_or(|changes| changes.as_array().is_some_and(Vec::is_empty)))
+                && !(parent_shell
+                    && inspect_shell_kind(kind)
+                    && output["terminal_receipt"]["termination_origin"] == "parent_shell"
+                    && output
+                        .get("changes")
+                        .is_none_or(|changes| changes.as_array().is_some_and(Vec::is_empty)))
+        };
         let mut execution_order = Vec::with_capacity(commands.len());
         let mut mutation_steps = BTreeSet::new();
         let mut verifier_steps = BTreeSet::new();
+        let mut settled_searches = BTreeSet::new();
+        let mut refused = BTreeSet::new();
         for (index, (command, result)) in commands.iter().zip(results).enumerate() {
-            let Some(kind) = terminal_identity(&command["command_type"]) else { self.hard_veto = true; return; };
-            let Some(step) = terminal_command_step(command) else { self.hard_veto = true; return; };
-            if result["command_type"] != kind || terminal_command_step(result) != Some(step) {
-                self.hard_veto = true; return;
+            let Some(kind) = terminal_identity(&command["command_type"]) else {
+                veto!(self);
+                return;
+            };
+            let Some(step) = terminal_command_step(command) else {
+                veto!(self);
+                return;
+            };
+            let denied = result["command_type"] != kind
+                && self.policy_denial_proven(value, command, result, index);
+            if (result["command_type"] != kind && !denied) || terminal_command_step(result) != Some(step) {
+                veto!(self);
+                return;
+            }
+            if denied {
+                refused.insert(index);
             }
             if stream_count != 0 {
-                let Some(binding) = self.streamed.remove(&(runtime.to_owned(), index)) else { self.hard_veto = true; return; };
-                if binding.kind != kind || binding.step != step
-                    || binding.completed.as_ref().is_none_or(|(result_index, fingerprint)|
-                        *result_index >= commands.len() || terminal_fingerprint(result).as_ref() != Some(fingerprint))
-                    || value.get("provider_tool_call_id").is_some_and(|id| id.as_str() != Some(binding.provider_call_id.as_str())) {
-                    self.hard_veto = true; return;
+                let Some(binding) = self.streamed.remove(&(runtime.to_owned(), index)) else {
+                    veto!(self);
+                    return;
+                };
+                if binding.kind != kind
+                    || binding.step != step
+                    || binding
+                        .completed
+                        .as_ref()
+                        .is_none_or(|(result_index, fingerprint)| {
+                            *result_index >= commands.len()
+                                || terminal_stream_fingerprint(result).as_ref() != Some(fingerprint)
+                        })
+                    || value
+                        .get("provider_tool_call_id")
+                        .is_some_and(|id| id.as_str() != Some(binding.provider_call_id.as_str()))
+                {
+                    veto!(self);
+                    return;
                 }
                 let call = (runtime.to_owned(), binding.provider_call_id);
-                if self.streamed_calls.len() >= MAX_TERMINAL_TRACKED_COMMANDS && !self.streamed_calls.contains(&call) {
-                    self.hard_veto = true; return;
+                if self.streamed_calls.len() >= MAX_TERMINAL_TRACKED_COMMANDS
+                    && !self.streamed_calls.contains(&call)
+                {
+                    veto!(self);
+                    return;
                 }
                 self.streamed_calls.insert(call);
             }
-            if kind == "focused_verifier" { verifier_steps.insert(step); }
-            if terminal_command_may_mutate(kind, &result["output"]) { mutation_steps.insert(step); }
+            if kind == "focused_verifier" && !denied {
+                verifier_steps.insert(step);
+            }
+            let search_settled = self.search_no_match_proven(value, command, result, index);
+            if search_settled {
+                settled_searches.insert(index);
+            } else if !denied && may_mutate(kind, &result["output"]) {
+                mutation_steps.insert(step);
+            }
             execution_order.push((step, index));
         }
         // Commands within a step can overlap. Array order is NOT a happens-before proof.
-        if !mutation_steps.is_disjoint(&verifier_steps) { self.hard_veto = true; return; }
+        if !mutation_steps.is_disjoint(&verifier_steps) {
+            veto!(self);
+            return;
+        }
         // Fold authenticated outcomes by scheduled step, not presentation order.
         // Keep original command/result indices and streamed bindings unchanged.
         execution_order.sort_unstable();
-        let mut terminal_status_guard = code_tools::command_run::CommandRunTerminalStatusGuard::default();
-        for (_, index) in execution_order {
+        let mut terminal_status_guard =
+            code_tools::command_run::CommandRunTerminalStatusGuard::default();
+        for (step, index) in execution_order {
             let (command, result) = (&commands[index], &results[index]);
             let kind = command["command_type"].as_str().unwrap_or_default();
+            if refused.contains(&index) {
+                // Authenticated non-attempt: no output, receipt, mutation or verifier outcome.
+                terminal_status_guard.observe_step(command.get("step").and_then(Value::as_u64));
+                terminal_status_guard.observe_result(Some(false));
+                continue;
+            }
+            let position = (self.runtimes.len() as u64, step);
+            let read_settled = kind == "source_read"
+                && !mutation_steps.contains(&step)
+                && self.observe_own_edit_read(value, command, result, index, position);
             if result.get("output").is_none_or(Value::is_null) {
                 // Native guards reject before dispatch and therefore have no
                 // output/receipt. Replay ONLY this batch's already-settled
                 // outcomes; neither the error text nor historical failures
                 // authenticate a non-attempt by themselves.
-                let reported_command = output.get("commands").and_then(|commands| commands.get(index)).unwrap_or(command);
-                if success || value["sequence"].as_u64().is_none() || kind != "task_status"
-                    || !Self::done_guard_rejection_proven(&terminal_status_guard, commands, index, reported_command, result) {
-                    self.hard_veto = true; return;
+                let reported_command = output
+                    .get("commands")
+                    .and_then(|commands| commands.get(index))
+                    .unwrap_or(command);
+                if success
+                    || value["sequence"].as_u64().is_none()
+                    || kind != "task_status"
+                    || !Self::done_guard_rejection_proven(
+                        &terminal_status_guard,
+                        commands,
+                        index,
+                        reported_command,
+                        result,
+                    )
+                {
+                    veto!(self);
+                    return;
                 }
             } else if kind == "focused_verifier" {
                 self.observe_verifier(command, result);
-            } else if !success && !terminal_command_outcome_proven(command, result) {
-                // Authenticate ONLY a singleton router-owned syntax/shape
-                // non-attempt. This never proves a read succeeded or resolves a
+            } else if !success
+                && !terminal_command_outcome_proven(command, result)
+                && !read_settled
+                && !settled_searches.contains(&index)
+                && !self.closed_effect_free_failure_proven(inspect, parent_shell, value, command, result, index)
+            {
+                // Authenticate a router-owned argument non-attempt in a read-only
+                // batch. This never proves a read succeeded or resolves a
                 // verifier failure, and cannot forgive a mixed mutating batch.
-                if commands.len() != 1 || kind != "source_read"
-                    || !self.observe_source_read_rejection(runtime, arguments, command, result) {
-                    self.hard_veto = true;
+                // Non-mutating peers (focused verifiers, task status, planning,
+                // other reads) leave that proof intact; any mutating peer does not.
+                if !mutation_steps.is_empty()
+                    || kind != "source_read"
+                    || !(self.observe_source_read_rejection(runtime, arguments, command, result)
+                        || self.source_navigation_refusal_proven(value, command, result, index)
+                        || self.source_read_digest_mismatch_proven(value, command, result, index))
+                {
+                    veto!(self);
                 }
             }
             self.observe_receipts(&result["output"]);
-            if terminal_command_may_mutate(kind, &result["output"]) {
+            if may_mutate(kind, &result["output"])
+                && !settled_searches.contains(&index)
+            {
+                self.own_edits.clear();
                 match self.mutation_generation.checked_add(1) {
                     Some(generation) => self.mutation_generation = generation,
-                    None => self.hard_veto = true,
+                    None => veto!(self),
+                }
+                if kind == "apply_patch"
+                    && commands
+                        .iter()
+                        .zip(results)
+                        .filter(|(command, result)| {
+                            terminal_command_step(command) == Some(step)
+                                && may_mutate(
+                                    command["command_type"].as_str().unwrap_or_default(),
+                                    &result["output"],
+                                )
+                        })
+                        .count()
+                        == 1
+                {
+                    self.observe_own_edit_patch(value, command, result, index, position);
                 }
             }
-            if self.hard_veto { return; }
+            if self.hard_veto {
+                return;
+            }
             // Failed verifiers enter here only after receipt/cleanup/grant
             // validation. Their unresolved state remains in self.failures.
             terminal_status_guard.observe_step(command.get("step").and_then(Value::as_u64));
             terminal_status_guard.observe_result(result.get("success").and_then(Value::as_bool));
         }
+    }
+
+    fn search_no_match_proven(
+        &self,
+        batch: &Value,
+        command: &Value,
+        result: &Value,
+        index: usize,
+    ) -> bool {
+        let output = &result["output"];
+        let receipt = &output["terminal_receipt"];
+        let (Some(kind), Some(line), Some(contract)) = (
+            command["command_type"].as_str(),
+            command["command_line"].as_str(),
+            self.contract.as_ref(),
+        ) else {
+            return false;
+        };
+        // The raw failed receipt is immutable. Only the effective search outcome is settled.
+        if result["success"] != false
+            || output["exit_code"] != 1
+            || output["stdout"] != ""
+            || output["stderr"] != ""
+            || receipt["exit_code"] != 1
+            || receipt["failure_class"] != "workload_exit_nonzero"
+            || receipt["termination_origin"] != "workload"
+            || receipt["authority_effect"] != "none"
+            || receipt["staging_authority"] != "none"
+            || receipt["authoritative_publication"] != "unproven"
+            || !terminal_receipt_closed_with_reconciliation(receipt, "failed", true)
+            || !receipt.as_object().is_some_and(|object| {
+                object.iter().all(|(key, value)| {
+                    matches!(key.as_str(), "terminal_state" | "exit_code" | "reconcile_required")
+                        || terminal_payload_field_proven(key, value)
+                })
+            })
+            || receipt
+                .get("apply_patch_changes")
+                .is_some_and(|changes| !changes.as_array().is_some_and(Vec::is_empty))
+            || !self.own_edit_receipt_authenticated(batch, command, result, index)
+            || !result.as_object().is_some_and(|object| {
+                object.iter().all(|(key, value)| {
+                    matches!(key.as_str(), "success" | "output")
+                        || terminal_payload_field_proven(key, value)
+                })
+            })
+            || !output.as_object().is_some_and(|object| {
+                object.iter().all(|(key, value)| {
+                    matches!(key.as_str(), "exit_code" | "terminal_receipt")
+                        || terminal_payload_field_proven(key, value)
+                })
+            })
+            || output
+                .get("changes")
+                .is_some_and(|changes| !changes.as_array().is_some_and(Vec::is_empty))
+        {
+            return false;
+        }
+        // Reuse exact argv parsing, executable pins and read scopes. Failure stays blocked.
+        tura_path::jspace::JSpaceMatcher::from_value(&self.session_directory, contract)
+            .and_then(|matcher| matcher.check_read_search_command(kind, line))
+            .is_ok()
+    }
+
+    fn inspect_contract_admitted(&self) -> bool {
+        self.contract.as_ref().is_some_and(|contract| {
+            contract.get("inspect_shell").is_some()
+                && tura_path::jspace::JSpaceMatcher::from_value(&self.session_directory, contract)
+                    .is_ok_and(|matcher| matcher.inspect_shell_admitted())
+        })
+    }
+
+    fn parent_shell_contract_admitted(&self) -> bool {
+        self.contract.as_ref().is_some_and(|contract| {
+            contract.get("parent_shell").is_some()
+                && tura_path::jspace::JSpaceMatcher::from_value(&self.session_directory, contract)
+                    .is_ok_and(|matcher| matcher.parent_shell_admitted())
+        })
+    }
+
+    // J-Space refused this command before dispatch, and the router's durable witness for its call
+    // describes exactly this command and refusal. A non-attempt: nothing ran, nothing is accepted.
+    fn policy_denial_proven(&self, batch: &Value, command: &Value, result: &Value, index: usize) -> bool {
+        let (Some(runtime), Some(authorization)) = (
+            batch["runtime_id"].as_str(),
+            self.contract.as_ref().and_then(|contract| contract["authorization_semantic_sha256"].as_str()),
+        ) else {
+            return false;
+        };
+        let Some(call) = terminal_command_call_id(batch, command, result, index) else {
+            return false;
+        };
+        let Ok(store) = tura_path::command_receipts::ReceiptStore::open_existing(&self.session_directory) else {
+            return false;
+        };
+        terminal_policy_denial_shape(result)
+            && code_tools::command_run::JSpacePolicyDenial::authenticate(
+                &store, &self.session_id, runtime, &call, Some(authorization), command, result,
+            )
+    }
+
+    // A failed command whose authenticated, closed receipt proves it changed nothing this worker
+    // delivers. Like a no-match search this settles execution certainty only: the record stays
+    // failed and nothing about the task is inferred from it.
+    fn closed_effect_free_failure_proven(
+        &self,
+        inspect: bool,
+        parent_shell: bool,
+        batch: &Value,
+        command: &Value,
+        result: &Value,
+        index: usize,
+    ) -> bool {
+        match command["command_type"].as_str() {
+            Some(kind) if inspect_shell_kind(kind) => {
+                (inspect && self.inspect_shell_failure_proven(batch, command, result, index))
+                    || (parent_shell && self.parent_shell_failure_proven(batch, command, result, index))
+            }
+            Some("source_read") => self.unwritable_read_failure_proven(batch, command, result, index),
+            Some("apply_patch") => self.unapplied_patch_proven(batch, command, result, index),
+            _ => false,
+        }
+    }
+
+    // Writable paths, and any path a glob scope may cover, stay with the own-edit read rules.
+    fn path_writable(&self, path: &str) -> bool {
+        path.starts_with('/')
+            || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+            || self.contract.as_ref().is_none_or(|contract| {
+                ["write_scopes", "declared_targets"]
+                    .iter()
+                    .filter_map(|key| contract[*key].as_array())
+                    .flatten()
+                    .any(|scope| scope.as_str().is_none_or(|scope| scope == path || scope.contains('*')))
+            })
+    }
+
+    // An in-process read that failed before returning content (a page out of range, an over-long
+    // line, a missing JSON pointer, an oversized value, a mismatched digest) had no effect, and off
+    // the writable paths no mutation in its batch can bear on it (real tasks 2026-10-23..25).
+    fn unwritable_read_failure_proven(
+        &self,
+        batch: &Value,
+        command: &Value,
+        result: &Value,
+        index: usize,
+    ) -> bool {
+        let output = &result["output"];
+        let Some(line) = command["command_line"].as_str() else {
+            return false;
+        };
+        let Ok(request) = code_tools::commands::source_read::parse_command_line_typed(line) else {
+            return false;
+        };
+        let receipt = &output["terminal_receipt"];
+        result["success"] == false
+            && output["exit_code"] == 1
+            && output["stdout"] == ""
+            && output["error_type"]
+                .as_str()
+                .is_some_and(|code| code.starts_with("SOURCE_READ_") && output["stderr"] == code)
+            && Self::effect_free_source_read_receipt(receipt)
+            // Facts the receipt binds must be the ones shown, and must describe this exact read.
+            && ["navigation_refusal", "source_read_evidence"]
+                .iter()
+                .all(|key| receipt.get(*key).is_none_or(|bound| output.get(*key) == Some(bound)))
+            && receipt.get("source_read_evidence").is_none_or(|evidence| {
+                code_tools::commands::source_read::SourceReadContentEvidence::parse_bounded(evidence)
+                    .is_some_and(|proof| !proof.content_satisfied && proof.matches_command(line))
+            })
+            && receipt.get("navigation_refusal").is_none_or(|refusal| {
+                code_tools::commands::source_read::navigation_refusal_matches(refusal, line)
+            })
+            && output
+                .get("changes")
+                .is_none_or(|changes| changes.as_array().is_some_and(Vec::is_empty))
+            && !self.path_writable(request.path())
+            && self.own_edit_receipt_authenticated(batch, command, result, index)
+    }
+
+    // apply_patch checks file existence and matches context before it writes each change, and it
+    // reports `changes` whenever any change was written. A patch whose every change failed for one
+    // of those pre-write reasons therefore changed no file (real tasks 2026-10-23..25).
+    fn unapplied_patch_proven(
+        &self,
+        batch: &Value,
+        command: &Value,
+        result: &Value,
+        index: usize,
+    ) -> bool {
+        const PRE_WRITE: [&str; 5] = [
+            "ContextMismatch",
+            "UpdateFileNotFound",
+            "DeleteFileNotFound",
+            "AddFileExists",
+            "ParseError",
+        ];
+        let output = &result["output"];
+        let receipt = &output["terminal_receipt"];
+        result["success"] == false
+            && output["exit_code"] == 1
+            && output["stdout"] == ""
+            && output.get("changes").is_none()
+            && output["error_type"]
+                .as_str()
+                .is_some_and(|code| PRE_WRITE.contains(&code) || code == "MultiplePatchFailures")
+            && output["failed_changes"].as_array().is_some_and(|failures| {
+                !failures.is_empty()
+                    && failures.iter().all(|failure| {
+                        failure["error_type"].as_str().is_some_and(|code| PRE_WRITE.contains(&code))
+                    })
+            })
+            && receipt["termination_origin"] == "in_process_apply_patch"
+            && receipt["pid"].is_null()
+            && receipt["exit_code"] == 1
+            && receipt["failure_class"] == "workload_exit_nonzero"
+            && receipt["authority_effect"] == "none"
+            && receipt["staging_authority"] == "none"
+            && receipt["authoritative_publication"] == "unproven"
+            && receipt.get("apply_patch_changes").is_none()
+            && terminal_receipt_closed_with_reconciliation(receipt, "failed", true)
+            && self.own_edit_receipt_authenticated(batch, command, result, index)
+    }
+
+    // Real tasks 2026-10-23..25: most blocked workers ran an admitted inspect action whose only
+    // failures were closed non-zero shell exits (a crashed probe, a failing `test` or `diff`) and
+    // later reported done. The bound profile confines those shells to the evidence root, so a
+    // closed workload exit is a finding of the inspection, not an unknown effect. Like a no-match
+    // search this settles execution certainty only: the record stays failed, nothing is accepted.
+    fn inspect_shell_failure_proven(
+        &self,
+        batch: &Value,
+        command: &Value,
+        result: &Value,
+        index: usize,
+    ) -> bool {
+        let output = &result["output"];
+        let receipt = &output["terminal_receipt"];
+        let unchanged = |changes: Option<&Value>| {
+            changes.is_none_or(|changes| changes.as_array().is_some_and(Vec::is_empty))
+        };
+        command["command_type"].as_str().is_some_and(inspect_shell_kind)
+            && result["success"] == false
+            && output["exit_code"].as_i64().is_some_and(|code| code != 0)
+            && receipt["exit_code"] == output["exit_code"]
+            && receipt["failure_class"] == "workload_exit_nonzero"
+            && receipt["termination_origin"] == "workload"
+            && receipt["authority_effect"] == "none"
+            && receipt["staging_authority"] == "none"
+            && receipt["authoritative_publication"] == "unproven"
+            && terminal_receipt_closed_with_reconciliation(receipt, "failed", true)
+            && unchanged(receipt.get("apply_patch_changes"))
+            && unchanged(output.get("changes"))
+            && self.own_edit_receipt_authenticated(batch, command, result, index)
+    }
+
+    // A parent shell line ran in the parent under the contract's bound read-only profile, so its
+    // closed non-zero exit (a no-match search, a failing test, `git diff --check`) is a finding,
+    // not an unknown effect. Like an inspect shell this settles execution certainty only.
+    fn parent_shell_failure_proven(
+        &self,
+        batch: &Value,
+        command: &Value,
+        result: &Value,
+        index: usize,
+    ) -> bool {
+        let output = &result["output"];
+        let receipt = &output["terminal_receipt"];
+        let unchanged = |changes: Option<&Value>| {
+            changes.is_none_or(|changes| changes.as_array().is_some_and(Vec::is_empty))
+        };
+        command["command_type"].as_str().is_some_and(inspect_shell_kind)
+            && result["success"] == false
+            && output["exit_code"].as_i64().is_some_and(|code| code != 0)
+            && receipt["exit_code"] == output["exit_code"]
+            && receipt["failure_class"] == "workload_exit_nonzero"
+            && receipt["termination_origin"] == "parent_shell"
+            && receipt["pid"].is_null()
+            && receipt["authority_effect"] == "none"
+            && receipt["staging_authority"] == "none"
+            && receipt["authoritative_publication"] == "unproven"
+            && terminal_receipt_closed_with_reconciliation(receipt, "failed", true)
+            && unchanged(receipt.get("apply_patch_changes"))
+            && unchanged(output.get("changes"))
+            && self.own_edit_receipt_authenticated(batch, command, result, index)
+    }
+
+    fn own_edit_receipt_authenticated(
+        &self,
+        batch: &Value,
+        command: &Value,
+        result: &Value,
+        index: usize,
+    ) -> bool {
+        let receipt = &result["output"]["terminal_receipt"];
+        let Some(call) = terminal_identity(&receipt["call_id"]) else {
+            return false;
+        };
+        if terminal_command_call_id(batch, command, result, index).as_deref() != Some(call) {
+            return false;
+        }
+        let Some(path) = result["output"]["terminal_receipt_path"].as_str() else {
+            return false;
+        };
+        let Some(name) = std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
+            return false;
+        };
+        let Ok(store) =
+            tura_path::command_receipts::ReceiptStore::open_existing(&self.session_directory)
+        else {
+            return false;
+        };
+        store
+            .display_path(name)
+            .ok()
+            .is_some_and(|stored| stored == std::path::Path::new(path))
+            && store
+                .read(name)
+                .ok()
+                .filter(|bytes| bytes.len() <= 64 * 1024)
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .as_ref()
+                == Some(receipt)
+    }
+
+    fn own_edit_path_authorized(&self, path: &str) -> bool {
+        use code_tools::commands::source_read::source_read_recovery_authorization;
+        let Some(contract) = self
+            .contract
+            .as_ref()
+            .filter(|contract| source_read_recovery_authorization(contract).is_some())
+        else {
+            return false;
+        };
+        contract["repo_root"].as_str() == self.session_directory.to_str()
+            && ["read_scopes", "write_scopes", "declared_targets"]
+                .iter()
+                .all(|key| {
+                    contract[*key]
+                        .as_array()
+                        .is_some_and(|paths| paths.iter().any(|value| value == path))
+                })
+            && contract["allowed_operations"]
+                .as_array()
+                .is_some_and(|ops| ops.iter().any(|op| op == "modify"))
+            && contract["denied_operations"]
+                .as_array()
+                .is_some_and(|ops| !ops.iter().any(|op| op == "modify"))
+    }
+
+    fn observe_own_edit_patch(
+        &mut self,
+        batch: &Value,
+        command: &Value,
+        result: &Value,
+        index: usize,
+        position: (u64, u64),
+    ) {
+        let output = &result["output"];
+        let receipt = &output["terminal_receipt"];
+        if !terminal_command_outcome_proven(command, result)
+            || receipt["termination_origin"] != "in_process_apply_patch"
+            || !receipt["pid"].is_null()
+            || receipt["exit_code"] != 0
+            || receipt["failure_class"] != "none"
+            || receipt["authority_effect"] != "none"
+            || receipt["staging_authority"] != "none"
+            || receipt["authoritative_publication"] != "unproven"
+            || ["retry_safe", "auto_retry_allowed"]
+                .iter()
+                .any(|key| receipt[*key] != false)
+            || !self.own_edit_receipt_authenticated(batch, command, result, index)
+        {
+            return;
+        }
+        let (Some(facts), Some(changes)) = (
+            receipt["apply_patch_changes"].as_array(),
+            output["changes"].as_array(),
+        ) else {
+            return;
+        };
+        if facts.is_empty() || facts.len() > 128 || facts.len() != changes.len() {
+            return;
+        }
+        if !serde_json::to_vec(facts).is_ok_and(|bytes| bytes.len() <= 16 * 1024) {
+            return;
+        }
+        let mut paths = BTreeSet::new();
+        if !facts.iter().zip(changes).all(|(fact, change)| {
+            let Some(path) = fact["path"].as_str() else {
+                return false;
+            };
+            fact.as_object().is_some_and(|object| object.len() == 4)
+                && fact["kind"] == "update"
+                && paths.insert(path)
+                && self.own_edit_path_authorized(path)
+                && change["kind"] == "update"
+                && change.get("move_path").is_none_or(Value::is_null)
+                && ["path", "preimage_sha256", "postimage_sha256"]
+                    .iter()
+                    .all(|key| change[*key] == fact[*key])
+                && ["preimage_sha256", "postimage_sha256"]
+                    .iter()
+                    .all(|key| fact[*key].as_str().is_some_and(terminal_sha256))
+        }) {
+            return;
+        }
+        for fact in facts {
+            self.own_edits.insert(
+                fact["path"]
+                    .as_str()
+                    .expect("every fact was checked above to carry a string path")
+                    .to_owned(),
+                (position, fact.clone()),
+            );
+        }
+    }
+
+    fn observe_own_edit_read(
+        &mut self,
+        batch: &Value,
+        command: &Value,
+        result: &Value,
+        index: usize,
+        position: (u64, u64),
+    ) -> bool {
+        use code_tools::commands::source_read::SourceReadContentEvidence;
+        let output = &result["output"];
+        let receipt = &output["terminal_receipt"];
+        let Some(proof) =
+            SourceReadContentEvidence::parse_bounded(&receipt["source_read_evidence"])
+        else {
+            return false;
+        };
+        let passed = result["success"] == true;
+        let code = if passed { 0 } else { 1 };
+        let state = if passed { "completed" } else { "failed" };
+        if proof.content_satisfied != passed || output["source_read_evidence"] != receipt["source_read_evidence"]
+            || !command["command_line"].as_str().is_some_and(|line| proof.matches_command(line))
+            || !self.own_edit_path_authorized(proof.request.path())
+            || !self.own_edit_receipt_authenticated(batch, command, result, index)
+            || receipt["schema_version"] != "tura_command_terminal_receipt_v1"
+            || receipt["termination_origin"] != "in_process_source_read" || !receipt["pid"].is_null()
+            || receipt["outcome"] != "known" || receipt["terminal_state"] != state || receipt["exit_code"] != code
+            || receipt["failure_class"] != if passed { "none" } else { "workload_exit_nonzero" }
+            // A failed in-process read still asks for semantic reconciliation,
+            // but its authenticated buffer witness proves it has no effects.
+            || receipt["reconcile_required"] != !passed
+            || ["termination_proven", "process_reaped", "process_group_empty"].iter().any(|key| receipt[*key] != true)
+            || receipt["authority_effect"] != "none" || receipt["staging_authority"] != "none"
+            || receipt["authoritative_publication"] != "unproven"
+            || ["retry_safe", "auto_retry_allowed"].iter().any(|key| receipt[*key] != false)
+            || ["timed_out", "cancelled"].iter().any(|key| receipt.get(*key).is_some_and(|value| value != false))
+            || receipt.get("error").is_some_and(|error| !error.is_null() && error != "")
+            || receipt.get("unresolved_effects").is_some_and(|effects| !effects.is_null() && !effects.as_array().is_some_and(Vec::is_empty))
+            || !result.as_object().is_some_and(|object| object.iter().all(|(key, value)| match key.as_str() {
+                "success" => value == passed, "output" => true,
+                "error" => value.is_null() || value.as_str().is_some_and(|error| !passed || error.is_empty()),
+                _ => terminal_payload_field_proven(key, value),
+            }))
+            || output.get("changes").is_some_and(|changes| !changes.as_array().is_some_and(Vec::is_empty))
+            || output.get("failed_change").is_some_and(|value| !value.is_null())
+            || [output, result].iter().any(|value| value.get("jspace_error_code").is_some_and(|value| !value.is_null()))
+            || !output.as_object().is_some_and(|object| object.iter().all(|(key, value)| match key.as_str() {
+                "terminal_receipt" => true, "exit_code" => value == code,
+                "success" => value == passed, "terminal_state" | "status" => value == state,
+                "reconcile_required" => value == !passed,
+                _ => terminal_payload_field_proven(key, value),
+            }))
+            || (passed && (!terminal_command_outcome_proven(command, result) || output["truncated"] != false
+                || output["path"] != proof.request.path() || output["source_sha256"] != proof.source_sha256))
+            || (!passed && (output["error_type"] != "SOURCE_READ_SHA256_MISMATCH" || output["stdout"] != ""
+                || output["stderr"] != "SOURCE_READ_SHA256_MISMATCH"
+                || self.failed_reads.len() >= MAX_TERMINAL_TRACKED_COMMANDS))
+        {
+            return false;
+        }
+        if passed {
+            for (failed, generation, failed_position, resolved) in &mut self.failed_reads {
+                if *generation == self.mutation_generation
+                    && *failed_position < position
+                    && proof.satisfies(failed)
+                {
+                    *resolved = true;
+                }
+            }
+        } else {
+            let Some((patched_at, patch)) = self.own_edits.get(proof.request.path()) else {
+                return false;
+            };
+            if *patched_at >= position
+                || patch["preimage_sha256"].as_str() != proof.request.expected_sha256()
+                || patch["postimage_sha256"] != proof.source_sha256
+            {
+                return false;
+            }
+            self.failed_reads
+                .push((proof, self.mutation_generation, position, false));
+        }
+        true
     }
 
     fn done_guard_rejection_proven(
@@ -1714,47 +2876,160 @@ impl TerminalOutcomeTracker {
         reported_command: &Value,
         result: &Value,
     ) -> bool {
-        let Some(command) = commands.get(index) else { return false; };
-        let (step, done) = code_tools::command_run::CommandRunTerminalStatusGuard::command_metadata(command);
-        let Some(step) = step.filter(|_| done && index + 1 == commands.len()) else { return false; };
-        if !commands[..index].iter().all(|command| command["step"].as_u64()
-            .is_some_and(|prior| prior > 0 && prior < step))
-            || result["success"] != false || result.get("output").is_some_and(|output| !output.is_null()) {
+        let Some(command) = commands.get(index) else {
+            return false;
+        };
+        let (step, done) =
+            code_tools::command_run::CommandRunTerminalStatusGuard::command_metadata(command);
+        let Some(step) = step.filter(|_| done && index + 1 == commands.len()) else {
+            return false;
+        };
+        if !commands[..index].iter().all(|command| {
+            command["step"]
+                .as_u64()
+                .is_some_and(|prior| prior > 0 && prior < step)
+        }) || result["success"] != false
+            || result.get("output").is_some_and(|output| !output.is_null())
+        {
             return false;
         }
         // Explicit sole-final ordering excludes ORDER_ERROR. An error here
         // can only come from a validated failure earlier in this same batch.
-        let Some(error) = guard.done_error(Some(step), true) else { return false; };
+        let Some(error) = guard.done_error(Some(step), true) else {
+            return false;
+        };
         result["error"].as_str() == Some(error)
-            && ["id", "command_id", "command_run_id", "provider_tool_call_id", "command_index"].iter()
-                .all(|key| result.get(*key) == reported_command.get(*key))
-            && result.as_object().is_some_and(|object| object.iter().all(|(key, value)| match key.as_str() {
-                "command_type" => value == "task_status",
-                "step" => value.as_u64() == Some(step),
-                "success" => value.as_bool() == Some(false),
-                "error" => value.as_str() == Some(error),
-                "output" => value.is_null(),
-                "command" => value == reported_command,
-                "command_index" => value.as_u64() == Some(index as u64),
-                "id" | "command_id" | "command_run_id" | "provider_tool_call_id" => terminal_identity(value).is_some(),
-                // Non-attempts have no receipt, payload, or additional effects.
-                _ => false,
-            }))
+            && [
+                "id",
+                "command_id",
+                "command_run_id",
+                "provider_tool_call_id",
+                "command_index",
+            ]
+            .iter()
+            .all(|key| result.get(*key) == reported_command.get(*key))
+            && result.as_object().is_some_and(|object| {
+                object.iter().all(|(key, value)| match key.as_str() {
+                    "command_type" => value == "task_status",
+                    "step" => value.as_u64() == Some(step),
+                    "success" => value.as_bool() == Some(false),
+                    "error" => value.as_str() == Some(error),
+                    "output" => value.is_null(),
+                    "command" => value == reported_command,
+                    "command_index" => value.as_u64() == Some(index as u64),
+                    "id" | "command_id" | "command_run_id" | "provider_tool_call_id" => {
+                        terminal_identity(value).is_some()
+                    }
+                    // Non-attempts have no receipt, payload, or additional effects.
+                    _ => false,
+                })
+            })
     }
 
-    fn observe_source_read_rejection(&mut self, runtime: &str, arguments: &Value, command: &Value, result: &Value) -> bool {
-        use code_tools::commands::source_read::{SourceReadPreExecutionRejection, source_read_recovery_authorization};
-        let Some(authorization) = self.contract.as_ref().and_then(source_read_recovery_authorization)
-            else { return false; };
-        let Some(proof) = SourceReadPreExecutionRejection::parse_bounded(&result["output"]["pre_execution_rejection"])
-            else { return false; };
-        if arguments.get("execution_id").is_some_and(|id| id.as_str() != Some(proof.execution_id())) {
+    fn source_navigation_refusal_proven(
+        &self, batch: &Value, command: &Value, result: &Value, index: usize,
+    ) -> bool {
+        let output = &result["output"];
+        let receipt = &output["terminal_receipt"];
+        let Some(line) = command["command_line"].as_str() else { return false; };
+        // This settles execution certainty only. The original read stays failed,
+        // and no requested source content or task acceptance is inferred.
+        result["success"] == false
+            && output["error_type"] == "SOURCE_READ_JSON_VALUE_TOO_LARGE"
+            && output["stdout"] == "" && output["stderr"] == "SOURCE_READ_JSON_VALUE_TOO_LARGE"
+            && output["navigation_refusal"] == receipt["navigation_refusal"]
+            && code_tools::commands::source_read::navigation_refusal_matches(&output["navigation_refusal"], line)
+            && self.own_edit_receipt_authenticated(batch, command, result, index)
+            && Self::effect_free_source_read_receipt(receipt)
+            && output.get("changes").is_none_or(|changes| changes.as_array().is_some_and(Vec::is_empty))
+    }
+
+    // A well-formed expected_sha256 that does not match the current file (I23 V424: a digest
+    // copied from another file) ends in-process before any content is returned. Like a
+    // navigation refusal this settles execution certainty only: the read stays failed and no
+    // source content, dependency proof or acceptance is inferred. Writable paths stay with the
+    // own-edit read rules, where a stale pin means the worker has not observed its own change.
+    fn source_read_digest_mismatch_proven(
+        &self, batch: &Value, command: &Value, result: &Value, index: usize,
+    ) -> bool {
+        use code_tools::commands::source_read::SourceReadContentEvidence;
+        let output = &result["output"];
+        let receipt = &output["terminal_receipt"];
+        let Some(line) = command["command_line"].as_str() else { return false; };
+        let Some(proof) = SourceReadContentEvidence::parse_bounded(&output["source_read_evidence"]) else {
+            return false;
+        };
+        let Some(path) = output["source_read_evidence"]["request"]["path"].as_str() else { return false; };
+        let Some(contract) = self.contract.as_ref() else { return false; };
+        let writable = ["write_scopes", "declared_targets"].iter()
+            .filter_map(|key| contract[*key].as_array())
+            .flatten()
+            .any(|scope| scope.as_str().is_none_or(|scope| scope == path || scope.contains('*')));
+        if writable {
             return false;
         }
-        let Ok(store) = tura_path::command_receipts::ReceiptStore::open_existing(&self.session_directory)
-            else { return false; };
-        proof.authenticate(&store, &self.session_id, runtime, authorization, command, result)
-            && self.receipts.len() < MAX_TERMINAL_TRACKED_COMMANDS
+        result["success"] == false
+            && !proof.content_satisfied && proof.matches_command(line)
+            && output["error_type"] == "SOURCE_READ_SHA256_MISMATCH"
+            && output["stdout"] == "" && output["stderr"] == "SOURCE_READ_SHA256_MISMATCH"
+            && output["source_read_evidence"] == receipt["source_read_evidence"]
+            && self.own_edit_receipt_authenticated(batch, command, result, index)
+            && Self::effect_free_source_read_receipt(receipt)
+            && output.get("changes").is_none_or(|changes| changes.as_array().is_some_and(Vec::is_empty))
+    }
+
+    fn effect_free_source_read_receipt(receipt: &Value) -> bool {
+        receipt["termination_origin"] == "in_process_source_read"
+            && receipt["pid"].is_null() && receipt["outcome"] == "known"
+            && receipt["terminal_state"] == "failed" && receipt["exit_code"] == 1
+            && receipt["authority_effect"] == "none" && receipt["staging_authority"] == "none"
+            && receipt["authoritative_publication"] == "unproven"
+            && ["termination_proven", "process_reaped", "process_group_empty", "reconcile_required"]
+                .iter().all(|key| receipt[*key] == true)
+            && ["retry_safe", "auto_retry_allowed"].iter().all(|key| receipt[*key] == false)
+    }
+
+    fn observe_source_read_rejection(
+        &mut self,
+        runtime: &str,
+        arguments: &Value,
+        command: &Value,
+        result: &Value,
+    ) -> bool {
+        use code_tools::commands::source_read::{
+            SourceReadPreExecutionRejection, source_read_recovery_authorization,
+        };
+        let Some(authorization) = self
+            .contract
+            .as_ref()
+            .and_then(source_read_recovery_authorization)
+        else {
+            return false;
+        };
+        let Some(proof) = SourceReadPreExecutionRejection::parse_bounded(
+            &result["output"]["pre_execution_rejection"],
+        ) else {
+            return false;
+        };
+        if arguments
+            .get("execution_id")
+            .is_some_and(|id| id.as_str() != Some(proof.execution_id()))
+        {
+            return false;
+        }
+        let Ok(store) =
+            tura_path::command_receipts::ReceiptStore::open_existing(&self.session_directory)
+        else {
+            return false;
+        };
+        proof.authenticate(
+            &store,
+            &self.session_id,
+            runtime,
+            authorization,
+            command,
+            result,
+        ) && self.receipts.len() < MAX_TERMINAL_TRACKED_COMMANDS
             && self.receipts.insert(proof.call_id().to_owned())
     }
 
@@ -1764,56 +3039,113 @@ impl TerminalOutcomeTracker {
         if passed && output.get("verification_evidence").is_none() {
             // The wire proof is optional. Preserve legacy/native successes under
             // the original validator, but NEVER use them to resolve a failure.
-            if !terminal_command_outcome_proven(command, result) { self.hard_veto = true; }
+            if !terminal_command_outcome_proven(command, result) {
+                veto!(self);
+            }
             return;
         }
-        let Some(line) = command["command_line"].as_str().filter(|line| line.len() <= 256) else { self.hard_veto = true; return; };
-        let Ok(selection) = serde_json::from_str::<TerminalVerifierSelection>(line) else { self.hard_veto = true; return; };
-        let Some(binding) = self.binding.as_ref() else { self.hard_veto = true; return; };
+        let Some(line) = command["command_line"]
+            .as_str()
+            .filter(|line| line.len() <= 256)
+        else {
+            veto!(self);
+            return;
+        };
+        let Ok(selection) = serde_json::from_str::<TerminalVerifierSelection>(line) else {
+            veto!(self);
+            return;
+        };
+        let Some(binding) = self.binding.as_ref() else {
+            veto!(self);
+            return;
+        };
         let index = selection.verifier_index;
         let receipt = &output["terminal_receipt"];
-        let Some(call_id) = terminal_identity(&receipt["call_id"]) else { self.hard_veto = true; return; };
-        let Some(exit_code) = receipt["exit_code"].as_i64() else { self.hard_veto = true; return; };
+        let Some(call_id) = terminal_identity(&receipt["call_id"]) else {
+            veto!(self);
+            return;
+        };
+        let Some(exit_code) = receipt["exit_code"].as_i64() else {
+            veto!(self);
+            return;
+        };
         let state = if passed { "completed" } else { "failed" };
-        if binding.grants.get(index).is_none() || command["step"].as_u64().is_none_or(|step| step == 0)
-            || ["workdir", "cwd", "timeout_ms", "stall_timeout_ms", "arguments"].iter()
-                .any(|key| command.get(*key).is_some_and(|value| !value.is_null()))
-            || output["executor"] != "parent_focused_verifier" || !terminal_receipt_closed(receipt, state)
+        if binding.grants.get(index).is_none()
+            || command["step"].as_u64().is_none_or(|step| step == 0)
+            || [
+                "workdir",
+                "cwd",
+                "timeout_ms",
+                "stall_timeout_ms",
+                "arguments",
+            ]
+            .iter()
+            .any(|key| command.get(*key).is_some_and(|value| !value.is_null()))
+            || output["executor"] != "parent_focused_verifier"
+            || !terminal_receipt_closed(receipt, state)
             || receipt["termination_origin"] != "parent_verifier"
             || (!passed && receipt["failure_class"] != "workload")
             || (passed && !matches!(receipt["failure_class"].as_str(), Some("none" | "workload")))
-            || !matches!(receipt["authoritative_publication"].as_str(), Some("proven" | "unproven"))
+            || !matches!(
+                receipt["authoritative_publication"].as_str(),
+                Some("proven" | "unproven")
+            )
             || receipt["staging_authority"] != "none"
-            || receipt["authority_effect"] != "none" || !(0..=i32::MAX as i64).contains(&exit_code)
+            || receipt["authority_effect"] != "none"
+            || !(0..=i32::MAX as i64).contains(&exit_code)
             || passed != (exit_code == 0)
-            || result.get("error").is_some_and(|error| !error.is_null() && (error.as_str().is_none() || (passed && error != "")))
-            || !result.as_object().is_some_and(|object| object.iter().all(|(key, value)|
-                matches!(key.as_str(), "success" | "error" | "output") || terminal_payload_field_proven(key, value)))
-            || !output.as_object().is_some_and(|object| object.iter().all(|(key, value)| match key.as_str() {
-                "terminal_receipt" => true,
-                "exit_code" => value.as_i64() == Some(exit_code),
-                "success" => value.as_bool() == Some(passed),
-                "terminal_state" => value.as_str() == Some(state),
-                _ => terminal_payload_field_proven(key, value),
-            })) {
-            self.hard_veto = true; return;
+            || result.get("error").is_some_and(|error| {
+                !error.is_null() && (error.as_str().is_none() || (passed && error != ""))
+            })
+            || !result.as_object().is_some_and(|object| {
+                object.iter().all(|(key, value)| {
+                    matches!(key.as_str(), "success" | "error" | "output")
+                        || terminal_payload_field_proven(key, value)
+                })
+            })
+            || !output.as_object().is_some_and(|object| {
+                object.iter().all(|(key, value)| match key.as_str() {
+                    "terminal_receipt" => true,
+                    "exit_code" => value.as_i64() == Some(exit_code),
+                    "success" => value.as_bool() == Some(passed),
+                    "terminal_state" => value.as_str() == Some(state),
+                    _ => terminal_payload_field_proven(key, value),
+                })
+            })
+        {
+            veto!(self);
+            return;
         }
         // The parent route produces failed/known/positive-exit receipts only for
         // settled workload failures. Lost channels, signals, and cleanup failures
         // have unknown/terminated/negative-exit outcomes and cannot enter here.
         if !passed {
-            if output.get("verification_evidence").is_some() { self.hard_veto = true; return; }
+            if output.get("verification_evidence").is_some() {
+                veto!(self);
+                return;
+            }
             self.failures.insert(index, None);
         } else if let Some(proof) = output.get("verification_evidence") {
-            let Some(postimages) = TerminalVerifierProof::source_fingerprint(proof, binding, index, call_id) else {
-                self.hard_veto = true; return;
+            let Some(postimages) =
+                TerminalVerifierProof::source_fingerprint(proof, binding, index, call_id)
+            else {
+                veto!(self);
+                return;
             };
-            if self.postimages.as_ref().is_some_and(|(generation, previous)|
-                *generation == self.mutation_generation && previous != &postimages) {
-                self.hard_veto = true; return;
+            if self
+                .postimages
+                .as_ref()
+                .is_some_and(|(generation, previous)| {
+                    *generation == self.mutation_generation && previous != &postimages
+                })
+            {
+                veto!(self);
+                return;
             }
             self.postimages = Some((self.mutation_generation, postimages));
-            if let Some(generation) = self.failures.get_mut(&index) { *generation = Some(self.mutation_generation); }
+            if let Some(generation) = self.failures.get_mut(&index) {
+                *generation = Some(self.mutation_generation);
+            }
         }
     }
 
@@ -1822,68 +3154,120 @@ impl TerminalOutcomeTracker {
             // Native recording omits duplicate event payloads, not their audit
             // records. Require the exact marker AND every retained completion;
             // observe_batch still binds each fingerprint to the canonical result.
-            let Some(marker) = value.as_object() else { return false; };
-            if marker.len() != 3 || value["omitted_from_record"] != true
-                || value["reason"] != COMMAND_EVENTS_OMISSION_REASON {
+            let Some(marker) = value.as_object() else {
+                return false;
+            };
+            if marker.len() != 3
+                || value["omitted_from_record"] != true
+                || value["reason"] != COMMAND_EVENTS_OMISSION_REASON
+            {
                 return false;
             }
             let streamed = self.streamed.keys().filter(|(id, _)| id == runtime).count();
             return if value["count"].as_u64() == Some(0) {
                 streamed == 0
             } else {
-                value["count"].as_u64() == Some(commands as u64 * 2) && streamed == commands
-                    && (0..commands).all(|index| self.streamed.get(&(runtime.to_owned(), index))
-                        .and_then(|binding| binding.completed.as_ref())
-                        .is_some_and(|(result_index, _)| *result_index < commands))
+                value["count"].as_u64() == Some(commands as u64 * 2)
+                    && streamed == commands
+                    && (0..commands).all(|index| {
+                        self.streamed
+                            .get(&(runtime.to_owned(), index))
+                            .and_then(|binding| binding.completed.as_ref())
+                            .is_some_and(|(result_index, _)| *result_index < commands)
+                    })
             };
         };
-        if events.is_empty() { return !self.streamed.keys().any(|(id, _)| id == runtime); }
-        if events.len() != commands * 2 { return false; }
+        if events.is_empty() {
+            return !self.streamed.keys().any(|(id, _)| id == runtime);
+        }
+        if events.len() != commands * 2 {
+            return false;
+        }
         let mut seen = BTreeSet::new();
         events.iter().all(|event| {
-            let Some((index, result_index)) = terminal_stream_indices(event) else { return false; };
+            let Some((index, result_index)) = terminal_stream_indices(event) else {
+                return false;
+            };
             let ready = event["status"] == "ready";
-            let Some(binding) = self.streamed.get(&(runtime.to_owned(), index)) else { return false; };
-            seen.insert((index, ready)) && terminal_stream_header_proven(event) && event["command_type"] == binding.kind
+            let Some(binding) = self.streamed.get(&(runtime.to_owned(), index)) else {
+                return false;
+            };
+            seen.insert((index, ready))
+                && terminal_stream_header_proven(event)
+                && event["command_type"] == binding.kind
                 && event["step"].as_u64() == Some(binding.step)
                 && terminal_stream_identity_matches(event, runtime, &binding.provider_call_id)
                 && if ready {
-                    terminal_identity(&event["provider_tool_call_id"]) == Some(binding.provider_call_id.as_str())
+                    terminal_identity(&event["provider_tool_call_id"])
+                        == Some(binding.provider_call_id.as_str())
                         && terminal_payload_proven(event)
                 } else {
-                    binding.completed.as_ref().is_some_and(|(completed_index, fingerprint)|
-                        result_index == Some(*completed_index) && *completed_index < commands
-                            && terminal_fingerprint(&event["result"]).as_ref() == Some(fingerprint))
+                    binding
+                        .completed
+                        .as_ref()
+                        .is_some_and(|(completed_index, fingerprint)| {
+                            result_index == Some(*completed_index)
+                                && *completed_index < commands
+                                && terminal_stream_fingerprint(&event["result"]).as_ref()
+                                    == Some(fingerprint)
+                        })
                         && event["success"] == event["result"]["success"]
-                        && event.get("error").is_none_or(|error| error == &event["result"]["error"])
+                        && event
+                            .get("error")
+                            .is_none_or(|error| error == &event["result"]["error"])
                 }
         })
     }
 
     fn observe_receipts(&mut self, value: &Value) {
         match value {
-            Value::Object(object) => for (key, value) in object {
-                if key == "terminal_receipt" {
-                    let Some(id) = terminal_identity(&value["call_id"]) else { self.hard_veto = true; return; };
-                    if self.receipts.len() >= MAX_TERMINAL_TRACKED_COMMANDS || !self.receipts.insert(id.to_owned()) {
-                        self.hard_veto = true; return;
+            Value::Object(object) => {
+                for (key, value) in object {
+                    if key == "terminal_receipt" {
+                        let Some(id) = terminal_identity(&value["call_id"]) else {
+                            veto!(self);
+                            return;
+                        };
+                        if self.receipts.len() >= MAX_TERMINAL_TRACKED_COMMANDS
+                            || !self.receipts.insert(id.to_owned())
+                        {
+                            veto!(self);
+                            return;
+                        }
+                    } else {
+                        self.observe_receipts(value);
                     }
-                } else { self.observe_receipts(value); }
-                if self.hard_veto { return; }
-            },
-            Value::Array(values) => for value in values { self.observe_receipts(value); if self.hard_veto { return; } },
+                    if self.hard_veto {
+                        return;
+                    }
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    self.observe_receipts(value);
+                    if self.hard_veto {
+                        return;
+                    }
+                }
+            }
             _ => {}
         }
     }
 }
 
 fn terminal_stream_header_proven(event: &Value) -> bool {
-    event.as_object().is_some_and(|object| object.iter().all(|(key, value)|
-        matches!(key.as_str(), "result" | "success" | "error" | "status") || terminal_payload_field_proven(key, value)))
+    event.as_object().is_some_and(|object| {
+        object.iter().all(|(key, value)| {
+            matches!(key.as_str(), "result" | "success" | "error" | "status")
+                || terminal_payload_field_proven(key, value)
+        })
+    })
 }
 
 fn terminal_bounded_index(value: &Value) -> Option<usize> {
-    let index = value.as_u64().and_then(|index| usize::try_from(index).ok())?;
+    let index = value
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())?;
     (index < MAX_TERMINAL_TRACKED_COMMANDS).then_some(index)
 }
 
@@ -1898,27 +3282,48 @@ fn terminal_stream_indices(event: &Value) -> Option<(usize, Option<usize>)> {
         None if ready => None,
         None => return None,
     };
-    let identities = [event, &event["command"], &event["result"], &event["result"]["command"]];
+    let identities = [
+        event,
+        &event["command"],
+        &event["result"],
+        &event["result"]["command"],
+    ];
     // Native completions distinguish stable command position from arrival
     // position. Legacy result-index-only records retain their positional form;
     // any supplied stable identity copy must agree, never silently fall back.
     let command_index = if ready {
         event.get("command_index")?
     } else {
-        identities.iter().find_map(|value| value.get("command_index"))
+        identities
+            .iter()
+            .find_map(|value| value.get("command_index"))
             .or_else(|| event.get("result_index"))?
     };
     let index = terminal_bounded_index(command_index)?;
-    (identities.iter().all(|value| value.get("command_index")
-        .is_none_or(|value| value.as_u64() == Some(index as u64)))
-        && (!ready || result_index.is_none_or(|result_index| result_index == index)))
-        .then_some((index, result_index))
+    (identities.iter().all(|value| {
+        value
+            .get("command_index")
+            .is_none_or(|value| value.as_u64() == Some(index as u64))
+    }) && (!ready || result_index.is_none_or(|result_index| result_index == index)))
+    .then_some((index, result_index))
 }
 
 fn terminal_stream_identity_matches(event: &Value, runtime: &str, provider_call: &str) -> bool {
-    [event, &event["command"], &event["result"], &event["result"]["command"]].iter().all(|value|
-        value.get("runtime_id").is_none_or(|id| id.as_str() == Some(runtime))
-            && value.get("provider_tool_call_id").is_none_or(|id| id.as_str() == Some(provider_call)))
+    [
+        event,
+        &event["command"],
+        &event["result"],
+        &event["result"]["command"],
+    ]
+    .iter()
+    .all(|value| {
+        value
+            .get("runtime_id")
+            .is_none_or(|id| id.as_str() == Some(runtime))
+            && value
+                .get("provider_tool_call_id")
+                .is_none_or(|id| id.as_str() == Some(provider_call))
+    })
 }
 
 fn terminal_command_step(command: &Value) -> Option<u64> {
@@ -1929,20 +3334,53 @@ fn terminal_command_step(command: &Value) -> Option<u64> {
 }
 
 fn terminal_command_may_mutate(kind: &str, output: &Value) -> bool {
-    !matches!(kind, "source_read" | "focused_verifier" | "task_status" | "planning")
-        || output.get("changes").is_some_and(|changes| !changes.as_array().is_some_and(Vec::is_empty))
+    !matches!(
+        kind,
+        "source_read" | "focused_verifier" | "task_status" | "planning"
+    ) || output
+        .get("changes")
+        .is_some_and(|changes| !changes.as_array().is_some_and(Vec::is_empty))
+}
+
+// The shell command types J-Space admits under an inspect contract.
+fn inspect_shell_kind(kind: &str) -> bool {
+    matches!(kind, "zsh" | "bash" | "shell_command")
 }
 
 fn terminal_results_end_in_done(
     tool_results: &[crate::tool_router::execute_tool::ToolExecutionResult],
 ) -> bool {
-    tool_results.last()
+    tool_results
+        .last()
         .filter(|result| result.tool_name == crate::manas::COMMAND_RUN_TOOL)
-        .and_then(|result| result.result.get("results").and_then(serde_json::Value::as_array))
+        .and_then(|result| {
+            result
+                .result
+                .get("results")
+                .and_then(serde_json::Value::as_array)
+        })
         .and_then(|results| results.last())
         .filter(|result| result["command_type"] == "task_status")
-        .and_then(|result| result.pointer("/output/task_status/status")
-            .and_then(serde_json::Value::as_str)) == Some("done")
+        .and_then(|result| {
+            result
+                .pointer("/output/task_status/status")
+                .and_then(serde_json::Value::as_str)
+        })
+        == Some("done")
+}
+
+fn runtime_preserves_terminal_delivery(
+    session: &SessionManagement,
+    runtime: &RuntimeAggregate,
+    tool_call_count: usize,
+) -> bool {
+    // A retryable pre-effect failure does not invalidate a later delivery.
+    // Keep its history/unknown usage; do not recover any accepted tool effect.
+    runtime.session_id == session.session_id
+        && !runtime.runtime_id.trim().is_empty()
+        && runtime.tool_call.len() == tool_call_count
+        && (runtime.state == RuntimeState::Finished
+            || (tool_call_count == 0 && runtime_failure_allows_retry(runtime)))
 }
 
 fn terminal_evidence_boundary_proven(
@@ -1956,13 +3394,15 @@ fn terminal_evidence_boundary_proven(
 ) -> bool {
     // Feed sealing and the tool-results checkpoint must already have succeeded
     // at the caller. Their errors propagate before reaching this boundary.
+    // Automatic pressure only matters for a next prompt; proven terminal
+    // delivery needs none. Explicit pending compaction remains a fence.
     delivery_proven
+        && runtime.state == RuntimeState::Finished
         && terminal_task_status == Some("done")
         && terminal_results_end_in_done(tool_results)
         && runtime.session_id == session.session_id
         && !runtime.runtime_id.trim().is_empty()
         && !pending_compaction
-        && auto_compact_summary_after_new_context(session, runtime, tool_results).is_none()
         && visible_reply_delivered
 }
 
@@ -1982,7 +3422,8 @@ fn terminal_status_needs_final_response_turn(
 mod tests {
     use super::{
         DEFAULT_MANAS_MAX_TURNS, ProviderRetryProgress, auto_compact_summary_after_new_context,
-        commit_terminal_session_checkpoint, complete_active_doing_task_after_non_planning_reply,
+        commit_terminal_session_checkpoint, compact_tool_turn_retaining_delivered_reply,
+        complete_active_doing_task_after_non_planning_reply, delivered_tool_turn_reply,
         increment_turn_with_fresh_timestamp, manas_max_turns, messages_with_initial_context_prefix,
         should_auto_complete_non_planning_doing_after_tool_turn,
         should_continue_after_no_tool_compaction, should_continue_no_tool_task_status_retry,
@@ -1993,6 +3434,7 @@ mod tests {
     use crate::manas::tool_catalog::provider_command_run_commands_for_jspace;
     use crate::tool_router::execute_tool::ToolExecutionResult;
     use crate::turn_loop::no_tool_policy::no_tool_retry_limit;
+    use crate::turn_loop::tool_step::PendingCompactContext;
     use chrono::{Duration, Utc};
     use lifecycle::{PlanStatus, SessionInput, SessionManagement, SessionState, TaskStep};
     use lifecycle::{ProviderConfig, ToolChoice};
@@ -2020,7 +3462,32 @@ mod tests {
         session
     }
 
-    fn outcome_verifier(session: &SessionManagement, call: &str, index: usize, exit: i32, proof: bool) -> (serde_json::Value, serde_json::Value) {
+    #[test]
+    fn task_reply_content_is_not_effect_evidence() {
+        let command = json!({"command_type":"task_status", "arguments":{
+            "status":"done", "final_reply":{"parent":{"status":"pending"},
+            "historical":{"exit_code":1,"success":false}}}});
+        assert!(super::terminal_payload_proven(&command));
+        let mut failed = command.clone();
+        failed["success"] = json!(false);
+        assert!(!super::terminal_payload_proven(&failed));
+        let mut pending = command.clone();
+        pending["arguments"]["status"] = json!("pending");
+        assert!(!super::terminal_payload_proven(&pending));
+        let mut other = command;
+        other["command_type"] = json!("shell_command");
+        assert!(!super::terminal_payload_proven(&other));
+        assert!(!super::terminal_payload_proven(&json!({"command_type":"task_status",
+            "arguments":null})));
+    }
+
+    fn outcome_verifier(
+        session: &SessionManagement,
+        call: &str,
+        index: usize,
+        exit: i32,
+        proof: bool,
+    ) -> (serde_json::Value, serde_json::Value) {
         let passed = exit == 0;
         let mut output = json!({
             "executor": "parent_focused_verifier", "exit_code": exit,
@@ -2035,9 +3502,17 @@ mod tests {
         });
         if proof {
             let contract = session.jspace_contract.as_ref().expect("admitted contract");
-            let sources = contract["declared_targets"].as_array().expect("targets").iter().map(|path| (
-                path.as_str().expect("path").to_owned(), json!({"sha256": "b".repeat(64), "bytes": 28, "mode": 420})
-            )).collect::<serde_json::Map<_, _>>();
+            let sources = contract["declared_targets"]
+                .as_array()
+                .expect("targets")
+                .iter()
+                .map(|path| {
+                    (
+                        path.as_str().expect("path").to_owned(),
+                        json!({"sha256": "b".repeat(64), "bytes": 28, "mode": 420}),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
             output["verification_evidence"] = json!({
                 "schema_version": "nokiy_focused_verifier_evidence_v1",
                 "authorization_semantic_sha256": contract["authorization_semantic_sha256"],
@@ -2046,14 +3521,32 @@ mod tests {
                 "call_id": call, "source_postimages": sources
             });
         }
-        (json!({"command_type": "focused_verifier", "command_line": json!({"verifier_index": index}).to_string(), "step": 1}),
+        (
+            json!({"command_type": "focused_verifier", "command_line": json!({"verifier_index": index}).to_string(), "step": 1}),
             json!({"command_type": "focused_verifier", "step": 1, "success": passed,
-                "error": if passed { serde_json::Value::Null } else { json!("test failed") }, "output": output}))
+                "error": if passed { serde_json::Value::Null } else { json!("test failed") }, "output": output}),
+        )
+    }
+
+    fn outcome_optional_create_session() -> SessionManagement {
+        let mut session = outcome_session();
+        let contract = session.jspace_contract.as_mut().expect("admitted contract");
+        contract["declared_targets"] = json!(["src/example.rs", "src/optional.rs"]);
+        contract["write_scopes"] = contract["declared_targets"].clone();
+        contract["dcf_generation"] = json!({"source_snapshot": {
+            "src/example.rs": {"sha256": "b".repeat(64), "mode": 420},
+            "src/optional.rs": null
+        }});
+        contract["allowed_operations"] = json!(["read", "modify", "create", "command"]);
+        contract["denied_operations"] = json!([]);
+        session
     }
 
     fn outcome_mutation() -> (serde_json::Value, serde_json::Value) {
-        (json!({"command_type": "apply_patch", "command_line": "fixture patch", "step": 1}),
-            json!({"command_type": "apply_patch", "step": 1, "success": true, "output": {"changes": ["src/example.rs"]}}))
+        (
+            json!({"command_type": "apply_patch", "command_line": "fixture patch", "step": 1}),
+            json!({"command_type": "apply_patch", "step": 1, "success": true, "output": {"changes": ["src/example.rs"]}}),
+        )
     }
 
     fn outcome_guard_rejection() -> (serde_json::Value, serde_json::Value) {
@@ -2063,24 +3556,452 @@ mod tests {
         let mut guard = code_tools::command_run::CommandRunTerminalStatusGuard::default();
         guard.observe_step(Some(2));
         guard.observe_result(Some(false));
-        (command, json!({"command_type": "task_status", "step": 3, "success": false,
-            "error": guard.done_error(Some(3), true).expect("batch-local failure fence")}))
+        (
+            command,
+            json!({"command_type": "task_status", "step": 3, "success": false,
+            "error": guard.done_error(Some(3), true).expect("batch-local failure fence")}),
+        )
     }
 
-    fn outcome_batch(runtime: &str, pairs: Vec<(serde_json::Value, serde_json::Value)>) -> serde_json::Value {
+    fn outcome_batch(
+        runtime: &str,
+        pairs: Vec<(serde_json::Value, serde_json::Value)>,
+    ) -> serde_json::Value {
         let (commands, results): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
         let success = results.iter().all(|result| result["success"] == true);
-        let error = results.iter().find(|result| result["success"] == false)
-            .and_then(|result| result.get("error")).cloned().unwrap_or(serde_json::Value::Null);
+        let error = results
+            .iter()
+            .find(|result| result["success"] == false)
+            .and_then(|result| result.get("error"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         json!({"type": "tool_result", "tool_name": "command_run", "runtime_id": runtime,
             "success": success, "error": error, "input": {"commands": commands}, "output": {"results": results}})
     }
 
-    fn append_outcome(session: &mut SessionManagement, runtime: &str, pairs: Vec<(serde_json::Value, serde_json::Value)>) {
+    fn append_outcome(
+        session: &mut SessionManagement,
+        runtime: &str,
+        pairs: Vec<(serde_json::Value, serde_json::Value)>,
+    ) {
         session.push_log(outcome_batch(runtime, pairs).to_string(), Utc::now());
     }
 
-    fn streamed_outcome(session: &mut SessionManagement, runtime: &str, pair: (serde_json::Value, serde_json::Value)) {
+    #[cfg(unix)]
+    async fn own_edit_read_fixture(
+        separate_repair: bool,
+        reverse: bool,
+    ) -> (
+        tempfile::TempDir,
+        SessionManagement,
+        Vec<(serde_json::Value, serde_json::Value)>,
+    ) {
+        use code_tools::commands::{
+            apply_patch::ApplyPatchHandler,
+            source_read::{SourceReadHandler, open_admitted_root},
+        };
+        use code_tools::runtime::tool::{ToolCall, ToolContext, ToolHandler, ToolPayload};
+        let root = tempfile::tempdir().unwrap();
+        let mut session = outcome_session();
+        session.session_directory = root.path().canonicalize().unwrap();
+        std::fs::create_dir(session.session_directory.join("src")).unwrap();
+        std::fs::write(session.session_directory.join("src/example.rs"), "old\n").unwrap();
+        let contract = session.jspace_contract.as_mut().unwrap();
+        contract["repo_root"] = json!(session.session_directory);
+        contract["source_read"] = json!(true);
+        contract["allowed_operations"] = json!(["read", "modify", "command"]);
+        contract["denied_operations"] = json!([]);
+        contract["read_scopes"] = json!(["src/example.rs"]);
+        let context = |id: String| {
+            ToolContext::new(session.session_directory.clone())
+                .with_call_id(id)
+                .with_source_read_root(Some(std::sync::Arc::new(
+                    open_admitted_root(&session.session_directory).unwrap(),
+                )))
+        };
+        let mut args = json!({"path":"src/example.rs", "start_line":1, "end_line":1});
+        let baseline = SourceReadHandler
+            .handle(
+                ToolCall {
+                    tool_name: "source_read".to_owned(),
+                    call_id: "baseline".to_owned(),
+                    payload: ToolPayload::Function {
+                        arguments: args.clone(),
+                    },
+                },
+                context("baseline".to_owned()),
+            )
+            .await
+            .unwrap();
+        let old = baseline.body["source_sha256"].clone();
+        let patch =
+            "*** Begin Patch\n*** Update File: src/example.rs\n@@\n-old\n+new\n*** End Patch\n";
+        let mut pairs: Vec<(serde_json::Value, serde_json::Value)> = Vec::new();
+        for (index, (kind, step)) in [("apply_patch", 1), ("source_read", 2), ("source_read", 3)]
+            .into_iter()
+            .enumerate()
+        {
+            let provider = if separate_repair && index == 2 {
+                "repair-call"
+            } else {
+                "own-call"
+            };
+            let command_index = if separate_repair && index == 2 {
+                0
+            } else if reverse {
+                2 - index
+            } else {
+                index
+            };
+            let id = format!("own-runtime.tool.command_run:{provider}:{command_index}");
+            let (line, output) = if kind == "apply_patch" {
+                let output = ApplyPatchHandler
+                    .handle(
+                        ToolCall {
+                            tool_name: kind.to_owned(),
+                            call_id: id.clone(),
+                            payload: ToolPayload::Freeform {
+                                input: patch.to_owned(),
+                            },
+                        },
+                        context(id),
+                    )
+                    .await
+                    .unwrap();
+                (patch.to_owned(), output)
+            } else {
+                args["expected_sha256"] = if index == 1 {
+                    old.clone()
+                } else {
+                    pairs[1].1["output"]["source_read_evidence"]["source_sha256"].clone()
+                };
+                let output = SourceReadHandler
+                    .handle(
+                        ToolCall {
+                            tool_name: kind.to_owned(),
+                            call_id: id.clone(),
+                            payload: ToolPayload::Function {
+                                arguments: args.clone(),
+                            },
+                        },
+                        context(id),
+                    )
+                    .await
+                    .unwrap();
+                (args.to_string(), output)
+            };
+            pairs.push((json!({"command_type":kind, "command_line":line, "step":step}),
+                json!({"command_type":kind, "step":step, "success":output.success, "output":output.body,
+                    "command_id":format!("{provider}:{command_index}"), "provider_tool_call_id":provider, "command_index":command_index})));
+        }
+        if reverse {
+            pairs.reverse();
+        }
+        (root, session, pairs)
+    }
+
+    #[cfg(unix)]
+    fn own_edit_wire_identity_batch(
+        mut pairs: Vec<(serde_json::Value, serde_json::Value)>,
+        qualified: bool,
+    ) -> serde_json::Value {
+        for (command, result) in &mut pairs {
+            if qualified {
+                result["command_id"] = result["output"]["terminal_receipt"]["call_id"].clone();
+            }
+            result["command_run_id"] = if qualified {
+                json!("own-runtime.tool.command_run")
+            } else {
+                result["provider_tool_call_id"].clone()
+            };
+            result["runtime_id"] = json!("own-runtime");
+            for key in [
+                "command_id",
+                "command_run_id",
+                "provider_tool_call_id",
+                "command_index",
+            ] {
+                command[key] = result[key].clone();
+            }
+        }
+        let mut batch = outcome_batch("own-runtime", pairs);
+        batch["provider_tool_call_id"] = json!("own-call");
+        batch["output"]["commands"] = batch["input"]["commands"].clone();
+        batch
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn own_edit_failed_read_has_separate_exact_content_resolution_in_mixed_batch() {
+        let (_root, mut session, pairs) = own_edit_read_fixture(true, false).await;
+        let mut first = pairs[..2].to_vec();
+        let mut guard = outcome_guard_rejection();
+        guard.0["step"] = json!(3);
+        guard.1["step"] = json!(3);
+        first.push(guard);
+        let mut batch = outcome_batch("own-runtime", first);
+        batch["sequence"] = json!(1); // native same-batch done guard remains a non-attempt
+        session.push_log(batch.to_string(), Utc::now());
+        let mut tracker = super::TerminalOutcomeTracker::new(&session);
+        assert!(!tracker.hard_veto);
+        assert!(!tracker.proven());
+        assert_eq!(tracker.failed_reads.len(), 1);
+        // Distinct native sequences in one runtime, not a reused canonical batch.
+        let mut repair = outcome_batch("own-runtime", vec![pairs[2].clone()]);
+        repair["sequence"] = json!(2);
+        session.push_log(repair.to_string(), Utc::now());
+        tracker.observe_session(&session);
+        assert!(tracker.proven());
+        assert_eq!(pairs[1].1["success"], false);
+        assert_eq!(pairs[1].1["output"]["exit_code"], 1);
+        assert_eq!(
+            pairs[1].1["output"]["terminal_receipt"]["terminal_state"],
+            "failed"
+        );
+        assert_eq!(
+            pairs[1].1["output"]["terminal_receipt"]["reconcile_required"],
+            true
+        );
+        let before = session
+            .session_log
+            .iter()
+            .map(|entry| entry.raw().to_owned())
+            .collect::<Vec<_>>();
+        let passed = outcome_verifier(&session, "after-read-pass", 0, 0, true);
+        append_outcome(&mut session, "verifier-runtime", vec![passed]);
+        tracker.observe_session(&session);
+        assert!(tracker.proven());
+        assert_eq!(
+            before,
+            session
+                .session_log
+                .iter()
+                .take(before.len())
+                .map(|entry| entry.raw().to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn own_edit_read_reconciliation_uses_steps_not_array_order() {
+        for reverse in [false, true] {
+            let (_root, mut session, pairs) = own_edit_read_fixture(false, reverse).await;
+            append_outcome(&mut session, "own-runtime", pairs);
+            let tracker = super::TerminalOutcomeTracker::new(&session);
+            assert!(tracker.proven(), "reverse={reverse}");
+            assert!(!tracker.hard_veto);
+            assert_eq!(tracker.failed_reads.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn own_edit_read_reconciliation_accepts_coherent_wire_identities_in_either_step_order() {
+        for qualified in [false, true] {
+            for reverse in [false, true] {
+                let (_root, mut session, pairs) = own_edit_read_fixture(false, reverse).await;
+                let batch = own_edit_wire_identity_batch(pairs, qualified);
+                let raw = batch.to_string();
+                session.push_log(raw.clone(), Utc::now());
+                let tracker = super::TerminalOutcomeTracker::new(&session);
+                assert!(tracker.proven(), "qualified={qualified}, reverse={reverse}");
+                assert!(!tracker.hard_veto);
+                assert_eq!(tracker.failed_reads.len(), 1);
+                assert_eq!(batch["output"]["results"][1]["success"], false);
+                assert_eq!(batch["output"]["results"][1]["output"]["exit_code"], 1);
+                assert_eq!(
+                    batch["output"]["results"][1]["output"]["terminal_receipt"]["terminal_state"],
+                    "failed"
+                );
+                assert_eq!(session.session_log.last().unwrap().raw(), raw.as_str());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn own_edit_read_recovery_rejects_mixed_and_foreign_wire_identities() {
+        for qualified in [false, true] {
+            for scenario in [
+                "mixed_run",
+                "foreign_run",
+                "foreign_runtime_id",
+                "foreign_provider_id",
+                "crossed_provider",
+                "crossed_index",
+                "foreign_batch_provider",
+                "foreign_result_runtime",
+                "reported_id",
+                "reported_run",
+                "reported_provider",
+                "reported_index",
+            ] {
+                let (_root, mut session, pairs) = own_edit_read_fixture(false, false).await;
+                let mut batch = own_edit_wire_identity_batch(pairs, qualified);
+                let other_run = if qualified {
+                    "own-call"
+                } else {
+                    "own-runtime.tool.command_run"
+                };
+                let other_id = if qualified {
+                    "own-call:2"
+                } else {
+                    "own-runtime.tool.command_run:own-call:2"
+                };
+                match scenario {
+                    "mixed_run" => {
+                        batch["output"]["results"][2]["command_run_id"] = json!(other_run)
+                    }
+                    "foreign_run" => {
+                        batch["output"]["results"][2]["command_run_id"] =
+                            json!("foreign-runtime.tool.command_run")
+                    }
+                    "foreign_runtime_id" => {
+                        batch["output"]["results"][2]["command_id"] =
+                            json!("foreign-runtime.tool.command_run:own-call:2")
+                    }
+                    "foreign_provider_id" => {
+                        batch["output"]["results"][2]["command_id"] = json!(if qualified {
+                            "own-runtime.tool.command_run:foreign-call:2"
+                        } else {
+                            "foreign-call:2"
+                        })
+                    }
+                    "crossed_provider" => {
+                        batch["output"]["results"][2]["provider_tool_call_id"] =
+                            json!("foreign-call")
+                    }
+                    "crossed_index" => batch["output"]["results"][2]["command_index"] = json!(1),
+                    "foreign_batch_provider" => {
+                        batch["provider_tool_call_id"] = json!("foreign-call")
+                    }
+                    "foreign_result_runtime" => {
+                        batch["output"]["results"][2]["runtime_id"] = json!("foreign-runtime")
+                    }
+                    "reported_id" => batch["output"]["commands"][2]["command_id"] = json!(other_id),
+                    "reported_run" => {
+                        batch["output"]["commands"][2]["command_run_id"] = json!(other_run)
+                    }
+                    "reported_provider" => {
+                        batch["output"]["commands"][2]["provider_tool_call_id"] =
+                            json!("foreign-call")
+                    }
+                    "reported_index" => batch["output"]["commands"][2]["command_index"] = json!(1),
+                    _ => unreachable!(),
+                }
+                batch["input"]["commands"] = batch["output"]["commands"].clone();
+                let tracker = super::TerminalOutcomeTracker::new(&session);
+                assert!(
+                    !tracker.own_edit_receipt_authenticated(
+                        &batch,
+                        &batch["input"]["commands"][2],
+                        &batch["output"]["results"][2],
+                        2
+                    ),
+                    "qualified={qualified}, scenario={scenario}"
+                );
+                session.push_log(batch.to_string(), Utc::now());
+                let tracker = super::TerminalOutcomeTracker::new(&session);
+                assert!(
+                    !tracker.proven(),
+                    "qualified={qualified}, scenario={scenario}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn own_edit_read_does_not_resolve_across_a_settled_intervening_mutation() {
+        let (_root, mut session, pairs) = own_edit_read_fixture(true, false).await;
+        append_outcome(&mut session, "own-runtime", pairs[..2].to_vec());
+        let mut tracker = super::TerminalOutcomeTracker::new(&session);
+        assert!(!tracker.hard_veto);
+        append_outcome(&mut session, "mutation-runtime", vec![outcome_mutation()]);
+        let mut repair = outcome_batch("own-runtime", vec![pairs[2].clone()]);
+        repair["sequence"] = json!(2);
+        session.push_log(repair.to_string(), Utc::now());
+        tracker.observe_session(&session);
+        assert!(!tracker.hard_veto);
+        assert!(!tracker.proven());
+        assert!(!tracker.failed_reads[0].3);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn own_edit_read_recovery_rejects_missing_foreign_ambiguous_and_intervening_effects() {
+        for scenario in 0..13 {
+            let (_root, mut session, mut pairs) = own_edit_read_fixture(false, false).await;
+            match scenario {
+                0 => {
+                    pairs[0].1["output"]["terminal_receipt"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("apply_patch_changes");
+                }
+                1 => {
+                    pairs[1].1["output"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("source_read_evidence");
+                }
+                2 => {
+                    pairs[2].1["output"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("source_read_evidence");
+                }
+                3 => {
+                    pairs[2].0["command_line"] = json!(
+                        json!({"path":"src/example.rs", "start_line":1, "end_line":2,
+                    "expected_sha256":pairs[2].1["output"]["source_sha256"]})
+                        .to_string()
+                    )
+                }
+                4 => {
+                    pairs[1].0["step"] = json!(1);
+                    pairs[1].1["step"] = json!(1);
+                }
+                5 => {
+                    pairs[2].0["step"] = json!(2);
+                    pairs[2].1["step"] = json!(2);
+                }
+                6 => pairs[2].1["output"]["terminal_receipt"]["process_group_empty"] = json!(false),
+                7 => {
+                    session.jspace_contract.as_mut().unwrap()["denied_operations"] = json!(["read"])
+                }
+                8 => {
+                    pairs[2].1["output"]["terminal_receipt"]["call_id"] =
+                        json!("foreign-runtime.tool.command_run:own-call:2")
+                }
+                9 => pairs[2].1["output"]["truncated"] = json!(true),
+                10 => pairs[0].1["success"] = json!(false),
+                _ => {}
+            }
+            if scenario == 11 {
+                let mutation = outcome_mutation();
+                let mut mutation = mutation;
+                mutation.0["step"] = json!(3);
+                mutation.1["step"] = json!(3);
+                pairs[2].0["step"] = json!(4);
+                pairs[2].1["step"] = json!(4);
+                pairs.insert(2, mutation);
+            }
+            if scenario == 12 {
+                pairs.push(pairs[2].clone());
+            }
+            append_outcome(&mut session, "own-runtime", pairs);
+            let tracker = super::TerminalOutcomeTracker::new(&session);
+            assert!(!tracker.proven(), "scenario={scenario}");
+        }
+    }
+
+    fn streamed_outcome(
+        session: &mut SessionManagement,
+        runtime: &str,
+        pair: (serde_json::Value, serde_json::Value),
+    ) {
         let (command, result) = &pair;
         let events = json!([
             {"status": "ready", "command_index": 0, "step": command["step"],
@@ -2100,27 +4021,55 @@ mod tests {
         session.push_log(batch.to_string(), Utc::now());
     }
 
-    fn native_streamed_batch(runtime: &RuntimeAggregate, provider_call: &str, mut pairs: Vec<(serde_json::Value, serde_json::Value)>) -> serde_json::Value {
+    fn native_streamed_batch(
+        runtime: &RuntimeAggregate,
+        provider_call: &str,
+        mut pairs: Vec<(serde_json::Value, serde_json::Value)>,
+    ) -> serde_json::Value {
         for (index, (command, result)) in pairs.iter_mut().enumerate() {
             command["command_id"] = json!(format!("{provider_call}:{index}"));
             command["command_run_id"] = json!(provider_call);
             command["provider_tool_call_id"] = json!(provider_call);
             command["command_index"] = json!(index);
-            for key in ["command_id", "command_run_id", "provider_tool_call_id", "command_index"] {
+            for key in [
+                "command_id",
+                "command_run_id",
+                "provider_tool_call_id",
+                "command_index",
+            ] {
                 result[key] = command[key].clone();
             }
             result["command"] = command.clone();
         }
         let mut batch = outcome_batch(&runtime.runtime_id, pairs);
         let now = Utc::now();
-        let events = batch["input"]["commands"].as_array().expect("commands").iter()
-            .zip(batch["output"]["results"].as_array().expect("results")).enumerate()
-            .flat_map(|(index, (command, result))| [
-                crate::provider_flow::streamed_command_run::streamed_command_event_record(
-                    "ready", &runtime.runtime_id, provider_call, index, command, None, now),
-                crate::provider_flow::streamed_command_run::streamed_command_result_record(
-                    "completed", &runtime.runtime_id, index, result, now),
-            ]).collect::<Vec<_>>();
+        let events = batch["input"]["commands"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .zip(batch["output"]["results"].as_array().expect("results"))
+            .enumerate()
+            .flat_map(|(index, (command, result))| {
+                [
+                    crate::provider_flow::streamed_command_run::streamed_command_event_record(
+                        "ready",
+                        &runtime.runtime_id,
+                        provider_call,
+                        index,
+                        command,
+                        None,
+                        now,
+                    ),
+                    crate::provider_flow::streamed_command_run::streamed_command_result_record(
+                        "completed",
+                        &runtime.runtime_id,
+                        index,
+                        result,
+                        now,
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
         batch["output"]["commands"] = batch["input"]["commands"].clone();
         batch["output"]["command_events"] = json!(events);
         batch
@@ -2128,16 +4077,23 @@ mod tests {
 
     fn native_crossed_index_batch(runtime: &RuntimeAggregate) -> serde_json::Value {
         let done = terminal_done_result();
-        let mut doing = (done.arguments["commands"][0].clone(), done.result["results"][0].clone());
+        let mut doing = (
+            done.arguments["commands"][0].clone(),
+            done.result["results"][0].clone(),
+        );
         doing.0["command_line"] = json!(json!({"status": "doing"}).to_string());
         doing.1["output"]["task_status"]["status"] = json!("doing");
-        let mut read = (json!({"command_type": "source_read", "step": 2,
+        let mut read = (
+            json!({"command_type": "source_read", "step": 2,
             "command_line": json!({"path": "tests/test_graph_process.py", "start_line": 69,
                 "end_line": 248, "line_numbers": true}).to_string()}),
-            crate::tool_callback_sanitizer::tests::source_read_result());
+            crate::tool_callback_sanitizer::tests::source_read_result(),
+        );
         read.1["step"] = json!(2);
         let mut batch = native_streamed_batch(runtime, "scripted-command-100", vec![read, doing]);
-        let events = batch["output"]["command_events"].as_array_mut().expect("events");
+        let events = batch["output"]["command_events"]
+            .as_array_mut()
+            .expect("events");
         events.swap(1, 2);
         events.swap(2, 3);
         events[2]["result_index"] = json!(0);
@@ -2145,13 +4101,388 @@ mod tests {
         batch
     }
 
-    fn record_native_outcome(session: &mut SessionManagement, runtime: &RuntimeAggregate, batch: &serde_json::Value) {
-        crate::tool_flow::command_run_result::record_streamed_command_events(session, runtime, &batch["output"]);
+    fn record_native_outcome(
+        session: &mut SessionManagement,
+        runtime: &RuntimeAggregate,
+        batch: &serde_json::Value,
+    ) {
+        crate::tool_flow::command_run_result::record_streamed_command_events(
+            session,
+            runtime,
+            &batch["output"],
+        );
         crate::context::accumulate_tool_result_with_provider_metadata(
-            session, "command_run", batch["input"].clone(), batch["output"].clone(),
-            batch["success"].as_bool().expect("batch success"), batch["error"].as_str().map(str::to_owned),
-            Some(&runtime.runtime_id), None,
-        ).expect("native context accumulation");
+            session,
+            "command_run",
+            batch["input"].clone(),
+            batch["output"].clone(),
+            batch["success"].as_bool().expect("batch success"),
+            batch["error"].as_str().map(str::to_owned),
+            Some(&runtime.runtime_id),
+            None,
+        )
+        .expect("native context accumulation");
+    }
+
+    #[cfg(unix)]
+    fn reseal_pinned_search_contract(session: &mut SessionManagement) {
+        let contract = session.jspace_contract.as_mut().unwrap();
+        contract.as_object_mut().unwrap().remove("content_sha256");
+        contract["authorization_semantic_sha256"] =
+            json!(tura_path::jspace::authorization_semantic_sha256(contract).unwrap());
+        contract["content_sha256"] = json!(tura_path::jspace::semantic_sha256(contract));
+    }
+
+    #[cfg(unix)]
+    fn persist_pinned_search_receipt(
+        session: &SessionManagement,
+        result: &mut serde_json::Value,
+        name: &str,
+    ) {
+        let store = tura_path::command_receipts::ReceiptStore::open(&session.session_directory)
+            .expect("receipt store");
+        let bytes = serde_json::to_vec(&result["output"]["terminal_receipt"]).unwrap();
+        store.publish_new(name, &bytes).expect("durable search receipt");
+        result["output"]["terminal_receipt_path"] = json!(store.display_path(name).unwrap());
+    }
+
+    #[cfg(unix)]
+    fn pinned_search_fixture() -> (
+        tempfile::TempDir,
+        SessionManagement,
+        RuntimeAggregate,
+        (serde_json::Value, serde_json::Value),
+    ) {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let root = base.join("workspace");
+        let artifacts = base.join("artifacts");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&artifacts).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/example.rs"), "old\n").unwrap();
+        let pinned = root.join("src/check.rs");
+        std::fs::write(&pinned, "verifier entry\n").unwrap();
+        let runner = root.join("runner");
+        // The native admission fixture's binary identity; no process is executed here.
+        std::fs::write(&runner, [0xfe, 0xed, 0xfa, 0xcf, 1, 2, 3, 4]).unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let executable = |name: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, name).unwrap();
+            json!({"path":path, "sha256":format!("{:x}", Sha256::digest(name.as_bytes()))})
+        };
+        let mut session = outcome_session();
+        session.session_directory = root.clone();
+        let contract = session.jspace_contract.as_mut().unwrap();
+        contract["repo_root"] = json!(root);
+        contract["dcf_generation"] = json!({"repo_root":root,
+            "context_mode":"local_workspace_jspace", "dcf_available":false, "required_domain_bindings":{}});
+        contract["provenance"] = json!({"matched_surface_ids":["surface"]});
+        contract["matched_surface_ids"] = json!(["surface"]);
+        contract["focused_verifiers"] = json!([]);
+        contract["source_read"] = json!(true);
+        contract["allowed_operations"] = json!(["read", "modify", "command"]);
+        contract["denied_operations"] = json!(["network", "install", "system_mutation"]);
+        contract["read_scopes"] = json!(["src/**"]);
+        contract["read_commands"] = json!({"roots":["src"], "rg":executable("rg"), "cat":executable("cat")});
+        contract["command_templates"] = json!([]);
+        contract["expansion"] = json!({"mode":"exact_target_only",
+            "error_code":"JSPACE_EXPANSION_REQUIRED", "mutation_on_expansion":false});
+        contract["verifier_artifact_root"] = json!(artifacts);
+        let verifier_commands = (0..2).map(|index| json!({
+            "argv":[runner, pinned, index.to_string()],
+            "executable_sha256":format!("{:x}", Sha256::digest(std::fs::read(&runner).unwrap())),
+            "pinned_files":[{"path":pinned, "sha256":format!("{:x}", Sha256::digest(std::fs::read(&pinned).unwrap()))}],
+            "timeout_seconds":30, "scratch_root":artifacts.join(format!("scratch-{index}")), "network":false
+        })).collect::<Vec<_>>();
+        contract["verifier_commands"] = json!(verifier_commands);
+        reseal_pinned_search_contract(&mut session);
+        let runtime = test_runtime_with_usage(&session, 0);
+        let line = format!("'{}' --no-config --max-filesize=1M -n -m 20 -- absent src", root.join("rg").display());
+        tura_path::jspace::JSpaceMatcher::from_value(&root, session.jspace_contract.as_ref().unwrap())
+            .expect("valid bound v2 discovery and verifier grant")
+            .check_read_search_command("zsh", &line)
+            .expect("pinned direct search");
+        let call = format!("{}.tool.command_run:search-provider:0", runtime.runtime_id);
+        let mut result = json!({"command_type":"zsh", "step":1, "success":false,
+            "command_id":"search-provider:0", "provider_tool_call_id":"search-provider", "command_index":0,
+            "output":{"exit_code":1, "stdout":"", "stderr":"", "terminal_receipt":{
+                "schema_version":"tura_command_terminal_receipt_v1", "call_id":call,
+                "outcome":"known", "terminal_state":"failed", "failure_class":"workload_exit_nonzero",
+                "termination_origin":"workload", "termination_proven":true, "process_reaped":true,
+                "process_group_empty":true, "reconcile_required":true, "exit_code":1,
+                "authority_effect":"none", "staging_authority":"none", "authoritative_publication":"unproven",
+                "retry_safe":false, "auto_retry_allowed":false
+            }}});
+        persist_pinned_search_receipt(&session, &mut result, "pinned-no-match.json");
+        (temp, session, runtime, (json!({"command_type":"zsh", "command_line":line, "step":1}), result))
+    }
+
+    #[cfg(unix)]
+    fn record_pinned_search_outcome(
+        session: &mut SessionManagement,
+        runtime: &RuntimeAggregate,
+        streamed: bool,
+        provider: &str,
+        pairs: Vec<(serde_json::Value, serde_json::Value)>,
+    ) {
+        let mut batch = native_streamed_batch(runtime, provider, pairs);
+        if !streamed {
+            batch["output"].as_object_mut().unwrap().remove("command_events");
+        }
+        record_native_outcome(session, runtime, &batch);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn focused_outcome_pinned_search_fail_patch_pass_preserves_raw_history() {
+        for streamed in [false, true] {
+            let (_temp, mut session, runtime, search) = pinned_search_fixture();
+            let original_receipt = std::fs::read(search.1["output"]["terminal_receipt_path"].as_str().unwrap()).unwrap();
+            let failed = outcome_verifier(&session, "initial-fail", 0, 1, false);
+            record_pinned_search_outcome(&mut session, &runtime, streamed, "failed-provider", vec![failed]);
+            let mut tracker = super::TerminalOutcomeTracker::new(&session);
+            assert!(!tracker.hard_veto);
+            assert!(!tracker.proven());
+            record_pinned_search_outcome(&mut session, &runtime, streamed, "search-provider", vec![search.clone()]);
+            tracker.observe_session(&session);
+            assert!(
+                !tracker.hard_veto,
+                "authenticated pinned rg no-match must settle; streamed={streamed}"
+            );
+            assert!(!tracker.proven(), "no-match cannot resolve the failed verifier");
+            assert_eq!(tracker.mutation_generation, 0);
+            let prefix = session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>();
+            record_pinned_search_outcome(&mut session, &runtime, streamed, "patch-provider", vec![outcome_mutation()]);
+            tracker.observe_session(&session);
+            assert_eq!(tracker.mutation_generation, 1);
+            assert!(!tracker.proven());
+            for (provider, index, proof) in [("other-verifier", 1, true), ("legacy-pass", 0, false)] {
+                let passed = outcome_verifier(&session, provider, index, 0, proof);
+                record_pinned_search_outcome(&mut session, &runtime, streamed, provider, vec![passed]);
+                tracker.observe_session(&session);
+                assert!(!tracker.hard_veto);
+                assert!(!tracker.proven(), "the exact bound verifier proof is still required");
+            }
+            let passed = outcome_verifier(&session, "exact-pass", 0, 0, true);
+            record_pinned_search_outcome(&mut session, &runtime, streamed, "passed-provider", vec![passed]);
+            tracker.observe_session(&session);
+            assert!(tracker.proven());
+            // A later proven read can share the verifier's step without becoming a mutation.
+            let mut later_search = search.clone();
+            later_search.1["output"]["terminal_receipt"]["call_id"] =
+                json!(format!("{}.tool.command_run:after-pass-provider:0", runtime.runtime_id));
+            persist_pinned_search_receipt(&session, &mut later_search.1, "after-pass-no-match.json");
+            let rechecked = outcome_verifier(&session, "rechecked-pass", 0, 0, true);
+            record_pinned_search_outcome(&mut session, &runtime, streamed, "after-pass-provider", vec![later_search, rechecked]);
+            tracker.observe_session(&session);
+            assert!(tracker.proven());
+            assert_eq!(tracker.mutation_generation, 1);
+            let done = terminal_done_result();
+            record_pinned_search_outcome(&mut session, &runtime, streamed, "done-provider",
+                vec![(done.arguments["commands"][0].clone(), done.result["results"][0].clone())]);
+            let raw = session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>();
+            tracker.observe_session(&session);
+            assert_eq!(tracker.delivery_status(&session, &runtime, &[done]), Some("done"));
+            assert!(super::TerminalOutcomeTracker::new(&session).proven());
+            assert_eq!(tracker.receipts.len(), 7, "callbacks do not replay receipts");
+            assert_eq!(raw[..prefix.len()], prefix);
+            assert_eq!(session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>(), raw);
+            assert_eq!(std::fs::read(search.1["output"]["terminal_receipt_path"].as_str().unwrap()).unwrap(), original_receipt);
+            assert_eq!(search.1["success"], false);
+            assert_eq!(search.1["output"]["terminal_receipt"]["terminal_state"], "failed");
+            assert_eq!(search.1["output"]["terminal_receipt"]["reconcile_required"], true);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn focused_outcome_pinned_search_refuses_unsettled_or_foreign_outcomes() {
+        for streamed in [false, true] {
+            for scenario in [
+                "exit2", "stdout", "stderr", "arbitrary-exit1", "shell-control", "pipeline",
+                "substitution", "wrapper", "json-wrapper", "cwd", "workdir", "arguments",
+                "pre", "follow", "outside", "wrong-hash", "changed-executable", "wrong-grant",
+                "read-denied", "command-denied", "absent-contract", "missing-receipt", "absent-receipt",
+                "missing-receipt-path", "missing-output", "conflicting-kind", "conflicting-step", "result-error",
+                "foreign-receipt", "conflicting-receipt", "foreign-call", "missing-call", "foreign-runtime",
+                "cleanup", "reaped", "termination", "unknown", "failure-class", "origin", "authority",
+                "staging", "publication", "reconcile", "timeout", "cancelled", "receipt-error",
+                "effect", "receipt-status", "receipt-patch", "output-status", "result-status", "changes",
+                "nested-effect", "duplicate", "later-mutation", "failed-verifier",
+            ] {
+                let (_temp, mut session, runtime, mut search) = pinned_search_fixture();
+                let line = search.0["command_line"].as_str().unwrap().to_owned();
+                let root = session.session_directory.clone();
+                let receipt = &mut search.1["output"]["terminal_receipt"];
+                match scenario {
+                    "exit2" => receipt["exit_code"] = json!(2),
+                    "foreign-call" => receipt["call_id"] = json!("foreign.tool.command_run:search-provider:0"),
+                    "missing-call" => { receipt.as_object_mut().unwrap().remove("call_id"); }
+                    "cleanup" => receipt["process_group_empty"] = json!(false),
+                    "reaped" => receipt["process_reaped"] = json!(false),
+                    "termination" => receipt["termination_proven"] = json!(false),
+                    "unknown" => receipt["outcome"] = json!("unknown"),
+                    "failure-class" => receipt["failure_class"] = json!("channel_lost"),
+                    "origin" => receipt["termination_origin"] = json!("router"),
+                    "authority" => receipt["authority_effect"] = json!("unknown"),
+                    "staging" => receipt["staging_authority"] = json!("unknown"),
+                    "publication" => receipt["authoritative_publication"] = json!("proven"),
+                    "reconcile" => receipt["reconcile_required"] = json!(false),
+                    "timeout" => receipt["timed_out"] = json!(true),
+                    "cancelled" => receipt["cancelled"] = json!(true),
+                    "receipt-error" => receipt["error"] = json!("lost channel"),
+                    "effect" => receipt["unresolved_effects"] = json!(["unknown"]),
+                    "receipt-status" => receipt["status"] = json!("unknown"),
+                    "receipt-patch" => receipt["apply_patch_changes"] = json!([{"path":"src/example.rs"}]),
+                    _ => {}
+                }
+                match scenario {
+                    "exit2" => search.1["output"]["exit_code"] = json!(2),
+                    "stdout" => search.1["output"]["stdout"] = json!("match\n"),
+                    "stderr" => search.1["output"]["stderr"] = json!(" \n"),
+                    "arbitrary-exit1" => search.0["command_line"] = json!("false"),
+                    "shell-control" => search.0["command_line"] = json!(format!("{line}; false")),
+                    "pipeline" => search.0["command_line"] = json!(format!("{line} | cat")),
+                    "substitution" => search.0["command_line"] = json!(line.replace("absent", "$(echo absent)")),
+                    "wrapper" => search.0["command_line"] = json!(format!("env {line}")),
+                    "json-wrapper" => search.0["command_line"] = json!(json!({"command":line, "cwd":root}).to_string()),
+                    "cwd" | "workdir" | "arguments" => search.0[scenario] = json!("."),
+                    "pre" => search.0["command_line"] = json!(line.replace(" -n ", " --pre cat -n ")),
+                    "follow" => search.0["command_line"] = json!(line.replace(" -n ", " --follow -n ")),
+                    "outside" => search.0["command_line"] = json!(line.replace("absent src", "absent ../outside")),
+                    "wrong-hash" => session.jspace_contract.as_mut().unwrap()["read_commands"]["rg"]["sha256"] = json!("0".repeat(64)),
+                    "changed-executable" => std::fs::write(root.join("rg"), "replaced").unwrap(),
+                    "wrong-grant" => {
+                        std::fs::create_dir(root.join("other")).unwrap();
+                        session.jspace_contract.as_mut().unwrap()["read_commands"]["roots"] = json!(["other"]);
+                        session.jspace_contract.as_mut().unwrap()["read_scopes"] = json!(["src/**", "other/**"]);
+                    }
+                    "read-denied" => session.jspace_contract.as_mut().unwrap()["allowed_operations"] = json!(["modify", "command"]),
+                    "command-denied" => session.jspace_contract.as_mut().unwrap()["allowed_operations"] = json!(["read", "modify"]),
+                    "foreign-runtime" => search.1["runtime_id"] = json!("foreign-runtime"),
+                    "conflicting-kind" => search.1["command_type"] = json!("bash"),
+                    "conflicting-step" => search.1["step"] = json!(2),
+                    "result-error" => search.1["error"] = json!("unsettled command"),
+                    "output-status" => search.1["output"]["status"] = json!("unknown"),
+                    "result-status" => search.1["status"] = json!("failed"),
+                    "changes" => search.1["output"]["changes"] = json!(["src/example.rs"]),
+                    "nested-effect" => search.1["output"]["extra"] = json!({"outcome":"unknown"}),
+                    _ => {}
+                }
+                reseal_pinned_search_contract(&mut session);
+                if !matches!(scenario, "conflicting-receipt" | "absent-receipt" | "foreign-receipt") {
+                    persist_pinned_search_receipt(&session, &mut search.1, "negative-no-match.json");
+                }
+                match scenario {
+                    "missing-receipt" => { search.1["output"].as_object_mut().unwrap().remove("terminal_receipt"); }
+                    "missing-receipt-path" => { search.1["output"].as_object_mut().unwrap().remove("terminal_receipt_path"); }
+                    "missing-output" => { search.1.as_object_mut().unwrap().remove("output"); }
+                    "absent-receipt" => {
+                        let store = tura_path::command_receipts::ReceiptStore::open_existing(&root).unwrap();
+                        search.1["output"]["terminal_receipt_path"] = json!(store.display_path("absent.json").unwrap());
+                    }
+                    "foreign-receipt" => search.1["output"]["terminal_receipt_path"] = json!(root.join("pinned-no-match.json")),
+                    "conflicting-receipt" => search.1["output"]["terminal_receipt"]["pid"] = json!(999),
+                    _ => {}
+                }
+                let failed = outcome_verifier(&session, "initial-fail", 0, 1, false);
+                let passed = outcome_verifier(&session, "exact-pass", 0, 0, true);
+                record_pinned_search_outcome(&mut session, &runtime, streamed, "failed-provider", vec![failed]);
+                if scenario == "absent-contract" { session.jspace_contract = None; }
+                record_pinned_search_outcome(&mut session, &runtime, streamed, "search-provider", vec![search.clone()]);
+                let mut tracker = super::TerminalOutcomeTracker::new(&session);
+                let initially_settled = matches!(scenario, "duplicate" | "later-mutation" | "failed-verifier");
+                assert_eq!(tracker.hard_veto, !initially_settled, "{scenario}, streamed={streamed}");
+                assert!(!tracker.proven());
+                record_pinned_search_outcome(&mut session, &runtime, streamed, "patch-provider", vec![outcome_mutation()]);
+                record_pinned_search_outcome(&mut session, &runtime, streamed, "passed-provider", vec![passed]);
+                tracker.observe_session(&session);
+                if initially_settled {
+                    assert!(tracker.proven(), "{scenario}, streamed={streamed}");
+                    match scenario {
+                        "duplicate" => record_pinned_search_outcome(&mut session, &runtime, streamed, "search-provider", vec![search]),
+                        "later-mutation" => record_pinned_search_outcome(&mut session, &runtime, streamed, "late-provider", vec![outcome_mutation()]),
+                        _ => {
+                            let failed = outcome_verifier(&session, "later-fail", 0, 1, false);
+                            record_pinned_search_outcome(&mut session, &runtime, streamed, "later-failed-provider", vec![failed]);
+                        }
+                    }
+                    tracker.observe_session(&session);
+                    assert_eq!(tracker.hard_veto, scenario == "duplicate");
+                }
+                assert!(!tracker.proven(), "{scenario}, streamed={streamed}");
+                let mut terminal_runtime = test_runtime_with_usage(&session, 0);
+                terminal_runtime.runtime_id = "terminal-runtime".to_owned();
+                let done = terminal_done_result();
+                record_pinned_search_outcome(&mut session, &terminal_runtime, streamed, "done-provider",
+                    vec![(done.arguments["commands"][0].clone(), done.result["results"][0].clone())]);
+                tracker.observe_session(&session);
+                assert_eq!(tracker.delivery_status(&session, &terminal_runtime, &[done]), Some("blocked"), "{scenario}, streamed={streamed}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn focused_outcome_legacy_no_match_without_structured_streams_stays_blocked() {
+        for streamed in [false, true] {
+            for missing in ["stdout", "stderr", "both"] {
+                for claim in ["none", "context-cache", "context-messages", "message-only", "assistant-text", "advisory-proof"] {
+                    let (_temp, mut session, runtime, mut search) = pinned_search_fixture();
+                    for key in ["stdout", "stderr"] {
+                        if missing == "both" || missing == key {
+                            search.1["output"].as_object_mut().unwrap().remove(key);
+                        }
+                    }
+                    let failed = outcome_verifier(&session, "initial-fail", 0, 1, false);
+                    record_pinned_search_outcome(&mut session, &runtime, streamed, "failed-provider", vec![failed]);
+                    let mut legacy = native_streamed_batch(&runtime, "search-provider", vec![search]);
+                    // Synthetic sequence-91 raw result; advisory text cannot supply absent streams.
+                    legacy["sequence"] = json!(91);
+                    legacy["input"]["commands"] = crate::context::strip_tool_reporting_fields(legacy["input"]["commands"].clone());
+                    let advisory = json!({"success":false, "exit_code":1, "stdout":"", "stderr":"", "message":"rg no matches"});
+                    match claim {
+                        "context-cache" => legacy["context_cache"] = advisory,
+                        "context-messages" => legacy["context_messages"] = json!([{"role":"tool", "content":advisory.to_string()}]),
+                        "message-only" => legacy["output"]["results"][0]["output"]["message"] = json!("rg no matches; empty stdout and stderr"),
+                        "assistant-text" => {
+                            session.push_log(json!({"type":"assistant", "text":"rg no matches; stdout and stderr were empty"}).to_string(), Utc::now());
+                        }
+                        "advisory-proof" => legacy["context_cache"] = json!({"verification_evidence":advisory, "source_postimages":{"sha256":"b".repeat(64)}}),
+                        _ => {}
+                    }
+                    // Keep streamed completions identical to the canonical raw result.
+                    if claim == "message-only" {
+                        legacy["output"]["command_events"][1]["result"] = legacy["output"]["results"][0].clone();
+                    }
+                    if streamed {
+                        crate::tool_flow::command_run_result::record_streamed_command_events(&mut session, &runtime, &legacy["output"]);
+                    } else {
+                        legacy["output"].as_object_mut().unwrap().remove("command_events");
+                    }
+                    session.push_log(legacy.to_string(), Utc::now());
+                    let mut tracker = super::TerminalOutcomeTracker::new(&session);
+                    assert!(tracker.hard_veto, "{missing}/{claim}, streamed={streamed}");
+                    record_pinned_search_outcome(&mut session, &runtime, streamed, "patch-provider", vec![outcome_mutation()]);
+                    let passed = outcome_verifier(&session, "exact-pass", 0, 0, true);
+                    record_pinned_search_outcome(&mut session, &runtime, streamed, "passed-provider", vec![passed]);
+                    let mut terminal_runtime = test_runtime_with_usage(&session, 0);
+                    terminal_runtime.runtime_id = "terminal-runtime".to_owned();
+                    let done = terminal_done_result();
+                    record_pinned_search_outcome(&mut session, &terminal_runtime, streamed, "done-provider",
+                        vec![(done.arguments["commands"][0].clone(), done.result["results"][0].clone())]);
+                    let raw = session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>();
+                    tracker.observe_session(&session);
+                    assert!(!tracker.proven());
+                    assert_eq!(tracker.delivery_status(&session, &terminal_runtime, &[done]), Some("blocked"));
+                    assert_eq!(session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>(), raw);
+                }
+            }
+        }
     }
 
     fn terminal_done_result() -> ToolExecutionResult {
@@ -2166,29 +4497,727 @@ mod tests {
         }
     }
 
-    fn source_read_rejection_fixture() -> (tempfile::TempDir, SessionManagement, RuntimeAggregate, (serde_json::Value, serde_json::Value)) {
-        use code_tools::commands::source_read::{SourceReadPreExecutionRejection, parse_command_line_typed};
+    fn source_read_rejection_fixture() -> (
+        tempfile::TempDir,
+        SessionManagement,
+        RuntimeAggregate,
+        (serde_json::Value, serde_json::Value),
+    ) {
+        source_read_rejection_fixture_for(
+            r#"{"path":"answer.txt","start_line":1,"end_line":ninety}"#,
+        )
+    }
+
+    fn source_read_rejection_fixture_for(line: &str) -> (
+        tempfile::TempDir,
+        SessionManagement,
+        RuntimeAggregate,
+        (serde_json::Value, serde_json::Value),
+    ) {
+        use code_tools::commands::source_read::{
+            SourceReadPreExecutionRejection, parse_command_line_typed,
+        };
         let root = tempfile::tempdir().expect("workspace");
         let mut session = outcome_session();
         session.session_directory = root.path().canonicalize().expect("physical workspace");
-        std::fs::write(session.session_directory.join("answer.txt"), "answer\n").expect("source file");
+        std::fs::write(session.session_directory.join("answer.txt"), "answer\n")
+            .expect("source file");
         let contract = session.jspace_contract.as_mut().unwrap();
         contract["source_read"] = json!(true);
         contract["allowed_operations"] = json!(["read", "modify", "command"]);
         contract["denied_operations"] = json!([]);
         contract["read_scopes"] = json!(["answer.txt"]);
         let runtime = test_runtime_with_usage(&session, 0);
-        let command = json!({"command_type":"source_read", "step":1,
-            "command_line":r#"{"path":"answer.txt","start_line":1,"end_line":ninety}"#});
-        let error = parse_command_line_typed(command["command_line"].as_str().unwrap()).unwrap_err();
+        let command = json!({"command_type":"source_read", "step":1, "command_line":line});
+        let error =
+            parse_command_line_typed(command["command_line"].as_str().unwrap()).unwrap_err();
         let mut command = command;
         command["command"] = json!("source_read");
-        let proof = SourceReadPreExecutionRejection::new(&session.session_id, &runtime.runtime_id,
-            "rejected-read", "rejected-read:step:1:index:0", "a".repeat(64).as_str(),
-            &command, error.rejection_kind().unwrap(), error.to_string()).expect("router witness");
-        let store = tura_path::command_receipts::ReceiptStore::open(&session.session_directory).expect("receipt store");
+        let proof = SourceReadPreExecutionRejection::new(
+            &session.session_id,
+            &runtime.runtime_id,
+            "rejected-read",
+            "rejected-read:step:1:index:0",
+            "a".repeat(64).as_str(),
+            &command,
+            error.rejection_kind().unwrap(),
+            error.to_string(),
+        )
+        .expect("router witness");
+        let store = tura_path::command_receipts::ReceiptStore::open(&session.session_directory)
+            .expect("receipt store");
         proof.publish(&store).expect("durable router witness");
         (root, session, runtime, (command, proof.failed_result()))
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn typed_read_rejection_in_read_only_batch_does_not_poison_completion() {
+        use code_tools::commands::source_read::{SourceReadHandler, open_admitted_root};
+        use code_tools::runtime::tool::{ToolCall, ToolContext, ToolHandler, ToolPayload};
+        let (_root, mut session, runtime, rejected) = source_read_rejection_fixture();
+        let arguments = json!({"path":"answer.txt", "start_line":1, "end_line":1});
+        let context = ToolContext::new(session.session_directory.clone())
+            .with_call_id("peer-read".to_owned())
+            .with_source_read_root(Some(std::sync::Arc::new(
+                open_admitted_root(&session.session_directory).unwrap(),
+            )));
+        let read = SourceReadHandler.handle(ToolCall {
+            tool_name: "source_read".to_owned(), call_id: "peer-read".to_owned(),
+            payload: ToolPayload::Function { arguments: arguments.clone() },
+        }, context).await.unwrap();
+        assert_eq!(read.success, Some(true));
+        let peer = (
+            json!({"command_type":"source_read", "step":2, "command_line":arguments.to_string()}),
+            json!({"command_type":"source_read", "step":2, "success":true, "output":read.body}),
+        );
+        let batch = outcome_batch(&runtime.runtime_id, vec![rejected, peer]);
+        record_native_outcome(&mut session, &runtime, &batch);
+        let tracker = super::TerminalOutcomeTracker::new(&session);
+        assert!(!tracker.hard_veto);
+        assert!(tracker.proven());
+        assert_eq!(tracker.mutation_generation, 0);
+        assert_eq!(session.session_log.last().unwrap().value()["output"]["results"][0]["success"], false);
+    }
+
+    // I23 V422 Ultra worker b: a mis-copied expected_sha256 was rejected before execution in a
+    // batch that also ran the baseline verifier. The whole session was vetoed, so a worker whose
+    // corrected verifier and task_status done later succeeded still ended "blocked".
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn typed_read_rejection_beside_a_verifier_does_not_poison_completion() {
+        let (_root, mut session, runtime, rejected) = source_read_rejection_fixture();
+        let baseline = outcome_verifier(&session, "baseline-fail", 0, 1, false);
+        let batch = outcome_batch(&runtime.runtime_id, vec![rejected, baseline]);
+        record_native_outcome(&mut session, &runtime, &batch);
+        let tracker = super::TerminalOutcomeTracker::new(&session);
+        assert!(!tracker.hard_veto, "an authenticated read non-attempt beside a non-mutating verifier is not uncertainty");
+        assert!(!tracker.proven(), "the failed baseline verifier still blocks completion until a later pass");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn typed_read_rejection_beside_a_mutation_still_vetoes() {
+        let (_root, mut session, runtime, rejected) = source_read_rejection_fixture();
+        let batch = outcome_batch(&runtime.runtime_id, vec![rejected, outcome_mutation()]);
+        record_native_outcome(&mut session, &runtime, &batch);
+        assert!(super::TerminalOutcomeTracker::new(&session).hard_veto);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn oversized_json_navigation_does_not_poison_completion() {
+        use code_tools::commands::source_read::{SourceReadHandler, open_admitted_root};
+        use code_tools::runtime::tool::{ToolCall, ToolContext, ToolHandler, ToolPayload};
+        let (_root, mut session, runtime, _) = source_read_rejection_fixture();
+        std::fs::write(session.session_directory.join("answer.txt"),
+            json!({"large": "x".repeat(20_000)}).to_string()).unwrap();
+        let arguments = json!({"path":"answer.txt", "json_pointer":""});
+        let call_id = format!("{}.tool.command_run:navigation:0", runtime.runtime_id);
+        let context = ToolContext::new(session.session_directory.clone())
+            .with_call_id(call_id.clone())
+            .with_source_read_root(Some(std::sync::Arc::new(
+                open_admitted_root(&session.session_directory).unwrap(),
+            )));
+        let read = SourceReadHandler.handle(ToolCall {
+            tool_name: "source_read".to_owned(), call_id,
+            payload: ToolPayload::Function { arguments: arguments.clone() },
+        }, context).await.unwrap();
+        assert_eq!(read.success, Some(false));
+        assert_eq!(read.body["error_type"], "SOURCE_READ_JSON_VALUE_TOO_LARGE");
+        assert_eq!(read.body["terminal_receipt"]["authority_effect"], "none");
+        let batch = outcome_batch(&runtime.runtime_id, vec![(
+            json!({"command_type":"source_read", "step":1, "command_line":arguments.to_string()}),
+            json!({"command_type":"source_read", "step":1, "success":false, "output":read.body,
+                "command_id":"navigation:0", "provider_tool_call_id":"navigation", "command_index":0}),
+        )]);
+        record_native_outcome(&mut session, &runtime, &batch);
+        let tracker = super::TerminalOutcomeTracker::new(&session);
+        assert!(!tracker.hard_veto, "known effect-free navigation refusal must not become permanent uncertainty");
+        assert_eq!(session.session_log.last().unwrap().value()["output"]["results"][0]["success"], false);
+        let valid = session.session_log.last().unwrap().value().clone();
+        for (pointer, replacement) in [
+            ("/output/results/0/output/navigation_refusal/source_sha256", json!("0".repeat(64))),
+            ("/output/results/0/output/terminal_receipt_path", json!("/missing/receipt.json")),
+            ("/output/results/0/output/terminal_receipt/authority_effect", json!("workspace")),
+            ("/output/results/0/output/error_type", json!("SOURCE_READ_DENIED")),
+        ] {
+            let mut altered = valid.clone();
+            *altered.pointer_mut(pointer).expect("fixture field") = replacement;
+            let mut rejected = super::TerminalOutcomeTracker::unobserved(&session);
+            rejected.observe_batch(&altered);
+            assert!(rejected.hard_veto, "must reject altered proof at {pointer}");
+        }
+    }
+
+    // I23 V424 Efficient worker b read a test file with the digest of another file; the read
+    // ended in-process with SOURCE_READ_SHA256_MISMATCH and no content, yet vetoed the session.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn wrong_digest_read_does_not_poison_completion() {
+        use code_tools::commands::source_read::{SourceReadHandler, open_admitted_root};
+        use code_tools::runtime::tool::{ToolCall, ToolContext, ToolHandler, ToolPayload};
+        let (_root, mut session, runtime, _) = source_read_rejection_fixture();
+        let arguments = json!({"path":"answer.txt", "start_line":1, "end_line":1,
+            "expected_sha256": "0".repeat(64)});
+        let call_id = format!("{}.tool.command_run:mismatch:0", runtime.runtime_id);
+        let context = ToolContext::new(session.session_directory.clone())
+            .with_call_id(call_id.clone())
+            .with_source_read_root(Some(std::sync::Arc::new(
+                open_admitted_root(&session.session_directory).unwrap(),
+            )));
+        let read = SourceReadHandler.handle(ToolCall {
+            tool_name: "source_read".to_owned(), call_id,
+            payload: ToolPayload::Function { arguments: arguments.clone() },
+        }, context).await.unwrap();
+        assert_eq!(read.success, Some(false));
+        assert_eq!(read.body["error_type"], "SOURCE_READ_SHA256_MISMATCH");
+        assert_eq!(read.body["terminal_receipt"]["authority_effect"], "none");
+        let batch = outcome_batch(&runtime.runtime_id, vec![(
+            json!({"command_type":"source_read", "step":1, "command_line":arguments.to_string()}),
+            json!({"command_type":"source_read", "step":1, "success":false, "output":read.body,
+                "command_id":"mismatch:0", "provider_tool_call_id":"mismatch", "command_index":0}),
+        )]);
+        record_native_outcome(&mut session, &runtime, &batch);
+        let tracker = super::TerminalOutcomeTracker::new(&session);
+        assert!(!tracker.hard_veto, "an effect-free digest mismatch must not become permanent uncertainty");
+        assert_eq!(session.session_log.last().unwrap().value()["output"]["results"][0]["success"], false);
+        let mut writable = session.clone();
+        writable.jspace_contract.as_mut().unwrap()["write_scopes"] = json!(["answer.txt"]);
+        assert!(super::TerminalOutcomeTracker::new(&writable).hard_veto,
+            "a stale pin on a writable path stays with the own-edit read rules");
+        let valid = session.session_log.last().unwrap().value().clone();
+        let other_range = json!({"path":"answer.txt", "start_line":1, "end_line":2,
+            "expected_sha256": "0".repeat(64)}).to_string();
+        for (pointer, replacement) in [
+            ("/output/results/0/output/source_read_evidence/content_satisfied", json!(true)),
+            ("/output/results/0/output/terminal_receipt/authority_effect", json!("workspace")),
+            ("/output/results/0/output/error_type", json!("SOURCE_READ_DENIED")),
+            ("/input/commands/0/command_line", json!(other_range)),
+        ] {
+            let mut altered = valid.clone();
+            *altered.pointer_mut(pointer).expect("fixture field") = replacement;
+            let mut rejected = super::TerminalOutcomeTracker::unobserved(&session);
+            rejected.observe_batch(&altered);
+            assert!(rejected.hard_veto, "must reject altered proof at {pointer}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn inspect_session() -> (tempfile::TempDir, SessionManagement, RuntimeAggregate) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let mut session = outcome_session();
+        session.session_directory = root.clone();
+        let contract = session.jspace_contract.as_mut().unwrap();
+        contract.as_object_mut().unwrap().remove("verifier_commands");
+        for (key, value) in [
+            ("repo_root", json!(root)),
+            ("dcf_generation", json!({"repo_root": root, "context_mode": "inspect_workspace_jspace",
+                "dcf_available": false, "required_domain_bindings": {}})),
+            ("provenance", json!({"context_mode": "inspect_workspace_jspace", "authority": "parent_task"})),
+            ("matched_surface_ids", json!([])),
+            ("read_scopes", json!([])),
+            ("write_scopes", json!([])),
+            ("declared_targets", json!([])),
+            ("command_templates", json!([])),
+            ("focused_verifiers", json!([])),
+            ("allowed_operations", json!(["command", "read"])),
+            ("denied_operations", json!(["create", "delete", "modify", "network"])),
+            ("expansion", json!({"mode": "exact_target_only",
+                "error_code": "JSPACE_EXPANSION_REQUIRED", "mutation_on_expansion": false})),
+            ("inspect_shell", json!({"schema_version": "nokiy_inspect_shell_v1",
+                "profile_sha256": "a".repeat(64), "evidence_root": root.join("evidence"),
+                "network": "inherit"})),
+        ] {
+            contract[key] = value;
+        }
+        reseal_pinned_search_contract(&mut session);
+        assert!(tura_path::jspace::JSpaceMatcher::from_value(&root, session.jspace_contract.as_ref().unwrap())
+            .expect("admitted inspect contract")
+            .inspect_shell_admitted());
+        let runtime = test_runtime_with_usage(&session, 0);
+        (temp, session, runtime)
+    }
+
+    // A writing contract whose shell lines run in the parent under a bound read-only profile.
+    #[cfg(unix)]
+    fn parent_shell_session() -> (tempfile::TempDir, SessionManagement, RuntimeAggregate) {
+        let (temp, mut session, _) = inspect_session();
+        let root = session.session_directory.clone();
+        let contract = session.jspace_contract.as_mut().unwrap();
+        contract.as_object_mut().unwrap().remove("inspect_shell");
+        for (key, value) in [
+            ("read_scopes", json!(["src/**"])),
+            ("write_scopes", json!(["src/**"])),
+            ("declared_targets", json!(["src/main.rs"])),
+            ("allowed_operations", json!(["command", "create", "modify", "read"])),
+            ("denied_operations", json!(["delete", "network"])),
+            ("parent_shell", json!({"schema_version": "nokiy_parent_shell_v1",
+                "profile_sha256": "b".repeat(64), "evidence_root": root.join("evidence"),
+                "network": "inherit"})),
+        ] {
+            contract[key] = value;
+        }
+        reseal_pinned_search_contract(&mut session);
+        assert!(tura_path::jspace::JSpaceMatcher::from_value(&root, session.jspace_contract.as_ref().unwrap())
+            .expect("admitted parent shell contract")
+            .parent_shell_admitted());
+        let runtime = test_runtime_with_usage(&session, 0);
+        (temp, session, runtime)
+    }
+
+    #[cfg(unix)]
+    fn parent_origin(receipt: &mut serde_json::Value) {
+        receipt["termination_origin"] = json!("parent_shell");
+        receipt["pid"] = json!(null);
+    }
+
+    // V431: a writing worker's shell lines (git diff --check, rg, a failing test) run in the parent.
+    // Their closed non-zero exits are findings, and they never count as edits to delivered files.
+    #[test]
+    #[cfg(unix)]
+    fn parent_shell_failure_does_not_poison_completion_or_count_as_an_edit() {
+        for exit in [1, 2] {
+            let (_temp, mut session, runtime) = parent_shell_session();
+            let failed = inspect_shell_failure(&session, &runtime, &format!("parent-{exit}"), exit, parent_origin);
+            record_native_outcome(&mut session, &runtime, &outcome_batch(&runtime.runtime_id, vec![failed]));
+            let mut tracker = super::TerminalOutcomeTracker::new(&session);
+            assert!(!tracker.hard_veto, "a closed parent shell exit {exit} is a finding");
+            assert_eq!(tracker.mutation_generation, 0, "parent shells cannot change delivered files");
+            let done = terminal_done_result();
+            record_pinned_search_outcome(&mut session, &runtime, false, "done-provider",
+                vec![(done.arguments["commands"][0].clone(), done.result["results"][0].clone())]);
+            tracker.observe_session(&session);
+            assert_eq!(tracker.delivery_status(&session, &runtime, &[done]), Some("done"));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parent_shell_proof_needs_the_policy_and_the_parent_origin() {
+        // An in-engine shell failure in a writing contract stays uncertain.
+        let (_temp, mut session, runtime) = parent_shell_session();
+        let engine = inspect_shell_failure(&session, &runtime, "engine", 1, |_| {});
+        record_native_outcome(&mut session, &runtime, &outcome_batch(&runtime.runtime_id, vec![engine]));
+        assert!(super::TerminalOutcomeTracker::new(&session).hard_veto);
+        // The parent origin proves nothing without the admitted policy.
+        let (_temp, mut session, runtime) = parent_shell_session();
+        let failed = inspect_shell_failure(&session, &runtime, "unbound", 1, parent_origin);
+        session.jspace_contract.as_mut().unwrap().as_object_mut().unwrap().remove("parent_shell");
+        reseal_pinned_search_contract(&mut session);
+        record_native_outcome(&mut session, &runtime, &outcome_batch(&runtime.runtime_id, vec![failed]));
+        assert!(super::TerminalOutcomeTracker::new(&session).hard_veto);
+        let open_or_effectful: [(&str, fn(&mut serde_json::Value)); 4] = [
+            ("pid", |receipt| { parent_origin(receipt); receipt["pid"] = json!(7); }),
+            ("group", |receipt| { parent_origin(receipt); receipt["process_group_empty"] = json!(false); }),
+            ("authority", |receipt| { parent_origin(receipt); receipt["authority_effect"] = json!("workspace"); }),
+            ("patched", |receipt| { parent_origin(receipt); receipt["apply_patch_changes"] = json!(["src/main.rs"]); }),
+        ];
+        for (name, alter) in open_or_effectful {
+            let (_temp, mut session, runtime) = parent_shell_session();
+            let failed = inspect_shell_failure(&session, &runtime, name, 1, alter);
+            record_native_outcome(&mut session, &runtime, &outcome_batch(&runtime.runtime_id, vec![failed]));
+            assert!(super::TerminalOutcomeTracker::new(&session).hard_veto, "{name} must stay uncertain");
+        }
+    }
+
+    #[cfg(unix)]
+    fn inspect_shell_failure(
+        session: &SessionManagement,
+        runtime: &RuntimeAggregate,
+        provider: &str,
+        exit: i64,
+        alter: fn(&mut serde_json::Value),
+    ) -> (serde_json::Value, serde_json::Value) {
+        let call = format!("{}.tool.command_run:{provider}:0", runtime.runtime_id);
+        let mut receipt = json!({
+            "schema_version": "tura_command_terminal_receipt_v1", "call_id": call,
+            "outcome": "known", "terminal_state": "failed", "failure_class": "workload_exit_nonzero",
+            "termination_origin": "workload", "termination_proven": true, "process_reaped": true,
+            "process_group_empty": true, "reconcile_required": true, "exit_code": exit, "pid": 4242,
+            "authority_effect": "none", "staging_authority": "none", "authoritative_publication": "unproven",
+            "retry_safe": false, "auto_retry_allowed": false, "stall_timeout_ms": null,
+            "wall_time_ms": 256, "wall_timeout_ms": 20000,
+            "replay_semantics": "diagnosed_replay_only_after_no_authoritative_publication_or_idempotent_cas_proof"});
+        alter(&mut receipt);
+        let mut result = json!({"command_type": "zsh", "step": 1, "success": false,
+            "command_id": format!("{provider}:0"), "provider_tool_call_id": provider, "command_index": 0,
+            "output": {"exit_code": exit, "stdout": "", "stderr": "Traceback (most recent call last)",
+                "message": format!("Exit code: {exit}"), "terminal_receipt": receipt}});
+        persist_pinned_search_receipt(session, &mut result, &format!("{provider}.json"));
+        let line = "python3 -B - <<'PY'\nimport subprocess\nsubprocess.run(['/bin/ps'], check=True)\nPY";
+        (json!({"command_type": "zsh", "step": 1, "timeout_ms": 20000, "command_line": line}), result)
+    }
+
+    // Real tasks 2026-10-23..25: 15 of 22 blocked workers ran an admitted inspect action whose only
+    // failures were closed non-zero shell exits (a crashed probe, a failing check) and then reported
+    // done; every one of them still ended "blocked".
+    #[test]
+    #[cfg(unix)]
+    fn inspect_shell_failure_does_not_poison_completion() {
+        for exit in [1, 2] {
+            let (_temp, mut session, runtime) = inspect_session();
+            let failed = inspect_shell_failure(&session, &runtime, &format!("probe-{exit}"), exit, |_| {});
+            record_native_outcome(&mut session, &runtime, &outcome_batch(&runtime.runtime_id, vec![failed]));
+            let mut tracker = super::TerminalOutcomeTracker::new(&session);
+            assert!(!tracker.hard_veto, "a closed inspect shell exit {exit} is a finding, not uncertainty");
+            assert_eq!(tracker.mutation_generation, 0, "inspect shells cannot change delivered files");
+            assert_eq!(session.session_log.last().unwrap().value()["output"]["results"][0]["success"], false);
+            let done = terminal_done_result();
+            record_pinned_search_outcome(&mut session, &runtime, false, "done-provider",
+                vec![(done.arguments["commands"][0].clone(), done.result["results"][0].clone())]);
+            tracker.observe_session(&session);
+            assert_eq!(tracker.delivery_status(&session, &runtime, &[done]), Some("done"));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inspect_shell_failure_needs_the_admitted_contract_and_a_closed_effect_free_receipt() {
+        // An ordinary contract does not fence its shells to an evidence root.
+        let (_temp, mut session, runtime) = inspect_session();
+        let failed = inspect_shell_failure(&session, &runtime, "plain", 1, |_| {});
+        session.jspace_contract.as_mut().unwrap().as_object_mut().unwrap().remove("inspect_shell");
+        reseal_pinned_search_contract(&mut session);
+        record_native_outcome(&mut session, &runtime, &outcome_batch(&runtime.runtime_id, vec![failed]));
+        assert!(super::TerminalOutcomeTracker::new(&session).hard_veto);
+        // Authenticated receipts that are not closed, or carry an effect, stay uncertain.
+        let open_or_effectful: [(&str, fn(&mut serde_json::Value)); 8] = [
+            ("timed-out", |receipt| receipt["timed_out"] = json!(true)),
+            ("group", |receipt| receipt["process_group_empty"] = json!(false)),
+            ("authority", |receipt| receipt["authority_effect"] = json!("workspace")),
+            ("staging", |receipt| receipt["staging_authority"] = json!("staged")),
+            ("class", |receipt| receipt["failure_class"] = json!("wall_timeout")),
+            ("origin", |receipt| receipt["termination_origin"] = json!("runtime")),
+            ("unresolved", |receipt| receipt["unresolved_effects"] = json!(["evidence/out.json"])),
+            ("patched", |receipt| receipt["apply_patch_changes"] = json!(["evidence/a.py"])),
+        ];
+        for (name, alter) in open_or_effectful {
+            let (_temp, mut session, runtime) = inspect_session();
+            let failed = inspect_shell_failure(&session, &runtime, name, 1, alter);
+            record_native_outcome(&mut session, &runtime, &outcome_batch(&runtime.runtime_id, vec![failed]));
+            assert!(super::TerminalOutcomeTracker::new(&session).hard_veto, "{name} must stay uncertain");
+        }
+        // The logged result must be the one the durable receipt authenticates.
+        let (_temp, mut session, runtime) = inspect_session();
+        let failed = inspect_shell_failure(&session, &runtime, "valid", 1, |_| {});
+        record_native_outcome(&mut session, &runtime, &outcome_batch(&runtime.runtime_id, vec![failed]));
+        let valid = session.session_log.last().unwrap().value().clone();
+        let mut accepted = super::TerminalOutcomeTracker::unobserved(&session);
+        accepted.observe_batch(&valid);
+        assert!(!accepted.hard_veto);
+        for (pointer, replacement) in [
+            ("/output/results/0/output/terminal_receipt_path", json!("/missing/receipt.json")),
+            ("/output/results/0/output/exit_code", json!(0)),
+            ("/output/results/0/output/terminal_receipt/authority_effect", json!("workspace")),
+            ("/output/results/0/command_id", json!("other:0")),
+        ] {
+            let mut altered = valid.clone();
+            *altered.pointer_mut(pointer).expect("fixture field") = replacement;
+            let mut rejected = super::TerminalOutcomeTracker::unobserved(&session);
+            rejected.observe_batch(&altered);
+            assert!(rejected.hard_veto, "must reject altered proof at {pointer}");
+        }
+        let mut changed = valid;
+        changed["output"]["results"][0]["output"]["changes"] = json!(["src/example.rs"]);
+        let mut rejected = super::TerminalOutcomeTracker::unobserved(&session);
+        rejected.observe_batch(&changed);
+        assert!(rejected.hard_veto, "a reported file change is never an inspect finding");
+    }
+
+    // Real tasks 2026-10-23..25: J-Space refused inspect workers' apply_patch of their own helper
+    // files. The refused command never ran, yet every such worker ended "blocked".
+    #[test]
+    #[cfg(unix)]
+    fn authenticated_policy_denial_does_not_poison_completion() {
+        for streamed in [false, true] {
+            for scenario in 0..5 {
+                let (_temp, mut session, runtime) = inspect_session();
+                let line = "*** Begin Patch\n*** Update File: tasklib.py\n@@\n-a\n+b\n*** End Patch\n";
+                let command = json!({"command_type": "apply_patch", "step": 1, "command_line": line});
+                let error = "JSPACE_OPERATION_DENIED: operation=modify target=tasklib.py detail=denied";
+                let mut result = json!({"command_type": "jspace", "step": 1, "success": false, "error": error,
+                    "jspace_error_code": "JSPACE_OPERATION_DENIED", "operation": "modify", "target": "tasklib.py",
+                    "effect_state": "not_started", "mutation_count": 0, "authority_effect": "none",
+                    "delivery_state": "deterministic_policy_denial", "replayable": true});
+                let call = format!("{}.tool.command_run:refused:0", runtime.runtime_id);
+                let authorization = session.jspace_contract.as_ref().unwrap()["authorization_semantic_sha256"]
+                    .as_str().unwrap().to_owned();
+                let mut witnessed = command.clone();
+                match scenario {
+                    2 => witnessed["command_line"] = json!(line.replace("tasklib", "packetlib")),
+                    3 => result["error"] = json!("JSPACE_OPERATION_DENIED: operation=modify target=tasklib.py detail=other"),
+                    4 => result["output"] = json!({"exit_code": 0}),
+                    _ => {}
+                }
+                if scenario != 1 {
+                    let denial = code_tools::command_run::JSpacePolicyDenial::new(&session.session_id,
+                        &runtime.runtime_id, &call, &call, &authorization, &witnessed, "JSPACE_OPERATION_DENIED",
+                        "modify", "tasklib.py", error).expect("router witness");
+                    let store = tura_path::command_receipts::ReceiptStore::open(&session.session_directory).unwrap();
+                    denial.publish(&store).expect("durable witness");
+                }
+                record_pinned_search_outcome(&mut session, &runtime, streamed, "refused", vec![(command, result)]);
+                let mut tracker = super::TerminalOutcomeTracker::new(&session);
+                if scenario != 0 {
+                    assert!(tracker.hard_veto, "scenario {scenario} streamed={streamed} must stay uncertain");
+                    continue;
+                }
+                assert!(!tracker.hard_veto, "streamed={streamed}: a witnessed refusal is a non-attempt");
+                assert_eq!(tracker.mutation_generation, 0, "a refused patch changes nothing");
+                let done = terminal_done_result();
+                record_pinned_search_outcome(&mut session, &runtime, streamed, "done-provider",
+                    vec![(done.arguments["commands"][0].clone(), done.result["results"][0].clone())]);
+                tracker.observe_session(&session);
+                assert_eq!(tracker.delivery_status(&session, &runtime, &[done]), Some("done"));
+            }
+        }
+    }
+
+    // Paired gate 2026-10-24: a worker named its command ("id"), so the router suffixed the receipt
+    // call id with it and authentication of the closed failure failed on the identity format.
+    #[test]
+    #[cfg(unix)]
+    fn named_command_receipts_authenticate_with_the_router_call_id() {
+        assert_eq!(super::terminal_binding_call_id("run:call:0", "call:0", &json!({})), "run:call:0");
+        for (command, expected) in [
+            (json!({"id": "scope"}), "run:call:0:scope"),
+            (json!({"id": "run:call:0"}), "run:call:0"),
+            (json!({"id": "run:call:0:x"}), "run:call:0:x"),
+            (json!({"id": 7, "command_id": "named"}), "run:call:0:named"),
+            (json!({"id": " ", "result_id": "kept"}), "run:call:0:kept"),
+            (json!({"command_id": "call:0"}), "run:call:0"),
+        ] {
+            assert_eq!(super::terminal_binding_call_id("run:call:0", "call:0", &command), expected, "{command}");
+        }
+        let (_temp, mut session, runtime) = inspect_session();
+        let (mut command, result) = inspect_shell_failure(&session, &runtime, "named", 2, |receipt| {
+            receipt["call_id"] = json!(format!("{}:probe_scope", receipt["call_id"].as_str().unwrap()));
+        });
+        command["id"] = json!("probe_scope");
+        record_native_outcome(&mut session, &runtime, &outcome_batch(&runtime.runtime_id, vec![(command, result)]));
+        let tracker = super::TerminalOutcomeTracker::new(&session);
+        assert!(!tracker.hard_veto, "the suffixed call id is the router's identity for a named command");
+    }
+
+    #[test]
+    fn stream_fingerprint_ignores_only_the_optional_source_delta() {
+        let change = |delta: serde_json::Value, post: &str| json!({"command_type": "apply_patch", "success": true,
+            "output": {"exit_code": 0, "changes": [{"kind": "update", "path": "src/a.rs",
+                "preimage_sha256": "a".repeat(64), "postimage_sha256": post, "source_delta": delta}]}});
+        let full = change(json!({"schema_version": "nokiy_applied_source_delta_v1", "hunks": [{"after_text": "x\n"}]}),
+            &"b".repeat(64));
+        let reference = change(json!({"omitted_from_context": true, "reason": "read back",
+            "represented_by_result_indexes": [1]}), &"b".repeat(64));
+        assert_ne!(super::terminal_fingerprint(&full), super::terminal_fingerprint(&reference));
+        assert_eq!(super::terminal_stream_fingerprint(&full), super::terminal_stream_fingerprint(&reference));
+        let other_postimage = change(json!({"omitted_from_context": true}), &"c".repeat(64));
+        assert_ne!(super::terminal_stream_fingerprint(&full), super::terminal_stream_fingerprint(&other_postimage));
+        let plain = json!({"command_type": "source_read", "output": {"stdout": "x"}});
+        assert_eq!(super::terminal_stream_fingerprint(&plain), super::terminal_fingerprint(&plain));
+    }
+
+    #[cfg(unix)]
+    async fn handled_read(
+        session: &SessionManagement,
+        runtime: &RuntimeAggregate,
+        provider: &str,
+        arguments: serde_json::Value,
+    ) -> (serde_json::Value, serde_json::Value) {
+        use code_tools::commands::source_read::{SourceReadHandler, open_admitted_root};
+        use code_tools::runtime::tool::{ToolCall, ToolContext, ToolHandler, ToolPayload};
+        let call_id = format!("{}.tool.command_run:{provider}:0", runtime.runtime_id);
+        let context = ToolContext::new(session.session_directory.clone())
+            .with_call_id(call_id.clone())
+            .with_source_read_root(Some(std::sync::Arc::new(
+                open_admitted_root(&session.session_directory).unwrap(),
+            )));
+        let read = SourceReadHandler.handle(ToolCall {
+            tool_name: "source_read".to_owned(), call_id,
+            payload: ToolPayload::Function { arguments: arguments.clone() },
+        }, context).await.unwrap();
+        (json!({"command_type": "source_read", "step": 1, "command_line": arguments.to_string()}),
+         json!({"command_type": "source_read", "step": 1, "success": read.success, "output": read.body,
+            "command_id": format!("{provider}:0"), "provider_tool_call_id": provider, "command_index": 0}))
+    }
+
+    // Real tasks 2026-10-23..25: reads that failed before returning content (an over-long line, an
+    // oversized JSON value, a page past the end) vetoed workers that then finished their work.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unwritable_read_failure_does_not_poison_completion() {
+        let (_root, mut session, runtime, _) = source_read_rejection_fixture();
+        let (command, result) = handled_read(&session, &runtime, "past-end",
+            json!({"path": "answer.txt", "start_line": 40, "end_line": 41})).await;
+        assert_eq!(result["success"], false);
+        assert!(result["output"]["error_type"].as_str().unwrap().starts_with("SOURCE_READ_"), "{result}");
+        let mut beside = outcome_mutation();
+        beside.0["step"] = json!(2);
+        beside.1["step"] = json!(2);
+        let mut mixed = session.clone();
+        record_native_outcome(&mut mixed, &runtime,
+            &outcome_batch(&runtime.runtime_id, vec![(command.clone(), result.clone()), beside]));
+        assert!(!super::TerminalOutcomeTracker::new(&mixed).hard_veto,
+            "a mutation elsewhere in the batch cannot bear on a non-writable read");
+        record_native_outcome(&mut session, &runtime,
+            &outcome_batch(&runtime.runtime_id, vec![(command.clone(), result.clone())]));
+        let tracker = super::TerminalOutcomeTracker::new(&session);
+        assert!(!tracker.hard_veto, "an effect-free read of a non-writable file is not uncertainty");
+        assert_eq!(session.session_log.last().unwrap().value()["output"]["results"][0]["success"], false);
+        let mut writable = session.clone();
+        writable.jspace_contract.as_mut().unwrap()["write_scopes"] = json!(["answer.txt"]);
+        assert!(super::TerminalOutcomeTracker::new(&writable).hard_veto,
+            "a failed read of a writable path stays with the own-edit read rules");
+        let valid = session.session_log.last().unwrap().value().clone();
+        for (pointer, replacement) in [
+            ("/output/results/0/output/stdout", json!("40: text")),
+            ("/output/results/0/output/terminal_receipt/authority_effect", json!("workspace")),
+            ("/output/results/0/output/error_type", json!("PERMISSION_DENIED")),
+            ("/input/commands/0/command_line", json!(json!({"path": "/abs/answer.txt"}).to_string())),
+        ] {
+            let mut altered = valid.clone();
+            *altered.pointer_mut(pointer).expect("fixture field") = replacement;
+            let mut rejected = super::TerminalOutcomeTracker::unobserved(&session);
+            rejected.observe_batch(&altered);
+            assert!(rejected.hard_veto, "must reject altered proof at {pointer}");
+        }
+    }
+
+    #[cfg(unix)]
+    async fn handled_patch(
+        session: &SessionManagement,
+        runtime: &RuntimeAggregate,
+        provider: &str,
+        patch: &str,
+    ) -> (serde_json::Value, serde_json::Value) {
+        use code_tools::commands::apply_patch::ApplyPatchHandler;
+        use code_tools::runtime::tool::{ToolCall, ToolContext, ToolHandler, ToolPayload};
+        let call_id = format!("{}.tool.command_run:{provider}:0", runtime.runtime_id);
+        let output = ApplyPatchHandler.handle(ToolCall {
+            tool_name: "apply_patch".to_owned(), call_id: call_id.clone(),
+            payload: ToolPayload::Freeform { input: patch.to_owned() },
+        }, ToolContext::new(session.session_directory.clone()).with_call_id(call_id)).await.unwrap();
+        (json!({"command_type": "apply_patch", "step": 1, "command_line": patch}),
+         json!({"command_type": "apply_patch", "step": 1, "success": output.success, "output": output.body,
+            "command_id": format!("{provider}:0"), "provider_tool_call_id": provider, "command_index": 0}))
+    }
+
+    // Real tasks 2026-10-23..25: a patch whose context no longer matched wrote nothing, yet vetoed a
+    // worker whose corrected patch and verifier then succeeded.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unapplied_patch_does_not_poison_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = outcome_session();
+        session.session_directory = root.path().canonicalize().unwrap();
+        std::fs::create_dir(session.session_directory.join("src")).unwrap();
+        std::fs::write(session.session_directory.join("src/example.rs"), "old\n").unwrap();
+        std::fs::write(session.session_directory.join("src/other.rs"), "kept\n").unwrap();
+        let runtime = test_runtime_with_usage(&session, 0);
+        let mismatch = "*** Begin Patch\n*** Update File: src/example.rs\n@@\n-absent\n+new\n*** End Patch\n";
+        let (command, result) = handled_patch(&session, &runtime, "mismatch", mismatch).await;
+        assert_eq!(result["success"], false);
+        assert_eq!(result["output"]["error_type"], "ContextMismatch", "{result}");
+        assert!(result["output"].get("changes").is_none());
+        let mut settled = session.clone();
+        record_native_outcome(&mut settled, &runtime, &outcome_batch(&runtime.runtime_id, vec![(command, result)]));
+        assert!(!super::TerminalOutcomeTracker::new(&settled).hard_veto, "a patch that wrote nothing is not uncertainty");
+        assert_eq!(std::fs::read_to_string(session.session_directory.join("src/example.rs")).unwrap(), "old\n");
+        // One change applied before another failed: the tree changed, so the failure stays open.
+        let partial = "*** Begin Patch\n*** Update File: src/other.rs\n@@\n-kept\n+changed\n\
+            *** Update File: src/example.rs\n@@\n-absent\n+new\n*** End Patch\n";
+        let (command, result) = handled_patch(&session, &runtime, "partial", partial).await;
+        assert_eq!(result["success"], false);
+        assert!(result["output"]["changes"].as_array().is_some_and(|changes| !changes.is_empty()), "{result}");
+        let mut open = session.clone();
+        record_native_outcome(&mut open, &runtime, &outcome_batch(&runtime.runtime_id, vec![(command, result)]));
+        assert!(super::TerminalOutcomeTracker::new(&open).hard_veto);
+    }
+
+    // Operator analysis only (no provider, no writes): replay a finished worker's exported session
+    // log through the current tracker and report the first entry that vetoes completion. Set
+    // NOKIY_REPLAY_DIR to an export holding log.jsonl and meta.json, bind TURA_COMMAND_RECEIPT_ROOT
+    // and TURA_COMMAND_RECEIPT_WORKSPACE to the original run, then run this test with --ignored.
+    #[test]
+    #[ignore]
+    fn replay_recorded_terminal() {
+        let dir = PathBuf::from(std::env::var("NOKIY_REPLAY_DIR").expect("NOKIY_REPLAY_DIR"));
+        let read = |path: &std::path::Path| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let meta = read(&dir.join("meta.json"));
+        let mut session = test_session(meta["session_id"].as_str().unwrap());
+        session.session_directory = PathBuf::from(meta["workspace"].as_str().unwrap());
+        session.jspace_contract = Some(read(std::path::Path::new(meta["contract"].as_str().unwrap())));
+        let mut tracker = super::TerminalOutcomeTracker::unobserved(&session);
+        let (mut first_veto, mut batches) = (serde_json::Value::Null, 0);
+        let log = std::fs::read_to_string(dir.join("log.jsonl")).unwrap();
+        for (index, line) in log.lines().enumerate() {
+            session.push_log(line.to_owned(), Utc::now());
+            tracker.observe_session(&session);
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            batches += usize::from(value["type"] == "tool_result");
+            if tracker.hard_veto && first_veto.is_null() {
+                // Fresh projection with the same contract and session for predicate probes only.
+                let probe = super::TerminalOutcomeTracker::unobserved(&session);
+                let matcher = tura_path::jspace::JSpaceMatcher::from_value(
+                    &probe.session_directory, probe.contract.as_ref().unwrap());
+                let commands = value["input"]["commands"].as_array().cloned().unwrap_or_default();
+                let results = value["output"]["results"].as_array().cloned().unwrap_or_default();
+                let checks = commands.iter().zip(&results).enumerate()
+                    .filter(|(_, (_, result))| result["success"] == false)
+                    .map(|(position, (command, result))| json!({
+                        "index": position,
+                        "authenticated": probe.own_edit_receipt_authenticated(&value, command, result, position),
+                        "call_id": super::terminal_command_call_id(&value, command, result, position),
+                        "denial_shape": super::terminal_policy_denial_shape(result),
+                        "denial_proven": probe.policy_denial_proven(&value, command, result, position),
+                        "closed": super::terminal_receipt_closed_with_reconciliation(
+                            &result["output"]["terminal_receipt"], "failed", true),
+                        "inspect_proof": probe.inspect_shell_failure_proven(&value, command, result, position),
+                        "receipt_path": result["output"]["terminal_receipt_path"],
+                    })).collect::<Vec<_>>();
+                let diagnosis = json!({"inspect_admitted": probe.inspect_contract_admitted(),
+                    "matcher": matcher.err().map(|error| error.to_string()), "checks": checks,
+                    "batch_outcome_proven": value["type"] == "tool_result" && value["success"] == true
+                        && super::terminal_tool_outcome_proven(crate::manas::COMMAND_RUN_TOOL, true, None,
+                            &value["input"], &value["output"]),
+                    "unproven_results": commands.iter().zip(&results).enumerate()
+                        .filter(|(_, (command, result))| result["success"] == true
+                            && !super::terminal_command_outcome_proven(command, result))
+                        .map(|(position, (command, result))| json!({"index": position,
+                            "kind": command["command_type"], "result_kind": result["command_type"],
+                            "payload_proven": super::terminal_payload_proven(result),
+                            "receipt": result["output"]["terminal_receipt"].as_object().map(|receipt| receipt.iter()
+                                .filter(|(key, _)| !matches!(key.as_str(), "call_id" | "source_read_evidence"
+                                    | "apply_patch_changes"))
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect::<serde_json::Map<_, _>>())}))
+                        .collect::<Vec<_>>(),
+                    "stream": (value["type"] == "streamed_command_event").then(|| json!({
+                        "status": value["status"], "kind": value["command_type"], "step": value["step"]}))});
+                let failed = value["output"]["results"].as_array().map(|results| {
+                    results.iter().filter(|result| result["success"] == false).map(|result| json!({
+                        "kind": result["command_type"], "error_type": result["output"]["error_type"],
+                        "exit": result["output"]["exit_code"], "null_output": result["output"].is_null(),
+                        "origin": result["output"]["terminal_receipt"]["termination_origin"],
+                        "error": result["error"].as_str().map(|error| error.chars().take(160).collect::<String>()),
+                    })).collect::<Vec<_>>()
+                });
+                let kinds = value["input"]["commands"].as_array().map(|commands| {
+                    commands.iter().map(|command| command["command_type"].clone()).collect::<Vec<_>>()
+                });
+                first_veto = json!({"entry": index, "type": value["type"], "kinds": kinds, "failed": failed,
+                    "veto_line": tracker.veto_line, "diagnosis": diagnosis});
+            }
+        }
+        println!("REPLAY {}", json!({"session": meta["session_id"], "batches": batches,
+            "hard_veto": tracker.hard_veto, "proven": tracker.proven(), "first_veto": first_veto,
+            "binding": tracker.binding.is_some(), "generation": tracker.mutation_generation,
+            "failures": tracker.failures.iter().map(|(key, value)| json!([key, value])).collect::<Vec<_>>(),
+            "failed_reads": tracker.failed_reads.iter().filter(|read| !read.3).count()}));
     }
 
     #[tokio::test]
@@ -2196,82 +5225,182 @@ mod tests {
     async fn typed_pre_execution_rejection_preserves_corrected_evidence_only_completion() {
         use code_tools::commands::source_read::{SourceReadHandler, open_admitted_root};
         use code_tools::runtime::tool::{ToolCall, ToolContext, ToolHandler, ToolPayload};
-        for rejected in [false, true] {
-            let (_root, mut session, runtime, pair) = source_read_rejection_fixture();
+        for rejected_line in [
+            None,
+            Some(r#"{"path":"answer.txt","start_line":1,"end_line":ninety}"#),
+            Some(r#"{"path":"answer.txt","start_line":1,"end_line":1,"expected_sha256":"5c7d6faa308bb6125375d6b1b06a0106d5e09fd22b182d51a6bf1c6af1c6af1c6af5321124"}"#),
+        ] {
+            let rejected = rejected_line.is_some();
+            let (_root, mut session, runtime, pair) = rejected_line.map_or_else(
+                source_read_rejection_fixture, source_read_rejection_fixture_for,
+            );
             if rejected {
                 assert!(!super::terminal_command_outcome_proven(&pair.0, &pair.1));
                 let batch = outcome_batch(&runtime.runtime_id, vec![pair]);
                 record_native_outcome(&mut session, &runtime, &batch);
-                assert_eq!(session.session_log.last().unwrap().value()["output"]["results"][0]["success"], false);
-                assert_eq!(session.session_log.last().unwrap().value()["output"], batch["output"]);
+                assert_eq!(
+                    session.session_log.last().unwrap().value()["output"]["results"][0]["success"],
+                    false
+                );
+                assert_eq!(
+                    session.session_log.last().unwrap().value()["output"],
+                    batch["output"]
+                );
             }
             let arguments = json!({"path":"answer.txt", "start_line":1, "end_line":1});
             let context = ToolContext::new(session.session_directory.clone())
                 .with_call_id("corrected-read".to_owned())
-                .with_source_read_root(Some(std::sync::Arc::new(open_admitted_root(&session.session_directory).unwrap())));
-            let read = SourceReadHandler.handle(ToolCall { tool_name:"source_read".to_owned(),
-                call_id:"corrected-read".to_owned(), payload:ToolPayload::Function { arguments:arguments.clone() },
-            }, context).await.expect("actual corrected read");
+                .with_source_read_root(Some(std::sync::Arc::new(
+                    open_admitted_root(&session.session_directory).unwrap(),
+                )));
+            let read = SourceReadHandler
+                .handle(
+                    ToolCall {
+                        tool_name: "source_read".to_owned(),
+                        call_id: "corrected-read".to_owned(),
+                        payload: ToolPayload::Function {
+                            arguments: arguments.clone(),
+                        },
+                    },
+                    context,
+                )
+                .await
+                .expect("actual corrected read");
             assert_eq!(read.success, Some(true));
-            assert_eq!(read.body["stdout"], "answer\n");
-            let batch = outcome_batch(&runtime.runtime_id, vec![(
-                json!({"command_type":"source_read", "step":1, "command_line":arguments.to_string()}),
-                json!({"command_type":"source_read", "step":1, "success":true, "output":read.body}),
-            )]);
+            assert_eq!(read.body["stdout"], "1: answer\n");
+            let batch = outcome_batch(
+                &runtime.runtime_id,
+                vec![(
+                    json!({"command_type":"source_read", "step":1, "command_line":arguments.to_string()}),
+                    json!({"command_type":"source_read", "step":1, "success":true, "output":read.body}),
+                )],
+            );
             record_native_outcome(&mut session, &runtime, &batch);
             let mutation = outcome_batch(&runtime.runtime_id, vec![outcome_mutation()]);
             record_native_outcome(&mut session, &runtime, &mutation);
-            let verifier = outcome_batch(&runtime.runtime_id, vec![outcome_verifier(&session, "verified-call", 0, 0, true)]);
+            let verifier = outcome_batch(
+                &runtime.runtime_id,
+                vec![outcome_verifier(&session, "verified-call", 0, 0, true)],
+            );
             record_native_outcome(&mut session, &runtime, &verifier);
             let done = terminal_done_result();
-            let done_batch = outcome_batch(&runtime.runtime_id, vec![(done.arguments["commands"][0].clone(), done.result["results"][0].clone())]);
+            let done_batch = outcome_batch(
+                &runtime.runtime_id,
+                vec![(
+                    done.arguments["commands"][0].clone(),
+                    done.result["results"][0].clone(),
+                )],
+            );
             record_native_outcome(&mut session, &runtime, &done_batch);
-            let raw = session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>();
+            let raw = session
+                .session_log
+                .iter()
+                .map(|entry| entry.raw().to_owned())
+                .collect::<Vec<_>>();
             let tracker = super::TerminalOutcomeTracker::new(&session);
             assert!(!tracker.hard_veto, "rejected={rejected}");
             assert_eq!(tracker.mutation_generation, 1);
-            assert_eq!(tracker.delivery_status(&session, &runtime, std::slice::from_ref(&done)), Some("done"));
-            assert_eq!(raw, session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>(), "audit history is immutable");
+            assert_eq!(
+                tracker.delivery_status(&session, &runtime, std::slice::from_ref(&done)),
+                Some("done")
+            );
+            assert_eq!(
+                raw,
+                session
+                    .session_log
+                    .iter()
+                    .map(|entry| entry.raw().to_owned())
+                    .collect::<Vec<_>>(),
+                "audit history is immutable"
+            );
             session.session_directory = session.session_directory.join("foreign-workspace");
-            assert_eq!(tracker.delivery_status(&session, &runtime, &[done]), None, "receipt location is immutable");
+            assert_eq!(
+                tracker.delivery_status(&session, &runtime, &[done]),
+                None,
+                "receipt location is immutable"
+            );
         }
     }
 
     #[test]
     fn rejection_recovery_blocks_forged_changed_mixed_and_unperformed_outcomes() {
         for scenario in 0..12 {
-            let (_root, mut session, runtime, (mut command, mut result)) = source_read_rejection_fixture();
+            let (_root, mut session, runtime, (mut command, mut result)) =
+                source_read_rejection_fixture();
             match scenario {
-                0 => { result["output"].as_object_mut().unwrap().remove("pre_execution_rejection"); }
+                0 => {
+                    result["output"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("pre_execution_rejection");
+                }
                 1 => result["output"]["pre_execution_rejection"]["process_started"] = json!(true),
-                2 => result["output"]["pre_execution_rejection"]["runtime_id"] = json!("foreign-runtime"),
-                3 => result["output"]["pre_execution_rejection"]["command_sha256"] = json!("b".repeat(64)),
-                4 => { result["success"] = json!(true); result["error"] = serde_json::Value::Null; }
+                2 => {
+                    result["output"]["pre_execution_rejection"]["runtime_id"] =
+                        json!("foreign-runtime")
+                }
+                3 => {
+                    result["output"]["pre_execution_rejection"]["command_sha256"] =
+                        json!("b".repeat(64))
+                }
+                4 => {
+                    result["success"] = json!(true);
+                    result["error"] = serde_json::Value::Null;
+                }
                 5 => result["output"]["outcome"] = json!("unknown"),
-                6 => command["command_line"] = json!(r#"{"path":"answer.txt","start_line":1,"end_line":1}"#),
-                7 => session.jspace_contract.as_mut().unwrap()["denied_operations"] = json!(["read"]),
+                6 => {
+                    command["command_line"] =
+                        json!(r#"{"path":"answer.txt","start_line":1,"end_line":1}"#)
+                }
+                7 => {
+                    session.jspace_contract.as_mut().unwrap()["denied_operations"] = json!(["read"])
+                }
                 8 => {
                     use code_tools::commands::source_read::SourceReadPreExecutionRejection;
-                    let proof = SourceReadPreExecutionRejection::parse_bounded(&result["output"]["pre_execution_rejection"]).unwrap();
-                    let store = tura_path::command_receipts::ReceiptStore::open_existing(&session.session_directory).unwrap();
-                    store.replace(&proof.receipt_name(), b"{}").expect("corrupt durable proof");
+                    let proof = SourceReadPreExecutionRejection::parse_bounded(
+                        &result["output"]["pre_execution_rejection"],
+                    )
+                    .unwrap();
+                    let store = tura_path::command_receipts::ReceiptStore::open_existing(
+                        &session.session_directory,
+                    )
+                    .unwrap();
+                    store
+                        .replace(&proof.receipt_name(), b"{}")
+                        .expect("corrupt durable proof");
                 }
                 _ => {}
             }
             let mut pairs = vec![(command, result)];
-            if scenario == 9 { pairs.push(outcome_mutation()); }
+            if scenario == 9 {
+                pairs.push(outcome_mutation());
+            }
             let mut batch = outcome_batch(&runtime.runtime_id, pairs);
-            if scenario == 10 { batch["input"]["execution_id"] = json!("foreign-execution"); }
+            if scenario == 10 {
+                batch["input"]["execution_id"] = json!("foreign-execution");
+            }
             record_native_outcome(&mut session, &runtime, &batch);
-            if scenario == 11 { record_native_outcome(&mut session, &runtime, &batch); }
+            if scenario == 11 {
+                record_native_outcome(&mut session, &runtime, &batch);
+            }
             let mut terminal_runtime = test_runtime_with_usage(&session, 0);
             terminal_runtime.runtime_id = "terminal-runtime".to_owned();
             let done = terminal_done_result();
-            let batch = outcome_batch(&terminal_runtime.runtime_id, vec![(done.arguments["commands"][0].clone(), done.result["results"][0].clone())]);
+            let batch = outcome_batch(
+                &terminal_runtime.runtime_id,
+                vec![(
+                    done.arguments["commands"][0].clone(),
+                    done.result["results"][0].clone(),
+                )],
+            );
             record_native_outcome(&mut session, &terminal_runtime, &batch);
             let tracker = super::TerminalOutcomeTracker::new(&session);
             assert!(tracker.hard_veto, "scenario {scenario}");
-            assert_eq!(tracker.delivery_status(&session, &terminal_runtime, &[done]), Some("blocked"), "scenario {scenario}");
+            assert_eq!(
+                tracker.delivery_status(&session, &terminal_runtime, &[done]),
+                Some("blocked"),
+                "scenario {scenario}"
+            );
         }
     }
 
@@ -2280,18 +5409,27 @@ mod tests {
         for unknown in [false, true] {
             let (_root, mut session, runtime, pair) = source_read_rejection_fixture();
             let prior = if unknown {
-                (json!({"command_type":"source_read", "step":1, "command_line":"fixture"}),
+                (
+                    json!({"command_type":"source_read", "step":1, "command_line":"fixture"}),
                     json!({"command_type":"source_read", "step":1, "success":false,
-                        "error":"SOURCE_READ_ARGUMENTS_INVALID: forged prefix", "output":{"outcome":"unknown"}}))
-            } else { outcome_verifier(&session, "failed-call", 0, 7, false) };
+                        "error":"SOURCE_READ_ARGUMENTS_INVALID: forged prefix", "output":{"outcome":"unknown"}}),
+                )
+            } else {
+                outcome_verifier(&session, "failed-call", 0, 7, false)
+            };
             let batch = outcome_batch(&runtime.runtime_id, vec![prior]);
             record_native_outcome(&mut session, &runtime, &batch);
             let batch = outcome_batch(&runtime.runtime_id, vec![pair]);
             record_native_outcome(&mut session, &runtime, &batch);
             let tracker = super::TerminalOutcomeTracker::new(&session);
-            assert!(!tracker.proven(), "no unperformed verification or unknown effect is excused");
+            assert!(
+                !tracker.proven(),
+                "no unperformed verification or unknown effect is excused"
+            );
             assert_eq!(tracker.hard_veto, unknown);
-            if !unknown { assert_eq!(tracker.failures.get(&0), Some(&None)); }
+            if !unknown {
+                assert_eq!(tracker.failures.get(&0), Some(&None));
+            }
         }
     }
 
@@ -2300,23 +5438,39 @@ mod tests {
         let mut session = outcome_session();
         let runtime = test_runtime_with_usage(&session, 0);
         let done = terminal_done_result();
-        append_outcome(&mut session, &runtime.runtime_id, vec![
-            (done.arguments["commands"][0].clone(), done.result["results"][0].clone())]);
+        append_outcome(
+            &mut session,
+            &runtime.runtime_id,
+            vec![(
+                done.arguments["commands"][0].clone(),
+                done.result["results"][0].clone(),
+            )],
+        );
         let tracker = super::TerminalOutcomeTracker::new(&session);
         assert!(tracker.proven());
-        assert_eq!(tracker.delivery_status(&session, &runtime, &[done]), Some("done"));
+        assert_eq!(
+            tracker.delivery_status(&session, &runtime, &[done]),
+            Some("done")
+        );
         for terminal_status in ["done", "blocked"] {
             let marker = super::TerminalEvidenceRecord {
-                kind: "nokiy.terminal_evidence", schema_version: "nokiy_terminal_evidence_v1",
-                session_id: &session.session_id, runtime_id: &runtime.runtime_id,
-                terminal_status, delivery_mode: "evidence_only",
-                parent_acceptance_required: true, final_summary_turn_executed: false,
+                kind: "nokiy.terminal_evidence",
+                schema_version: "nokiy_terminal_evidence_v1",
+                session_id: &session.session_id,
+                runtime_id: &runtime.runtime_id,
+                terminal_status,
+                delivery_mode: "evidence_only",
+                parent_acceptance_required: true,
+                final_summary_turn_executed: false,
             };
-            assert_eq!(serde_json::to_value(marker).expect("terminal marker"), json!({
-                "type":"nokiy.terminal_evidence", "schema_version":"nokiy_terminal_evidence_v1",
-                "session_id":session.session_id, "runtime_id":runtime.runtime_id, "terminal_status":terminal_status,
-                "delivery_mode":"evidence_only", "parent_acceptance_required":true, "final_summary_turn_executed":false,
-            }));
+            assert_eq!(
+                serde_json::to_value(marker).expect("terminal marker"),
+                json!({
+                    "type":"nokiy.terminal_evidence", "schema_version":"nokiy_terminal_evidence_v1",
+                    "session_id":session.session_id, "runtime_id":runtime.runtime_id, "terminal_status":terminal_status,
+                    "delivery_mode":"evidence_only", "parent_acceptance_required":true, "final_summary_turn_executed":false,
+                })
+            );
         }
     }
 
@@ -2327,31 +5481,53 @@ mod tests {
             let past = if scenario == 0 {
                 outcome_verifier(&session, "failed-verifier", 0, 7, false)
             } else {
-                (json!({"command_type":"shell_command", "step":1, "command_line":"fixture"}),
+                (
+                    json!({"command_type":"shell_command", "step":1, "command_line":"fixture"}),
                     json!({"command_type":"shell_command", "step":1, "success":scenario != 1,
-                        "error":if scenario == 1 { json!("exit 7") } else { serde_json::Value::Null },
-                        "output":match scenario {
-                            1 => json!({"exit_code":7}),
-                            2 => json!({"exit_code":0, "outcome":"unknown"}),
-                            _ => json!({"exit_code":0, "terminal_receipt":{"reconcile_required":true}}),
-                        }}))
+                    "error":if scenario == 1 { json!("exit 7") } else { serde_json::Value::Null },
+                    "output":match scenario {
+                        1 => json!({"exit_code":7}),
+                        2 => json!({"exit_code":0, "outcome":"unknown"}),
+                        _ => json!({"exit_code":0, "terminal_receipt":{"reconcile_required":true}}),
+                    }}),
+                )
             };
             append_outcome(&mut session, "past-runtime", vec![past]);
             let mut tracker = super::TerminalOutcomeTracker::new(&session);
             let runtime = test_runtime_with_usage(&session, 0);
             let done = terminal_done_result();
-            append_outcome(&mut session, &runtime.runtime_id, vec![
-                (done.arguments["commands"][0].clone(), done.result["results"][0].clone())]);
+            append_outcome(
+                &mut session,
+                &runtime.runtime_id,
+                vec![(
+                    done.arguments["commands"][0].clone(),
+                    done.result["results"][0].clone(),
+                )],
+            );
             tracker.observe_session(&session);
-            let raw = session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>();
+            let raw = session
+                .session_log
+                .iter()
+                .map(|entry| entry.raw().to_owned())
+                .collect::<Vec<_>>();
             let failures = tracker.failures.clone();
             let hard_veto = tracker.hard_veto;
             assert!(!tracker.proven());
-            assert_eq!(tracker.delivery_status(&session, &runtime, &[done]), Some("blocked"));
+            assert_eq!(
+                tracker.delivery_status(&session, &runtime, &[done]),
+                Some("blocked")
+            );
             assert!(!tracker.proven(), "delivery is not recovery or acceptance");
             assert_eq!(tracker.failures, failures);
             assert_eq!(tracker.hard_veto, hard_veto);
-            assert_eq!(raw, session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>());
+            assert_eq!(
+                raw,
+                session
+                    .session_log
+                    .iter()
+                    .map(|entry| entry.raw().to_owned())
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
@@ -2364,8 +5540,13 @@ mod tests {
             let tracker = super::TerminalOutcomeTracker::new(&session);
             let runtime = test_runtime_with_usage(&session, 0);
             let done = terminal_done_result();
-            let mut batch = outcome_batch(&runtime.runtime_id, vec![
-                (done.arguments["commands"][0].clone(), done.result["results"][0].clone())]);
+            let mut batch = outcome_batch(
+                &runtime.runtime_id,
+                vec![(
+                    done.arguments["commands"][0].clone(),
+                    done.result["results"][0].clone(),
+                )],
+            );
             match scenario {
                 0 => batch["session_id"] = json!("foreign-session"),
                 1 => batch["output"]["results"][0]["output"]["outcome"] = json!("unknown"),
@@ -2373,14 +5554,40 @@ mod tests {
                 3 => batch["runtime_id"] = json!("foreign-runtime"),
                 4 => session.session_log_retention.omitted_entries = 1,
                 5 => {
-                    session.push_log(json!({"type":"nokiy.terminal_evidence",
-                        "session_id":session.session_id, "runtime_id":"foreign-runtime"}).to_string(), Utc::now());
+                    session.push_log(
+                        json!({"type":"nokiy.terminal_evidence",
+                        "session_id":session.session_id, "runtime_id":"foreign-runtime"})
+                        .to_string(),
+                        Utc::now(),
+                    );
                 }
                 _ => session.jspace_contract = None,
             }
             session.push_log(batch.to_string(), Utc::now());
-            assert_eq!(tracker.delivery_status(&session, &runtime, &[done]), None, "scenario {scenario}");
+            assert_eq!(
+                tracker.delivery_status(&session, &runtime, &[done]),
+                None,
+                "scenario {scenario}"
+            );
             assert!(!tracker.proven());
+        }
+    }
+
+    #[test]
+    fn tool_compaction_cannot_reopen_a_settled_terminal_status() {
+        for compacted in [false, true] {
+            for status in [Some("done"), Some("question")] {
+                assert!(!super::should_continue_after_tool_compaction(
+                    compacted, status
+                ));
+            }
+            for status in [None, Some("doing"), Some("unknown")] {
+                assert_eq!(
+                    super::should_continue_after_tool_compaction(compacted, status),
+                    compacted,
+                    "nonterminal status {status:?} retains normal continuation"
+                );
+            }
         }
     }
 
@@ -2388,32 +5595,190 @@ mod tests {
     fn terminal_evidence_boundary_keeps_delivery_terminal_identity_and_compaction_fences() {
         let mut session = test_session("terminal-boundary");
         let mut runtime = test_runtime_with_usage(&session, 0);
+        runtime
+            .transition(lifecycle::RuntimeState::Dispatching)
+            .expect("dispatch terminal runtime");
+        runtime.mark_called(Utc::now()).expect("provider called");
+        runtime
+            .mark_waiting_first_token()
+            .expect("waiting for provider output");
+        runtime.mark_first_token(Utc::now()).expect("provider output");
+        runtime
+            .finish_success(Utc::now(), None)
+            .expect("finished terminal runtime");
         let results = vec![terminal_done_result()];
-        let boundary = |session: &SessionManagement, runtime: &RuntimeAggregate, delivery, status, compact, reply| {
-            super::terminal_evidence_boundary_proven(delivery, session, runtime, &results, status, compact, reply)
+        let boundary = |session: &SessionManagement,
+                        runtime: &RuntimeAggregate,
+                        delivery,
+                        status,
+                        compact,
+                        reply| {
+            super::terminal_evidence_boundary_proven(
+                delivery, session, runtime, &results, status, compact, reply,
+            )
         };
-        assert!(boundary(&session, &runtime, true, Some("done"), false, true));
-        assert!(!boundary(&session, &runtime, false, Some("done"), false, true),
-            "absent/unproven transport, checkpoint or feed delivery cannot skip continuation");
-        assert!(!boundary(&session, &runtime, true, Some("done"), false, false), "publication failure");
-        assert!(!boundary(&session, &runtime, true, Some("done"), true, true), "pending compaction");
+        assert!(boundary(
+            &session,
+            &runtime,
+            true,
+            Some("done"),
+            false,
+            true
+        ));
+        assert!(
+            !boundary(&session, &runtime, false, Some("done"), false, true),
+            "absent/unproven transport, checkpoint or feed delivery cannot skip continuation"
+        );
+        assert!(
+            !boundary(&session, &runtime, true, Some("done"), false, false),
+            "publication failure"
+        );
+        assert!(
+            !boundary(&session, &runtime, true, Some("done"), true, true),
+            "pending compaction"
+        );
         for status in [None, Some("doing"), Some("question")] {
             assert!(!boundary(&session, &runtime, true, status, false, true));
         }
         runtime.session_id = "foreign-session".to_string();
-        assert!(!boundary(&session, &runtime, true, Some("done"), false, true));
+        assert!(!boundary(
+            &session,
+            &runtime,
+            true,
+            Some("done"),
+            false,
+            true
+        ));
         runtime.session_id = session.session_id.clone();
         runtime.runtime_id.clear();
-        assert!(!boundary(&session, &runtime, true, Some("done"), false, true));
+        assert!(!boundary(
+            &session,
+            &runtime,
+            true,
+            Some("done"),
+            false,
+            true
+        ));
         runtime.runtime_id = "current-runtime".to_string();
         session.context_tokens.limit = 1;
         session.context_tokens.input = 1;
-        assert!(!boundary(&session, &runtime, true, Some("done"), false, true), "automatic compaction");
+        assert!(
+            super::auto_compact_summary_after_new_context(&session, &runtime, &results).is_some(),
+            "continuation would require automatic compaction"
+        );
+        assert!(
+            boundary(&session, &runtime, true, Some("done"), false, true),
+            "automatic pressure must not block proven terminal delivery"
+        );
+        assert!(
+            !boundary(&session, &runtime, false, Some("done"), false, true),
+            "unproven delivery under automatic pressure"
+        );
+        assert!(
+            !boundary(&session, &runtime, true, Some("done"), false, false),
+            "unpublished reply under automatic pressure"
+        );
+        assert!(
+            !boundary(&session, &runtime, true, Some("done"), true, true),
+            "explicit pending compaction under automatic pressure"
+        );
+        for status in [None, Some("doing"), Some("question")] {
+            assert!(!boundary(&session, &runtime, true, status, false, true));
+        }
+        runtime.session_id = "foreign-session".to_string();
+        assert!(!boundary(
+            &session,
+            &runtime,
+            true,
+            Some("done"),
+            false,
+            true
+        ));
+        runtime.session_id = session.session_id.clone();
+        runtime.runtime_id.clear();
+        assert!(!boundary(
+            &session,
+            &runtime,
+            true,
+            Some("done"),
+            false,
+            true
+        ));
+        runtime.runtime_id = "current-runtime".to_string();
         assert!(!super::terminal_results_end_in_done(&[]));
+        assert!(
+            !super::terminal_evidence_boundary_proven(
+                true,
+                &session,
+                &runtime,
+                &[],
+                Some("done"),
+                false,
+                true
+            ),
+            "empty results under automatic pressure"
+        );
         let mut unsafe_results = results;
-        unsafe_results[0].result["results"].as_array_mut().expect("results").push(
-            json!({"command_type":"shell_command", "success":true, "output":{"exit_code":0}}));
-        assert!(!super::terminal_results_end_in_done(&unsafe_results), "done must be last");
+        unsafe_results[0].result["results"]
+            .as_array_mut()
+            .expect("results")
+            .push(
+                json!({"command_type":"shell_command", "success":true, "output":{"exit_code":0}}),
+            );
+        assert!(
+            !super::terminal_results_end_in_done(&unsafe_results),
+            "done must be last"
+        );
+        assert!(
+            !super::terminal_evidence_boundary_proven(
+                true,
+                &session,
+                &runtime,
+                &unsafe_results,
+                Some("done"),
+                false,
+                true
+            ),
+            "done must be last under automatic pressure"
+        );
+    }
+
+    #[test]
+    fn retryable_pre_effect_failure_preserves_only_future_terminal_delivery() {
+        let session = test_session("recovered-provider-delivery");
+        for state in [
+            lifecycle::RuntimeState::Failed,
+            lifecycle::RuntimeState::TimedOut,
+        ] {
+            let mut runtime = test_runtime_with_usage(&session, 0);
+            crate::provider_flow::errors::finish_runtime_failure(
+                &mut runtime,
+                Utc::now(),
+                "CALL_FAILED",
+                "provider ended before any command".to_string(),
+                state,
+            )
+            .expect("record pre-effect failure");
+            assert!(super::runtime_preserves_terminal_delivery(&session, &runtime, 0));
+            assert_eq!(runtime.state, state, "delivery does not rewrite failure history");
+            assert!(!super::terminal_evidence_boundary_proven(
+                true,
+                &session,
+                &runtime,
+                &[terminal_done_result()],
+                Some("done"),
+                false,
+                true,
+            ));
+            assert!(!super::runtime_preserves_terminal_delivery(&session, &runtime, 1));
+            runtime.session_id = "foreign-session".to_string();
+            assert!(!super::runtime_preserves_terminal_delivery(&session, &runtime, 0));
+            runtime.session_id = session.session_id.clone();
+            runtime.error.as_mut().unwrap().retry_allowed = false;
+            assert!(!super::runtime_preserves_terminal_delivery(&session, &runtime, 0));
+            runtime.error = None;
+            assert!(!super::runtime_preserves_terminal_delivery(&session, &runtime, 0));
+        }
     }
 
     #[test]
@@ -2421,40 +5786,91 @@ mod tests {
         let mut session = outcome_session();
         let runtime = test_runtime_with_usage(&session, 0);
         let failed = outcome_verifier(&session, "failed-call", 0, 1, false);
-        record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "failed-provider", vec![failed]));
-        let failed_history = session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>();
+        record_native_outcome(
+            &mut session,
+            &runtime,
+            &native_streamed_batch(&runtime, "failed-provider", vec![failed]),
+        );
+        let failed_history = session
+            .session_log
+            .iter()
+            .map(|entry| entry.raw().to_owned())
+            .collect::<Vec<_>>();
         let failure = session.session_log.last().expect("native failure").value();
         assert_eq!(failure["success"], false);
         assert_eq!(failure["error"], "test failed");
         assert_eq!(failure["context_cache"]["error"], "test failed");
         assert!(session.session_log[1].value().get("error").is_none());
-        assert_eq!(session.session_log[1].value()["result"]["error"], "test failed");
+        assert_eq!(
+            session.session_log[1].value()["result"]["error"],
+            "test failed"
+        );
         let mut tracker = super::TerminalOutcomeTracker::new(&session);
         assert!(!tracker.hard_veto);
         assert!(!tracker.proven());
-        record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "repair-provider", vec![outcome_mutation()]));
+        record_native_outcome(
+            &mut session,
+            &runtime,
+            &native_streamed_batch(&runtime, "repair-provider", vec![outcome_mutation()]),
+        );
         tracker.observe_session(&session);
         assert!(!tracker.hard_veto);
         assert!(!tracker.proven());
         let passed = outcome_verifier(&session, "passed-call", 0, 0, true);
         let proof = passed.1["output"]["verification_evidence"].clone();
-        record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "passed-provider", vec![passed]));
+        record_native_outcome(
+            &mut session,
+            &runtime,
+            &native_streamed_batch(&runtime, "passed-provider", vec![passed]),
+        );
         let recorded = session.session_log.last().expect("native pass").value();
-        assert_eq!(recorded["output"]["results"][0]["output"]["verification_evidence"], proof);
-        assert_eq!(recorded["output"]["command_events"]["omitted_from_record"], true);
+        assert_eq!(
+            recorded["output"]["results"][0]["output"]["verification_evidence"],
+            proof
+        );
+        assert_eq!(
+            recorded["output"]["command_events"]["omitted_from_record"],
+            true
+        );
         assert_eq!(recorded["output"]["command_events"]["count"], 2);
-        let raw = session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>();
+        let raw = session
+            .session_log
+            .iter()
+            .map(|entry| entry.raw().to_owned())
+            .collect::<Vec<_>>();
         tracker.observe_session(&session);
         assert!(tracker.proven());
         assert_eq!(tracker.mutation_generation, 1);
-        assert_eq!(tracker.receipts.len(), 2, "callbacks are not additional executions");
-        assert_eq!(tracker.runtimes.len(), 3, "distinct calls share one native runtime");
+        assert_eq!(
+            tracker.receipts.len(),
+            2,
+            "callbacks are not additional executions"
+        );
+        assert_eq!(
+            tracker.runtimes.len(),
+            3,
+            "distinct calls share one native runtime"
+        );
         assert_eq!(raw[..failed_history.len()], failed_history);
-        assert_eq!(session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>(), raw);
-        record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "late-provider", vec![outcome_mutation()]));
+        assert_eq!(
+            session
+                .session_log
+                .iter()
+                .map(|entry| entry.raw().to_owned())
+                .collect::<Vec<_>>(),
+            raw
+        );
+        record_native_outcome(
+            &mut session,
+            &runtime,
+            &native_streamed_batch(&runtime, "late-provider", vec![outcome_mutation()]),
+        );
         tracker.observe_session(&session);
         assert!(!tracker.hard_veto);
-        assert!(!tracker.proven(), "a later mutation invalidates the resolution");
+        assert!(
+            !tracker.proven(),
+            "a later mutation invalidates the resolution"
+        );
     }
 
     #[test]
@@ -2466,12 +5882,16 @@ mod tests {
             let command = json!({"command_type": "source_read", "step": 1,
                 "command_line": json!({"path": "tests/test_graph_process.py", "start_line": 69,
                     "end_line": 248, "line_numbers": true}).to_string()});
-            let mut batch = native_streamed_batch(&runtime, "source-provider", vec![(command, result)]);
+            let mut batch =
+                native_streamed_batch(&runtime, "source-provider", vec![(command, result)]);
             if changed {
                 // Same byte count, identity and pagination; genuinely different
                 // source text must still fail the exact outcome fingerprint.
-                let stdout = batch["output"]["results"][0]["output"]["stdout"].as_str().unwrap();
-                batch["output"]["results"][0]["output"]["stdout"] = json!(stdout.replacen("abcdef", "ABCDEF", 1));
+                let stdout = batch["output"]["results"][0]["output"]["stdout"]
+                    .as_str()
+                    .unwrap();
+                batch["output"]["results"][0]["output"]["stdout"] =
+                    json!(stdout.replacen("abcdef", "ABCDEF", 1));
             }
             record_native_outcome(&mut session, &runtime, &batch);
             let streamed = &session.session_log[1].value()["result"];
@@ -2479,9 +5899,17 @@ mod tests {
             for result in [streamed, completed] {
                 assert_eq!(result["output"]["stdout"].as_str().unwrap().len(), 10_055);
                 assert_eq!(result["output"]["next_line"], 249);
-                assert!(!result["output"]["stdout"].as_str().unwrap().contains("Total output lines:"));
+                assert!(
+                    !result["output"]["stdout"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Total output lines:")
+                );
             }
-            assert_eq!(super::terminal_fingerprint(streamed) == super::terminal_fingerprint(completed), !changed);
+            assert_eq!(
+                super::terminal_fingerprint(streamed) == super::terminal_fingerprint(completed),
+                !changed
+            );
             let tracker = super::TerminalOutcomeTracker::new(&session);
             assert_eq!(tracker.hard_veto, changed);
             assert_eq!(tracker.proven(), !changed);
@@ -2502,16 +5930,35 @@ mod tests {
             let passed = outcome_verifier(&session, "pass", 0, 0, true);
             let mut batch = native_streamed_batch(&runtime, "provider", vec![passed]);
             match scenario {
-                0 => batch["output"]["results"][0]["output"]["stdout"] = json!("not the streamed result"),
-                1 => batch["output"]["command_events"][1]["provider_tool_call_id"] = json!("other-provider"),
-                2 => { batch["output"]["command_events"].as_array_mut().expect("events").remove(1); },
-                3 => batch["output"]["command_events"][1]["error"] = json!("contradictory event error"),
-                _ => batch["output"]["command_events"] = json!({
-                    "omitted_from_record": true, "count": 2, "reason": super::COMMAND_EVENTS_OMISSION_REASON
-                }),
+                0 => {
+                    batch["output"]["results"][0]["output"]["stdout"] =
+                        json!("not the streamed result")
+                }
+                1 => {
+                    batch["output"]["command_events"][1]["provider_tool_call_id"] =
+                        json!("other-provider")
+                }
+                2 => {
+                    batch["output"]["command_events"]
+                        .as_array_mut()
+                        .expect("events")
+                        .remove(1);
+                }
+                3 => {
+                    batch["output"]["command_events"][1]["error"] =
+                        json!("contradictory event error")
+                }
+                _ => {
+                    batch["output"]["command_events"] = json!({
+                        "omitted_from_record": true, "count": 2, "reason": super::COMMAND_EVENTS_OMISSION_REASON
+                    })
+                }
             }
             record_native_outcome(&mut session, &runtime, &batch);
-            assert!(super::TerminalOutcomeTracker::new(&session).hard_veto, "scenario {scenario}");
+            assert!(
+                super::TerminalOutcomeTracker::new(&session).hard_veto,
+                "scenario {scenario}"
+            );
         }
     }
 
@@ -2541,25 +5988,45 @@ mod tests {
         let runtime = test_runtime_with_usage(&session, 0);
         let passed = outcome_verifier(&session, "pass", 0, 0, true);
         let batch = native_streamed_batch(&runtime, "provider", vec![passed]);
-        let sanitized = crate::tool_callback_sanitizer::sanitize_tool_callback_output(&batch["output"]);
+        let sanitized =
+            crate::tool_callback_sanitizer::sanitize_tool_callback_output(&batch["output"]);
         let marker = &sanitized["command_events"];
         let mut tracker = super::TerminalOutcomeTracker::new(&session);
-        assert!(!tracker.streamed_batch_matches(&runtime.runtime_id, 1, marker), "omission alone supplies no proof");
-        crate::tool_flow::command_run_result::record_streamed_command_events(&mut session, &runtime, &batch["output"]);
+        assert!(
+            !tracker.streamed_batch_matches(&runtime.runtime_id, 1, marker),
+            "omission alone supplies no proof"
+        );
+        crate::tool_flow::command_run_result::record_streamed_command_events(
+            &mut session,
+            &runtime,
+            &batch["output"],
+        );
         tracker.observe_session(&session);
         assert!(!tracker.hard_veto);
-        assert!(!tracker.proven(), "completions still need their canonical batch");
+        assert!(
+            !tracker.proven(),
+            "completions still need their canonical batch"
+        );
         assert!(tracker.streamed_batch_matches(&runtime.runtime_id, 1, marker));
         for scenario in 0..5 {
             let mut malformed = marker.clone();
             match scenario {
-                0 => { malformed.as_object_mut().expect("marker").remove("omitted_from_record"); malformed["unexpected"] = json!(true); },
+                0 => {
+                    malformed
+                        .as_object_mut()
+                        .expect("marker")
+                        .remove("omitted_from_record");
+                    malformed["unexpected"] = json!(true);
+                }
                 1 => malformed["reason"] = json!("arbitrary omission"),
                 2 => malformed["count"] = json!(1),
                 3 => malformed["unexpected"] = json!(true),
                 _ => malformed["count"] = json!(0),
             }
-            assert!(!tracker.streamed_batch_matches(&runtime.runtime_id, 1, &malformed), "scenario {scenario}");
+            assert!(
+                !tracker.streamed_batch_matches(&runtime.runtime_id, 1, &malformed),
+                "scenario {scenario}"
+            );
         }
     }
 
@@ -2569,12 +6036,37 @@ mod tests {
             let mut session = outcome_session();
             let runtime = test_runtime_with_usage(&session, 0);
             let passed = outcome_verifier(&session, "first-call", 0, 0, true);
-            record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "first-provider", vec![passed]));
+            record_native_outcome(
+                &mut session,
+                &runtime,
+                &native_streamed_batch(&runtime, "first-provider", vec![passed]),
+            );
             let mut tracker = super::TerminalOutcomeTracker::new(&session);
             assert!(tracker.proven());
-            let passed = outcome_verifier(&session, if duplicate_provider { "new-call" } else { "first-call" }, 0, 0, true);
-            record_native_outcome(&mut session, &runtime, &native_streamed_batch(
-                &runtime, if duplicate_provider { "first-provider" } else { "new-provider" }, vec![passed]));
+            let passed = outcome_verifier(
+                &session,
+                if duplicate_provider {
+                    "new-call"
+                } else {
+                    "first-call"
+                },
+                0,
+                0,
+                true,
+            );
+            record_native_outcome(
+                &mut session,
+                &runtime,
+                &native_streamed_batch(
+                    &runtime,
+                    if duplicate_provider {
+                        "first-provider"
+                    } else {
+                        "new-provider"
+                    },
+                    vec![passed],
+                ),
+            );
             tracker.observe_session(&session);
             assert!(tracker.hard_veto);
             assert!(!tracker.proven());
@@ -2584,17 +6076,28 @@ mod tests {
     #[test]
     fn focused_outcome_native_advisory_context_does_not_mask_uncertain_failures() {
         for (key, value) in [
-            ("outcome", json!("unknown")), ("process_reaped", json!(false)),
-            ("failure_class", json!("cleanup")), ("authority_effect", json!("unproven")),
-            ("authoritative_publication", json!("unknown")), ("exit_code", json!(-1)),
+            ("outcome", json!("unknown")),
+            ("process_reaped", json!(false)),
+            ("failure_class", json!("cleanup")),
+            ("authority_effect", json!("unproven")),
+            ("authoritative_publication", json!("unknown")),
+            ("exit_code", json!(-1)),
         ] {
             let mut session = outcome_session();
             let runtime = test_runtime_with_usage(&session, 0);
             let mut failed = outcome_verifier(&session, "uncertain-call", 0, 1, false);
             failed.1["output"]["terminal_receipt"][key] = value;
-            record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "uncertain-provider", vec![failed]));
+            record_native_outcome(
+                &mut session,
+                &runtime,
+                &native_streamed_batch(&runtime, "uncertain-provider", vec![failed]),
+            );
             let passed = outcome_verifier(&session, "pass", 0, 0, true);
-            record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "passed-provider", vec![passed]));
+            record_native_outcome(
+                &mut session,
+                &runtime,
+                &native_streamed_batch(&runtime, "passed-provider", vec![passed]),
+            );
             let tracker = super::TerminalOutcomeTracker::new(&session);
             assert!(tracker.hard_veto, "{key}");
             assert!(!tracker.proven(), "{key}");
@@ -2607,7 +6110,11 @@ mod tests {
             let mut session = outcome_session();
             let runtime = test_runtime_with_usage(&session, 0);
             let failed = outcome_verifier(&session, "fail", 0, 1, false);
-            record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "failed-provider", vec![failed]));
+            record_native_outcome(
+                &mut session,
+                &runtime,
+                &native_streamed_batch(&runtime, "failed-provider", vec![failed]),
+            );
             let mut passed = outcome_verifier(&session, "pass", 0, 0, true);
             let proof = &mut passed.1["output"]["verification_evidence"];
             match scenario {
@@ -2615,10 +6122,88 @@ mod tests {
                 1 => proof["verifier_sha256"] = json!("d".repeat(64)),
                 2 => proof["verifier_index"] = json!(1),
                 3 => proof["call_id"] = json!("other-call"),
-                4 => { proof["source_postimages"].as_object_mut().expect("images").remove("src/example.rs"); },
-                _ => proof["source_postimages"]["src/ungranted.rs"] = json!({"sha256": "b".repeat(64), "bytes": 28, "mode": 420}),
+                4 => {
+                    proof["source_postimages"]
+                        .as_object_mut()
+                        .expect("images")
+                        .remove("src/example.rs");
+                }
+                _ => {
+                    proof["source_postimages"]["src/ungranted.rs"] =
+                        json!({"sha256": "b".repeat(64), "bytes": 28, "mode": 420})
+                }
             }
-            record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "passed-provider", vec![passed]));
+            record_native_outcome(
+                &mut session,
+                &runtime,
+                &native_streamed_batch(&runtime, "passed-provider", vec![passed]),
+            );
+            let tracker = super::TerminalOutcomeTracker::new(&session);
+            assert!(tracker.hard_veto, "scenario {scenario}");
+            assert!(!tracker.proven(), "scenario {scenario}");
+        }
+    }
+
+    #[test]
+    fn focused_outcome_native_optional_create_target_may_stay_absent_or_be_created() {
+        for absent in [true, false] {
+            let mut session = outcome_optional_create_session();
+            let runtime = test_runtime_with_usage(&session, 0);
+            let failed = outcome_verifier(&session, "fail", 0, 1, false);
+            record_native_outcome(&mut session, &runtime,
+                &native_streamed_batch(&runtime, "failed-provider", vec![failed]));
+            let mut tracker = super::TerminalOutcomeTracker::new(&session);
+            assert!(!tracker.proven());
+            let mut passed = outcome_verifier(&session, "pass", 0, 0, true);
+            if absent {
+                passed.1["output"]["verification_evidence"]["source_postimages"]["src/optional.rs"] = serde_json::Value::Null;
+            }
+            record_native_outcome(&mut session, &runtime,
+                &native_streamed_batch(&runtime, "passed-provider", vec![passed]));
+            tracker.observe_session(&session);
+            assert!(!tracker.hard_veto);
+            assert!(tracker.proven(), "absent={absent}");
+            record_native_outcome(&mut session, &runtime,
+                &native_streamed_batch(&runtime, "mutation-provider", vec![outcome_mutation()]));
+            tracker.observe_session(&session);
+            assert!(!tracker.proven(), "later mutation still requires a fresh pass");
+        }
+    }
+
+    #[test]
+    fn focused_outcome_native_null_postimages_require_exact_initial_absence_and_create_grant() {
+        for scenario in 0..11 {
+            let mut session = outcome_optional_create_session();
+            let contract = session.jspace_contract.as_mut().expect("contract");
+            match scenario {
+                0 => { contract["dcf_generation"]["source_snapshot"].as_object_mut().unwrap().remove("src/optional.rs"); }
+                1 => { contract["dcf_generation"].as_object_mut().unwrap().remove("source_snapshot"); }
+                2 => contract["dcf_generation"]["source_snapshot"]["src/optional.rs"] = contract["dcf_generation"]["source_snapshot"]["src/example.rs"].clone(),
+                3 => contract["allowed_operations"] = json!(["read", "modify", "command"]),
+                4 => contract["denied_operations"] = json!(["create"]),
+                5 => contract["write_scopes"] = json!(["src/example.rs"]),
+                6 => { contract.as_object_mut().unwrap().remove("allowed_operations"); }
+                7 => { contract.as_object_mut().unwrap().remove("denied_operations"); }
+                10 => {
+                    contract["source_snapshot"] = contract["dcf_generation"]["source_snapshot"].clone();
+                    contract.as_object_mut().unwrap().remove("dcf_generation");
+                }
+                _ => {}
+            }
+            let runtime = test_runtime_with_usage(&session, 0);
+            let failed = outcome_verifier(&session, "fail", 0, 1, false);
+            record_native_outcome(&mut session, &runtime,
+                &native_streamed_batch(&runtime, "failed-provider", vec![failed]));
+            let mut passed = outcome_verifier(&session, "pass", 0, 0, true);
+            let images = &mut passed.1["output"]["verification_evidence"]["source_postimages"];
+            images["src/optional.rs"] = serde_json::Value::Null;
+            match scenario {
+                8 => images["src/example.rs"] = serde_json::Value::Null,
+                9 => { images.as_object_mut().unwrap().remove("src/optional.rs"); }
+                _ => {}
+            }
+            record_native_outcome(&mut session, &runtime,
+                &native_streamed_batch(&runtime, "passed-provider", vec![passed]));
             let tracker = super::TerminalOutcomeTracker::new(&session);
             assert!(tracker.hard_veto, "scenario {scenario}");
             assert!(!tracker.proven(), "scenario {scenario}");
@@ -2630,20 +6215,38 @@ mod tests {
         let mut session = outcome_session();
         let runtime = test_runtime_with_usage(&session, 0);
         let legacy = outcome_verifier(&session, "initial-pass", 0, 0, false);
-        record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "initial-provider", vec![legacy]));
+        record_native_outcome(
+            &mut session,
+            &runtime,
+            &native_streamed_batch(&runtime, "initial-provider", vec![legacy]),
+        );
         let mut tracker = super::TerminalOutcomeTracker::new(&session);
-        assert!(tracker.proven(), "legacy success remains valid without resolving anything");
+        assert!(
+            tracker.proven(),
+            "legacy success remains valid without resolving anything"
+        );
         let failed = outcome_verifier(&session, "fail", 0, 1, false);
-        record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "failed-provider", vec![failed]));
+        record_native_outcome(
+            &mut session,
+            &runtime,
+            &native_streamed_batch(&runtime, "failed-provider", vec![failed]),
+        );
         let proof = outcome_verifier(&session, "legacy-pass", 0, 0, true).1["output"]["verification_evidence"].clone();
         let mut legacy = outcome_verifier(&session, "legacy-pass", 0, 0, false);
         legacy.1["output"]["source_postimages"] = proof["source_postimages"].clone();
         legacy.1["output"]["stdout"] = json!(proof.to_string());
         legacy.1["output"]["context_cache"] = json!({"verification_evidence": proof});
-        record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "legacy-provider", vec![legacy]));
+        record_native_outcome(
+            &mut session,
+            &runtime,
+            &native_streamed_batch(&runtime, "legacy-provider", vec![legacy]),
+        );
         tracker.observe_session(&session);
         assert!(!tracker.hard_veto);
-        assert!(!tracker.proven(), "advisory objects and JSON-looking stdout are not canonical proof");
+        assert!(
+            !tracker.proven(),
+            "advisory objects and JSON-looking stdout are not canonical proof"
+        );
     }
 
     #[test]
@@ -2651,7 +6254,11 @@ mod tests {
         let mut session = outcome_session();
         let mut runtime = test_runtime_with_usage(&session, 0);
         let failed = outcome_verifier(&session, "fail", 0, 1, false);
-        record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "failed-provider", vec![failed]));
+        record_native_outcome(
+            &mut session,
+            &runtime,
+            &native_streamed_batch(&runtime, "failed-provider", vec![failed]),
+        );
         let mut tracker = super::TerminalOutcomeTracker::new(&session);
         assert!(!tracker.hard_veto);
         assert!(!tracker.proven());
@@ -2659,10 +6266,17 @@ mod tests {
         session.clear_session_log();
         runtime.runtime_id = "after-compaction".to_owned();
         let passed = outcome_verifier(&session, "pass", 0, 0, true);
-        record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "passed-provider", vec![passed]));
+        record_native_outcome(
+            &mut session,
+            &runtime,
+            &native_streamed_batch(&runtime, "passed-provider", vec![passed]),
+        );
         tracker.observe_session(&session);
         assert!(tracker.proven());
-        assert!(super::TerminalOutcomeTracker::new(&session).hard_veto, "advisory context cannot reconstruct the omitted prefix");
+        assert!(
+            super::TerminalOutcomeTracker::new(&session).hard_veto,
+            "advisory context cannot reconstruct the omitted prefix"
+        );
     }
 
     #[test]
@@ -2670,7 +6284,13 @@ mod tests {
         let mut session = outcome_session();
         let failed = outcome_verifier(&session, "failed-call", 0, 1, false);
         let original = outcome_batch("failed-runtime", vec![failed]);
-        assert!(!super::terminal_tool_outcome_proven("command_run", false, Some("test failed"), &original["input"], &original["output"]));
+        assert!(!super::terminal_tool_outcome_proven(
+            "command_run",
+            false,
+            Some("test failed"),
+            &original["input"],
+            &original["output"]
+        ));
         session.push_log(original.to_string(), Utc::now());
         let mut tracker = super::TerminalOutcomeTracker::new(&session);
         assert!(!tracker.proven());
@@ -2685,12 +6305,31 @@ mod tests {
         assert!(!tracker.proven());
         let passed = outcome_verifier(&session, "passed-call", 0, 0, true);
         append_outcome(&mut session, "passed-runtime", vec![passed]);
-        let raw = session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>();
+        let raw = session
+            .session_log
+            .iter()
+            .map(|entry| entry.raw().to_owned())
+            .collect::<Vec<_>>();
         tracker.observe_session(&session);
         assert!(tracker.proven());
         assert_eq!(tracker.mutation_generation, 1);
-        assert_eq!(session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>(), raw);
-        assert_eq!(session.session_log.iter().next().expect("failure retained").value(), &original);
+        assert_eq!(
+            session
+                .session_log
+                .iter()
+                .map(|entry| entry.raw().to_owned())
+                .collect::<Vec<_>>(),
+            raw
+        );
+        assert_eq!(
+            session
+                .session_log
+                .iter()
+                .next()
+                .expect("failure retained")
+                .value(),
+            &original
+        );
         tracker.observe_session(&session); // A readback is not a new successful run.
         assert_eq!(tracker.receipts.len(), 3);
     }
@@ -2698,59 +6337,104 @@ mod tests {
     #[test]
     fn focused_outcome_native_guard_rejection_requires_a_fresh_current_grant_pass() {
         for (index, proof, late_mutation, resolved) in [
-            (0, true, false, true), (1, true, false, false),
-            (0, false, false, false), (0, true, true, false),
+            (0, true, false, true),
+            (1, true, false, false),
+            (0, false, false, false),
+            (0, true, true, false),
         ] {
             for null_output in [false, true] {
                 for reverse in [false, true] {
                     let mut session = outcome_session();
                     let mut runtime = test_runtime_with_usage(&session, 0);
                     let mut failed = outcome_verifier(&session, "failed-call", 0, 1, false);
-                    failed.0["step"] = json!(2); failed.1["step"] = json!(2);
+                    failed.0["step"] = json!(2);
+                    failed.1["step"] = json!(2);
                     let mut rejected = outcome_guard_rejection();
-                    if null_output { rejected.1["output"] = serde_json::Value::Null; }
+                    if null_output {
+                        rejected.1["output"] = serde_json::Value::Null;
+                    }
                     let mut pairs = vec![outcome_mutation(), failed, rejected];
-                    if reverse { pairs.swap(0, 1); }
+                    if reverse {
+                        pairs.swap(0, 1);
+                    }
                     let mut batch = native_streamed_batch(&runtime, "failed-provider", pairs);
-                    batch["output"]["command_events"].as_array_mut().expect("events")
+                    batch["output"]["command_events"]
+                        .as_array_mut()
+                        .expect("events")
                         .sort_by_key(|event| event["step"].as_u64().expect("step"));
                     record_native_outcome(&mut session, &runtime, &batch);
-                    let failed_history = session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>();
+                    let failed_history = session
+                        .session_log
+                        .iter()
+                        .map(|entry| entry.raw().to_owned())
+                        .collect::<Vec<_>>();
                     let mut tracker = super::TerminalOutcomeTracker::new(&session);
                     assert!(!tracker.hard_veto);
-                    assert!(!tracker.proven(), "a fenced done does not settle the failed verifier");
+                    assert!(
+                        !tracker.proven(),
+                        "a fenced done does not settle the failed verifier"
+                    );
                     assert_eq!(tracker.failures.get(&0), Some(&None));
 
                     runtime.runtime_id = "repaired-runtime".to_owned();
                     let mut passed = outcome_verifier(&session, "passed-call", index, 0, proof);
-                    passed.0["step"] = json!(2); passed.1["step"] = json!(2);
+                    passed.0["step"] = json!(2);
+                    passed.1["step"] = json!(2);
                     let mut mutation = outcome_mutation();
-                    if late_mutation { mutation.0["step"] = json!(3); mutation.1["step"] = json!(3); }
+                    if late_mutation {
+                        mutation.0["step"] = json!(3);
+                        mutation.1["step"] = json!(3);
+                    }
                     let done = terminal_done_result();
-                    let mut status = (done.arguments["commands"][0].clone(), done.result["results"][0].clone());
+                    let mut status = (
+                        done.arguments["commands"][0].clone(),
+                        done.result["results"][0].clone(),
+                    );
                     let done_step = if late_mutation { 4 } else { 3 };
-                    status.0["step"] = json!(done_step); status.1["step"] = json!(done_step);
+                    status.0["step"] = json!(done_step);
+                    status.1["step"] = json!(done_step);
                     let mut pairs = vec![mutation, passed, status];
-                    if reverse { pairs.swap(0, 1); }
+                    if reverse {
+                        pairs.swap(0, 1);
+                    }
                     let mut batch = native_streamed_batch(&runtime, "repair-provider", pairs);
-                    batch["output"]["command_events"].as_array_mut().expect("events")
+                    batch["output"]["command_events"]
+                        .as_array_mut()
+                        .expect("events")
                         .sort_by_key(|event| event["step"].as_u64().expect("step"));
                     record_native_outcome(&mut session, &runtime, &batch);
-                    let raw = session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>();
+                    let raw = session
+                        .session_log
+                        .iter()
+                        .map(|entry| entry.raw().to_owned())
+                        .collect::<Vec<_>>();
                     tracker.observe_session(&session);
                     assert!(!tracker.hard_veto);
                     assert_eq!(tracker.proven(), resolved);
                     assert_eq!(tracker.mutation_generation, 2);
-                    let resolution = (index == 0 && proof).then_some(if late_mutation { 1 } else { 2 });
+                    let resolution =
+                        (index == 0 && proof).then_some(if late_mutation { 1 } else { 2 });
                     assert_eq!(tracker.failures.get(&0), Some(&resolution));
                     assert_eq!(tracker.receipts.len(), 2);
                     assert_eq!(tracker.runtimes.len(), 2);
                     assert!(tracker.streamed.is_empty());
                     assert_eq!(&raw[..failed_history.len()], failed_history.as_slice());
-                    assert_eq!(session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>(), raw);
-                    assert_eq!(super::TerminalOutcomeTracker::new(&session).proven(), resolved);
-                    assert_eq!(tracker.delivery_status(&session, &runtime, &[terminal_done_result()]),
-                        Some(if resolved { "done" } else { "blocked" }));
+                    assert_eq!(
+                        session
+                            .session_log
+                            .iter()
+                            .map(|entry| entry.raw().to_owned())
+                            .collect::<Vec<_>>(),
+                        raw
+                    );
+                    assert_eq!(
+                        super::TerminalOutcomeTracker::new(&session).proven(),
+                        resolved
+                    );
+                    assert_eq!(
+                        tracker.delivery_status(&session, &runtime, &[terminal_done_result()]),
+                        Some(if resolved { "done" } else { "blocked" })
+                    );
                 }
             }
         }
@@ -2763,23 +6447,45 @@ mod tests {
             let mut runtime = test_runtime_with_usage(&session, 0);
             if scenario == 17 {
                 let historical = outcome_verifier(&session, "historical-call", 0, 1, false);
-                record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "historical-provider", vec![historical]));
+                record_native_outcome(
+                    &mut session,
+                    &runtime,
+                    &native_streamed_batch(&runtime, "historical-provider", vec![historical]),
+                );
             }
             let mut failed = outcome_verifier(&session, "failed-call", 0, 1, false);
-            failed.0["step"] = json!(2); failed.1["step"] = json!(2);
+            failed.0["step"] = json!(2);
+            failed.1["step"] = json!(2);
             let mut pairs = vec![outcome_mutation(), failed, outcome_guard_rejection()];
             match scenario {
                 0 | 17 => {
                     let index = if scenario == 17 { 1 } else { 0 }; // Historical failures cannot fence this batch.
                     pairs[1] = outcome_verifier(&session, "passed-call", index, 0, true);
-                    pairs[1].0["step"] = json!(2); pairs[1].1["step"] = json!(2);
+                    pairs[1].0["step"] = json!(2);
+                    pairs[1].1["step"] = json!(2);
                 }
                 1 => pairs[1].1["output"]["terminal_receipt"]["process_group_empty"] = json!(false),
-                2 => { pairs[1].1["output"].as_object_mut().expect("output").remove("terminal_receipt"); },
-                3 => { pairs[0].1["success"] = json!(false); pairs[0].1["error"] = pairs[2].1["error"].clone(); },
-                4 => { pairs[2].0["step"] = json!(2); pairs[2].1["step"] = json!(2); },
-                5 => { pairs[0].0.as_object_mut().expect("command").remove("step"); },
-                6 => { pairs[2].0.as_object_mut().expect("command").remove("step"); pairs[2].1["step"] = json!(1); },
+                2 => {
+                    pairs[1].1["output"]
+                        .as_object_mut()
+                        .expect("output")
+                        .remove("terminal_receipt");
+                }
+                3 => {
+                    pairs[0].1["success"] = json!(false);
+                    pairs[0].1["error"] = pairs[2].1["error"].clone();
+                }
+                4 => {
+                    pairs[2].0["step"] = json!(2);
+                    pairs[2].1["step"] = json!(2);
+                }
+                5 => {
+                    pairs[0].0.as_object_mut().expect("command").remove("step");
+                }
+                6 => {
+                    pairs[2].0.as_object_mut().expect("command").remove("step");
+                    pairs[2].1["step"] = json!(1);
+                }
                 7 => pairs[2].0["command_line"] = json!(json!({"status": "doing"}).to_string()),
                 8 => pairs[2].1["error"] = json!("TERMINAL_STATUS_PRIOR_RESULT: forged suffix"),
                 9 => pairs[2].1["output"] = json!({}),
@@ -2795,12 +6501,15 @@ mod tests {
             } else {
                 let mut batch = native_streamed_batch(&runtime, "failed-provider", pairs);
                 if scenario == 13 {
-                    batch["output"]["results"][2]["command"]["command_line"] = json!("different command");
+                    batch["output"]["results"][2]["command"]["command_line"] =
+                        json!("different command");
                     // Retain matching fingerprints: the canonical command copy itself must agree.
-                    batch["output"]["command_events"][5]["result"] = batch["output"]["results"][2].clone();
+                    batch["output"]["command_events"][5]["result"] =
+                        batch["output"]["results"][2].clone();
                 }
                 if scenario == 16 {
-                    batch["output"]["command_events"][5]["provider_tool_call_id"] = json!("other-provider");
+                    batch["output"]["command_events"][5]["provider_tool_call_id"] =
+                        json!("other-provider");
                 }
                 record_native_outcome(&mut session, &runtime, &batch);
             }
@@ -2809,9 +6518,16 @@ mod tests {
             assert!(!tracker.proven(), "scenario {scenario}");
             runtime.runtime_id = "fresh-runtime".to_owned();
             let passed = outcome_verifier(&session, "fresh-call", 0, 0, true);
-            record_native_outcome(&mut session, &runtime, &native_streamed_batch(&runtime, "fresh-provider", vec![passed]));
+            record_native_outcome(
+                &mut session,
+                &runtime,
+                &native_streamed_batch(&runtime, "fresh-provider", vec![passed]),
+            );
             tracker.observe_session(&session);
-            assert!(!tracker.proven(), "a later pass cannot hide scenario {scenario}");
+            assert!(
+                !tracker.proven(),
+                "a later pass cannot hide scenario {scenario}"
+            );
         }
     }
 
@@ -2828,7 +6544,8 @@ mod tests {
         tracker.observe_session(&session);
         assert!(!tracker.proven());
         let mut passed = outcome_verifier(&session, "repass", 0, 0, true);
-        passed.1["output"]["verification_evidence"]["source_postimages"]["src/example.rs"]["sha256"] = json!("c".repeat(64));
+        passed.1["output"]["verification_evidence"]["source_postimages"]["src/example.rs"]["sha256"] =
+            json!("c".repeat(64));
         append_outcome(&mut session, "r-repass", vec![passed]);
         tracker.observe_session(&session);
         assert!(tracker.proven());
@@ -2837,7 +6554,8 @@ mod tests {
         tracker.observe_session(&session);
         assert!(!tracker.proven());
         let mut passed = outcome_verifier(&session, "pass-after-failure", 0, 0, true);
-        passed.1["output"]["verification_evidence"]["source_postimages"]["src/example.rs"]["sha256"] = json!("c".repeat(64));
+        passed.1["output"]["verification_evidence"]["source_postimages"]["src/example.rs"]["sha256"] =
+            json!("c".repeat(64));
         append_outcome(&mut session, "r-pass-after-failure", vec![passed]);
         tracker.observe_session(&session);
         assert!(tracker.proven());
@@ -2848,11 +6566,19 @@ mod tests {
         for (pointer, value) in [
             ("/schema_version", json!("other")),
             ("/authorization_semantic_sha256", json!("d".repeat(64))),
-            ("/verifier_index", json!(1)), ("/verifier_index", json!(-1)),
-            ("/verifier_sha256", json!("d".repeat(64))), ("/call_id", json!("other-call")),
+            ("/verifier_index", json!(1)),
+            ("/verifier_index", json!(-1)),
+            ("/verifier_sha256", json!("d".repeat(64))),
+            ("/call_id", json!("other-call")),
             ("/source_postimages", json!({})),
-            ("/source_postimages", json!({"src/other.rs": {"sha256": "b".repeat(64), "bytes": 28, "mode": 420}})),
-            ("/source_postimages/src~1example.rs/sha256", json!("B".repeat(64))),
+            (
+                "/source_postimages",
+                json!({"src/other.rs": {"sha256": "b".repeat(64), "bytes": 28, "mode": 420}}),
+            ),
+            (
+                "/source_postimages/src~1example.rs/sha256",
+                json!("B".repeat(64)),
+            ),
             ("/source_postimages/src~1example.rs/bytes", json!(-1)),
             ("/source_postimages/src~1example.rs/mode", json!(1.5)),
         ] {
@@ -2860,7 +6586,9 @@ mod tests {
             let failed = outcome_verifier(&session, "fail", 0, 1, false);
             append_outcome(&mut session, "fail-runtime", vec![failed]);
             let mut passed = outcome_verifier(&session, "bad-pass", 0, 0, true);
-            *passed.1["output"]["verification_evidence"].pointer_mut(pointer).expect("fixture pointer") = value;
+            *passed.1["output"]["verification_evidence"]
+                .pointer_mut(pointer)
+                .expect("fixture pointer") = value;
             append_outcome(&mut session, "bad-runtime", vec![passed]);
             let mut tracker = super::TerminalOutcomeTracker::new(&session);
             assert!(tracker.hard_veto, "{pointer}");
@@ -2887,8 +6615,12 @@ mod tests {
         append_outcome(&mut session, "other-runtime", vec![passed]);
         let mut tracker = super::TerminalOutcomeTracker::new(&session);
         assert!(!tracker.proven());
-        assert!(!tracker.hard_veto, "a different valid verifier does not resolve index zero");
-        session.jspace_contract.as_mut().expect("contract")["verifier_commands"][0]["timeout_seconds"] = json!(31);
+        assert!(
+            !tracker.hard_veto,
+            "a different valid verifier does not resolve index zero"
+        );
+        session.jspace_contract.as_mut().expect("contract")["verifier_commands"][0]["timeout_seconds"] =
+            json!(31);
         let passed = outcome_verifier(&session, "changed-grant", 0, 0, true);
         append_outcome(&mut session, "changed-runtime", vec![passed]);
         tracker.observe_session(&session);
@@ -2898,14 +6630,21 @@ mod tests {
     #[test]
     fn focused_outcome_uncertain_cleanup_and_nonworkload_failures_never_resolve() {
         for (key, value) in [
-            ("outcome", json!("unknown")), ("terminal_state", json!("terminated")),
-            ("process_reaped", json!(false)), ("process_group_empty", json!(false)),
-            ("termination_proven", json!(false)), ("reconcile_required", json!(true)),
-            ("exit_code", json!(-1)), ("exit_code", serde_json::Value::Null),
-            ("failure_class", json!("cleanup")), ("termination_origin", json!("shell")),
-            ("unresolved_effects", json!(["pending"])), ("error", json!("cleanup failed")),
+            ("outcome", json!("unknown")),
+            ("terminal_state", json!("terminated")),
+            ("process_reaped", json!(false)),
+            ("process_group_empty", json!(false)),
+            ("termination_proven", json!(false)),
+            ("reconcile_required", json!(true)),
+            ("exit_code", json!(-1)),
+            ("exit_code", serde_json::Value::Null),
+            ("failure_class", json!("cleanup")),
+            ("termination_origin", json!("shell")),
+            ("unresolved_effects", json!(["pending"])),
+            ("error", json!("cleanup failed")),
             ("authority_effect", json!("unproven")),
-            ("staging_authority", json!("unknown")), ("authoritative_publication", json!("unknown")),
+            ("staging_authority", json!("unknown")),
+            ("authoritative_publication", json!("unknown")),
             ("timed_out", json!(true)),
         ] {
             let mut session = outcome_session();
@@ -2929,8 +6668,26 @@ mod tests {
             let mut tracker = super::TerminalOutcomeTracker::new(&session);
             assert!(tracker.proven());
             append_outcome(&mut session, "patch-runtime", vec![outcome_mutation()]);
-            let passed = outcome_verifier(&session, if duplicate_runtime { "new-call" } else { "same-call" }, 0, 0, true);
-            append_outcome(&mut session, if duplicate_runtime { "same-runtime" } else { "new-runtime" }, vec![passed]);
+            let passed = outcome_verifier(
+                &session,
+                if duplicate_runtime {
+                    "new-call"
+                } else {
+                    "same-call"
+                },
+                0,
+                0,
+                true,
+            );
+            append_outcome(
+                &mut session,
+                if duplicate_runtime {
+                    "same-runtime"
+                } else {
+                    "new-runtime"
+                },
+                vec![passed],
+            );
             tracker.observe_session(&session);
             assert!(tracker.hard_veto);
             assert!(!tracker.proven());
@@ -2944,34 +6701,60 @@ mod tests {
             let pair = outcome_verifier(&session, call, 0, exit, exit == 0);
             let value = outcome_batch("same-runtime", vec![pair]);
             crate::context::accumulate_tool_result_with_provider_metadata(
-                &mut session, "command_run", value["input"].clone(), value["output"].clone(),
-                exit == 0, if exit == 0 { None } else { Some("test failed".to_owned()) },
-                Some("same-runtime"), None,
-            ).expect("native context accumulation");
+                &mut session,
+                "command_run",
+                value["input"].clone(),
+                value["output"].clone(),
+                exit == 0,
+                if exit == 0 {
+                    None
+                } else {
+                    Some("test failed".to_owned())
+                },
+                Some("same-runtime"),
+                None,
+            )
+            .expect("native context accumulation");
         }
         let mut tracker = super::TerminalOutcomeTracker::new(&session);
         assert!(!tracker.hard_veto);
         assert!(tracker.proven());
         assert_eq!(tracker.runtimes.len(), 2);
-        let duplicate = session.session_log.last().expect("last result").raw().to_owned();
+        let duplicate = session
+            .session_log
+            .last()
+            .expect("last result")
+            .raw()
+            .to_owned();
         session.push_log(duplicate, Utc::now());
         tracker.observe_session(&session);
-        assert!(tracker.hard_veto, "replaying the same native sequence remains invalid");
+        assert!(
+            tracker.hard_veto,
+            "replaying the same native sequence remains invalid"
+        );
     }
 
     #[test]
     fn focused_outcome_batch_steps_are_happens_before_not_array_order() {
-        for (mutation_step, verifier_step, expected, hard) in [(1, 2, true, false), (1, 1, false, true), (2, 1, false, false)] {
+        for (mutation_step, verifier_step, expected, hard) in [
+            (1, 2, true, false),
+            (1, 1, false, true),
+            (2, 1, false, false),
+        ] {
             for reverse in [false, true] {
                 let mut session = outcome_session();
                 let failed = outcome_verifier(&session, "fail", 0, 1, false);
                 append_outcome(&mut session, "fail-runtime", vec![failed]);
                 let mut mutation = outcome_mutation();
-                mutation.0["step"] = json!(mutation_step); mutation.1["step"] = json!(mutation_step);
+                mutation.0["step"] = json!(mutation_step);
+                mutation.1["step"] = json!(mutation_step);
                 let mut passed = outcome_verifier(&session, "pass", 0, 0, true);
-                passed.0["step"] = json!(verifier_step); passed.1["step"] = json!(verifier_step);
+                passed.0["step"] = json!(verifier_step);
+                passed.1["step"] = json!(verifier_step);
                 let mut pairs = vec![mutation, passed];
-                if reverse { pairs.reverse(); }
+                if reverse {
+                    pairs.reverse();
+                }
                 append_outcome(&mut session, "batch-runtime", pairs);
                 let tracker = super::TerminalOutcomeTracker::new(&session);
                 assert_eq!(tracker.proven(), expected);
@@ -2983,7 +6766,8 @@ mod tests {
         append_outcome(&mut session, "fail-runtime", vec![failed]);
         let passed = outcome_verifier(&session, "pass", 0, 0, true);
         let mut mutation = outcome_mutation();
-        mutation.0["step"] = json!(2); mutation.1["step"] = json!(2);
+        mutation.0["step"] = json!(2);
+        mutation.1["step"] = json!(2);
         append_outcome(&mut session, "batch-runtime", vec![passed, mutation]);
         let tracker = super::TerminalOutcomeTracker::new(&session);
         assert!(!tracker.proven());
@@ -2992,22 +6776,38 @@ mod tests {
 
     #[test]
     fn focused_outcome_nonmonotonic_prefixes_are_proven() {
-        for order in [vec![0, 1], vec![1, 0], vec![0, 1, 2], vec![1, 0, 2], vec![1, 2, 0]] {
+        for order in [
+            vec![0, 1],
+            vec![1, 0],
+            vec![0, 1, 2],
+            vec![1, 0, 2],
+            vec![1, 2, 0],
+        ] {
             let mut session = outcome_session();
             let runtime = test_runtime_with_usage(&session, 0);
             let done = terminal_done_result();
-            let mut doing = (done.arguments["commands"][0].clone(), done.result["results"][0].clone());
+            let mut doing = (
+                done.arguments["commands"][0].clone(),
+                done.result["results"][0].clone(),
+            );
             doing.0["command_line"] = json!(json!({"status": "doing"}).to_string());
             doing.1["output"]["task_status"]["status"] = json!("doing");
-            let mut read = (json!({"command_type": "source_read", "step": 2,
+            let mut read = (
+                json!({"command_type": "source_read", "step": 2,
                 "command_line": json!({"path": "tests/test_graph_process.py", "start_line": 69,
                     "end_line": 248, "line_numbers": true}).to_string()}),
-                crate::tool_callback_sanitizer::tests::source_read_result());
+                crate::tool_callback_sanitizer::tests::source_read_result(),
+            );
             read.1["step"] = json!(2);
             let pairs = [doing.clone(), read, doing];
-            let mut batch = native_streamed_batch(&runtime, "prefix-provider",
-                order.iter().map(|&index| pairs[index].clone()).collect());
-            batch["output"]["command_events"].as_array_mut().expect("events")
+            let mut batch = native_streamed_batch(
+                &runtime,
+                "prefix-provider",
+                order.iter().map(|&index| pairs[index].clone()).collect(),
+            );
+            batch["output"]["command_events"]
+                .as_array_mut()
+                .expect("events")
                 .sort_by_key(|event| event["step"].as_u64().expect("step"));
             record_native_outcome(&mut session, &runtime, &batch);
             let mut tracker = super::TerminalOutcomeTracker::new(&session);
@@ -3016,16 +6816,32 @@ mod tests {
             assert_eq!(tracker.mutation_generation, 0);
             assert!(tracker.streamed.is_empty());
             let mut passed = outcome_verifier(&session, "pass", 0, 0, true);
-            passed.0["step"] = json!(2); passed.1["step"] = json!(2);
+            passed.0["step"] = json!(2);
+            passed.1["step"] = json!(2);
             let done = terminal_done_result();
-            let mut status = (done.arguments["commands"][0].clone(), done.result["results"][0].clone());
-            status.0["step"] = json!(3); status.1["step"] = json!(3);
-            record_native_outcome(&mut session, &runtime,
-                &native_streamed_batch(&runtime, "repair-provider", vec![outcome_mutation(), passed, status]));
+            let mut status = (
+                done.arguments["commands"][0].clone(),
+                done.result["results"][0].clone(),
+            );
+            status.0["step"] = json!(3);
+            status.1["step"] = json!(3);
+            record_native_outcome(
+                &mut session,
+                &runtime,
+                &native_streamed_batch(
+                    &runtime,
+                    "repair-provider",
+                    vec![outcome_mutation(), passed, status],
+                ),
+            );
             tracker.observe_session(&session);
             assert!(!tracker.hard_veto, "{order:?}");
             assert_eq!(tracker.mutation_generation, 1);
-            assert_eq!(tracker.delivery_status(&session, &runtime, &[terminal_done_result()]), Some("done"), "{order:?}");
+            assert_eq!(
+                tracker.delivery_status(&session, &runtime, &[terminal_done_result()]),
+                Some("done"),
+                "{order:?}"
+            );
         }
     }
 
@@ -3035,11 +6851,17 @@ mod tests {
         let runtime = test_runtime_with_usage(&session, 0);
         let batch = native_crossed_index_batch(&runtime);
         assert_eq!(batch["output"]["commands"], batch["input"]["commands"]);
-        let events = batch["output"]["command_events"].as_array().expect("events");
+        let events = batch["output"]["command_events"]
+            .as_array()
+            .expect("events");
         for (index, kind, step) in [(0, "source_read", 2), (1, "task_status", 1)] {
             assert_eq!(events[index]["status"], "ready");
             assert_eq!(events[index]["command_index"], json!(index));
-            for value in [&events[index], &batch["input"]["commands"][index], &batch["output"]["results"][index]] {
+            for value in [
+                &events[index],
+                &batch["input"]["commands"][index],
+                &batch["output"]["results"][index],
+            ] {
                 assert_eq!(value["command_type"], kind);
                 assert_eq!(value["step"], json!(step));
             }
@@ -3060,13 +6882,22 @@ mod tests {
             tracker.observe_streamed(event);
             assert!(!tracker.hard_veto, "event_index={index}");
         }
-        assert!(!tracker.proven(), "completions still require their canonical batch");
-        assert!(tracker.streamed_batch_matches(&runtime.runtime_id, 2, &batch["output"]["command_events"]));
+        assert!(
+            !tracker.proven(),
+            "completions still require their canonical batch"
+        );
+        assert!(tracker.streamed_batch_matches(
+            &runtime.runtime_id,
+            2,
+            &batch["output"]["command_events"]
+        ));
         let mut conflicting = batch["output"]["command_events"].clone();
         conflicting[2]["result_index"] = json!(1);
         conflicting[3]["result_index"] = json!(0);
-        assert!(!tracker.streamed_batch_matches(&runtime.runtime_id, 2, &conflicting),
-            "duplicate event payloads must retain authenticated completion positions");
+        assert!(
+            !tracker.streamed_batch_matches(&runtime.runtime_id, 2, &conflicting),
+            "duplicate event payloads must retain authenticated completion positions"
+        );
         tracker.observe_batch(&batch);
         assert!(tracker.proven());
         assert_eq!(tracker.mutation_generation, 0);
@@ -3081,31 +6912,81 @@ mod tests {
 
     #[test]
     fn focused_outcome_streamed_indices_preserve_legacy_and_validate_every_copy() {
-        assert_eq!(super::terminal_stream_indices(&json!({"status": "ready", "command_index": 0})), Some((0, None)));
-        assert_eq!(super::terminal_stream_indices(&json!({"status": "ready", "command_index": 0, "result_index": 0})),
-            Some((0, Some(0))));
-        assert_eq!(super::terminal_stream_indices(&json!({"status": "completed", "result_index": 0})), Some((0, Some(0))));
+        assert_eq!(
+            super::terminal_stream_indices(&json!({"status": "ready", "command_index": 0})),
+            Some((0, None))
+        );
+        assert_eq!(
+            super::terminal_stream_indices(
+                &json!({"status": "ready", "command_index": 0, "result_index": 0})
+            ),
+            Some((0, Some(0)))
+        );
+        assert_eq!(
+            super::terminal_stream_indices(&json!({"status": "completed", "result_index": 0})),
+            Some((0, Some(0)))
+        );
         let completed = json!({"status": "completed", "command_index": 1, "result_index": 0,
             "result": {"command_index": 1, "command": {"command_index": 1}}});
-        assert_eq!(super::terminal_stream_indices(&completed), Some((1, Some(0))));
+        assert_eq!(
+            super::terminal_stream_indices(&completed),
+            Some((1, Some(0)))
+        );
         let mut embedded_only = completed.clone();
-        embedded_only.as_object_mut().unwrap().remove("command_index");
-        assert_eq!(super::terminal_stream_indices(&embedded_only), Some((1, Some(0))));
-        embedded_only["result"].as_object_mut().unwrap().remove("command_index");
-        assert_eq!(super::terminal_stream_indices(&embedded_only), Some((1, Some(0))));
-        for field in ["/command_index", "/result/command_index", "/result/command/command_index"] {
-            for value in [json!(0), json!(null), json!(-1), json!(0.5), json!("1"), json!(true),
-                json!(super::MAX_TERMINAL_TRACKED_COMMANDS), json!(u64::MAX)] {
+        embedded_only
+            .as_object_mut()
+            .unwrap()
+            .remove("command_index");
+        assert_eq!(
+            super::terminal_stream_indices(&embedded_only),
+            Some((1, Some(0)))
+        );
+        embedded_only["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("command_index");
+        assert_eq!(
+            super::terminal_stream_indices(&embedded_only),
+            Some((1, Some(0)))
+        );
+        for field in [
+            "/command_index",
+            "/result/command_index",
+            "/result/command/command_index",
+        ] {
+            for value in [
+                json!(0),
+                json!(null),
+                json!(-1),
+                json!(0.5),
+                json!("1"),
+                json!(true),
+                json!(super::MAX_TERMINAL_TRACKED_COMMANDS),
+                json!(u64::MAX),
+            ] {
                 let mut malformed = completed.clone();
                 *malformed.pointer_mut(field).expect("identity copy") = value;
-                assert!(super::terminal_stream_indices(&malformed).is_none(), "{field}: {malformed}");
+                assert!(
+                    super::terminal_stream_indices(&malformed).is_none(),
+                    "{field}: {malformed}"
+                );
             }
         }
-        for value in [json!(null), json!(-1), json!(0.5), json!("0"), json!(true),
-            json!(super::MAX_TERMINAL_TRACKED_COMMANDS), json!(u64::MAX)] {
+        for value in [
+            json!(null),
+            json!(-1),
+            json!(0.5),
+            json!("0"),
+            json!(true),
+            json!(super::MAX_TERMINAL_TRACKED_COMMANDS),
+            json!(u64::MAX),
+        ] {
             let mut malformed = completed.clone();
             malformed["result_index"] = value;
-            assert!(super::terminal_stream_indices(&malformed).is_none(), "{malformed}");
+            assert!(
+                super::terminal_stream_indices(&malformed).is_none(),
+                "{malformed}"
+            );
         }
         for malformed in [
             json!({"status": "ready", "result_index": 0, "command": {"command_index": 0}}),
@@ -3113,7 +6994,10 @@ mod tests {
             json!({"status": "completed", "command_index": 1}),
             json!({"status": "pending", "command_index": 1, "result_index": 0}),
         ] {
-            assert!(super::terminal_stream_indices(&malformed).is_none(), "{malformed}");
+            assert!(
+                super::terminal_stream_indices(&malformed).is_none(),
+                "{malformed}"
+            );
         }
     }
 
@@ -3123,33 +7007,60 @@ mod tests {
             let mut session = outcome_session();
             let runtime = test_runtime_with_usage(&session, 0);
             let mut batch = native_crossed_index_batch(&runtime);
-            let events = batch["output"]["command_events"].as_array_mut().expect("events");
+            let events = batch["output"]["command_events"]
+                .as_array_mut()
+                .expect("events");
             match scenario {
                 0 => events[2]["command_index"] = json!(0),
                 1 => events[2]["result"]["command_index"] = json!(0),
                 2 => events[2]["result"]["command"]["command_index"] = json!(0),
                 3 => events[2]["result"]["provider_tool_call_id"] = json!("other-provider"),
-                4 => events[2]["result"]["command"]["provider_tool_call_id"] = json!("other-provider"),
+                4 => {
+                    events[2]["result"]["command"]["provider_tool_call_id"] =
+                        json!("other-provider")
+                }
                 5 => events[2]["runtime_id"] = json!("other-runtime"),
                 6 => events[2]["provider_tool_call_id"] = json!("other-provider"),
                 7 => events[2]["result"]["runtime_id"] = json!("other-runtime"),
                 8 => events[2]["result"]["command"]["runtime_id"] = json!("other-runtime"),
                 9 => events[3]["result_index"] = json!(0),
                 10 => events[3]["result_index"] = json!(2),
-                11 => { let duplicate = events[2].clone(); events.push(duplicate); },
-                12 => { events.remove(3); },
-                13 => batch["output"]["results"].as_array_mut().expect("results").swap(0, 1),
-                _ => batch["output"]["results"][0]["output"]["stdout"] = json!("not the streamed result"),
+                11 => {
+                    let duplicate = events[2].clone();
+                    events.push(duplicate);
+                }
+                12 => {
+                    events.remove(3);
+                }
+                13 => batch["output"]["results"]
+                    .as_array_mut()
+                    .expect("results")
+                    .swap(0, 1),
+                _ => {
+                    batch["output"]["results"][0]["output"]["stdout"] =
+                        json!("not the streamed result")
+                }
             }
             let mut streamed = super::TerminalOutcomeTracker::new(&session);
-            for event in batch["output"]["command_events"].as_array().expect("events") {
+            for event in batch["output"]["command_events"]
+                .as_array()
+                .expect("events")
+            {
                 streamed.observe_streamed(event);
-                if streamed.hard_veto { break; }
+                if streamed.hard_veto {
+                    break;
+                }
             }
             // Identity conflicts and duplicate positions must fail before the
             // final fingerprint comparison can incidentally reject them.
-            assert_eq!(streamed.hard_veto, matches!(scenario, 0..=9 | 11), "scenario {scenario}");
-            if !streamed.hard_veto { streamed.observe_batch(&batch); }
+            assert_eq!(
+                streamed.hard_veto,
+                matches!(scenario, 0..=9 | 11),
+                "scenario {scenario}"
+            );
+            if !streamed.hard_veto {
+                streamed.observe_batch(&batch);
+            }
             assert!(streamed.hard_veto, "explicit events: scenario {scenario}");
             assert!(!streamed.proven(), "explicit events: scenario {scenario}");
             record_native_outcome(&mut session, &runtime, &batch);
@@ -3165,20 +7076,32 @@ mod tests {
             let mut session = outcome_session();
             let runtime = test_runtime_with_usage(&session, 0);
             let failed = outcome_verifier(&session, "fail", 0, 1, false);
-            record_native_outcome(&mut session, &runtime,
-                &native_streamed_batch(&runtime, "failed-provider", vec![failed]));
+            record_native_outcome(
+                &mut session,
+                &runtime,
+                &native_streamed_batch(&runtime, "failed-provider", vec![failed]),
+            );
             let mut tracker = super::TerminalOutcomeTracker::new(&session);
             assert!(!tracker.hard_veto);
             assert!(!tracker.proven());
             let mut passed = outcome_verifier(&session, "pass", 0, 0, true);
-            passed.0["step"] = json!(2); passed.1["step"] = json!(2);
+            passed.0["step"] = json!(2);
+            passed.1["step"] = json!(2);
             let done = terminal_done_result();
-            let mut status = (done.arguments["commands"][0].clone(), done.result["results"][0].clone());
-            status.0["step"] = json!(3); status.1["step"] = json!(3);
+            let mut status = (
+                done.arguments["commands"][0].clone(),
+                done.result["results"][0].clone(),
+            );
+            status.0["step"] = json!(3);
+            status.1["step"] = json!(3);
             let mut pairs = vec![outcome_mutation(), passed, status];
-            if reverse { pairs.swap(0, 1); }
+            if reverse {
+                pairs.swap(0, 1);
+            }
             let mut batch = native_streamed_batch(&runtime, "repair-provider", pairs);
-            batch["output"]["command_events"].as_array_mut().expect("events")
+            batch["output"]["command_events"]
+                .as_array_mut()
+                .expect("events")
                 .sort_by_key(|event| event["step"].as_u64().expect("step"));
             record_native_outcome(&mut session, &runtime, &batch);
             tracker.observe_session(&session);
@@ -3188,26 +7111,42 @@ mod tests {
             assert_eq!(tracker.failures.get(&0), Some(&Some(1)));
             assert_eq!(tracker.receipts.len(), 2);
             assert!(tracker.streamed.is_empty());
-            assert_eq!(tracker.delivery_status(&session, &runtime, &[terminal_done_result()]), Some("done"));
+            assert_eq!(
+                tracker.delivery_status(&session, &runtime, &[terminal_done_result()]),
+                Some("done")
+            );
         }
     }
 
     #[test]
     fn focused_outcome_nonmonotonic_verifier_chronology_is_not_array_order() {
-        for (fail_step, mutation_step, pass_step, resolution) in [
-            (1, 2, 3, Some(1)), (3, 2, 1, None), (1, 3, 2, Some(0)),
-        ] {
-            for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+        for (fail_step, mutation_step, pass_step, resolution) in
+            [(1, 2, 3, Some(1)), (3, 2, 1, None), (1, 3, 2, Some(0))]
+        {
+            for order in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
                 let mut session = outcome_session();
                 let mut failed = outcome_verifier(&session, "fail", 0, 1, false);
-                failed.0["step"] = json!(fail_step); failed.1["step"] = json!(fail_step);
+                failed.0["step"] = json!(fail_step);
+                failed.1["step"] = json!(fail_step);
                 let mut mutation = outcome_mutation();
-                mutation.0["step"] = json!(mutation_step); mutation.1["step"] = json!(mutation_step);
+                mutation.0["step"] = json!(mutation_step);
+                mutation.1["step"] = json!(mutation_step);
                 let mut passed = outcome_verifier(&session, "pass", 0, 0, true);
-                passed.0["step"] = json!(pass_step); passed.1["step"] = json!(pass_step);
+                passed.0["step"] = json!(pass_step);
+                passed.1["step"] = json!(pass_step);
                 let pairs = [failed, mutation, passed];
-                append_outcome(&mut session, "batch-runtime",
-                    order.iter().map(|&index| pairs[index].clone()).collect());
+                append_outcome(
+                    &mut session,
+                    "batch-runtime",
+                    order.iter().map(|&index| pairs[index].clone()).collect(),
+                );
                 let tracker = super::TerminalOutcomeTracker::new(&session);
                 assert!(!tracker.hard_veto, "{order:?}");
                 assert_eq!(tracker.mutation_generation, 1);
@@ -3223,10 +7162,13 @@ mod tests {
             let mut session = outcome_session();
             let runtime = test_runtime_with_usage(&session, 0);
             let mut passed = outcome_verifier(&session, "pass", 0, 0, true);
-            passed.0["step"] = json!(2); passed.1["step"] = json!(2);
+            passed.0["step"] = json!(2);
+            passed.1["step"] = json!(2);
             let mut mutation = outcome_mutation();
             match scenario {
-                2 => { mutation.1.as_object_mut().expect("result").remove("output"); },
+                2 => {
+                    mutation.1.as_object_mut().expect("result").remove("output");
+                }
                 3 => mutation.1["output"]["status"] = json!("pending"),
                 4 => {
                     mutation.1["success"] = json!(false);
@@ -3236,10 +7178,21 @@ mod tests {
             }
             let mut batch = native_streamed_batch(&runtime, "provider", vec![passed, mutation]);
             match scenario {
-                0 => batch["output"]["results"].as_array_mut().expect("results").swap(0, 1),
+                0 => batch["output"]["results"]
+                    .as_array_mut()
+                    .expect("results")
+                    .swap(0, 1),
                 1 => batch["output"]["results"][1]["step"] = json!(2),
-                5 => batch["output"]["command_events"][1]["provider_tool_call_id"] = json!("other-provider"),
-                6 => { batch["output"]["command_events"].as_array_mut().expect("events").remove(1); },
+                5 => {
+                    batch["output"]["command_events"][1]["provider_tool_call_id"] =
+                        json!("other-provider")
+                }
+                6 => {
+                    batch["output"]["command_events"]
+                        .as_array_mut()
+                        .expect("events")
+                        .remove(1);
+                }
                 // A distinct completion index is valid; a batch-out-of-bounds
                 // completion index is not (duplicates are covered separately).
                 7 => batch["output"]["command_events"][3]["result_index"] = json!(2),
@@ -3257,28 +7210,52 @@ mod tests {
     #[ignore = "offline diagnostic; requires NOKIY_TERMINAL_HISTORY_FIXTURE"]
     fn focused_outcome_saved_history_replay() {
         #[derive(serde::Deserialize)]
-        struct SavedHistoryRecord { record_json: String }
+        struct SavedHistoryRecord {
+            record_json: String,
+        }
 
         let path = std::env::var_os("NOKIY_TERMINAL_HISTORY_FIXTURE")
             .expect("set NOKIY_TERMINAL_HISTORY_FIXTURE to the saved native history");
         let fixture = std::fs::read(path).expect("read saved history fixture");
-        let history: Vec<SavedHistoryRecord> = serde_json::from_slice(&fixture).expect("parse saved history array");
+        let document: serde_json::Value = serde_json::from_slice(&fixture).expect("parse fixture");
+        let history: Vec<SavedHistoryRecord> = serde_json::from_value(
+            document.get("records").unwrap_or(&document).clone()).expect("parse saved history array");
         assert!(!history.is_empty(), "saved history is empty");
-        let session = outcome_session();
+        let mut session = outcome_session();
+        if document.is_object() {
+            session = test_session(document["session_id"].as_str().expect("session id"));
+            session.session_directory = document["session_directory"].as_str()
+                .expect("session directory").into();
+            session.jspace_contract = Some(document["jspace_contract"].clone());
+        }
         let mut tracker = super::TerminalOutcomeTracker::new(&session);
         let mut batches = 0;
         for (index, entry) in history.into_iter().enumerate() {
-            let record: serde_json::Value = serde_json::from_str(&entry.record_json).expect("parse exact native record");
-            assert!(record.is_object(), "native history record must be an object");
+            let record: serde_json::Value =
+                serde_json::from_str(&entry.record_json).expect("parse exact native record");
+            assert!(
+                record.is_object(),
+                "native history record must be an object"
+            );
             match record["type"].as_str() {
                 Some("streamed_command_event") => tracker.observe_streamed(&record),
-                Some("tool_result") => { tracker.observe_batch(&record); batches += 1; }
+                Some("tool_result") => {
+                    tracker.observe_batch(&record);
+                    batches += 1;
+                }
                 _ => {}
             }
-            assert!(!tracker.hard_veto, "first hard veto: event_index={index} runtime={} sequence={:?}",
-                super::terminal_identity(&record["runtime_id"]).unwrap_or("<missing>"), record["sequence"].as_u64());
+            assert!(
+                !tracker.hard_veto,
+                "first hard veto: event_index={index} runtime={} sequence={:?}",
+                super::terminal_identity(&record["runtime_id"]).unwrap_or("<missing>"),
+                record["sequence"].as_u64()
+            );
         }
-        assert!(batches != 0 && tracker.proven(), "full saved history not proven");
+        assert!(
+            batches != 0 && tracker.proven(),
+            "full saved history not proven"
+        );
     }
 
     #[test]
@@ -3292,14 +7269,20 @@ mod tests {
                 1 => batch["output"]["results"] = json!([]),
                 2 => batch["output"]["results"][0]["success"] = serde_json::Value::Null,
                 3 => batch["output"]["cancelled"] = json!(true),
-                4 => { batch["input"]["commands"][0]["command_type"] = json!("shell_command"); batch["output"]["results"][0]["command_type"] = json!("shell_command"); }
+                4 => {
+                    batch["input"]["commands"][0]["command_type"] = json!("shell_command");
+                    batch["output"]["results"][0]["command_type"] = json!("shell_command");
+                }
                 5 => batch["error"] = json!("unrelated wrapper failure"),
                 _ => batch["output"]["results"][0]["reconcile_required"] = json!(true),
             }
             session.push_log(batch.to_string(), Utc::now());
             let passed = outcome_verifier(&session, "pass", 0, 0, true);
             append_outcome(&mut session, "pass-runtime", vec![passed]);
-            assert!(super::TerminalOutcomeTracker::new(&session).hard_veto, "scenario {scenario}");
+            assert!(
+                super::TerminalOutcomeTracker::new(&session).hard_veto,
+                "scenario {scenario}"
+            );
         }
     }
 
@@ -3316,7 +7299,11 @@ mod tests {
         streamed_outcome(&mut session, "pass-runtime", passed);
         tracker.observe_session(&session);
         assert!(tracker.proven());
-        assert_eq!(tracker.receipts.len(), 2, "callbacks are not additional runs");
+        assert_eq!(
+            tracker.receipts.len(),
+            2,
+            "callbacks are not additional runs"
+        );
         assert_eq!(tracker.runtimes.len(), 2);
     }
 
@@ -3326,20 +7313,35 @@ mod tests {
             let mut session = outcome_session();
             let passed = outcome_verifier(&session, "pass", 0, 0, true);
             streamed_outcome(&mut session, "pass-runtime", passed);
-            let mut entries = session.session_log.iter().map(|entry| entry.value().clone()).collect::<Vec<_>>();
+            let mut entries = session
+                .session_log
+                .iter()
+                .map(|entry| entry.value().clone())
+                .collect::<Vec<_>>();
             match scenario {
                 // Legacy result-index-only identity still needs a matching ready.
                 0 => entries[1]["result_index"] = json!(1),
                 1 => entries[1]["runtime_id"] = json!("other-runtime"),
-                2 => entries[1]["result"]["output"]["terminal_receipt"]["call_id"] = json!("other-call"),
+                2 => {
+                    entries[1]["result"]["output"]["terminal_receipt"]["call_id"] =
+                        json!("other-call")
+                }
                 3 => entries[1]["provider_tool_call_id"] = json!("other-provider-call"),
                 4 => entries.insert(1, entries[0].clone()),
-                5 => { entries.remove(1); },
+                5 => {
+                    entries.remove(1);
+                }
                 6 => entries[1]["success"] = json!(false),
-                _ => entries[2]["output"]["command_events"][1]["result"]["output"]["terminal_receipt"]["call_id"] = json!("other-call"),
+                _ => {
+                    entries[2]["output"]["command_events"][1]["result"]["output"]["terminal_receipt"]
+                        ["call_id"] = json!("other-call")
+                }
             }
             session.replace_session_log(entries.into_iter().map(|value| value.to_string()));
-            assert!(super::TerminalOutcomeTracker::new(&session).hard_veto, "scenario {scenario}");
+            assert!(
+                super::TerminalOutcomeTracker::new(&session).hard_veto,
+                "scenario {scenario}"
+            );
         }
     }
 
@@ -3355,17 +7357,26 @@ mod tests {
         append_outcome(&mut session, "pass-runtime", vec![passed]);
         tracker.observe_session(&session);
         assert!(tracker.proven());
-        assert!(super::TerminalOutcomeTracker::new(&session).hard_veto, "fresh readers lack the omitted prefix");
+        assert!(
+            super::TerminalOutcomeTracker::new(&session).hard_veto,
+            "fresh readers lack the omitted prefix"
+        );
         append_outcome(&mut session, "unseen-patch", vec![outcome_mutation()]);
         session.session_log_retention.omitted_entries += session.session_log.len() as u64;
         session.clear_session_log();
         tracker.observe_session(&session);
-        assert!(tracker.hard_veto, "trimming an unobserved outcome is a history gap");
+        assert!(
+            tracker.hard_veto,
+            "trimming an unobserved outcome is a history gap"
+        );
     }
 
     #[test]
     fn focused_outcome_terminal_markers_and_inconsistent_postimages_are_hard_vetoes() {
-        for marker in [json!({"type": "nokiy.terminal_evidence"}), json!({"schema_version": "nokiy_terminal_evidence_v1"})] {
+        for marker in [
+            json!({"type": "nokiy.terminal_evidence"}),
+            json!({"schema_version": "nokiy_terminal_evidence_v1"}),
+        ] {
             let mut session = outcome_session();
             session.push_log(marker.to_string(), Utc::now());
             assert!(super::TerminalOutcomeTracker::new(&session).hard_veto);
@@ -3374,7 +7385,8 @@ mod tests {
         let passed = outcome_verifier(&session, "pass-0", 0, 0, true);
         append_outcome(&mut session, "runtime-0", vec![passed]);
         let mut passed = outcome_verifier(&session, "pass-1", 1, 0, true);
-        passed.1["output"]["verification_evidence"]["source_postimages"]["src/example.rs"]["sha256"] = json!("c".repeat(64));
+        passed.1["output"]["verification_evidence"]["source_postimages"]["src/example.rs"]["sha256"] =
+            json!("c".repeat(64));
         append_outcome(&mut session, "runtime-1", vec![passed]);
         assert!(super::TerminalOutcomeTracker::new(&session).hard_veto);
     }
@@ -3383,13 +7395,15 @@ mod tests {
     fn focused_outcome_readonly_empty_coverage_is_valid_but_mutable_empty_coverage_is_not() {
         let mut session = outcome_session();
         let contract = session.jspace_contract.as_mut().expect("contract");
-        contract["declared_targets"] = json!([]); contract["write_scopes"] = json!([]);
+        contract["declared_targets"] = json!([]);
+        contract["write_scopes"] = json!([]);
         let failed = outcome_verifier(&session, "fail", 0, 1, false);
         append_outcome(&mut session, "fail-runtime", vec![failed]);
         let passed = outcome_verifier(&session, "pass", 0, 0, true);
         append_outcome(&mut session, "pass-runtime", vec![passed]);
         assert!(super::TerminalOutcomeTracker::new(&session).proven());
-        session.jspace_contract.as_mut().expect("contract")["write_scopes"] = json!(["src/example.rs"]);
+        session.jspace_contract.as_mut().expect("contract")["write_scopes"] =
+            json!(["src/example.rs"]);
         assert!(super::TerminalOutcomeTracker::new(&session).hard_veto);
     }
 
@@ -3410,18 +7424,30 @@ mod tests {
         assert!(tracker.runtimes.len() <= super::MAX_TERMINAL_TRACKED_COMMANDS);
         assert!(tracker.streamed.len() <= super::MAX_TERMINAL_TRACKED_COMMANDS);
         assert!(tracker.streamed_calls.len() <= super::MAX_TERMINAL_TRACKED_COMMANDS);
-        assert!(super::terminal_fingerprint(&json!("x".repeat(super::MAX_TERMINAL_EVIDENCE_BYTES))).is_none());
+        assert!(
+            super::terminal_fingerprint(&json!("x".repeat(super::MAX_TERMINAL_EVIDENCE_BYTES)))
+                .is_none()
+        );
     }
 
     #[test]
     fn focused_outcome_grant_hash_is_sorted_compact_utf8_and_includes_all_fields() {
         use sha2::{Digest, Sha256};
         let value = json!({"z": [false, 2], "a": {"b": "雪", "a": 1}});
-        let expected = format!("{:x}", Sha256::digest("{\"a\":{\"a\":1,\"b\":\"雪\"},\"z\":[false,2]}".as_bytes()));
-        assert_eq!(super::terminal_fingerprint(&value).as_deref(), Some(expected.as_str()));
+        let expected = format!(
+            "{:x}",
+            Sha256::digest("{\"a\":{\"a\":1,\"b\":\"雪\"},\"z\":[false,2]}".as_bytes())
+        );
+        assert_eq!(
+            super::terminal_fingerprint(&value).as_deref(),
+            Some(expected.as_str())
+        );
         let mut with_extra = value.clone();
         with_extra["content_sha256"] = json!("c".repeat(64));
-        assert_ne!(super::terminal_fingerprint(&value), super::terminal_fingerprint(&with_extra));
+        assert_ne!(
+            super::terminal_fingerprint(&value),
+            super::terminal_fingerprint(&with_extra)
+        );
     }
 
     #[tokio::test]
@@ -3432,19 +7458,33 @@ mod tests {
 
         let root = tempfile::tempdir().expect("receipt workspace");
         let directory = root.path().canonicalize().expect("canonical workspace");
-        let store = Arc::new(tura_path::command_receipts::ReceiptStore::open(&directory).expect("receipt store"));
+        let store = Arc::new(
+            tura_path::command_receipts::ReceiptStore::open(&directory).expect("receipt store"),
+        );
         let mut session = outcome_session();
         for (call, exit) in [("actual-failure", 1), ("actual-pass", 0)] {
             let (command, fixture) = outcome_verifier(&session, call, 0, exit, exit == 0);
-            let ctx = ToolContext::new(directory.clone()).with_call_id(call.to_owned())
+            let ctx = ToolContext::new(directory.clone())
+                .with_call_id(call.to_owned())
                 .with_receipt_store(Some(Arc::clone(&store)));
             let observation = VerifierObservation {
-                success: exit == 0, exit_code: exit, stdout: "verifier output".to_owned(),
-                stderr: if exit == 0 { String::new() } else { "test failed".to_owned() },
-                process_reaped: true, process_group_empty: true, outcome: "known".to_owned(),
-                source_postimages: None, verification_evidence: fixture["output"].get("verification_evidence").cloned(),
+                success: exit == 0,
+                exit_code: exit,
+                stdout: "verifier output".to_owned(),
+                stderr: if exit == 0 {
+                    String::new()
+                } else {
+                    "test failed".to_owned()
+                },
+                process_reaped: true,
+                process_group_empty: true,
+                outcome: "known".to_owned(),
+                source_postimages: None,
+                verification_evidence: fixture["output"].get("verification_evidence").cloned(),
+                verifier_output: None,
             };
-            let response = execute_remote_focused_verifier(5, &ctx, async { Ok(observation) }).await;
+            let response =
+                execute_remote_focused_verifier(5, &ctx, async { Ok(observation) }).await;
             assert_eq!(response.success, exit == 0);
             assert!(response.changes.is_empty());
             let result = json!({"command_type": "focused_verifier", "step": 1, "success": response.success,
@@ -3464,17 +7504,25 @@ mod tests {
             let mut failed = outcome_verifier(&session, "fail", 0, 1, false);
             match scenario {
                 0 => failed.0["command_line"] = json!("{\"verifier_index\":0,\"argv\":[]}"),
-                1 => failed.0["command_line"] = json!("{\"verifier_index\":0,\"verifier_index\":0}"),
+                1 => {
+                    failed.0["command_line"] = json!("{\"verifier_index\":0,\"verifier_index\":0}")
+                }
                 2 => failed.0["command_line"] = json!("{\"verifier_index\":999}"),
                 3 => failed.0["workdir"] = json!("."),
                 4 => failed.1["output"]["terminal_receipt"]["call_id"] = json!(""),
                 5 => failed.1["output"]["executor"] = json!("other"),
-                6 => { failed.0["step"] = json!(0); failed.1["step"] = json!(0); },
+                6 => {
+                    failed.0["step"] = json!(0);
+                    failed.1["step"] = json!(0);
+                }
                 7 => session.jspace_contract = None,
                 _ => failed.1["output"]["verification_evidence"] = json!({}),
             }
             append_outcome(&mut session, "failed-runtime", vec![failed]);
-            assert!(super::TerminalOutcomeTracker::new(&session).hard_veto, "scenario {scenario}");
+            assert!(
+                super::TerminalOutcomeTracker::new(&session).hard_veto,
+                "scenario {scenario}"
+            );
         }
     }
 
@@ -3488,14 +7536,24 @@ mod tests {
             let mut passed = outcome_verifier(&session, "pass", 0, 0, true);
             let proof = &mut passed.1["output"]["verification_evidence"];
             match scenario {
-                0 => { proof["source_postimages"].as_object_mut().expect("images").remove("src/second.rs"); },
+                0 => {
+                    proof["source_postimages"]
+                        .as_object_mut()
+                        .expect("images")
+                        .remove("src/second.rs");
+                }
                 1 => proof["unexpected"] = json!(true),
                 2 => proof["source_postimages"]["src/second.rs"]["unexpected"] = json!(true),
-                3 => { proof.as_object_mut().expect("proof").remove("call_id"); },
+                3 => {
+                    proof.as_object_mut().expect("proof").remove("call_id");
+                }
                 _ => proof["call_id"] = json!("x".repeat(super::MAX_TERMINAL_EVIDENCE_BYTES)),
             }
             append_outcome(&mut session, "passed-runtime", vec![passed]);
-            assert!(super::TerminalOutcomeTracker::new(&session).hard_veto, "scenario {scenario}");
+            assert!(
+                super::TerminalOutcomeTracker::new(&session).hard_veto,
+                "scenario {scenario}"
+            );
         }
     }
 
@@ -3504,10 +7562,17 @@ mod tests {
         let mut session = outcome_session();
         let passed = outcome_verifier(&session, "pass", 0, 0, true);
         streamed_outcome(&mut session, "passed-runtime", passed);
-        let entries = session.session_log.iter().map(|entry| entry.raw().to_owned()).collect::<Vec<_>>();
+        let entries = session
+            .session_log
+            .iter()
+            .map(|entry| entry.raw().to_owned())
+            .collect::<Vec<_>>();
         session.replace_session_log(entries[..2].iter().cloned());
         let mut tracker = super::TerminalOutcomeTracker::new(&session);
-        assert!(!tracker.proven(), "callbacks alone are not a canonical successful run");
+        assert!(
+            !tracker.proven(),
+            "callbacks alone are not a canonical successful run"
+        );
         session.session_log_retention.omitted_entries = 2;
         session.clear_session_log();
         session.push_log(entries[2].clone(), Utc::now());
@@ -3521,7 +7586,10 @@ mod tests {
     fn focused_outcome_legacy_native_success_is_not_a_resolving_proof() {
         let mut session = outcome_session();
         let mut native = outcome_verifier(&session, "native-pass", 0, 0, false);
-        native.1["output"].as_object_mut().expect("output").remove("executor");
+        native.1["output"]
+            .as_object_mut()
+            .expect("output")
+            .remove("executor");
         native.1["output"]["terminal_receipt"]["termination_origin"] = json!("process_exit");
         let mut no_binding = test_session("legacy-native");
         append_outcome(&mut no_binding, "native-runtime", vec![native.clone()]);
@@ -3538,14 +7606,15 @@ mod tests {
     fn terminal_evidence_requires_bound_known_command_outcomes_and_closed_effects() {
         let arguments = json!({"commands":[{"command_type":"shell_command"}]});
         let output = json!({"results":[{"command_type":"shell_command", "success":true,
-            "output":{"exit_code":0, "stdout":"verified", "terminal_receipt":{
-                "schema_version":"tura_command_terminal_receipt_v1",
-                "outcome":"known", "terminal_state":"completed", "termination_proven":true,
-                "process_reaped":true, "process_group_empty":true, "reconcile_required":false,
-                "authoritative_publication":"unproven", "authority_effect":"none", "exit_code":null
-            }}}]});
-        let proven = |output: &serde_json::Value| super::terminal_tool_outcome_proven(
-            "command_run", true, None, &arguments, output);
+        "output":{"exit_code":0, "stdout":"verified", "terminal_receipt":{
+            "schema_version":"tura_command_terminal_receipt_v1",
+            "outcome":"known", "terminal_state":"completed", "termination_proven":true,
+            "process_reaped":true, "process_group_empty":true, "reconcile_required":false,
+            "authoritative_publication":"unproven", "authority_effect":"none", "exit_code":null
+        }}}]});
+        let proven = |output: &serde_json::Value| {
+            super::terminal_tool_outcome_proven("command_run", true, None, &arguments, output)
+        };
         assert!(proven(&output));
         for (pointer, key, value) in [
             ("/results/0", "success", json!(false)),
@@ -3553,24 +7622,54 @@ mod tests {
             ("/results/0/output", "exit_code", json!(7)),
             ("/results/0/output", "exit_code", serde_json::Value::Null),
             ("/results/0/output", "outcome", json!("unknown")),
-            ("/results/0/output/terminal_receipt", "reconcile_required", json!(true)),
-            ("/results/0/output/terminal_receipt", "process_reaped", json!(false)),
-            ("/results/0/output/terminal_receipt", "process_group_empty", json!(false)),
-            ("/results/0/output/terminal_receipt", "termination_proven", json!(false)),
-            ("/results/0/output/terminal_receipt", "unresolved_effects", json!(["pending effect"])),
+            (
+                "/results/0/output/terminal_receipt",
+                "reconcile_required",
+                json!(true),
+            ),
+            (
+                "/results/0/output/terminal_receipt",
+                "process_reaped",
+                json!(false),
+            ),
+            (
+                "/results/0/output/terminal_receipt",
+                "process_group_empty",
+                json!(false),
+            ),
+            (
+                "/results/0/output/terminal_receipt",
+                "termination_proven",
+                json!(false),
+            ),
+            (
+                "/results/0/output/terminal_receipt",
+                "unresolved_effects",
+                json!(["pending effect"]),
+            ),
         ] {
             let mut invalid = output.clone();
             invalid.pointer_mut(pointer).expect("fixture path")[key] = value;
-            assert!(!proven(&invalid), "{pointer}/{key} must veto terminal delivery");
+            assert!(
+                !proven(&invalid),
+                "{pointer}/{key} must veto terminal delivery"
+            );
         }
         let mut unknown = output.clone();
-        unknown["results"][0].as_object_mut().expect("result").remove("success");
+        unknown["results"][0]
+            .as_object_mut()
+            .expect("result")
+            .remove("success");
         assert!(!proven(&unknown));
         assert!(!proven(&json!({"results":[]})));
-        assert!(!super::terminal_tool_outcome_proven("opaque", true, None, &arguments, &output));
+        assert!(!super::terminal_tool_outcome_proven(
+            "opaque", true, None, &arguments, &output
+        ));
         let mut incomplete = output;
-        incomplete["results"][0]["output"]["terminal_receipt"].as_object_mut()
-            .expect("receipt").remove("outcome");
+        incomplete["results"][0]["output"]["terminal_receipt"]
+            .as_object_mut()
+            .expect("receipt")
+            .remove("outcome");
         assert!(!proven(&incomplete));
     }
 
@@ -3622,10 +7721,7 @@ mod tests {
         )
         .expect("record transport failure after an accepted effect");
 
-        assert!(
-            !(runtime.state == lifecycle::RuntimeState::TimedOut
-                || crate::provider_flow::errors::runtime_failure_allows_retry(&runtime))
-        );
+        assert!(!crate::provider_flow::errors::runtime_failure_allows_retry(&runtime));
         let failure = runtime.error.as_ref().expect("runtime failure");
         assert_eq!(
             failure.error_code.as_deref(),
@@ -3659,7 +7755,9 @@ mod tests {
         write_provider_retry_progress(&mut output, ProviderRetryProgress::Wait);
         write_provider_retry_progress(&mut output, ProviderRetryProgress::Start);
 
-        assert!(crate::provider_flow::errors::runtime_failure_allows_retry(&runtime));
+        assert!(crate::provider_flow::errors::runtime_failure_allows_retry(
+            &runtime
+        ));
         assert!(crate::provider_flow::errors::runtime_failure_requires_exact_input(&runtime));
         assert!(!runtime.error.as_ref().unwrap().fallback_allowed);
         assert_eq!(
@@ -3741,11 +7839,11 @@ mod tests {
             vec![task.clone()]
         );
         assert_eq!(
-            messages_with_initial_context_prefix(&[developer.clone()], vec![], "task"),
+            messages_with_initial_context_prefix(std::slice::from_ref(&developer), vec![], "task"),
             vec![developer.clone()]
         );
         assert_eq!(
-            messages_with_initial_context_prefix(&[developer.clone()], vec![task.clone()], "task"),
+            messages_with_initial_context_prefix(std::slice::from_ref(&developer), vec![task.clone()], "task"),
             vec![developer, task]
         );
     }
@@ -3759,7 +7857,7 @@ mod tests {
         for distinct in [user, changed_metadata, changed_content] {
             assert_eq!(
                 messages_with_initial_context_prefix(
-                    &[developer.clone()],
+                    std::slice::from_ref(&developer),
                     vec![distinct.clone()],
                     "task"
                 ),
@@ -3782,12 +7880,12 @@ mod tests {
             next_call.clone(),
         ];
         assert_eq!(
-            messages_with_initial_context_prefix(&[developer.clone()], session.clone(), "task"),
+            messages_with_initial_context_prefix(std::slice::from_ref(&developer), session.clone(), "task"),
             session
         );
         assert_eq!(
             messages_with_initial_context_prefix(
-                &[developer.clone()],
+                std::slice::from_ref(&developer),
                 vec![
                     call.clone(),
                     result.clone(),
@@ -4100,7 +8198,8 @@ mod tests {
             runtime.text = text;
             runtime.output = output;
             let publication = visible_runtime_reply(&runtime).map(|_| Ok::<(), &str>(()));
-            let compacted = auto_compact_summary_after_new_context(&session, &runtime, &[]).is_some();
+            let compacted =
+                auto_compact_summary_after_new_context(&session, &runtime, &[]).is_some();
 
             assert!(publication.as_ref().is_some_and(Result::is_ok));
             assert!(compacted);
@@ -4222,6 +8321,7 @@ mod tests {
                 Some("done"),
                 Some(reply),
                 true,
+                None,
             ));
         }
         assert!(!should_end_turn_without_task_status_backfill(
@@ -4229,18 +8329,21 @@ mod tests {
             Some("done"),
             Some(real_reply),
             false,
+            None,
         ));
         assert!(should_end_turn_without_task_status_backfill(
             std::slice::from_ref(&question_status_result),
             Some("question"),
             Some("Which file should I use?"),
             true,
+            None,
         ));
         assert!(!should_end_turn_without_task_status_backfill(
             std::slice::from_ref(&doing_status_result),
             Some("doing"),
             Some("Done."),
             true,
+            None,
         ));
 
         for status in [None, Some("question"), Some("doing")] {
@@ -4249,6 +8352,7 @@ mod tests {
                 status,
                 Some("Done."),
                 true,
+                None,
             ));
         }
 
@@ -4263,6 +8367,7 @@ mod tests {
                 Some("done"),
                 Some(real_reply),
                 true,
+                None,
             ));
         }
 
@@ -4281,6 +8386,7 @@ mod tests {
             Some("done"),
             Some(real_reply),
             true,
+            None,
         ));
         let wrong_tool_result = ToolExecutionResult {
             tool_name: "task_status".to_string(),
@@ -4291,18 +8397,21 @@ mod tests {
             Some("done"),
             Some(real_reply),
             true,
+            None,
         ));
         assert!(!should_end_turn_without_task_status_backfill(
             &[status_result.clone(), status_result],
             Some("done"),
             Some(real_reply),
             true,
+            None,
         ));
         assert!(!should_end_turn_without_task_status_backfill(
             &[],
             Some("done"),
             Some(real_reply),
             true,
+            None,
         ));
     }
 
@@ -4354,6 +8463,7 @@ mod tests {
                                 Some(status),
                                 visible.as_deref(),
                                 published,
+                                runtime.output.as_ref(),
                             ),
                             expected.is_some() && published,
                             "{status}: {text:?}, published={published}"
@@ -4368,6 +8478,298 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn terminal_done_shortcut_requires_final_or_legacy_public_message() {
+        let session = test_session("session-terminal-public-phase");
+        let mut runtime = test_runtime_with_usage(&session, 0);
+        let status_result = ToolExecutionResult {
+            tool_name: "command_run".to_string(),
+            arguments: json!({"commands":[{"command_type":"task_status"}]}),
+            result: json!({"results":[{
+                "command_type":"task_status", "success":true,
+                "output":{"task_status":{"status":"done"}}
+            }]}),
+            success: true,
+            error: None,
+        };
+        for (output, expected_shortcut) in [
+            (
+                json!({"text":"Progress.", "public_messages":[
+                    {"phase":"commentary", "text":"Progress."}
+                ]}),
+                false,
+            ),
+            (
+                json!({"text":"完", "public_messages":[
+                    {"phase":"final_answer", "text":"完"}
+                ]}),
+                true,
+            ),
+            (json!({"text":"Done."}), true),
+            (json!("Done."), true),
+            (
+                json!({"text":"Progress.\nDone.", "public_messages":[
+                    {"phase":"commentary", "text":"Progress."},
+                    {"phase":"final_answer", "text":"Done."}
+                ]}),
+                true,
+            ),
+            (
+                json!({"text":"Progress.\nLegacy.", "public_messages":[
+                    {"phase":"commentary", "text":"Progress."},
+                    {"phase":null, "text":"Legacy."}
+                ]}),
+                true,
+            ),
+            (
+                json!({"text":"Progress.", "public_messages":[
+                    {"phase":"commentary", "text":"Progress."},
+                    {"phase":"final_answer", "text":""},
+                    {"phase":"final_answer", "text":" \t\u{2003}"},
+                    {"phase":"final_answer", "text":"<think>hidden</think>"}
+                ]}),
+                false,
+            ),
+            (
+                json!({"text":"", "public_messages":[
+                    {"phase":"commentary", "text":""},
+                    {"phase":"final_answer", "text":""}
+                ]}),
+                false,
+            ),
+        ] {
+            // Mimic apply_provider_response: text is flattened, output retains
+            // the public projection. The decision must consult that output.
+            runtime.text = tura_llm_rust::extract_response_text(&output).unwrap_or_default();
+            runtime.output = Some(output);
+            let visible = visible_runtime_reply(&runtime);
+            for acknowledged in [false, true] {
+                let published = acknowledged && visible.is_some();
+                let shortcut = should_end_turn_without_task_status_backfill(
+                    std::slice::from_ref(&status_result),
+                    Some("done"),
+                    visible.as_deref(),
+                    published,
+                    runtime.output.as_ref(),
+                );
+                assert_eq!(
+                    shortcut,
+                    expected_shortcut && published,
+                    "{:?}",
+                    runtime.output
+                );
+                if !shortcut {
+                    assert!(terminal_status_needs_final_response_turn(
+                        Some("done"),
+                        published,
+                        false
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn commentary_does_not_change_the_question_shortcut() {
+        let output = json!({"text":"Which file?", "public_messages":[
+            {"phase":"commentary", "text":"Which file?"}
+        ]});
+        let status_result = ToolExecutionResult {
+            tool_name: "command_run".to_string(),
+            arguments: json!({"commands":[{"command_type":"task_status"}]}),
+            result: json!({"results":[{
+                "command_type":"task_status", "success":true,
+                "output":{"task_status":{"status":"question"}}
+            }]}),
+            success: true,
+            error: None,
+        };
+        assert!(should_end_turn_without_task_status_backfill(
+            &[status_result],
+            Some("question"),
+            Some("Which file?"),
+            true,
+            Some(&output)
+        ));
+    }
+
+    #[test]
+    fn explicit_terminal_reply_requires_successful_status_only_or_proven_ordered_result() {
+        let session = test_session("explicit-final-reply");
+        let mut runtime = test_runtime_with_usage(&session, 0);
+        runtime.state = lifecycle::RuntimeState::Finished;
+        runtime.tool_call.push(lifecycle::ToolCallRecord {
+            tool_called_name: "command_run".into(),
+            tool_called_input: json!({"commands":[]}),
+            provider_metadata: None,
+            tool_received_at: runtime.created_at,
+            tool_executed_at: runtime.created_at,
+            tool_calldata_received_at: runtime.created_at,
+            tool_reported_success: true,
+            agent_reported_success: true,
+            agent_reported_helpful: true,
+            agent_reported_summary: String::new(),
+            validator_reported_success: None,
+        });
+        runtime.output = Some(json!({"public_messages":[
+            {"phase":"commentary", "text":"Finishing."}
+        ]}));
+        let reply = r#"{"findings":[{"id":1,"answer":"Complete"}]}"#;
+        let single = json!({"results":[{
+            "command_type":"task_status", "success":true,
+            "output":{"task_status":{"status":"done", "final_reply":reply}}
+        }]});
+        let result = ToolExecutionResult {
+            tool_name: "command_run".into(), arguments: json!({}),
+            result: single.clone(), success: true, error: None,
+        };
+        for output in [single.clone(), json!({"streamed_command_run_result":single.clone()}),
+            json!({"results":[{"mode":"batch", "results":single["results"]}]})] {
+            let wrapped = ToolExecutionResult { result:output, ..result.clone() };
+            assert_eq!(super::explicit_terminal_task_reply(&session, &runtime, &[wrapped]),
+                Some(reply.to_string()));
+        }
+        let ordered = json!({"results":[
+            {"command_type":"apply_patch", "step":1, "success":true, "output":{}},
+            {"command_type":"source_read", "step":2, "success":true, "output":{}},
+            {"command_type":"task_status", "step":3, "success":true,
+             "output":{"task_status":{"status":"done", "final_reply":reply}}}
+        ]});
+        let ordered_result = ToolExecutionResult {
+            arguments: json!({"commands":[
+                {"command_type":"apply_patch"},
+                {"command_type":"source_read"},
+                {"command_type":"task_status"}
+            ]}),
+            result: ordered.clone(),
+            ..result.clone()
+        };
+        for output in [ordered.clone(), json!({"streamed_command_run_result":ordered.clone()})] {
+            let wrapped = ToolExecutionResult { result:output, ..ordered_result.clone() };
+            assert_eq!(super::explicit_terminal_task_reply(&session, &runtime, &[wrapped]),
+                Some(reply.to_string()));
+        }
+        for (key, value) in [
+            ("outcome", json!("unknown")),
+            ("exit_code", json!(7)),
+            ("reconcile_required", json!(true)),
+            ("unresolved_effects", json!(["pending"])),
+            ("terminal_receipt", json!({"reconcile_required":true})),
+        ] {
+            let mut unknown = ordered.clone();
+            unknown["results"][0]["output"][key] = value;
+            for output in [unknown.clone(), json!({"streamed_command_run_result":unknown})] {
+                let wrapped = ToolExecutionResult { result:output, ..ordered_result.clone() };
+                assert!(super::explicit_terminal_task_reply(&session, &runtime, &[wrapped]).is_none(),
+                    "unknown or open effects at {key} cannot deliver a pre-authored success");
+            }
+        }
+        for arguments in [json!({}), json!({"commands":[]}), json!({"commands":[
+            {"command_type":"other"}, {"command_type":"source_read"}, {"command_type":"task_status"}
+        ]})] {
+            let mismatched = ToolExecutionResult { arguments, ..ordered_result.clone() };
+            assert!(super::explicit_terminal_task_reply(&session, &runtime, &[mismatched]).is_none());
+        }
+        let mut failed_ordered = ordered;
+        failed_ordered["results"][0]["success"] = json!(false);
+        let failed = ToolExecutionResult { result:failed_ordered, ..result.clone() };
+        assert!(super::explicit_terminal_task_reply(&session, &runtime, &[failed]).is_none());
+        // Explicit task delivery does not relabel commentary as a final phase.
+        assert!(!super::runtime_output_has_final_reply(runtime.output.as_ref()));
+        for value in [
+            json!({"reply_message":"Hello", "verified":true}),
+            json!({"commands":[], "tool_calls":[], "verified":true}),
+            json!([{"reply_message":"Hello", "value":"literal <think>data</think>"}, 42]),
+        ] {
+            let status = code_tools::commands::task_status::normalize_output(
+                Some(&json!({"status":"done", "final_reply":value})), "").unwrap();
+            let expected = status["task_status"]["final_reply"].as_str().unwrap().to_string();
+            let mut typed = result.clone();
+            typed.result["results"][0]["output"] = status;
+            assert_eq!(super::explicit_terminal_task_reply(&session, &runtime, &[typed.clone()]), Some(expected));
+            for invalid_reply in ["{}", "[]", "null", "true", "\"text\"", "{unfinished"] {
+                typed.result["results"][0]["output"]["task_status"]["final_reply"] = json!(invalid_reply);
+                assert!(super::explicit_terminal_task_reply(&session, &runtime, &[typed.clone()]).is_none());
+            }
+            typed.result["results"][0]["output"]["task_status"]["final_reply_format"] = json!("unknown");
+            assert!(super::explicit_terminal_task_reply(&session, &runtime, &[typed]).is_none());
+        }
+        for output in [
+            json!({"results":[]}),
+            json!({"results":[single["results"][0], single["results"][0]]}),
+            json!({"results":[{"command_type":"source_read", "success":true}, single["results"][0]]}),
+            json!({"results":[{"command_type":"task_status", "success":false,
+                "output":{"task_status":{"status":"done", "final_reply":reply}}}]}),
+        ] {
+            let invalid = ToolExecutionResult { result:output, ..result.clone() };
+            assert!(super::explicit_terminal_task_reply(&session, &runtime, &[invalid]).is_none());
+        }
+        {
+            let mut invalid = result.clone();
+            invalid.result["results"][0]["output"]["task_status"]["status"] = json!("doing");
+            assert!(super::explicit_terminal_task_reply(&session, &runtime, &[invalid]).is_none());
+            // A question delivers its blocker inline instead of in a regeneration turn.
+            let mut question = result.clone();
+            question.result["results"][0]["output"]["task_status"]["status"] = json!("question");
+            assert!(super::explicit_terminal_task_reply(&session, &runtime, &[question]).is_some());
+        }
+        {
+            let field = "compact_context";
+            let mut invalid = result.clone();
+            invalid.result["results"][0]["output"]["task_status"][field] = json!("handoff");
+            assert!(super::explicit_terminal_task_reply(&session, &runtime, &[invalid]).is_none());
+        }
+        for text in ["", " \t\u{2003}", "<think>hidden</think>", "<think>unfinished"] {
+            let mut invalid = result.clone();
+            invalid.result["results"][0]["output"]["task_status"]["final_reply"] = json!(text);
+            assert!(super::explicit_terminal_task_reply(&session, &runtime, &[invalid]).is_none());
+        }
+        for invalid in [
+            ToolExecutionResult { success:false, ..result.clone() },
+            ToolExecutionResult { error:Some("uncertain".into()), ..result.clone() },
+            ToolExecutionResult { tool_name:"other".into(), ..result.clone() },
+        ] {
+            assert!(super::explicit_terminal_task_reply(&session, &runtime, &[invalid]).is_none());
+        }
+        assert!(super::explicit_terminal_task_reply(&session, &runtime, &[]).is_none());
+        assert!(super::explicit_terminal_task_reply(&session, &runtime, &[result.clone(), result.clone()]).is_none());
+        for state in [lifecycle::RuntimeState::Failed, lifecycle::RuntimeState::TimedOut] {
+            let mut invalid = runtime.clone();
+            invalid.state = state;
+            assert!(super::explicit_terminal_task_reply(&session, &invalid, std::slice::from_ref(&result)).is_none());
+        }
+        let mut invalid = runtime.clone();
+        invalid.session_id = "foreign".into();
+        assert!(super::explicit_terminal_task_reply(&session, &invalid, std::slice::from_ref(&result)).is_none());
+        let mut invalid = runtime.clone();
+        invalid.runtime_id.clear();
+        assert!(super::explicit_terminal_task_reply(&session, &invalid, std::slice::from_ref(&result)).is_none());
+        runtime.tool_call.clear();
+        assert!(super::explicit_terminal_task_reply(&session, &runtime, &[result]).is_none());
+    }
+
+    #[test]
+    fn streamed_provider_wrapper_preserves_final_reply_phase_decision() {
+        for (phase, expected) in [("commentary", false), ("final_answer", true)] {
+            let content = json!({"text":"Public reply", "public_messages":[
+                {"phase":phase, "text":"Public reply"}
+            ]});
+            let wrapped = json!({
+                "provider_content":content,
+                "streamed_command_run_result":{"results":[]},
+                "responses_continuity_observation":{"status":"completed"}
+            });
+            assert_eq!(
+                super::runtime_output_has_final_reply(Some(&wrapped)),
+                expected
+            );
+            assert_eq!(
+                super::runtime_output_has_final_reply(Some(&content)),
+                expected
+            );
         }
     }
 
@@ -4406,6 +8808,7 @@ mod tests {
                     Some(status),
                     reply,
                     true,
+                    None,
                 ));
             }
         }
@@ -4439,12 +8842,14 @@ mod tests {
                     Some(status),
                     Some(reply),
                     true,
+                    None,
                 ));
                 assert!(!should_end_turn_without_task_status_backfill(
                     std::slice::from_ref(&status_result),
                     Some(status),
                     Some(reply),
                     false,
+                    None,
                 ));
             }
         }
@@ -4488,6 +8893,191 @@ mod tests {
             true,
         ));
         assert!(!terminal_status_needs_final_response_turn(None, true, true));
+    }
+
+    #[test]
+    fn requested_compaction_keeps_published_question_reply_as_worker_final_text() {
+        // I17 shape: a published capability-gap reply, then one command_run
+        // whose only command is task_status question with compact_context.
+        let reply = "```nokiy_capability_gap_v1\n{\"missing_capabilities\":[{\"tool\":\"focused_verifier\"}]}\n```";
+        let mut turn = requested_compaction_turn("question", reply);
+        assert_eq!(turn.pending.len(), 1, "compact_context is still requested");
+        let status = crate::turn_loop::task_progress::command_run_result_terminal_task_status(
+            &turn.tool_results[0].result,
+        );
+        let visible = visible_runtime_reply(&turn.runtime);
+        let ends_without_backfill = should_end_turn_without_task_status_backfill(
+            &turn.tool_results,
+            status.as_deref(),
+            visible.as_deref(),
+            true,
+            turn.runtime.output.as_ref(),
+        );
+        assert!(
+            ends_without_backfill,
+            "without compaction this published question ends the turn"
+        );
+        let delivered = delivered_tool_turn_reply(None, ends_without_backfill, visible.as_deref());
+        assert_eq!(delivered, Some(reply));
+
+        // The I17 failure: compaction alone drops the delivered reply, and a
+        // settled question has no final response turn to replace it.
+        let mut lost = turn.session.clone();
+        assert!(
+            !compact_tool_turn_retaining_delivered_reply(
+                &mut lost,
+                &turn.pending,
+                None,
+                &[],
+                &mut None,
+            )
+            .expect("compaction without a delivered reply")
+        );
+        assert!(!super::should_continue_after_tool_compaction(
+            true,
+            Some("question")
+        ));
+        assert!(!terminal_status_needs_final_response_turn(
+            Some("question"),
+            true,
+            false
+        ));
+        assert_eq!(
+            worker_response(&lost)["error"],
+            "runtime completed without a final assistant message"
+        );
+
+        assert!(
+            compact_tool_turn_retaining_delivered_reply(
+                &mut turn.session,
+                &turn.pending,
+                delivered,
+                &[],
+                &mut None,
+            )
+            .expect("compaction with a delivered reply")
+        );
+        let record = assert_single_reply_after_compaction(&turn.session, reply);
+        assert_eq!(
+            record["id"],
+            crate::gateway_events::runtime_message_id(&turn.runtime.runtime_id),
+            "the published message identity is re-recorded, not a new message"
+        );
+        let response = worker_response(&turn.session);
+        assert_eq!(response["ok"], true, "{response:#}");
+        assert_eq!(response["final_text"], reply);
+    }
+
+    #[test]
+    fn requested_compaction_keeps_explicit_terminal_reply_as_worker_final_text() {
+        // task_status rejects final_reply with compact_context today, so this
+        // pins the explicit early exit in case both ever reach the loop.
+        let reply = "Patched and verified; parent acceptance is still required.";
+        let mut turn = requested_compaction_turn("done", "Progress note before the status.");
+        crate::context::accumulate_message(
+            &mut turn.session,
+            "assistant",
+            serde_json::Value::String(reply.to_string()),
+        )
+        .expect("explicit terminal reply is recorded after tool results");
+        let visible = visible_runtime_reply(&turn.runtime);
+        let delivered = delivered_tool_turn_reply(Some(reply), false, visible.as_deref());
+        assert_eq!(
+            delivered,
+            Some(reply),
+            "the explicit reply wins over commentary"
+        );
+
+        assert!(
+            compact_tool_turn_retaining_delivered_reply(
+                &mut turn.session,
+                &turn.pending,
+                delivered,
+                &[],
+                &mut None,
+            )
+            .expect("compaction with an explicit terminal reply")
+        );
+        assert_single_reply_after_compaction(&turn.session, reply);
+        let response = worker_response(&turn.session);
+        assert_eq!(response["ok"], true, "{response:#}");
+        assert_eq!(response["final_text"], reply);
+
+        // A reply without a retained record is still recorded once.
+        let mut session = test_session("session-compaction-reply-without-record");
+        let pending = vec![PendingCompactContext {
+            summary: "handoff".to_string(),
+            agent_message_content: None,
+            agent_message_timestamp: Utc::now(),
+        }];
+        assert!(
+            compact_tool_turn_retaining_delivered_reply(
+                &mut session,
+                &pending,
+                Some(reply),
+                &[],
+                &mut None,
+            )
+            .expect("compaction with an unrecorded reply")
+        );
+        assert_single_reply_after_compaction(&session, reply);
+    }
+
+    #[test]
+    fn requested_compaction_without_a_delivered_reply_keeps_existing_paths() {
+        let reply = "Visible progress text.";
+        for (status, published) in [("doing", true), ("question", false), ("done", false)] {
+            let mut turn = requested_compaction_turn(status, reply);
+            let visible = visible_runtime_reply(&turn.runtime);
+            let ends_without_backfill = should_end_turn_without_task_status_backfill(
+                &turn.tool_results,
+                Some(status),
+                visible.as_deref(),
+                published,
+                turn.runtime.output.as_ref(),
+            );
+            assert!(
+                !ends_without_backfill,
+                "{status}: the turn does not end yet"
+            );
+            let delivered =
+                delivered_tool_turn_reply(None, ends_without_backfill, visible.as_deref());
+            assert_eq!(delivered, None);
+
+            assert!(
+                !compact_tool_turn_retaining_delivered_reply(
+                    &mut turn.session,
+                    &turn.pending,
+                    delivered,
+                    &[],
+                    &mut None,
+                )
+                .expect("compaction without a delivered reply")
+            );
+            let log = turn
+                .session
+                .session_log
+                .iter()
+                .map(|entry| entry.value().clone())
+                .collect::<Vec<_>>();
+            assert!(
+                log.iter()
+                    .any(|record| record["type"] == "context_compaction")
+            );
+            assert!(
+                !log.iter().any(|record| record["role"] == "assistant"),
+                "{status}: nothing is re-recorded: {log:#?}"
+            );
+            // The unchanged gates still continue or request the final response.
+            assert_eq!(
+                super::should_continue_after_tool_compaction(true, Some(status)),
+                status == "doing"
+            );
+            assert_eq!(
+                terminal_status_needs_final_response_turn(Some(status), published, false),
+                status != "doing"
+            );
+        }
     }
 
     #[test]
@@ -4625,6 +9215,112 @@ mod tests {
             }))
             .expect("fixture usage should apply");
         runtime
+    }
+
+    struct RequestedCompactionTurn {
+        session: SessionManagement,
+        runtime: RuntimeAggregate,
+        tool_results: Vec<ToolExecutionResult>,
+        pending: Vec<PendingCompactContext>,
+    }
+
+    /// Mirrors the loop up to the tool-results checkpoint: the visible reply is
+    /// recorded, then a single task_status carrying compact_context is
+    /// extracted, stripped, and recorded as the tool result.
+    fn requested_compaction_turn(status: &str, reply: &str) -> RequestedCompactionTurn {
+        let mut session = test_session(&format!("session-{status}-requested-compaction"));
+        let mut runtime = test_runtime_with_usage(&session, 0);
+        runtime.text = reply.to_string();
+        crate::turn_loop::provider_step::accumulate_session_from_runtime(
+            &mut session,
+            &runtime,
+            true,
+        )
+        .expect("published runtime reply is recorded");
+        let task_status = json!({"status": status, "compact_context": "Branch handoff."});
+        let mut tool_results = vec![ToolExecutionResult {
+            tool_name: "command_run".to_string(),
+            arguments: json!({"commands":[{
+                "step": 1,
+                "command_type": "task_status",
+                "command_line": task_status.to_string(),
+            }]}),
+            result: json!({"results":[{
+                "step": 1,
+                "command_type": "task_status",
+                "success": true,
+                "output": {"task_status": task_status},
+            }]}),
+            success: true,
+            error: None,
+        }];
+        let pending = crate::turn_loop::tool_step::extract_compact_context_results(
+            &mut tool_results,
+            Some(&runtime),
+        );
+        for result in &tool_results {
+            crate::context::accumulate_tool_result_with_provider_metadata(
+                &mut session,
+                &result.tool_name,
+                result.arguments.clone(),
+                result.result.clone(),
+                result.success,
+                result.error.clone(),
+                Some(&runtime.runtime_id),
+                None,
+            )
+            .expect("tool result is recorded");
+        }
+        RequestedCompactionTurn {
+            session,
+            runtime,
+            tool_results,
+            pending,
+        }
+    }
+
+    fn worker_response(session: &SessionManagement) -> serde_json::Value {
+        crate::worker::response_from_mano_result_with_evidence(
+            &session.session_id,
+            crate::mano::ManoProcessResult {
+                session: session.clone(),
+                agents: Vec::new(),
+                final_error: None,
+            },
+            false,
+            |_, _| Err("a retained-log reply needs no evidence snapshot".to_string()),
+        )
+    }
+
+    /// The delivered reply is the only retained assistant record and follows
+    /// the compaction checkpoint.
+    fn assert_single_reply_after_compaction(
+        session: &SessionManagement,
+        reply: &str,
+    ) -> serde_json::Value {
+        let log = session
+            .session_log
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        let compaction = log
+            .iter()
+            .position(|record| record["type"] == "context_compaction")
+            .expect("requested compaction still applies");
+        let replies = log
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record["role"] == "assistant")
+            .collect::<Vec<_>>();
+        let [(index, record)] = replies.as_slice() else {
+            panic!("exactly one retained assistant record expected: {log:#?}");
+        };
+        assert!(
+            *index > compaction,
+            "reply must follow the compaction: {log:#?}"
+        );
+        assert_eq!(record["content"], reply);
+        (*record).clone()
     }
 
     struct EnvGuard {

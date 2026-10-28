@@ -21,28 +21,51 @@ pub(crate) fn provider_observation(raw: &serde_json::Value) -> ProviderObservati
         response_id: field(raw, "id"),
         model: field(raw, "model"),
         service_tier: field(raw, "service_tier"),
+        failed_attempts: Vec::new(),
     }
 }
 
-#[cfg(test)]
-mod observation_tests {
-    use super::provider_observation;
-    use serde_json::json;
+pub(crate) fn response_observation(response: &tura_llm_rust::ProviderResponse) -> ProviderObservation {
+    let mut observation = provider_observation(&response.raw);
+    observation.failed_attempts = failure_attempt_values(&response.failed_attempts);
+    observation
+}
 
-    #[test]
-    fn final_response_only_and_missing_fields_are_unknown() {
-        let raw = json!({"id":"resp-final", "model":"gpt-6", "service_tier":"default",
-            "events":[{"response":{"id":"resp-old", "service_tier":"priority"}}]});
-        let observed = provider_observation(&raw);
-        assert_eq!(observed.response_id.as_deref(), Some("resp-final"));
-        assert_eq!(observed.service_tier.as_deref(), Some("default"));
-        assert_eq!(observed.model.as_deref(), Some("gpt-6"));
-        let invalid = provider_observation(&json!({"id":" ", "model":42,
-            "service_tier":"x".repeat(257), "events":[{"response":{"service_tier":"priority"}}]}));
-        assert_eq!(invalid.response_id, None);
-        assert_eq!(invalid.model, None);
-        assert_eq!(invalid.service_tier, None);
+pub(crate) fn attach_transport_timing(
+    mut output: serde_json::Value,
+    metrics: Option<&tura_llm_rust::CallMetrics>,
+) -> serde_json::Value {
+    let timing = metrics.and_then(|m| m.transport_timing.as_ref());
+    let profile = metrics.and_then(|m| m.request_profile.as_ref());
+    if timing.is_none() && profile.is_none() {
+        return output;
     }
+    if let Some(text) = output.as_str() {
+        output = serde_json::json!({"text": text});
+    }
+    if let Some(object) = output.as_object_mut() {
+        if let Some(timing) = timing {
+            object.insert("provider_transport_timing".into(), serde_json::json!({
+                "schema_version": "provider_transport_timing_v1",
+                "source": "local_monotonic_clock",
+                "scope": "request_dispatch_to_validated_stream_completion",
+                "transport": timing.transport,
+                "response_headers_ms": timing.response_headers_ms,
+                "first_output_event_ms": timing.first_output_event_ms,
+                "completed_ms": timing.completed_ms,
+            }));
+        }
+        if let Some(profile) = profile {
+            object.insert("provider_request_profile".into(), profile.clone());
+        }
+    }
+    output
+}
+
+pub(crate) fn failure_attempt_values(
+    attempts: &[tura_llm_rust::failure_usage::FailedProviderAttempt],
+) -> Vec<serde_json::Value> {
+    attempts.iter().map(|a| serde_json::json!(a)).collect()
 }
 
 pub(crate) fn usage_report_from_metrics(
@@ -131,4 +154,73 @@ fn stable_json_hash(value: &serde_json::Value) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::provider_observation;
+    use serde_json::json;
+
+    #[test]
+    fn transport_timing_keeps_missing_unknown_and_does_not_change_usage() {
+        let text = json!("answer");
+        assert_eq!(super::attach_transport_timing(text.clone(), None), text);
+        let metrics = tura_llm_rust::CallMetrics {
+            transport_timing: Some(tura_llm_rust::TransportTiming {
+                transport: "http_sse".into(), response_headers_ms: 10,
+                first_output_event_ms: None, completed_ms: 30,
+            }), ..Default::default()
+        };
+        let output = super::attach_transport_timing(text, Some(&metrics));
+        assert_eq!(output["text"], "answer");
+        assert!(output["provider_transport_timing"]["first_output_event_ms"].is_null());
+        assert!(output.get("provider_request_profile").is_none());
+        assert!(metrics.usage.total_tokens.is_none());
+    }
+
+    #[test]
+    fn request_profile_is_attached_beside_the_visible_text() {
+        let metrics = tura_llm_rust::CallMetrics {
+            request_profile: Some(json!({"instructions_source": "model_catalog"})),
+            ..Default::default()
+        };
+        let output = super::attach_transport_timing(json!("answer"), Some(&metrics));
+        assert_eq!(output["text"], "answer");
+        assert_eq!(output["provider_request_profile"]["instructions_source"], "model_catalog");
+        assert!(output.get("provider_transport_timing").is_none());
+    }
+
+    #[test]
+    fn failure_usage_after_fallback_is_metadata_not_model_output_or_aggregate_cost() {
+        let response = tura_llm_rust::ProviderResponse {
+            content: json!("answer"),
+            raw: json!({"id":"success", "failed_attempts":[{"usage":{"total_tokens":999}}]}),
+            failed_attempts: vec![tura_llm_rust::failure_usage::FailedProviderAttempt {
+                usage: Some(tura_llm_rust::failure_usage::FailedUsage {
+                    total_tokens: Some(12), ..Default::default()
+                }), ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let observation = super::response_observation(&response);
+        assert_eq!(observation.failed_attempts.len(), 1);
+        assert_eq!(observation.failed_attempts[0]["usage"]["total_tokens"], 12);
+        assert_eq!(response.content, json!("answer"));
+        assert!(response.metrics.is_none());
+    }
+
+    #[test]
+    fn final_response_only_and_missing_fields_are_unknown() {
+        let raw = json!({"id":"resp-final", "model":"gpt-6", "service_tier":"default",
+            "events":[{"response":{"id":"resp-old", "service_tier":"priority"}}]});
+        let observed = provider_observation(&raw);
+        assert_eq!(observed.response_id.as_deref(), Some("resp-final"));
+        assert_eq!(observed.service_tier.as_deref(), Some("default"));
+        assert_eq!(observed.model.as_deref(), Some("gpt-6"));
+        let invalid = provider_observation(&json!({"id":" ", "model":42,
+            "service_tier":"x".repeat(257), "events":[{"response":{"service_tier":"priority"}}]}));
+        assert_eq!(invalid.response_id, None);
+        assert_eq!(invalid.model, None);
+        assert_eq!(invalid.service_tier, None);
+    }
 }

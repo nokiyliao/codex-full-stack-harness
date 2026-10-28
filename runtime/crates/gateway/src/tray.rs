@@ -913,6 +913,9 @@ mod tests {
     }
 
     #[test]
+    // Runtime shell processes are recognized by an environment marker; macOS does not expose
+    // other processes' environments, so kill-all cannot see them there.
+    #[cfg_attr(target_os = "macos", ignore = "macOS hides other processes' environment markers")]
     fn tray_kill_all_background_processes_stops_session_processes() -> anyhow::Result<()> {
         let workspace = tempfile::tempdir()?;
         let mut child = spawn_long_running_child(workspace.path(), true)?;

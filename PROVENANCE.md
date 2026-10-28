@@ -1,46 +1,40 @@
 # Source Provenance
 
-## Nokiy v157
+## Current V456 Surface
 
-This is the current snapshot. It includes `packages/nokiy` (MIT; source version
-field `0.3.21.dev0`; installed wheel `0.3.157.dev0`) and `runtime`
-(AGPL-3.0-or-later, modified Tura-derived engine). `releases/v157.json` records
-base commits and per-file hashes, including local uncommitted modifications.
-The base commits do not identify clean snapshots. Binary hashes do not constitute
-a reproducible-build claim. The v9 section below is the previous publication.
+This is a source publication, not a redistribution of installed executables or machine configuration.
 
-## Nokiy v9
-
-
-This snapshot includes `packages/nokiy` (MIT, caller `0.3.21.dev0`) and
-`runtime` (AGPL-3.0-or-later, modified Tura-derived engine). Their licenses and
-notices are preserved. `releases/v9.json` records base commits and per-file hashes,
-including local uncommitted modifications. The base commits do not identify
-clean snapshots. Installed caller v9 reuses runtime-image v8; binary hashes do not
-constitute a reproducible-build claim. The older component identities below are
-lineage references, not the complete current snapshot.
-
-This project is a new integration and product boundary, not a claim of clean-room
-implementation.
-
-## Tura lineage
-
-- Upstream: [Tura-AI/tura](https://github.com/Tura-AI/tura)
-- Modified public fork: [nokiyliao/tura](https://github.com/nokiyliao/tura)
-- Published fork source identity: `5c1c45c53a3ce29750f31c9d37eb7a326a3f5c78`
-- License: `AGPL-3.0-or-later`
-
-Files derived from Tura must retain applicable notices and identify their source
-preimage when they enter this repository. Git history and per-file notices remain
-authoritative; this summary does not reassign upstream authorship.
-
-## Companion projects
-
-| Component | Published identity | License |
+| Component | Source commit | Correspondence |
 | --- | --- | --- |
-| Codex Collaboration Harness | `v0.2.0` | MIT |
-| Deep Context Federation | `v0.91.0` | MIT |
-| Codex Session Governor | `v0.4.0` | MIT |
+| Python caller | `1101c58096f42e6299002a9f1fceba2f021c7d0d` | All 48 non-cache installed package files match byte-for-byte; installed wheel version 0.3.456.dev0 |
+| Rust worker payload | `d66a81c966aade525ec5f2ae2316c3236d62c68d` | All 602 recorded build-source inputs match; four binary hashes match the installed V456 image, inherited from V455 |
+| Switchboard | `c975ad840b08b24a1788b17f7de830e73dc928ec` | Committed source, tests and workflow topology; private diagnostic credentials/configuration and compiled caches excluded |
 
-References to these projects do not relicense them. Any future vendoring must
-preserve their notices and record the exact imported revision.
+These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in releases/v456.json identify the published contents. Publication-only documentation and preserved licenses are identified separately.
+
+The caller working tree contains an unrelated test modification, and the runtime working tree contains pending-message deletions; neither was adopted. Source was exported from exact commits, not by copying dirty worktrees or installed environment directories.
+
+## Excluded Material
+
+- Native binaries, wheels, virtual environments, node_modules, build caches and compiled Python files.
+- Runtime db/ and trace-evidence/ state, sessions, credentials, machine installation/admission records and raw private logs.
+- Operator-only external-latency diagnostics containing a local capability token. The diagnostic is not needed by the running service.
+- Private workspace DCF graphs, project authorization contracts, research data and account/order information.
+
+The generic runtime still uses historical tura_* executable and module names. They are modified source lineage, not a revived Skill or permission to operate private native state.
+
+## Licenses
+
+- packages/nokiy retains MIT and included third-party notices, including its DCF navigation notice.
+- runtime is modified Tura-derived AGPL-3.0-or-later code. The existing published runtime/LICENSE is preserved because the maintained source tree did not carry a separate copy.
+- packages/switchboard is published under this integration repository's AGPL-3.0-or-later license; npm dependencies are referenced, not vendored.
+
+Upstream Tura: https://github.com/Tura-AI/tura
+Modified public lineage: https://github.com/nokiyliao/tura
+Earlier public fork reference: `5c1c45c53a3ce29750f31c9d37eb7a326a3f5c78`.
+
+This is not a clean-room implementation or a claim of sole authorship. No upstream acceptance, independent audit, clean-machine installation or byte-identical binary rebuild is implied.
+
+## Previous Publications
+
+The former v157 publication was based on caller 8950bf3 and runtime bda10dc plus then-uncommitted changes. Its historical documentation/manifest remains history, not proof of current contents. The CURRENT.json pointer selects the current manifest.

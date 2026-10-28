@@ -278,6 +278,14 @@ pub fn load_config(directory: impl AsRef<Path>) -> TuraSessionConfig {
 
 pub fn save_config(directory: impl AsRef<Path>, config: &TuraSessionConfig) -> Result<(), String> {
     let directory = directory.as_ref();
+    // A relative session directory resolves against the gateway's working directory; writing
+    // there would scatter .tura state wherever the process was started.
+    if !directory.is_absolute() {
+        return Err(format!(
+            "session config directory must be absolute: {}",
+            directory.display()
+        ));
+    }
     let tura_directory = tura_dir(directory);
     std::fs::create_dir_all(&tura_directory).map_err(|err| {
         format!(
@@ -733,6 +741,12 @@ model=openrouter/qwen/qwen3.7-max
 
     #[test]
     fn save_config_reports_directory_path_on_create_failure() {
+        let relative = std::path::Path::new("relative-session-config-must-not-be-created");
+        let error = save_config(relative, &TuraSessionConfig::default())
+            .expect_err("a relative session directory is refused");
+        assert!(error.contains("must be absolute"), "{error}");
+        assert!(!relative.exists(), "nothing is written under the working directory");
+
         let temp = tempfile::tempdir().expect("tempdir");
         let blocked_tura_dir = temp.path().join(".tura");
         std::fs::write(&blocked_tura_dir, "not a directory").expect("write blocking file");

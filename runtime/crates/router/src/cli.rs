@@ -26,6 +26,22 @@ pub(crate) fn run_router_command(command: &str) -> anyhow::Result<()> {
             println!("nokiy_focused_verifier_parent_v1");
             Ok(())
         }
+        "source-read-capabilities" => {
+            println!("nokiy_admitted_source_digest_v1");
+            Ok(())
+        }
+        "capsule-source-read-capabilities" => {
+            println!("nokiy_capsule_source_digest_v1");
+            Ok(())
+        }
+        "observed-source-read-capabilities" => {
+            println!("nokiy_observed_source_digest_v1");
+            Ok(())
+        }
+        "directory-source-read-capabilities" => {
+            println!("nokiy_directory_source_read_v1");
+            Ok(())
+        }
         "focused-verifier-plan" => crate::parent_verifier::plan(),
         "native-once" => tokio_runtime()?.block_on(crate::native_once::run()),
         "serve" => tokio_runtime()?.block_on(serve_stdio()),

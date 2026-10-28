@@ -236,15 +236,19 @@ fn parse_long_command_keeps_wall_and_stall_budgets_separate_and_bounded() {
 }
 
 #[test]
-fn parse_rejects_stall_budget_that_cannot_fire_before_wall_timeout() {
-    let error = parse_args(&json!({
+fn parse_drops_stall_budget_that_cannot_fire_before_wall_timeout() {
+    let args = parse_args(&json!({
         "timeout_ms": 10_000,
         "stall_timeout_ms": 10_000,
-        "commands": [{"command_type": "bash", "command_line": "builder"}]
+        "commands": [
+            {"command_type": "bash", "command_line": "builder"},
+            {"command_type": "bash", "command_line": "watcher", "stall_timeout_ms": 2_000}
+        ]
     }))
-    .expect_err("stall watchdog must be lower than wall timeout");
-
-    assert!(error.contains("stall_timeout_ms must be lower"), "{error}");
+    .expect("a stall budget at or past the wall timeout adds no limit");
+    assert_eq!(args.commands[0].stall_timeout_ms, None);
+    assert_eq!(args.commands[0].effective_timeout_ms(), 10_000);
+    assert_eq!(args.commands[1].stall_timeout_ms, Some(2_000));
 }
 
 #[test]
@@ -666,6 +670,34 @@ fn parse_command_item_recovers_inline_arguments_and_residual_fields() {
 }
 
 #[test]
+fn structured_terminal_arguments_preserve_delivery_and_done_guards() {
+    let reply = json!({"answer":"Quoted \"text\" with newline\n", "verified":true});
+    let input = json!({"commands":[{"command_type":"task_status", "command_line":"",
+        "arguments":{"status":"done", "final_reply":reply}, "step":1}]});
+    let parsed = parse_args(&input).expect("structured terminal command");
+    let command = &parsed.commands[0];
+    assert_eq!(command.command, "task_status");
+    assert!(command.command_line.is_empty());
+    let output = crate::commands::task_status::normalize_output(
+        command.inline_arguments.as_ref(), &command.command_line).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(output["task_status"]["final_reply"].as_str().unwrap()).unwrap(), reply);
+    assert_eq!(super::CommandRunTerminalStatusGuard::command_metadata(&input["commands"][0]), (Some(1), true));
+    let mut guard = super::CommandRunTerminalStatusGuard::default();
+    guard.observe_step(Some(1));
+    guard.observe_result(Some(false));
+    assert!(guard.done_error(Some(2), true).is_some());
+
+    let conflicting = json!({"command_type":"task_status", "command_line":"doing",
+        "arguments":{"status":"done", "final_reply":reply}, "step":2});
+    assert_eq!(super::CommandRunTerminalStatusGuard::command_metadata(&conflicting), (Some(2), false));
+    let command = parse_command_item(&conflicting).unwrap();
+    let output = crate::commands::task_status::normalize_output(
+        command.inline_arguments.as_ref(), &command.command_line).unwrap();
+    assert_eq!(output["task_status"]["status"], "doing");
+    assert!(output["task_status"].get("final_reply").is_none());
+}
+
+#[test]
 fn parse_command_item_uses_shell_when_only_payload_field_is_present() {
     let item = parse_command_item(&json!({
         "payload": "echo payload-only",
@@ -690,6 +722,31 @@ fn parse_command_item_rejects_non_object_non_string_and_missing_command() {
             .expect_err("missing command")
             .contains("missing field `command_type`")
     );
+}
+
+// 2026-10-22 i8: a Luna worker sent exact source_read requests typed as zsh; the shell policy
+// refused them as unsafe syntax (JSPACE_COMMAND_SYNTAX_UNSAFE) and each cost a model round.
+#[test]
+fn shell_typed_source_read_json_is_retyped_but_shell_json_and_text_stay_shell() {
+    let shell = crate::commands::active_shell_command_name();
+    let request = r#"{"path":"task_b/tests/test_x.py","search_terms":["raise OSError","BENCH.capture("],"context_lines":3,"start_line":1,"end_line":180}"#;
+    let item = parse_command_item(&json!({
+        "command": "source_error_tests", "command_type": "zsh", "command_line": request
+    }))
+    .unwrap();
+    assert_eq!(item.command, "source_read");
+    assert_eq!(item.command_line, request);
+    for (line, reason) in [
+        (r#"{"command":"rg -n x task_b","workdir":"."}"#, "JSON shell invocation"),
+        (r#"{"path":"task_b/x.py"}"#, "no source_read-only field"),
+        (r#"{"path":["task_b/x.py"],"start_line":1}"#, "path is not a string"),
+        ("cat task_b/x.py", "plain shell text"),
+    ] {
+        let item = parse_command_item(&json!({"command_type": "zsh", "command_line": line})).unwrap();
+        assert_eq!(item.command, shell, "{reason}");
+    }
+    let item = parse_command_item(&json!({"command_type": "apply_patch", "command_line": request})).unwrap();
+    assert_eq!(item.command, "apply_patch");
 }
 
 #[test]
@@ -1051,7 +1108,7 @@ async fn batch_terminal_status_accepts_successful_work_at_a_later_final_step() {
     let workspace = tempfile::tempdir().unwrap();
     let output = super::execute_async_value(
         json!({"commands": [terminal_readback(1), terminal_readback(1), terminal_done(2)]}),
-        workspace.path().to_path_buf(),
+        workspace.path().canonicalize().unwrap(),
     )
     .await;
     let results = output["results"].as_array().expect("results");
@@ -1074,7 +1131,7 @@ async fn batch_terminal_status_fences_failures_without_halting_exploration_or_no
                 {"command_type": "task_status", "task_group": "command batch execution", "step": 3},
                 terminal_done(4)
             ]}),
-            workspace.path().to_path_buf(),
+            workspace.path().canonicalize().unwrap(),
         )
         .await;
         let results = output["results"].as_array().expect("results");
@@ -1086,7 +1143,7 @@ async fn batch_terminal_status_fences_failures_without_halting_exploration_or_no
     }
     let recovered = super::execute_async_value(
         json!({"commands": [terminal_readback(1), terminal_done(2)]}),
-        workspace.path().to_path_buf(),
+        workspace.path().canonicalize().unwrap(),
     )
     .await;
     assert_eq!(recovered["results"][1]["success"], true, "new batch: {recovered}");
@@ -1104,7 +1161,7 @@ async fn batch_terminal_status_rejects_shared_nonfinal_and_repaired_terminal_ste
     ] {
         let expected_count = commands.len();
         let output = super::execute_async_value(
-            json!({"commands": commands}), workspace.path().to_path_buf(),
+            json!({"commands": commands}), workspace.path().canonicalize().unwrap(),
         ).await;
         let results = output["results"].as_array().expect("results");
         assert_eq!(results.len(), expected_count, "every command needs a result: {output}");
@@ -1123,7 +1180,7 @@ async fn batch_terminal_status_rejects_shared_nonfinal_and_repaired_terminal_ste
 #[tokio::test]
 async fn streaming_terminal_status_waits_for_finish_after_successful_work() {
     let workspace = tempfile::tempdir().unwrap();
-    let mut executor = super::StreamingCommandRunExecutor::new(workspace.path().to_path_buf());
+    let mut executor = super::StreamingCommandRunExecutor::new(workspace.path().canonicalize().unwrap());
     let earlier = executor.push_command_value(terminal_readback(1)).await;
     assert_eq!(earlier.len(), 1);
     assert_eq!(earlier[0]["success"], true, "{earlier:?}");
@@ -1141,7 +1198,7 @@ async fn streaming_terminal_status_remembers_drained_failures_and_allows_a_new_b
     let mut failures = terminal_prior_failures();
     failures.push(json!({"step": 1})); // Streamed parse error, not a tool result.
     for failure in failures {
-        let mut executor = super::StreamingCommandRunExecutor::new(workspace.path().to_path_buf());
+        let mut executor = super::StreamingCommandRunExecutor::new(workspace.path().canonicalize().unwrap());
         let failed = executor.push_command_value(failure).await;
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert_eq!(failed[0]["success"], false, "{failed:?}");
@@ -1155,7 +1212,7 @@ async fn streaming_terminal_status_remembers_drained_failures_and_allows_a_new_b
         assert!(!executor.is_halted());
         assert!(executor.finish().await.is_empty());
     }
-    let mut fresh = super::StreamingCommandRunExecutor::new(workspace.path().to_path_buf());
+    let mut fresh = super::StreamingCommandRunExecutor::new(workspace.path().canonicalize().unwrap());
     assert!(fresh.push_command_value(terminal_done(1)).await.is_empty());
     assert_eq!(fresh.finish().await[0]["success"], true);
 }
@@ -1164,7 +1221,7 @@ async fn streaming_terminal_status_remembers_drained_failures_and_allows_a_new_b
 async fn streaming_terminal_status_rejects_following_work_and_ambiguous_steps() {
     let workspace = tempfile::tempdir().unwrap();
     for next_step in [1, 2] {
-        let mut executor = super::StreamingCommandRunExecutor::new(workspace.path().to_path_buf());
+        let mut executor = super::StreamingCommandRunExecutor::new(workspace.path().canonicalize().unwrap());
         assert!(executor.push_command_value(terminal_done(1)).await.is_empty());
         let results = executor.push_command_value(json!({
             "command_type": "task_status", "command_line": "doing", "step": next_step
@@ -1176,7 +1233,7 @@ async fn streaming_terminal_status_rejects_following_work_and_ambiguous_steps() 
         assert!(executor.finish().await.is_empty());
     }
     for steps in [vec![None], vec![Some(1)], vec![Some(3), Some(2)]] {
-        let mut executor = super::StreamingCommandRunExecutor::new(workspace.path().to_path_buf());
+        let mut executor = super::StreamingCommandRunExecutor::new(workspace.path().canonicalize().unwrap());
         for step in &steps {
             let result = executor.push_command_value(json!({
                 "command_type": "task_status", "command_line": "doing", "step": step

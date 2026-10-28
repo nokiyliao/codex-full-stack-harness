@@ -46,6 +46,87 @@ pub(crate) fn command_run_result_is_single_task_status(
     command_run_item_terminal_task_status(item).as_deref() == Some(status)
 }
 
+pub(crate) fn command_run_result_final_reply(result: &serde_json::Value) -> Option<(&str, bool)> {
+    let body = result.get("streamed_command_run_result").unwrap_or(result);
+    if !terminal_delivery_envelope_ok(result) || !terminal_delivery_envelope_ok(body) {
+        return None;
+    }
+    let raw = body.get("results")?.as_array()?;
+    let items = match raw.as_slice() {
+        [batch] if batch.get("mode").and_then(serde_json::Value::as_str) == Some("batch") => {
+            if !terminal_delivery_envelope_ok(batch) {
+                return None;
+            }
+            let nested = batch.get("results")?.as_array()?;
+            if nested.len() != 1 {
+                return None;
+            }
+            nested.as_slice()
+        }
+        rows => rows,
+    };
+    // Classify raw containers before flattening can discard their failure flags.
+    if items.iter().any(|row| row.get("mode").is_some()) {
+        return None;
+    }
+    let (item, prior) = items.split_last()?;
+    if !terminal_delivery_envelope_ok(item) {
+        return None;
+    }
+    if !prior.is_empty() {
+        let mut guard = code_tools::command_run::CommandRunTerminalStatusGuard::default();
+        let mut previous_step = 0;
+        for row in prior {
+            if !terminal_delivery_envelope_ok(row)
+                || command_result_type(row).is_none_or(|kind| kind == TASK_STATUS_COMMAND)
+            {
+                return None;
+            }
+            let step = row.get("step").and_then(serde_json::Value::as_u64)?;
+            if step == 0 || step < previous_step {
+                return None;
+            }
+            previous_step = step;
+            guard.observe_step(Some(step));
+            guard.observe_result(row.get("success").and_then(serde_json::Value::as_bool));
+        }
+        if guard.done_error(item.get("step").and_then(serde_json::Value::as_u64), true).is_some() {
+            return None;
+        }
+    }
+    if !matches!(command_run_item_terminal_task_status(item).as_deref(), Some("done" | "question")) {
+        return None;
+    }
+    let status = item.pointer("/output/task_status")?;
+    if status.get("compact_context").is_some() {
+        return None;
+    }
+    let reply = status.get("final_reply")?.as_str()?;
+    let structured = match status.get("final_reply_format") {
+        None => false,
+        Some(value) if value.as_str() == Some("json") => true,
+        Some(_) => return None,
+    };
+    if structured {
+        let value = serde_json::from_str::<serde_json::Value>(reply).ok()?;
+        if value.as_object().is_none_or(|object| object.is_empty())
+            && value.as_array().is_none_or(|array| array.is_empty())
+        {
+            return None;
+        }
+    }
+    Some((reply, structured))
+}
+
+fn terminal_delivery_envelope_ok(value: &serde_json::Value) -> bool {
+    value.get("cancelled").is_none_or(|flag| flag.as_bool() == Some(false))
+        && value.get("cancel_reason").is_none_or(serde_json::Value::is_null)
+        && value.get("error").is_none_or(serde_json::Value::is_null)
+        && value.get("failure").is_none_or(serde_json::Value::is_null)
+        && value.get("early_finish_reason").is_none_or(serde_json::Value::is_null)
+        && value.get("success").is_none_or(|flag| flag.as_bool() == Some(true))
+}
+
 pub(crate) fn command_run_result_has_command(result: &serde_json::Value) -> bool {
     command_run_result_items(result).into_iter().any(|item| {
         command_result_type(item).is_some_and(|command_type| command_type != TASK_STATUS_COMMAND)
@@ -187,6 +268,130 @@ mod tests {
     use lifecycle::{PlanStatus, SessionInput, SessionManagement, StartCondition, TaskStep};
     use serde_json::json;
     use std::path::PathBuf;
+
+    fn ordered_reply() -> serde_json::Value {
+        json!({"results":[
+            {"command_type":"apply_patch", "step":1, "success":true, "output":{}},
+            {"command_type":"source_read", "step":2, "success":true, "output":{}},
+            {"command_type":"task_status", "step":3, "success":true,
+             "output":{"task_status":{"status":"done", "final_reply":"Parent acceptance pending."}}}
+        ]})
+    }
+
+    #[test]
+    fn ordered_terminal_reply_accepts_successful_steps_and_streamed_envelope() {
+        let input = ordered_reply();
+        for result in [input.clone(), json!({"streamed_command_run_result":input.clone()})] {
+            assert_eq!(super::command_run_result_final_reply(&result),
+                       Some(("Parent acceptance pending.", false)));
+        }
+        let mut independent = input;
+        independent["results"][1]["step"] = json!(1);
+        assert!(super::command_run_result_final_reply(&independent).is_some());
+    }
+
+    #[test]
+    fn ordered_terminal_reply_rejects_failed_unknown_unordered_and_nested_results() {
+        let original = ordered_reply();
+        for flag in [json!(false), json!(null), json!("true")] {
+            let mut result = original.clone();
+            result["results"][0]["success"] = flag;
+            assert!(super::command_run_result_final_reply(&result).is_none());
+        }
+        for path in ["success", "step"] {
+            let mut result = original.clone();
+            result["results"][0].as_object_mut().unwrap().remove(path);
+            assert!(super::command_run_result_final_reply(&result).is_none());
+        }
+        for index in 0..3 {
+            for step in [json!(0), json!("1"), json!(-1), json!(null)] {
+                let mut result = original.clone();
+                result["results"][index]["step"] = step;
+                assert!(super::command_run_result_final_reply(&result).is_none());
+            }
+        }
+        for step in [1, 2] {
+            let mut result = original.clone();
+            result["results"][2]["step"] = json!(step);
+            assert!(super::command_run_result_final_reply(&result).is_none());
+        }
+        let mut reversed = original.clone();
+        reversed["results"][0]["step"] = json!(2);
+        reversed["results"][1]["step"] = json!(1);
+        assert!(super::command_run_result_final_reply(&reversed).is_none());
+        for status in ["doing", "question", "done"] {
+            let mut result = original.clone();
+            result["results"][0] = json!({"command_type":"task_status", "step":1,
+                "success":true, "output":{"task_status":{"status":status}}});
+            assert!(super::command_run_result_final_reply(&result).is_none());
+        }
+        for field in ["error", "cancel_reason", "early_finish_reason", "failure"] {
+            let mut result = original.clone();
+            result["results"][0][field] = json!("uncertain");
+            assert!(super::command_run_result_final_reply(&result).is_none());
+        }
+        let nested = json!({"results":[{"mode":"batch", "cancelled":true,
+            "results":original["results"]}]});
+        assert!(super::command_run_result_final_reply(&nested).is_none());
+        let mut not_last = original;
+        not_last["results"].as_array_mut().unwrap().swap(1, 2);
+        assert!(super::command_run_result_final_reply(&not_last).is_none());
+    }
+
+    #[test]
+    fn terminal_reply_never_ignores_outer_or_streamed_failure_flags() {
+        for flag in [json!(true), json!(null), json!("false")] {
+            for streamed in [false, true] {
+                let mut result = if streamed {
+                    json!({"streamed_command_run_result":ordered_reply()})
+                } else { ordered_reply() };
+                result["cancelled"] = flag.clone();
+                assert!(super::command_run_result_final_reply(&result).is_none());
+            }
+        }
+        for field in ["error", "cancel_reason", "early_finish_reason", "failure"] {
+            let mut body = ordered_reply();
+            body[field] = json!("uncertain");
+            assert!(super::command_run_result_final_reply(&body).is_none());
+            assert!(super::command_run_result_final_reply(
+                &json!({"streamed_command_run_result":body})).is_none());
+            let mut outer = json!({"streamed_command_run_result":ordered_reply()});
+            outer[field] = json!("uncertain");
+            assert!(super::command_run_result_final_reply(&outer).is_none());
+        }
+        let single = json!({"cancelled":true, "results":[ordered_reply()["results"][2]]});
+        assert!(super::command_run_result_final_reply(&single).is_none());
+        let done = ordered_reply()["results"][2].clone();
+        for raw in [
+            json!({"results":[{"mode":"batch", "cancelled":true, "results":[]}, done.clone()]}),
+            json!({"results":[{"mode":"batch", "cancelled":true, "results":[done.clone()]}]}),
+            json!({"results":[{"mode":"batch", "error":"unknown", "results":[]}, done.clone()]}),
+            json!({"results":[{"mode":"batch", "results":[]}, done.clone()]}),
+        ] {
+            assert!(super::command_run_result_final_reply(&raw).is_none());
+            assert!(super::command_run_result_final_reply(
+                &json!({"streamed_command_run_result":raw})).is_none());
+        }
+        let legacy = json!({"results":[{"mode":"batch", "results":[done]}]});
+        for result in [legacy.clone(), json!({"streamed_command_run_result":legacy.clone()})] {
+            assert_eq!(super::command_run_result_final_reply(&result),
+                Some(("Parent acceptance pending.", false)));
+        }
+        for (field, value) in [
+            ("cancelled", json!(true)),
+            ("success", json!(false)),
+            ("error", json!("unknown")),
+            ("failure", json!("unknown")),
+            ("cancel_reason", json!("unknown")),
+            ("early_finish_reason", json!("unknown")),
+        ] {
+            let mut result = legacy.clone();
+            result["results"][0][field] = value;
+            assert!(super::command_run_result_final_reply(&result).is_none());
+            assert!(super::command_run_result_final_reply(
+                &json!({"streamed_command_run_result":result})).is_none());
+        }
+    }
 
     #[test]
     fn task_status_detection_accepts_streamed_command_run_results() {

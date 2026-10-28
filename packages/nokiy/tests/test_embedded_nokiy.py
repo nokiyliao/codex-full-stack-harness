@@ -374,7 +374,7 @@ print(json.dumps(result))
         request = load_request(self.request_path)
         ready, terminal = {"status": "READY"}, {"status": "RESULT_AVAILABLE"}
         with patch.object(embedded_nokiy, "_prepare", side_effect=AssertionError("native-once preflight")), \
-             patch("codex_collaboration_harness.full_core.prepare", return_value=(ready,)) as direct_prepare, \
+             patch("codex_collaboration_harness.full_core.preflight", return_value=ready) as direct_prepare, \
              patch("codex_collaboration_harness.full_core.execute_full_core", return_value=terminal) as direct_execute:
             self.assertIs(preflight(request), ready)
             self.assertIs(execute(request), terminal)
@@ -507,6 +507,86 @@ print(json.dumps(result))
     def test_canonical_v2_policy_authorization_is_accepted(self) -> None:
         self._canonical_v2_context()
         self.assertEqual(preflight(load_request(self._write_request()))["status"], "READY")
+
+    def _mapped_v2_context(self) -> dict:
+        self.context, self.jspace = self._write_context()
+        self._canonical_v2_context()
+        contract = json.loads(self.jspace.read_text())
+        logical = "output/dcf_runtime/v2/current.json"
+        contract.update(source_read=True, read_scopes=[logical], command_templates=[], mapped_source_reads=[{
+            "schema_version": "dcf_mapped_source_read_binding_v1",
+            "contract_path": "config/contracts/dcf_v2_contract.json", "contract_sha256": "a" * 64,
+            "contract_identity": {"device": 1, "inode": 2}, "repo_identity": {"device": 1, "inode": 3},
+            "requested_logical_path": logical, "logical_path": logical, "logical_namespace": "output",
+            "alias_path": "output", "alias_link_text": "/fixture-cold/output",
+            "alias_identity": {"device": 1, "inode": 4}, "alias_parent_identity": {"device": 1, "inode": 3},
+            "physical_root": "/fixture-cold/output", "physical_root_identity": {"device": 2, "inode": 5},
+            "physical_path": "/fixture-cold/\u5de5\u4f5c\U0001f680/output/dcf_runtime/v2/current.json",
+        }])
+        self._seal_v2_context(contract)
+        return contract
+
+    def _seal_v2_context(self, contract: dict, *, authorization: bool = True) -> None:
+        if authorization:
+            payload = {key: contract[key] for key in (
+                "repo_root", "matched_surface_ids", "read_scopes", "write_scopes", "allowed_operations",
+                "denied_operations", "command_templates", "declared_targets", "expansion",
+            )}
+            payload.update(schema_version="jspace_authorization_v1",
+                           required_domain_bindings=contract["dcf_generation"]["required_domain_bindings"])
+            for key in ("command_effect_policy", "source_read", "mapped_source_reads"):
+                if key in contract:
+                    payload[key] = contract[key]
+            contract["authorization_semantic_sha256"] = canonical_sha256(payload)
+        contract.pop("content_sha256", None)
+        contract["content_sha256"] = canonical_sha256(contract)
+        self.jspace.write_text(json.dumps(contract))
+        context = json.loads(self.context.read_text())
+        context["jspace_semantic_sha256"] = contract["authorization_semantic_sha256"]
+        context.pop("semantic_sha256", None)
+        context["semantic_sha256"] = canonical_sha256(context)
+        self.context.write_text(json.dumps(context))
+
+    def test_mapped_v2_caller_digest_accepts_canonical_binding(self) -> None:
+        # This checks caller intake only, not native filesystem admission.
+        self._mapped_v2_context()
+        self.assertEqual(preflight(load_request(self._write_request()))["status"], "READY")
+
+    def test_mapped_v2_caller_digest_preserves_large_inode(self) -> None:
+        contract = self._mapped_v2_context()
+        contract["mapped_source_reads"][0]["alias_identity"]["inode"] = 18446744073709551615
+        self._seal_v2_context(contract)
+        self.assertEqual(preflight(load_request(self._write_request()))["status"], "READY")
+
+    def test_mapped_v2_binding_cannot_change_with_only_content_resealed(self) -> None:
+        contract = self._mapped_v2_context()
+        contract["mapped_source_reads"][0]["physical_path"] = "/another/current.json"
+        self._seal_v2_context(contract, authorization=False)
+        with self.assertRaisesRegex(EmbeddedNokiyError, "semantic digest differs"):
+            preflight(load_request(self._write_request()))
+
+    def test_mapped_v2_binding_cannot_be_removed_with_only_content_resealed(self) -> None:
+        contract = self._mapped_v2_context()
+        del contract["mapped_source_reads"]
+        self._seal_v2_context(contract, authorization=False)
+        with self.assertRaisesRegex(EmbeddedNokiyError, "semantic digest differs"):
+            preflight(load_request(self._write_request()))
+
+    def test_mapped_v2_requires_explicit_reader(self) -> None:
+        contract = self._mapped_v2_context()
+        del contract["source_read"]
+        self._seal_v2_context(contract)
+        with self.assertRaisesRegex(EmbeddedNokiyError, "mapped reads require"):
+            preflight(load_request(self._write_request()))
+
+    def test_mapped_v2_rejects_nonexact_binding_shape(self) -> None:
+        for bindings in (None, [], [{}, {}], [None], {}):
+            with self.subTest(bindings=bindings):
+                contract = self._mapped_v2_context()
+                contract["mapped_source_reads"] = bindings
+                self._seal_v2_context(contract)
+                with self.assertRaisesRegex(EmbeddedNokiyError, "mapped reads require"):
+                    preflight(load_request(self._write_request()))
 
     def test_legacy_v2_identity_remains_accepted(self) -> None:
         self._canonical_v2_context(include_policy=False)
@@ -695,6 +775,72 @@ class PreparationFailureDiagnosticsTests(unittest.TestCase):
                                  error.code if isinstance(error, EmbeddedNokiyError)
                                  else "NOKIY_EMBEDDED_INPUT_ERROR")
                 self.assertEqual(result["detail_sha256"], hashlib.sha256(self.secret.encode()).hexdigest())
+
+    def diagnostics(self):
+        return {"stage": "dcf_compile", "returncode": 2,
+                "stdout_bytes": 123, "stderr_bytes": len(self.secret),
+                "stdout_sha256": "a" * 64,
+                "stderr_sha256": hashlib.sha256(self.secret.encode()).hexdigest(),
+                "child_error_code": "JSPACE_SOURCE_READ_FILE_INVALID"}
+
+    def test_cli_preserves_validated_typed_cause_not_raw_detail(self):
+        diagnostics = self.diagnostics()
+        error = EmbeddedNokiyError("NOKIY_FULL_STACK_PREPARATION_FAILED", self.secret,
+                                  diagnostics=diagnostics)
+        result = self._prepare_error(error)
+        self.assertEqual(result["first_typed_blocker"], error.code)
+        self.assertEqual(result["diagnostics"], diagnostics)
+        self.assertEqual(result["issues"], [{"path": "action.read_scopes", "reason": "exact_file_unavailable"}])
+        safe = caller._safe_preparation_diagnostics(diagnostics)
+        self.assertIsNot(safe, diagnostics)
+        self.assertEqual(safe, diagnostics)
+
+    def test_malformed_or_unrecognized_diagnostics_are_omitted_as_a_whole(self):
+        safe = self.diagnostics()
+        invalid = [None, [], {}, {**safe, "detail": self.secret}]
+        for field, value in (
+            ("stage", []), ("stage", self.secret), ("returncode", True),
+            ("returncode", 256), ("returncode", -256), ("returncode", 0),
+            ("stdout_bytes", -1), ("stderr_bytes", True), ("stdout_bytes", 2**63),
+            ("stdout_sha256", "A" * 64), ("stderr_sha256", self.secret),
+            ("child_error_code", []), ("child_error_code", "JSPACE_" + self.secret + " raw detail"),
+        ):
+            invalid.append({**safe, field: value})
+        invalid.extend({key: value for key, value in safe.items() if key != missing}
+                       for missing in safe if missing != "child_error_code")
+        for diagnostics in invalid:
+            with self.subTest(diagnostics=diagnostics):
+                self.assertIsNone(caller._safe_preparation_diagnostics(diagnostics))
+                result = self._prepare_error(EmbeddedNokiyError(
+                    "NOKIY_FULL_STACK_PREPARATION_FAILED", self.secret, diagnostics=diagnostics))
+                self.assertNotIn("diagnostics", result)
+                self.assertNotIn("issues", result)
+
+    def test_canonical_namespaces_and_boundaries_preserve_diagnostics_only(self):
+        for child_code in ("JSPACE_COMMAND_EFFECT_UNVERIFIED", "TASK_CONTEXT_FIELDS_INVALID",
+                           "JSPACE_FUTURE_DIAGNOSTIC", "JSPACE_" + "A" * 96):
+            with self.subTest(child_code=child_code):
+                diagnostics = {**self.diagnostics(), "child_error_code": child_code}
+                result = self._prepare_error(EmbeddedNokiyError(
+                    "NOKIY_FULL_STACK_PREPARATION_FAILED", self.secret, diagnostics=diagnostics))
+                self.assertEqual(result["diagnostics"], diagnostics)
+                self.assertNotIn("issues", result)
+                self.assertEqual(result["status"], "BLOCKED_PREEXECUTION")
+        for child_code in ("JSPACE_", "JSPACE_1", "JSPACE_failure", "JSPACE_FAILURE\n",
+                           "JSPACE_" + "A" * 97, "OTHER_ERROR", True):
+            with self.subTest(child_code=child_code):
+                self.assertIsNone(caller._safe_preparation_diagnostics(
+                    {**self.diagnostics(), "child_error_code": child_code}))
+
+    def test_typed_diagnostics_apply_only_to_preparation_wrappers(self):
+        result = self._prepare_error(EmbeddedNokiyError(
+            "NOKIY_UNKNOWN_FAILURE", self.secret, diagnostics=self.diagnostics()))
+        self.assertNotIn("diagnostics", result)
+        self.assertNotIn("issues", result)
+        diagnostics = self.diagnostics()
+        diagnostics.pop("child_error_code")
+        diagnostics["returncode"] = 0
+        self.assertEqual(caller._safe_preparation_diagnostics(diagnostics), diagnostics)
 
     def test_successful_prepare_cli_does_not_use_failure_diagnostics(self):
         output = io.StringIO()

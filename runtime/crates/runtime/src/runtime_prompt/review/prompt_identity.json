@@ -1,0 +1,7 @@
+{
+  "id": "review",
+  "display_name": "Review Operation Manual",
+  "description": "Use for read-only code, provenance, or design analysis and evidence-grounded findings without required edits, reproduction, or test execution.",
+  "father_ids": [],
+  "capabilities": []
+}

@@ -44,7 +44,11 @@ const OAUTH_BETA: &str = "oauth-2025-04-20";
 pub(crate) const CLAUDE_CODE_SYSTEM_PROMPT: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
 
-const DEFAULT_MAX_TOKENS: u64 = 1024;
+// Agent turns carry thinking plus tool calls; 1024 truncated them. Matches the
+// Claude Code CLI's default output ceiling.
+const DEFAULT_MAX_TOKENS: u64 = 32000;
+// Anthropic allows four cache breakpoints per request, automatic caching included.
+const MAX_CACHE_BREAKPOINTS: usize = 4;
 
 /// `true` when the token is a Claude Code subscription OAuth token rather than a
 /// standard Anthropic API key.
@@ -123,6 +127,7 @@ pub async fn call_with_stream_events(
         content,
         raw: data,
         metrics: Some(metrics),
+        failed_attempts: Vec::new(),
     })
 }
 
@@ -166,6 +171,7 @@ async fn parse_anthropic_stream(
         content,
         raw: data,
         metrics: Some(metrics),
+        failed_attempts: Vec::new(),
     })
 }
 
@@ -427,9 +433,16 @@ fn build_payload(model: &str, messages: &[Value], options: &CallOptions, oauth: 
 
     // `temperature` is deliberately never forwarded: current Claude models
     // (e.g. opus-4-8) reject it as a deprecated parameter, and the runtime
-    // always supplies one. Extended thinking is the only sampling control we
-    // pass through.
-    if let Some(budget) = thinking_budget(options, max_tokens) {
+    // always supplies one. Thinking is the only sampling control we pass through.
+    // Claude 4.6 and later take adaptive thinking steered by output_config.effort,
+    // and 4.7 and later reject thinking.type "enabled" with HTTP 400; older models
+    // only support a manual budget.
+    if uses_adaptive_thinking(model) {
+        if let Some(effort) = adaptive_effort(options) {
+            payload.insert("thinking".to_string(), json!({ "type": "adaptive" }));
+            payload.insert("output_config".to_string(), json!({ "effort": effort }));
+        }
+    } else if let Some(budget) = thinking_budget(options, max_tokens) {
         payload.insert(
             "thinking".to_string(),
             json!({ "type": "enabled", "budget_tokens": budget }),
@@ -441,6 +454,13 @@ fn build_payload(model: &str, messages: &[Value], options: &CallOptions, oauth: 
     }
     if let Some(stop) = stop_sequences(options.stop.as_ref()) {
         payload.insert("stop_sequences".to_string(), stop);
+    }
+
+    // Automatic caching moves one breakpoint to the last cacheable block, so the
+    // growing conversation is read from cache instead of re-sent at full input
+    // price every turn. It uses one of the four breakpoint slots.
+    if explicit_cache_breakpoints(&payload) < MAX_CACHE_BREAKPOINTS {
+        payload.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
     }
 
     let mut payload = Value::Object(payload);
@@ -672,12 +692,63 @@ fn thinking_budget(options: &CallOptions, max_tokens: u64) -> Option<u64> {
         "low" => 1024,
         "medium" => 4096,
         "high" | "highest" | "xhigh" => 8192,
+        "max" | "ultra" => 16384,
         _ => 1024,
     };
     // Anthropic requires max_tokens to exceed the thinking budget; if the caller
     // capped max_tokens too low for the requested budget, skip thinking rather
     // than emit a request the API will reject.
     (max_tokens > budget).then_some(budget)
+}
+
+/// Effort level for adaptive thinking, or `None` to leave thinking off.
+fn adaptive_effort(options: &CallOptions) -> Option<&'static str> {
+    let effort = options.reasoning_effort.as_deref()?.trim().to_ascii_lowercase();
+    match effort.as_str() {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" => Some("xhigh"),
+        "max" | "ultra" | "highest" => Some("max"),
+        _ => None,
+    }
+}
+
+/// Unversioned or unrecognised names are treated as current models, since every
+/// Claude model since 4.6 uses adaptive thinking.
+fn uses_adaptive_thinking(model: &str) -> bool {
+    claude_model_version(model).is_none_or(|version| version >= (4, 6))
+}
+
+/// `(major, minor)` from ids such as `claude-opus-4-5-20251101`,
+/// `claude-fable-5-1` or the legacy `claude-3-7-sonnet-20250219`.
+fn claude_model_version(model: &str) -> Option<(u32, u32)> {
+    let name = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    let parts: Vec<&str> = name.strip_prefix("claude-")?.split('-').collect();
+    let number = |index: usize| parts.get(index).and_then(|part| part.parse::<u32>().ok());
+    // Date suffixes (20251101) are not minor versions.
+    let minor = |index: usize| number(index).filter(|value| *value < 100).unwrap_or(0);
+    match number(0) {
+        Some(major) => Some((major, minor(1))),
+        None => number(1).map(|major| (major, minor(2))),
+    }
+}
+
+fn explicit_cache_breakpoints(payload: &Map<String, Value>) -> usize {
+    fn count(value: &Value) -> usize {
+        match value {
+            Value::Object(map) => {
+                usize::from(map.contains_key("cache_control")) + map.values().map(count).sum::<usize>()
+            }
+            Value::Array(items) => items.iter().map(count).sum(),
+            _ => 0,
+        }
+    }
+    ["system", "tools", "messages"]
+        .iter()
+        .filter_map(|key| payload.get(*key))
+        .map(count)
+        .sum()
 }
 
 fn stop_sequences(stop: Option<&Value>) -> Option<Value> {

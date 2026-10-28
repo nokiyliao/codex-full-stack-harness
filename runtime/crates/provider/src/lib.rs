@@ -3,6 +3,7 @@
 
 pub mod auth_registry;
 pub mod content_type_fallback;
+pub mod failure_usage;
 pub mod llm;
 pub mod logging;
 pub mod metrics;

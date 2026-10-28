@@ -337,7 +337,7 @@ fn thinking_enabled_omits_temperature() {
         ..Default::default()
     };
     let messages = vec![json!({ "role": "user", "content": "hi" })];
-    let payload = build_payload("claude-opus-4-8", &messages, &options, true);
+    let payload = build_payload("claude-opus-4-5", &messages, &options, true);
     assert_eq!(payload["thinking"]["type"], "enabled");
     assert_eq!(payload["thinking"]["budget_tokens"], 1024);
     assert!(payload.get("temperature").is_none());
@@ -351,8 +351,97 @@ fn thinking_skipped_when_budget_exceeds_max_tokens() {
         ..Default::default()
     };
     let messages = vec![json!({ "role": "user", "content": "hi" })];
-    let payload = build_payload("claude-opus-4-8", &messages, &options, true);
+    let payload = build_payload("claude-sonnet-4-5", &messages, &options, true);
     assert!(payload.get("thinking").is_none());
+}
+
+#[test]
+fn current_models_use_adaptive_thinking_with_effort() {
+    let messages = vec![json!({ "role": "user", "content": "hi" })];
+    for (model, effort, expected) in [
+        ("claude-opus-5-5", "max", "max"),
+        ("claude-opus-4-8", "ultra", "max"),
+        ("claude-sonnet-4-6", "xhigh", "xhigh"),
+        ("claude-code/claude-fable-5-1", "medium", "medium"),
+        ("opus", "high", "high"),
+    ] {
+        let options = CallOptions {
+            reasoning_effort: Some(effort.to_string()),
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        let payload = build_payload(model, &messages, &options, true);
+        assert_eq!(payload["thinking"], json!({ "type": "adaptive" }), "{model}");
+        assert_eq!(payload["output_config"]["effort"], expected, "{model}");
+        assert!(payload["thinking"].get("budget_tokens").is_none(), "{model}");
+        assert!(payload.get("temperature").is_none(), "{model}");
+    }
+}
+
+#[test]
+fn adaptive_models_without_effort_omit_thinking() {
+    let messages = vec![json!({ "role": "user", "content": "hi" })];
+    for effort in [None, Some("none"), Some("minimal"), Some("default")] {
+        let options = CallOptions {
+            reasoning_effort: effort.map(str::to_string),
+            ..Default::default()
+        };
+        let payload = build_payload("claude-opus-5-5", &messages, &options, true);
+        assert!(payload.get("thinking").is_none());
+        assert!(payload.get("output_config").is_none());
+    }
+}
+
+#[test]
+fn legacy_max_effort_gets_largest_budget_under_default_max_tokens() {
+    let options = CallOptions {
+        reasoning_effort: Some("max".to_string()),
+        ..Default::default()
+    };
+    let messages = vec![json!({ "role": "user", "content": "hi" })];
+    let payload = build_payload("claude-opus-4-5-20251101", &messages, &options, true);
+    assert_eq!(payload["max_tokens"], 32000);
+    assert_eq!(payload["thinking"], json!({ "type": "enabled", "budget_tokens": 16384 }));
+    assert!(payload.get("output_config").is_none());
+}
+
+#[test]
+fn model_version_parsing_covers_current_and_legacy_names() {
+    assert_eq!(claude_model_version("claude-opus-4-5-20251101"), Some((4, 5)));
+    assert_eq!(claude_model_version("claude-opus-4-20250514"), Some((4, 0)));
+    assert_eq!(claude_model_version("claude-3-7-sonnet-20250219"), Some((3, 7)));
+    assert_eq!(claude_model_version("anthropic/claude-haiku-4-5"), Some((4, 5)));
+    assert_eq!(claude_model_version("claude-opus-5-5"), Some((5, 5)));
+    assert_eq!(claude_model_version("claude-opus"), None);
+    assert!(!uses_adaptive_thinking("claude-haiku-4-5-20251001"));
+    assert!(uses_adaptive_thinking("claude-opus-4-6"));
+    assert!(uses_adaptive_thinking("claude-sonnet"));
+}
+
+#[test]
+fn automatic_cache_control_is_added_within_breakpoint_limit() {
+    let messages = vec![json!({ "role": "user", "content": "hi" })];
+    let payload = build_payload("claude-opus-5-5", &messages, &CallOptions::default(), true);
+    assert_eq!(payload["cache_control"], json!({ "type": "ephemeral" }));
+
+    let cached = json!({ "type": "ephemeral" });
+    let options = CallOptions {
+        tools: Some(
+            (0..4)
+                .map(|index| {
+                    json!({
+                        "name": format!("tool{index}"),
+                        "description": "d",
+                        "input_schema": {"type": "object"},
+                        "cache_control": cached.clone(),
+                    })
+                })
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    let payload = build_payload("claude-opus-5-5", &messages, &options, false);
+    assert!(payload.get("cache_control").is_none());
 }
 
 #[test]

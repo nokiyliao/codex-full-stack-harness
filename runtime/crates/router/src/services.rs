@@ -2,6 +2,8 @@
 pub mod command_run;
 #[path = "services/focused_verifier.rs"]
 mod focused_verifier;
+#[path = "services/parent_shell.rs"]
+mod parent_shell;
 #[cfg(unix)]
 #[path = "services/direct_thread_writer.rs"]
 pub mod direct_thread_writer;

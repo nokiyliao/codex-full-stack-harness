@@ -1720,9 +1720,7 @@ mod tests {
 
         for (source, has_runtime_events) in rows {
             let fixture = RecoveryFixture::new(&format!("matrix-{source}"));
-            let revision = has_runtime_events
-                .then(|| fixture.commit_events(false))
-                .unwrap_or_default();
+            let revision = if has_runtime_events { fixture.commit_events(false) } else { Default::default() };
             fixture.interrupt();
             let reason = if has_runtime_events {
                 RecoveryCloseRuntimeReason::OrphanedRuntime

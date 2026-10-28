@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 import test_embedded_nokiy as fixtures
 from codex_collaboration_harness.embedded_nokiy import EmbeddedNokiyError, execute, load_request, preflight, read_terminal
+from codex_collaboration_harness.result_inspection import load_inspection_summary, project_terminal, summarize_terminal
 
 
 class OneShotCallerTests(unittest.TestCase):
@@ -90,7 +91,22 @@ class OneShotCallerTests(unittest.TestCase):
             self.assertEqual(caller.returncode, 2, stderr)
             terminal = json.loads(stdout)
             self.assertEqual(terminal["first_typed_blocker"], "NOKIY_EMBEDDED_CANCELLED")
+            # CLI delivery evidence is not part of the durable terminal.
+            inspection = terminal.pop("result_inspection")
+            summary_reference = terminal.pop("inspection_summary")
             self.assertEqual(read_terminal(request.artifact_root, request.request_id), terminal)
+            projected = project_terminal(
+                terminal, request.artifact_root, request.request_id,
+                request_thread_id=request.native_thread_id, require_request_binding=True)
+            self.assertEqual(inspection, projected["result_inspection"])
+            summary = load_inspection_summary(
+                summary_reference, expected_request_id=request.request_id,
+                expected_thread_id=request.native_thread_id,
+                terminal_reference={
+                    "path": str(request.artifact_root / request.request_id / "terminal.json"),
+                    "sha256": projected["result_inspection"]["terminal_sha256"],
+                })
+            self.assertEqual(summary, summarize_terminal(projected, request.artifact_root, request.request_id))
             with self.assertRaises(ProcessLookupError):
                 os.kill(router_pid, 0)
         finally:

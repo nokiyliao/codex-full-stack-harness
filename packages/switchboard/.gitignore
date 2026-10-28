@@ -1,0 +1,9 @@
+# Runtime state, caches, preimage backups and local agent sessions are not source.
+.DS_Store
+.ruff_cache/
+.tura/
+node_modules/
+runtime/
+backup/
+agents/
+src/__pycache__/

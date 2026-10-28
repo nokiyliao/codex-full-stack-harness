@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Quiescent failed-run fixtures, never a provider call or workspace read."""
 from copy import deepcopy
+from contextlib import redirect_stdout
 import hashlib
+import io
 import json
 from pathlib import Path
 import sqlite3
@@ -10,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from codex_collaboration_harness import embedded_nokiy as caller
-from codex_collaboration_harness import durable_recovery, result_inspection as inspector
+from codex_collaboration_harness import durable_recovery, full_core, result_inspection as inspector
 
 THREAD = "12345678-1234-1234-1234-123456789abc"
 
@@ -23,6 +25,26 @@ def store(path, value):
 def ref(path):
     raw = path.read_bytes()
     return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+
+class DurableFeedBudgetTests(unittest.TestCase):
+    def test_feed_beyond_the_former_8_mib_budget_stays_readable(self):
+        # 24h of V251 worker DBs: 163 of 241 exceeded 8 MiB and four exceeded 64 MiB.
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE runtimes (session_id TEXT, runtime_id TEXT)")
+        db.execute("CREATE TABLE session_feed_events (session_id TEXT, cursor INTEGER, runtime_id TEXT, "
+                   "event_id TEXT, event_json TEXT)")
+        db.execute("INSERT INTO runtimes VALUES ('s', 'r')")
+        padding = "x" * (512 * 1024)
+        for cursor in range(1, 21):
+            event = {"event": "message_upserted", "session_id": "s", "runtime_id": "r",
+                     "event_id": f"e{cursor}", "cursor": cursor, "text": padding}
+            db.execute("INSERT INTO session_feed_events VALUES ('s', ?, 'r', ?, ?)",
+                       (cursor, f"e{cursor}", json.dumps(event)))
+        records, coverage = durable_recovery._feed(db, "s", {"r"}, inspector)
+        self.assertEqual(len(records), 20)
+        self.assertEqual(coverage["event_count"], 20)
+        self.assertGreater(sum(len(json.dumps(event)) for _, _, event in records), 8 * 1024 * 1024)
 
 
 class DurableRecoveryTests(unittest.TestCase):
@@ -67,12 +89,12 @@ class DurableRecoveryTests(unittest.TestCase):
         self.add_command("source_read", {"exit_code": 0, "path": "a.py", "source_sha256": "b" * 64})
         self.publish()
 
-    def add_command(self, kind, output=None, *, exit_code=0):
+    def add_command(self, kind, output=None, *, exit_code=0, provider="call_example"):
         n = len(self.records) // 2
-        identifier = self.runtime + f".tool.command_run:call_example:{n}"
+        identifier = self.runtime + f".tool.command_run:{provider}:{n}"
         command = {"command": kind, "command_id": identifier, "command_index": n,
                    "command_run_id": self.runtime + ".tool.command_run", "command_type": kind,
-                   "provider_tool_call_id": "call_example", "step": 1, "command_line": kind + " a.py"}
+                   "provider_tool_call_id": provider, "step": 1, "command_line": kind + " a.py"}
         common = {k: command[k] for k in ("command_id", "command_index", "command_run_id",
                                           "command_type", "provider_tool_call_id", "step")}
         common.update(type="streamed_command_event", session_id=self.session, runtime_id=self.runtime)
@@ -87,6 +109,49 @@ class DurableRecoveryTests(unittest.TestCase):
                  "command": command.copy(), "success": exit_code == 0, "output": body}
         self.records.extend([{**common, "status": "ready", "command": command},
                              {**common, "status": "completed", "result": value}])
+
+    def policy_denial(self):
+        self.add_command("zsh")
+        ready, completed = self.records[-2:]
+        command = deepcopy(ready["command"])
+        value = {**{k: command[k] for k in durable_recovery._COMMAND_FIELDS},
+                 "command": command, "command_type": "jspace", "success": False,
+                 "effect_state": "not_started", "mutation_count": 0, "authority_effect": "none",
+                 "delivery_state": "deterministic_policy_denial", "replayable": True,
+                 "jspace_error_code": "JSPACE_READ_COMMAND_DENIED", "operation": "read",
+                 "target": "missing.py", "error": "JSPACE_READ_COMMAND_DENIED: missing operand"}
+        completed.update(command_type="jspace", result=value)
+        return command, value
+
+    def test_bound_policy_denial_preserves_other_command_evidence(self):
+        self.policy_denial()
+        self.publish()
+        result = self.inspect()
+        self.assertEqual(result["commands"][0]["execution_proof"], "known_success")
+        denied = result["commands"][-1]
+        self.assertEqual(denied["status"], "policy_denied")
+        self.assertEqual(denied["execution_proof"], "not_started")
+        self.assertIsNone(denied["exit_code"])
+        self.assertFalse(denied["automatic_retry_allowed"])
+
+    def test_policy_denial_feed_and_context_agree(self):
+        command, value = self.policy_denial()
+        command["command_index"] = 0
+        command["command_id"] = command["command_run_id"] + ":" + command["provider_tool_call_id"] + ":0"
+        value.update(command=command, command_id=command["command_id"], command_index=0)
+        records = [(1, self.runtime, self.feed_event([command], status="completed", results=[value]))]
+        events = list(durable_recovery._feed_commands(records, self.session, inspector))
+        self.assertEqual(events[-1][1]["result"]["command_type"], "jspace")
+
+    def test_policy_denial_rejects_identity_and_effect_conflicts(self):
+        command, value = self.policy_denial()
+        for field, changed in (("mutation_count", 1), ("mutation_count", False),
+                               ("effect_state", "started"), ("command_id", "other"),
+                               ("success", True), ("output", {})):
+            with self.subTest(field=field, changed=changed):
+                bad = {**value, field: changed}
+                with self.assertRaisesRegex(inspector.InspectionError, "DURABLE_COMMAND_IDENTITY_MISMATCH"):
+                    durable_recovery._policy_denial(bad, command, inspector)
 
     def feed_progress(self, command, *, include_metadata=False, canonical_command=False):
         fields = ("command_id", "command_run_id", "provider_tool_call_id", "command_index")
@@ -170,6 +235,176 @@ class DurableRecoveryTests(unittest.TestCase):
 
     def inspect(self, **kwargs):
         return inspector.inspect(self.root, self.rid, THREAD, **kwargs)
+
+    def interrupted(self):
+        self.lease, self.ended = 1, 0
+        self.publish()
+        (self.run / "terminal.json").unlink()
+        value = json.loads((self.run / "supervision.json").read_bytes())
+        value.update(failure="GRAPH_SUPERVISOR_CALLER_EXITED")
+        value["scope"]["engine_exit_code"] = -15
+        store(self.run / "supervision.json", value)
+
+    def test_opaque_provider_ids_preserve_context_and_feed_bindings(self):
+        for provider in ("scripted-command-0", "toolu_01opaque", "call_example"):
+            for source in ("context", "feed", "both"):
+                with self.subTest(provider=provider, source=source):
+                    self.records, self.feed = [], []
+                    self.add_command("source_read", provider=provider)
+                    command, value = self.records[0]["command"], self.records[1]["result"]
+                    if source != "context":
+                        self.feed = [self.feed_event([command], status="error",
+                            updates=[self.feed_update(command, "completed", value)])]
+                    if source == "feed":
+                        self.records = []
+                    self.publish()
+                    before = (self.run / "terminal.json").read_bytes()
+                    with patch.object(caller, "execute", side_effect=AssertionError("no replay")):
+                        result = self.inspect()
+                    self.assertEqual(len(result["commands"]), 1)
+                    self.assertEqual(result["commands"][0]["command_id"], command["command_id"])
+                    self.assertEqual(result["commands"][0]["receipt_check"], "matched")
+                    self.assertFalse(result["durable_recovery"]["replay_allowed"])
+                    self.assertEqual(result["terminal_status"], "BLOCKED")
+                    self.assertEqual(before, (self.run / "terminal.json").read_bytes())
+
+    def test_provider_id_budget_and_structural_context_fields_fail_closed(self):
+        invalid = ("", None, False, "call_\0", "call_\n", "call_\x7f", "call_\x85",
+                   "call_\u2028", "call_" + "x" * 256, "call_" + "\u00e9" * 126)
+        for provider in invalid:
+            for source in ("context", "feed"):
+                with self.subTest(provider=provider, source=source):
+                    self.records, self.feed = [], []
+                    self.add_command("source_read", provider=provider)
+                    if source == "feed":
+                        command, value = self.records[0]["command"], self.records[1]["result"]
+                        self.feed = [self.feed_event([command], status="error",
+                            updates=[self.feed_update(command, "completed", value)])]
+                        self.records = []
+                    self.publish()
+                    result = self.inspect()
+                    self.assertEqual(result["first_blocker"], "DURABLE_COMMAND_IDENTITY_MISMATCH")
+                    self.assertEqual(result["commands"], [])
+        for field, wrong in (("session_id", "foreign"), ("runtime_id", "foreign"),
+                ("command_run_id", "foreign.tool.command_run"), ("provider_tool_call_id", "other-opaque"),
+                ("command_id", self.runtime + ".tool.command_run:call_example:1"),
+                ("command_index", True), ("command_index", -1), ("command_index", 128),
+                ("command_type", ""), ("step", True)):
+            with self.subTest(field=field, wrong=wrong):
+                self.records, self.feed = [], []
+                self.add_command("source_read")
+                self.records[0][field] = wrong
+                self.publish()
+                result = self.inspect()
+                self.assertIn(result["first_blocker"], ("DURABLE_COMMAND_IDENTITY_MISMATCH",
+                                                       "DURABLE_RUNTIME_IDENTITY_MISMATCH"))
+                self.assertEqual(result["commands"], [])
+
+    def test_interrupted_cli_recovers_without_terminal_or_execution(self):
+        self.interrupted()
+        before = {str(p): p.read_bytes() for p in self.run.rglob('*') if p.is_file()}
+        output = io.StringIO()
+        with patch.dict('os.environ', CODEX_THREAD_ID=THREAD), redirect_stdout(output), \
+                patch.object(caller, 'execute', side_effect=AssertionError('no execution')):
+            code = caller.main(['read-result', '--artifact-root', str(self.root),
+                                '--request-id', self.rid, '--summary', '--require-verified-evidence'])
+        self.assertEqual(code, 2)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result['status'], 'INTERRUPTED_EVIDENCE_AVAILABLE')
+        self.assertFalse(result['automatic_retry_allowed'])
+        self.assertFalse(result['task_success'])
+        self.assertFalse(result['durable_recovery']['command_index_complete'])
+        self.assertFalse(result['durable_recovery']['runtime_rows_terminal'])
+        self.assertEqual(result['commands'][0]['receipt_check'], 'matched')
+        self.assertEqual(before, {str(p): p.read_bytes() for p in self.run.rglob('*') if p.is_file()})
+
+    def test_interrupted_pending_command_remains_unknown(self):
+        self.records.pop()
+        self.interrupted()
+        result = durable_recovery.inspect_interrupted(self.root, self.rid, THREAD)
+        self.assertEqual(result['commands'], [])
+        self.assertEqual(result['durable_recovery']['pending_command_count'], 1)
+        self.assertEqual(result['durable_recovery']['unobserved_filesystem_effects'], 'UNKNOWN')
+
+    def test_interrupted_receipted_edit_not_hidden_or_accepted(self):
+        self.add_command('apply_patch', {'changes': [{'path': 'a.py', 'kind': 'update'}]})
+        self.interrupted()
+        result = durable_recovery.inspect_interrupted(self.root, self.rid, THREAD)
+        self.assertEqual(len(result['durable_recovery']['file_changes']), 1)
+        self.assertEqual(result['durable_recovery']['current_postimage_proof'], 'not_read')
+        self.assertFalse(result['task_success'])
+
+    def test_interrupted_foreign_thread_and_changed_identity_rejected(self):
+        self.interrupted()
+        for thread in ('foreign', '12345678-1234-1234-1234-123456789abd', None):
+            with self.subTest(thread=thread), self.assertRaises(inspector.InspectionError):
+                durable_recovery.inspect_interrupted(self.root, self.rid, thread)
+        original = deepcopy(self.original)
+        original['model'] = 'foreign-model'
+        store(self.run / 'request-identity.json', original)
+        with self.assertRaisesRegex(inspector.InspectionError, 'IDENTITY_MISMATCH'):
+            durable_recovery.inspect_interrupted(self.root, self.rid, THREAD)
+
+    def test_interrupted_live_or_unknown_process_blocks_snapshot(self):
+        self.interrupted()
+        for state in ('present_unowned', 'permission_unknown', 'unknown'):
+            with patch.object(inspector, '_process', return_value=state), \
+                    self.assertRaisesRegex(inspector.InspectionError, 'CLEANUP_UNVERIFIED'):
+                durable_recovery.inspect_interrupted(self.root, self.rid, THREAD)
+
+    def test_interrupted_incomplete_cleanup_and_wrong_failure_rejected(self):
+        self.interrupted()
+        path = self.run / 'supervision.json'
+        original = json.loads(path.read_bytes())
+        changes = [('engine_reaped', False), ('no_live_descendants', False),
+                   ('cleanup_error', 'failed'), ('engine_exit_code', 0)]
+        for key, value in changes:
+            changed = deepcopy(original)
+            changed['scope'][key] = value
+            store(path, changed)
+            with self.subTest(key=key), self.assertRaisesRegex(inspector.InspectionError, 'CLEANUP_UNVERIFIED'):
+                durable_recovery.inspect_interrupted(self.root, self.rid, THREAD)
+        original['failure'] = 'UNRELATED_FAILURE'
+        store(path, original)
+        with self.assertRaisesRegex(inspector.InspectionError, 'CLEANUP_UNVERIFIED'):
+            durable_recovery.inspect_interrupted(self.root, self.rid, THREAD)
+
+    def test_interrupted_malformed_or_linked_terminal_never_falls_back(self):
+        self.interrupted()
+        path = self.run / 'terminal.json'
+        path.write_text('invalid')
+        with self.assertRaisesRegex(inspector.InspectionError, 'ORIGINAL_TERMINAL_PRESENT'):
+            durable_recovery.inspect_interrupted(self.root, self.rid, THREAD)
+        path.unlink()
+        path.symlink_to(self.run / 'missing')
+        with self.assertRaisesRegex(inspector.InspectionError, 'ORIGINAL_TERMINAL_PRESENT'):
+            durable_recovery.inspect_interrupted(self.root, self.rid, THREAD)
+
+    def test_interrupted_unsettled_database_not_read(self):
+        self.interrupted()
+        Path(str(self.db) + '-wal').write_bytes(b'pending')
+        with self.assertRaisesRegex(inspector.InspectionError, 'DATABASE_UNSETTLED'):
+            durable_recovery.inspect_interrupted(self.root, self.rid, THREAD)
+
+    def test_interrupted_tampered_receipt_not_accepted(self):
+        self.interrupted()
+        path = self.run / 'execution-state/command_receipts/command-0.json'
+        value = json.loads(path.read_bytes())
+        value['exit_code'] = 1
+        store(path, value)
+        with self.assertRaises(inspector.InspectionError):
+            durable_recovery.inspect_interrupted(self.root, self.rid, THREAD)
+
+    def test_interrupted_evidence_change_during_read_rejected(self):
+        self.interrupted()
+        original = durable_recovery.recover
+        def changing(*args, **kwargs):
+            result = original(*args, **kwargs)
+            (self.run / 'core.jsonl').write_text('{}\n')
+            return result
+        with patch.object(durable_recovery, 'recover', side_effect=changing), \
+                self.assertRaisesRegex(inspector.InspectionError, 'EVIDENCE_CHANGED'):
+            durable_recovery.inspect_interrupted(self.root, self.rid, THREAD)
 
     def test_feed_real_progress_and_noncompleted_updates_remain_pending(self):
         self.add_command("apply_patch", {"changes": [{"path": "a.py", "kind": "update"}]})
@@ -261,6 +496,62 @@ class DurableRecoveryTests(unittest.TestCase):
         self.assertEqual(result["first_blocker"], "TERMINAL_NOT_AVAILABLE")
         self.assertEqual(result["file_change_success"], "unproven")
         self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_feed_failed_updates_recover_known_failure_without_replay(self):
+        # Tura publishes a receipted nonzero command as update status "failed";
+        # its context copy is the same result recorded as completed/success=false.
+        self.add_command("source_read", {"exit_code": 1, "error_type": "SOURCE_READ_RANGE_OUT_OF_BOUNDS"},
+                         exit_code=1)
+        commands = [self.records[n]["command"] for n in (0, 2)]
+        values = [self.records[n]["result"] for n in (1, 3)]
+        running = self.feed_event(commands, updates=[
+            self.feed_update(commands[1], "ready"), self.feed_update(commands[1], "failed", values[1])])
+        completed = self.feed_event(commands, status="completed", updates=[
+            self.feed_update(commands[0], "completed", values[0]),
+            self.feed_update(commands[1], "failed", values[1])])
+        # The projected wrapper of a failed batch ends as a bare error notice.
+        wrapper = self.projected_feed_event(commands)
+        del wrapper["state"]["output"]
+        wrapper["state"].update(status="error", error="Tool execution failed")
+        wrapper["command_updates"] = []
+        self.feed = [running, wrapper, completed, deepcopy(completed)]
+        self.records = []
+        self.publish()
+        before = {path: path.read_bytes() for path in (self.run / "terminal.json", self.index, self.db)}
+        with patch.object(caller, "execute", side_effect=AssertionError("replay")):
+            result = self.inspect()
+        self.assertEqual([(row["command_id"], row["exit_code"], row["execution_proof"], row["receipt_check"])
+                          for row in result["commands"]],
+                         [(commands[1]["command_id"], 1, "known_failure", "matched"),
+                          (commands[0]["command_id"], 0, "known_success", "matched")])
+        details = result["durable_recovery"]
+        self.assertEqual(details["pending_command_count"], 0)
+        self.assertTrue(details["command_index_complete"])
+        self.assertFalse(details["replay_allowed"])
+        self.assertEqual(result["command_success"], "known_failure")
+        self.assertEqual(result["first_blocker"], "TERMINAL_NOT_AVAILABLE")
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
+        # "failed" never completes a successful result or a progress-only record.
+        for name, command, candidate in (("success under failed", commands[0], values[0]),
+                                         ("progress under failed", commands[1], self.feed_progress(commands[1]))):
+            with self.subTest(name=name):
+                self.feed = [self.feed_event(commands, updates=[self.feed_update(command, "failed", candidate)])]
+                self.publish()
+                result = self.inspect()
+                self.assertEqual(result["first_blocker"], "DURABLE_COMMAND_STATE_UNSUPPORTED")
+                self.assertEqual(result["commands"], [])
+        # An error wrapper may not carry results or updates of its own.
+        with_output = deepcopy(wrapper)
+        with_output["state"]["output"] = self.projected_feed_event(commands)["state"]["output"]
+        with_updates = deepcopy(wrapper)
+        with_updates["command_updates"] = [self.feed_update(commands[1], "failed", values[1])]
+        for name, event in (("error wrapper output", with_output), ("error wrapper updates", with_updates)):
+            with self.subTest(name=name):
+                self.feed = [running, event]
+                self.publish()
+                result = self.inspect()
+                self.assertEqual(result["first_blocker"], "DURABLE_FEED_IDENTITY_MISMATCH")
+                self.assertEqual(result["commands"], [])
 
     def test_feed_serialized_full_patch_results_recover_and_deduplicate_receipts(self):
         self.add_command("apply_patch", {"changes": [{"path": "a.py", "kind": "update"}]})
@@ -628,7 +919,7 @@ class DurableRecoveryTests(unittest.TestCase):
                 result = self.inspect()
                 self.assertEqual(result["first_blocker"], blocker)
                 self.assertEqual(result["commands"], [])
-        for status in ("ready", "running", "error", "unknown"):
+        for status in ("ready", "running", "error", "failed", "unknown"):
             with self.subTest(status=status):
                 self.feed = [self.feed_event([command], updates=[self.feed_update(command, status, value)])]
                 self.publish()
@@ -770,30 +1061,51 @@ class DurableRecoveryTests(unittest.TestCase):
         self.assertEqual(projected["result_inspection"]["command_success"], "known_failure")
         self.assertEqual(before, {p: p.read_bytes() for p in before})
 
-    def test_invalid_receipt_proof_is_not_recovered(self):
+    def test_invalid_receipt_proof_keeps_verified_neighbor_and_precise_diagnostic(self):
+        self.add_command("source_read")
         output = self.records[1]["result"]["output"]
         receipt = output["terminal_receipt"]
         valid = receipt.copy()
-        cases = [({"terminal_state": "completed", "exit_code": 1}, None),
-                 ({"terminal_state": "failed", "exit_code": 0}, None),
-                 ({"terminal_state": "cancelled", "exit_code": 1}, None),
-                 ({"outcome": "unknown"}, None)] + [
-            ({}, key) for key in ("process_reaped", "process_group_empty", "termination_proven")]
-        for fields, missing in cases:
-            with self.subTest(fields=fields, missing=missing):
+        cases = [("schema_version", "unsupported", "tura_command_terminal_receipt_v1"),
+                 ("outcome", "unknown", "known"), ("exit_code", "0", "int"),
+                 ("exit_code", None, "int"), ("terminal_state", "failed", "completed")] + [
+            (key, None, True) for key in ("process_reaped", "process_group_empty", "termination_proven")]
+        for field, bad, expected in cases:
+            with self.subTest(field=field, bad=bad):
                 receipt.clear()
                 receipt.update(valid)
-                receipt.update(fields)
-                if missing:
-                    receipt.pop(missing)
-                output["exit_code"] = receipt["exit_code"]
-                self.records[1]["result"]["success"] = output["exit_code"] == 0
+                if bad is None:
+                    receipt.pop(field)
+                else:
+                    receipt[field] = bad
                 store(Path(output["terminal_receipt_path"]), receipt)
                 self.publish()
-                result = self.inspect()
+                before = {p: p.read_bytes() for p in self.run.rglob("*") if p.is_file()}
+                with patch.object(caller, "execute", side_effect=AssertionError("replay")):
+                    result = self.inspect()
                 self.assertEqual(result["first_blocker"], "RECEIPT_PROOF_INVALID")
-                self.assertEqual(result["commands"], [])
                 self.assertEqual(result["command_success"], "unproven")
+                unknown, verified = result["commands"]
+                self.assertEqual((unknown["status"], unknown["receipt_check"], unknown["exit_code"], unknown["execution_proof"]),
+                                 ("unknown", "invalid", None, "unavailable"))
+                self.assertEqual(verified["execution_proof"], "known_success")
+                detail = result["first_blocker_detail"]
+                self.assertEqual(detail, unknown["first_blocker_detail"])
+                self.assertEqual((detail["failed_field"], detail["expected"]), (field, expected))
+                self.assertEqual(detail["failed_predicate"], "type_is_int" if field == "exit_code" else
+                                 "is_true" if field.startswith("process_") or field == "termination_proven" else "equals")
+                self.assertEqual(detail["receipt_copy"], "file")
+                self.assertEqual(detail["request_locator"], {"request_id": self.rid, "artifact_root": str(self.root)})
+                self.assertEqual(detail["receipt_path"], output["terminal_receipt_path"])
+                self.assertEqual(detail["identity"], {key: self.records[1][key] for key in
+                    ("command_id", "command_run_id", "runtime_id", "provider_tool_call_id", "command_index")})
+                self.assertEqual(detail["event_index"], 1)
+                self.assertEqual(result["observation_availability"], "partial")
+                self.assertEqual(result["aggregate_execution_proof"], "unproven")
+                self.assertFalse(result["durable_recovery"]["command_index_complete"])
+                for flag in ("task_success", "automatic_retry_allowed", "execution_replayed"):
+                    self.assertIs(result[flag], False)
+                self.assertEqual(before, {p: p.read_bytes() for p in before})
 
     def test_bool_receipt_exit_codes_rejected_in_either_durable_copy(self):
         output = self.records[1]["result"]["output"]
@@ -807,7 +1119,138 @@ class DurableRecoveryTests(unittest.TestCase):
                 self.records[1]["result"]["success"] = code == 0
                 store(Path(output["terminal_receipt_path"]), {**receipt, "exit_code": actual_code})
                 self.publish()
-                self.assertEqual(self.inspect()["first_blocker"], "RECEIPT_PROOF_INVALID")
+                result = self.inspect()
+                self.assertEqual(result["first_blocker"], "RECEIPT_PROOF_INVALID")
+                detail = result["first_blocker_detail"]
+                self.assertEqual((detail["failed_field"], detail["failed_predicate"], detail["observed"]["type"]),
+                                 ("exit_code", "type_is_int", "bool"))
+                self.assertEqual(detail["receipt_copy"], "file" if type(actual_code) is bool else "embedded")
+                self.assertEqual(result["commands"][0]["execution_proof"], "unavailable")
+
+    def test_mixed_interrupted_cli_preserves_observations_and_original_bytes_without_replay(self):
+        self.add_command("apply_patch", {"changes": [{"path": "a.py", "kind": "update"}],
+                                         "credentials": "RECEIPT_SECRET_SENTINEL"})
+        invalid = self.records[3]["result"]["output"]
+        invalid["terminal_receipt"]["process_reaped"] = False
+        store(Path(invalid["terminal_receipt_path"]), invalid["terminal_receipt"])
+        self.add_command("source_read", {"exit_code": 1}, exit_code=1)
+        self.interrupted()
+        before = {p: p.read_bytes() for p in self.run.rglob("*") if p.is_file()}
+        command = ["read-result", "--artifact-root", str(self.root), "--request-id", self.rid]
+        with patch.object(caller, "execute", side_effect=AssertionError("replay")), \
+                patch.object(caller, "_prepare", side_effect=AssertionError("fresh execution")), \
+                patch.dict(caller.os.environ, CODEX_THREAD_ID=THREAD):
+            for flags in ([], ["--summary", "--require-verified-evidence"]):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = caller.main(command + flags)
+                self.assertEqual(code, 2)
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["status"], "EXECUTION_UNCERTAIN")
+                self.assertEqual(result["first_typed_blocker"], "RECEIPT_PROOF_INVALID")
+                self.assertEqual(result["request_id"], self.rid)
+                self.assertEqual([row["execution_proof"] for row in result["commands"]],
+                                 ["known_success", "unavailable", "known_failure"])
+                self.assertEqual(result["first_blocker_detail"]["identity"]["command_index"], 1)
+                self.assertEqual(result["observation_availability"], "partial")
+                self.assertEqual(result["aggregate_execution_proof"], "unproven")
+                self.assertEqual(result["mission_acceptance"], "parent_owned")
+                for flag in ("task_success", "automatic_retry_allowed", "execution_replayed", "terminal_synthesized"):
+                    self.assertIs(result[flag], False)
+                details = result["durable_recovery"]
+                self.assertEqual((details["verified_command_count"], details["invalid_receipt_count"]), (2, 1))
+                self.assertEqual(details["file_changes"], [])
+                self.assertEqual(details["historical_postimages"], [])
+                self.assertEqual(details["unobserved_filesystem_effects"], "UNKNOWN")
+                self.assertNotIn("RECEIPT_SECRET_SENTINEL", output.getvalue())
+        self.assertFalse((self.run / "terminal.json").exists())
+        self.assertEqual(before, {p: p.read_bytes() for p in self.run.rglob("*") if p.is_file()})
+
+    def test_mixed_feed_receipts_keep_independent_observations(self):
+        self.add_command("source_read")
+        output = self.records[3]["result"]["output"]
+        output["terminal_receipt"]["termination_proven"] = False
+        store(Path(output["terminal_receipt_path"]), output["terminal_receipt"])
+        commands = [record["command"] for record in self.records[::2]]
+        values = [record["result"] for record in self.records[1::2]]
+        self.feed = [self.feed_event(commands, status="completed", results=values)]
+        self.records = []
+        self.interrupted()
+        result = durable_recovery.inspect_interrupted(self.root, self.rid, THREAD)
+        self.assertEqual(result["status"], "EXECUTION_UNCERTAIN")
+        self.assertEqual([row["execution_proof"] for row in result["commands"]], ["known_success", "unavailable"])
+        self.assertTrue(all(row["evidence_source"] == "durable_session_feed" for row in result["commands"]))
+        self.assertEqual(result["first_blocker_detail"]["identity"]["command_id"], commands[1]["command_id"])
+
+    def test_partial_observations_do_not_bypass_global_integrity_failures(self):
+        for failure in ("path", "copy", "command_identity", "receipt_identity", "exit", "aggregate", "contract", "digest", "owner", "hash"):
+            with self.subTest(failure=failure):
+                self.prepare_run()
+                invalid = self.records[1]["result"]["output"]
+                invalid["terminal_receipt"]["process_group_empty"] = False
+                store(Path(invalid["terminal_receipt_path"]), invalid["terminal_receipt"])
+                self.add_command("source_read", {"exit_code": 0})
+                last = self.records[3]["result"]["output"]
+                if failure == "path":
+                    last["terminal_receipt_path"] = str(self.root / "outside.json")
+                elif failure == "command_identity":
+                    self.records[3]["command_index"] = 0
+                elif failure == "receipt_identity":
+                    last["terminal_receipt"]["call_id"] = "foreign"
+                elif failure == "exit":
+                    last["exit_code"] = 2
+                elif failure == "aggregate":
+                    invalid["results"] = []
+                elif failure == "digest":
+                    self.original["model"] = "foreign"
+                self.publish()
+                if failure == "copy":
+                    store(Path(last["terminal_receipt_path"]), {**last["terminal_receipt"], "exit_code": 7})
+                elif failure == "contract":
+                    changed = {**self.contract, "allowed_operations": ["read"]}
+                    self.terminal.pop("original_jspace_artifact")
+                    store(self.run / "terminal.json", self.terminal)
+                    for name in ("jspace-original.json", "jspace.json"):
+                        store(self.run / name, changed)
+                elif failure == "hash":
+                    trajectory = self.run / "core.jsonl"
+                    trajectory.write_bytes(trajectory.read_bytes()[:-1] + b" ")
+                thread = "87654321-1234-1234-1234-123456789abc" if failure == "owner" else THREAD
+                result = inspector.inspect(self.root, self.rid, thread)
+                expected = {"path": "RECEIPT_PATH_INVALID", "copy": "RECEIPT_MISMATCH",
+                            "command_identity": "DURABLE_COMMAND_IDENTITY_MISMATCH",
+                            "receipt_identity": "DURABLE_RECEIPT_IDENTITY_MISMATCH", "exit": "EXIT_CODE_CONFLICT",
+                            "aggregate": "RECEIPT_PROOF_INVALID", "contract": "DURABLE_CONTRACT_MISMATCH",
+                            "digest": "TRAJECTORY_REQUEST_IDENTITY_MISMATCH", "owner": "THREAD_ID_MISMATCH"}
+                if failure == "hash":
+                    self.assertIn("HASH_MISMATCH", result["first_blocker"])
+                else:
+                    self.assertEqual(result["first_blocker"], expected[failure])
+                self.assertEqual(result["commands"], [])
+                self.assertEqual(result["artifact_integrity"], "unproven")
+                self.assertNotIn("durable_recovery", result)
+
+    def test_invalid_aggregate_cli_keeps_precise_failure_without_partial_observations(self):
+        self.add_command("source_read")
+        output = self.records[3]["result"]["output"]
+        output["results"] = []
+        output["terminal_receipt"]["termination_proven"] = False
+        store(Path(output["terminal_receipt_path"]), output["terminal_receipt"])
+        self.interrupted()
+        before = {p: p.read_bytes() for p in self.run.rglob("*") if p.is_file()}
+        output = io.StringIO()
+        with patch.dict(caller.os.environ, CODEX_THREAD_ID=THREAD), redirect_stdout(output), \
+                patch.object(caller, "execute", side_effect=AssertionError("replay")):
+            code = caller.main(["read-result", "--artifact-root", str(self.root), "--request-id", self.rid])
+        self.assertEqual(code, 2)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "EXECUTION_UNCERTAIN")
+        self.assertEqual(result["first_typed_blocker"], "RECEIPT_PROOF_INVALID")
+        self.assertEqual(result["first_blocker_detail"]["failed_field"], "termination_proven")
+        self.assertEqual(result.get("commands", []), [])
+        for flag in ("task_success", "automatic_retry_allowed", "execution_replayed"):
+            self.assertIs(result[flag], False)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.run.rglob("*") if p.is_file()})
 
     def test_durable_failed_receipt_mismatch_and_exit_conflicts_rejected(self):
         output = self.records[1]["result"]["output"]
@@ -949,6 +1392,61 @@ class DurableRecoveryTests(unittest.TestCase):
         details = self.inspect()["durable_recovery"]
         self.assertEqual(details["pending_command_count"], 1)
         self.assertFalse(details["command_index_complete"])
+
+    def test_failed_attempt_usage_survives_recovery_without_double_counting(self):
+        observation = {"type": "runtime_provider_observation", "runtime_id": self.runtime,
+                       "provider_observation": {"failed_attempts": [
+                           {"usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12,
+                                      "cached_input_tokens": 0, "invalid_fields": []}},
+                           {"usage": None},
+                           {"usage": {"input_tokens": -1, "invalid_fields": ["/input_tokens"]}},
+                       ]}}
+        self.records.extend([observation, deepcopy(observation),
+                             {"type": "runtime_usage", "runtime_id": self.runtime,
+                              "usage": {"input_tokens": 20, "output_tokens": 4, "total_tokens": 24}}])
+        self.publish()
+        result = self.inspect()
+        details = result["durable_recovery"]
+        self.assertIsNone(result["usage"])
+        self.assertEqual(details["reported_usage"]["totals"]["total_tokens"], 24)
+        failed = details["reported_failed_attempt_usage"]
+        self.assertEqual(failed["attempt_count"], 3)
+        self.assertEqual(failed["totals"]["total_tokens"], 12)
+        self.assertEqual(failed["totals"]["cached_input_tokens"], 0)
+        self.assertNotIn("reasoning_tokens", failed["totals"])
+        self.assertEqual(failed["unknown_attempt_count"], 1)
+        self.assertEqual(failed["invalid_attempt_count"], 1)
+        self.assertEqual(failed["coverage"], "partial")
+        self.assertEqual(failed["billing"], "UNKNOWN")
+        self.assertFalse(failed["included_in_reported_usage_totals"])
+        self.records[3]["provider_observation"]["failed_attempts"] = []
+        self.publish()
+        self.assertEqual(self.inspect()["first_blocker"], "DURABLE_FAILED_USAGE_CONFLICT")
+
+    def test_failed_attempt_usage_invalid_or_missing_fields_never_become_zero(self):
+        for value in [
+            {"input_tokens": True, "invalid_fields": []},
+            {"input_tokens": 2, "output_tokens": 1, "total_tokens": 2, "invalid_fields": []},
+            {"input_tokens": 2, "cached_input_tokens": 3, "invalid_fields": []},
+            {"output_tokens": 2, "reasoning_tokens": 3, "invalid_fields": []},
+        ]:
+            summary = durable_recovery._failed_usage_summary({"r": [{"usage": value}]})
+            self.assertEqual(summary["totals"], {})
+            self.assertEqual(summary["invalid_attempt_count"], 1)
+        summary = durable_recovery._failed_usage_summary({})
+        self.assertEqual(summary["coverage"], "partial")
+        self.assertEqual(summary["totals"], {})
+
+    def test_normal_terminal_preserves_failed_usage_summary_without_reclassification(self):
+        usage = {"total_tokens": 24, "reported_failed_attempt_usage":
+                 durable_recovery._failed_usage_summary({"r": [
+                     {"usage": {"total_tokens": 12, "invalid_fields": []}}, {"usage": None}]})}
+        turn = full_core._TurnSummary()
+        turn.observe({"type": "turn.completed", "status": "completed", "usage": usage})
+        turn.finish()
+        self.assertEqual(turn.usage, usage)
+        self.assertEqual(turn.usage["total_tokens"], 24)
+        self.assertEqual(turn.usage["reported_failed_attempt_usage"]["totals"]["total_tokens"], 12)
 
     def test_request_and_trajectory_identity_rejected(self):
         self.original["model"] = "gpt-6-astra"

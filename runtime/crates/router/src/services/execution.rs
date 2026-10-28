@@ -2381,9 +2381,8 @@ impl ExecutionService {
         permit: RuntimeSlotPermit,
     ) -> std::result::Result<(), RuntimeSlotPermit> {
         let sessions = self.sessions.lock();
-        if !sessions
-            .get(session_id)
-            .is_some_and(|lease| lease.runtime_id == runtime_id)
+        if sessions
+            .get(session_id).is_none_or(|lease| lease.runtime_id != runtime_id)
         {
             return Err(permit);
         }
@@ -2533,7 +2532,8 @@ fn value_contains_delivery_marker(value: &Value, marker: &str) -> bool {
 
 enum DirectDeliveryAdmission {
     Send,
-    Reconcile(ContinuationDispatchRecord),
+    // Boxed: the record is far larger than the other variants.
+    Reconcile(Box<ContinuationDispatchRecord>),
     Settled(&'static str),
 }
 
@@ -2558,7 +2558,7 @@ fn admit_trusted_direct_thread_delivery(
                     "direct_delivery_reconciled_awaiting_commander_ack",
                 ))
             } else {
-                Ok(DirectDeliveryAdmission::Reconcile(current))
+                Ok(DirectDeliveryAdmission::Reconcile(Box::new(current)))
             }
         }
         ContinuationWriteOutcome::AlreadyCompleted => Ok(DirectDeliveryAdmission::Settled(
@@ -3545,6 +3545,10 @@ fn evaluate_task_ready_set_request(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ready-set evidence binds every admission input explicitly"
+)]
 fn collect_task_ready_set_evidence(
     commander_session_id: &str,
     task_plan: &lifecycle::TaskPlan,
@@ -7565,7 +7569,7 @@ mod tests {
         let current = match admit_trusted_direct_thread_delivery(&store, &record, &message)
             .expect("replayed delivery admission")
         {
-            DirectDeliveryAdmission::Reconcile(current) => current,
+            DirectDeliveryAdmission::Reconcile(current) => *current,
             DirectDeliveryAdmission::Send => panic!("replay must not admit a second send"),
             DirectDeliveryAdmission::Settled(status) => {
                 panic!("accepted-only delivery is not settled: {status}")
@@ -9042,6 +9046,7 @@ mod tests {
         assert_eq!(std::env::var_os("TURA_PROJECT_ROOT"), previous_project);
     }
 
+    #[allow(clippy::await_holding_lock)] // the env lock serializes env-mutating tests across their runtimes
     #[tokio::test]
     async fn malformed_convergence_ledger_callsite_has_zero_durable_mutation() {
         let _lock = crate::services::ROUTER_TEST_ENV_LOCK
@@ -10106,6 +10111,7 @@ mod tests {
         assert_eq!(conflict.to_string(), "TASK_PACKET_DURABLE_CLAIM_MISMATCH");
     }
 
+    #[allow(clippy::await_holding_lock)] // the env lock serializes env-mutating tests across their runtimes
     #[cfg(unix)]
     #[tokio::test]
     async fn commander_task_packet_exact_replay_has_one_durable_admission() {
@@ -10487,6 +10493,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)] // the env lock serializes env-mutating tests across their runtimes
     #[tokio::test]
     async fn commander_task_packet_blocked_ready_set_has_zero_durable_effects() {
         let _lock = crate::services::ROUTER_TEST_ENV_LOCK
@@ -11005,6 +11012,7 @@ mod tests {
         assert_eq!(duplicate, (transport, delivery));
     }
 
+    #[allow(clippy::await_holding_lock)] // the env lock serializes env-mutating tests across their runtimes
     #[tokio::test]
     async fn pre_execution_terminalization_failure_publishes_zero_callbacks() {
         let _lock = crate::services::ROUTER_TEST_ENV_LOCK

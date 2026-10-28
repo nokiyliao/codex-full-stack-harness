@@ -8,7 +8,8 @@ use support::TestSessionDb;
 #[test]
 fn explicit_start_condition_round_trips_and_waits_for_user_action_when_already_idle() {
     let service = TestSessionDb::start().expect("session DB service should start");
-    let store = SessionStore::new();
+    let default_directory = tempfile::tempdir().expect("default session directory");
+    let store = SessionStore::with_default_directory(default_directory.path());
     let now = Utc::now();
     let session = create_canonical_session(&store, service.workspace());
 
@@ -43,7 +44,8 @@ fn explicit_start_condition_round_trips_and_waits_for_user_action_when_already_i
 #[test]
 fn status_field_does_not_accept_start_condition_values() {
     let service = TestSessionDb::start().expect("session DB service should start");
-    let store = SessionStore::new();
+    let default_directory = tempfile::tempdir().expect("default session directory");
+    let store = SessionStore::with_default_directory(default_directory.path());
     let session = create_canonical_session(&store, service.workspace());
     let before = session.task_management.clone();
 

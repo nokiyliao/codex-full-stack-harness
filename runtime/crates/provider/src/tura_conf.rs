@@ -247,6 +247,7 @@ mod tests {
 
     #[test]
     fn get_reads_uppercase_environment_keys() {
+        let _lock = crate::test_support::env_lock();
         // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
         #[allow(
             unsafe_code,
@@ -274,6 +275,7 @@ mod tests {
 
     #[test]
     fn reload_refreshes_cached_dotenv_values() {
+        let _lock = crate::test_support::env_lock();
         let _key = EnvRestore::remove("TURA_CONF_RELOAD_TEST_KEY");
         let temp = tempfile::tempdir().expect("temp env dir");
         let env_path = temp.path().join(".env");

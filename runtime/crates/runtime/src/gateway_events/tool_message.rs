@@ -181,7 +181,7 @@ pub(crate) fn publish_runtime_usage_record(
     });
     let state = serde_json::json!({
         "status": "completed",
-        "input": runtime.input.clone().unwrap_or(serde_json::Value::Null),
+        "input": runtime_feed_input(runtime.input.as_ref()),
         "output": runtime_output,
         "title": "Runtime usage",
         "metadata": metadata,
@@ -215,6 +215,33 @@ pub(crate) fn publish_runtime_usage_record(
             "failed to publish runtime usage record"
         );
     }
+}
+
+/// The feed is a progress and recovery index; the runtime record keeps the full
+/// request. Publishing each prompt copied the whole conversation into every
+/// provider round's row (quadratic bytes), so messages and tools become digests.
+fn runtime_feed_input(input: Option<&serde_json::Value>) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let Some(serde_json::Value::Object(fields)) = input else {
+        return input.cloned().unwrap_or(serde_json::Value::Null);
+    };
+    let projected = fields
+        .iter()
+        .map(|(key, value)| {
+            let value = if matches!(key.as_str(), "messages" | "tools") {
+                let encoded = serde_json::to_vec(value).unwrap_or_default();
+                serde_json::json!({
+                    "count": value.as_array().map(Vec::len),
+                    "bytes": encoded.len(),
+                    "sha256": format!("{:x}", Sha256::digest(&encoded)),
+                })
+            } else {
+                value.clone()
+            };
+            (key.clone(), value)
+        })
+        .collect();
+    serde_json::Value::Object(projected)
 }
 
 #[expect(
@@ -613,7 +640,28 @@ fn first_non_empty<const N: usize>(items: [&str; N]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::stable_tool_call_id;
+    use super::{runtime_feed_input, stable_tool_call_id};
+
+    #[test]
+    fn runtime_feed_input_keeps_keys_and_digests_prompt_bodies() {
+        let input = serde_json::json!({
+            "messages": [{"role": "user", "content": "x".repeat(4096)}],
+            "tools": [],
+            "options": {"stream": true},
+            "capsule_source_read_context": {"runtime_id": "r"},
+        });
+        let projected = runtime_feed_input(Some(&input));
+        for key in ["messages", "options", "tools", "capsule_source_read_context"] {
+            assert!(projected.get(key).is_some(), "durable readers require {key}");
+        }
+        assert_eq!(projected["messages"]["count"], 1);
+        assert_eq!(projected["messages"]["sha256"].as_str().map(str::len), Some(64));
+        assert_eq!(projected["tools"]["count"], 0);
+        assert_eq!(projected["options"], input["options"]);
+        assert_eq!(projected["capsule_source_read_context"], input["capsule_source_read_context"]);
+        assert!(serde_json::to_vec(&projected).unwrap().len() < 512);
+        assert_eq!(runtime_feed_input(None), serde_json::Value::Null);
+    }
 
     #[test]
     fn stable_tool_call_id_uses_normalized_execution_arguments() {

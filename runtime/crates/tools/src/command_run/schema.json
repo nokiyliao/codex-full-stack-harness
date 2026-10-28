@@ -39,7 +39,24 @@
             },
             "command_line": {
               "type": "string",
-              "description": "Command payload string. source_read: prefer JSON [\"path\",1,50,null,true] = [path,start_line,end_line,expected_sha256,line_numbers]; omit trailing optionals. Named range/search objects remain valid. JSON projection: named {\"path\":\"capsule.json\",\"json_pointer\":\"/field\"}, optional expected_sha256, no line/search options. RFC 6901 string; empty pointer selects whole JSON only within the existing range budgets (12288 text bytes, 16384 serialized result bytes including receipts). Returns compact selected JSON, projection metadata and source file SHA, not line coverage or pagination; invalid/missing/oversized selections fail without partial output. Exact granted paths, full SHA pins; range/search next_line pagination, max 200 lines. Other JSON-schema tools: escaped object strings; freeform: raw bodies; shell-like: text."
+              "description": "Command payload string. source_read: prefer JSON [\"path\",1,50,null,true] = [path,start_line,end_line,expected_sha256,line_numbers]; omit trailing optionals. Named range/search objects remain valid. JSON projection: named {\"path\":\"capsule.json\",\"json_pointer\":\"/field\"}, optional expected_sha256, no search options. RFC 6901 string; empty pointer selects whole JSON only within the JSON budgets (10000 text bytes, 16384 serialized result bytes including receipts). Returns compact selected JSON, projection metadata and source file SHA, not physical line coverage; invalid/missing/oversized selections fail without partial output and name json_recovery pages. A selected string takes start_line/end_line (string_* positions); a selected object or array takes children_offset (resume with children_next_offset). Exact granted paths, full SHA pins; range/search next_line pagination, max 200 lines. Other JSON-schema tools: escaped object strings; freeform: raw bodies; shell-like: text."
+            },
+            "arguments": {
+              "type": "object",
+              "x-tura-optional": true,
+              "additionalProperties": false,
+              "required": ["status", "final_reply"],
+              "properties": {
+                "status": {"type": "string", "enum": ["done"]},
+                "final_reply": {
+                  "anyOf": [
+                    {"type": "string", "minLength": 1},
+                    {"type": "object", "minProperties": 1},
+                    {"type": "array", "minItems": 1}
+                  ]
+                }
+              },
+              "description": "task_status done only; command_line must be empty. Supply the complete reply (object/array for JSON) after required checks. A pre-authored reply may follow fully-known successful work only as the sole command in a strictly later final step, with no earlier task_status or compact_context. All previous results must succeed; cancellation, unknown or failed results forbid delivery. Conclusions requiring review of prior output need a later model turn. Nonempty command_line wins."
             },
             "id": {
               "type": ["string", "null"],

@@ -1,0 +1,22 @@
+{
+  "name": "codex-official-inference-switchboard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "scripts": {
+    "admit": "node src/admission.mjs --admit",
+    "check": "node src/admission.mjs --check",
+    "live-test": "node tests/live-app-sequence.mjs",
+    "model-list-smoke": "node tests/app-model-list-smoke.mjs",
+    "start": "node src/server.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "ajv": "8.17.1",
+    "smol-toml": "1.7.1",
+    "ws": "8.18.3"
+  }
+}

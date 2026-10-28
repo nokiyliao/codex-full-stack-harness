@@ -56,6 +56,13 @@ fn checked_binding<'a>(session: &Path, binding: &'a ReceiptBinding) -> io::Resul
 
 const MAX_NAME_BYTES: usize = 255;
 
+fn observation_scope(binding: Option<&ReceiptBinding>) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let binding = binding?;
+    let bytes = serde_json::to_vec(&(&binding.root, &binding.workspace)).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
 fn validate_name(name: &str) -> io::Result<()> {
     if name.is_empty()
         || name.len() > MAX_NAME_BYTES
@@ -93,6 +100,7 @@ mod unix {
     pub struct ReceiptStore {
         directory: File,
         display_directory: PathBuf,
+        observation_scope: Option<String>,
     }
 
     impl ReceiptStore {
@@ -134,7 +142,13 @@ mod unix {
             Ok(Self {
                 directory,
                 display_directory,
+                observation_scope: super::observation_scope(binding),
             })
+        }
+
+        /// Identity of the validated process-owned store, not a path access grant.
+        pub fn observation_scope(&self) -> Option<&str> {
+            self.observation_scope.as_deref()
         }
 
         /// Return the conventional path for diagnostics only. Never use this
@@ -421,6 +435,7 @@ mod windows {
         display_directory: PathBuf,
         canonical_directory: PathBuf,
         creation_time: u64,
+        observation_scope: Option<String>,
     }
 
     impl ReceiptStore {
@@ -476,7 +491,12 @@ mod windows {
                 display_directory,
                 canonical_directory,
                 creation_time,
+                observation_scope: super::observation_scope(binding),
             })
+        }
+
+        pub fn observation_scope(&self) -> Option<&str> {
+            self.observation_scope.as_deref()
         }
 
         pub fn display_path(&self, name: &str) -> io::Result<PathBuf> {
@@ -716,6 +736,10 @@ mod unsupported {
     pub struct ReceiptStore;
 
     impl ReceiptStore {
+        pub fn observation_scope(&self) -> Option<&str> {
+            None
+        }
+
         fn unsupported() -> io::Error {
             io::Error::from(io::ErrorKind::Unsupported)
         }

@@ -20,7 +20,7 @@ use crate::provider_flow::streamed_command_run::{
     streamed_command_event_record, streamed_command_result_record,
 };
 use crate::router_command_run::{
-    annotate_router_results_from_command, execute_command_value_results,
+    annotate_router_results_from_command,
     resolve_router_command_bindings,
 };
 use crate::runtime_event_writer::RuntimeFeedPublisher;
@@ -150,6 +150,7 @@ pub(crate) struct SpawnStreamedCommandRunTask {
     pub(crate) session_directory: PathBuf,
     pub(crate) allowed_command_run_commands: Option<BTreeSet<String>>,
     pub(crate) jspace_contract: Option<Value>,
+    pub(crate) capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
     pub(crate) session_id: String,
     pub(crate) runtime_id: String,
     pub(crate) provider: Value,
@@ -254,7 +255,9 @@ pub(crate) fn spawn_streamed_command_run_task(
                     provider: &input.provider,
                     call_id: &input.call_id,
                     commands: &streamed_commands,
-                    results: &results,
+                    // Each completion carries only its new results; the terminal update
+                    // carries the full ordered set and durable readers accumulate by cursor.
+                    results: &completion.completed,
                     status: "running",
                     started_at: input.started_at,
                     ended_at: None,
@@ -282,7 +285,6 @@ pub(crate) fn spawn_streamed_command_run_task(
                 &mut active_step,
                 &mut running,
                 &streamed_commands,
-                &results,
                 &mut output_bindings,
                 &mut pending_binding_results,
             );
@@ -306,7 +308,6 @@ pub(crate) fn spawn_streamed_command_run_task(
                         done,
                         &mut running,
                         &streamed_commands,
-                        &results,
                         &output_bindings,
                     );
                     continue;
@@ -331,7 +332,6 @@ pub(crate) fn spawn_streamed_command_run_task(
                         &mut streamed_commands,
                         &mut step_normalizer,
                         next_order,
-                        &results,
                     ) {
                         Some(queued) => queued,
                         None => {
@@ -348,7 +348,6 @@ pub(crate) fn spawn_streamed_command_run_task(
                             done,
                             &mut running,
                             &streamed_commands,
-                            &results,
                             &output_bindings,
                         );
                     }
@@ -370,7 +369,6 @@ pub(crate) fn spawn_streamed_command_run_task(
                         &mut active_step,
                         &mut running,
                         &streamed_commands,
-                        &results,
                         &output_bindings,
                     );
                 }
@@ -470,7 +468,6 @@ fn prepare_stream_command(
     streamed_commands: &mut Vec<Value>,
     step_normalizer: &mut StreamStepNormalizer,
     order: usize,
-    results: &[Value],
 ) -> Option<QueuedStreamCommand> {
     let StreamedCommandEvent {
         tool_call_id,
@@ -576,7 +573,7 @@ fn prepare_stream_command(
         provider: &input.provider,
         call_id: &input.call_id,
         commands: streamed_commands,
-        results,
+        results: &[],
         status: "running",
         started_at: input.started_at,
         ended_at: None,
@@ -617,7 +614,6 @@ fn enqueue_or_start_stream_command(
     active_step: &mut Option<u64>,
     running: &mut usize,
     streamed_commands: &[Value],
-    results: &[Value],
     output_bindings: &code_tools::command_run::CommandRunOutputBindings,
 ) {
     match *active_step {
@@ -627,7 +623,6 @@ fn enqueue_or_start_stream_command(
             command,
             running,
             streamed_commands,
-            results,
             output_bindings,
         ),
         Some(_) => pending.push_back(command),
@@ -639,7 +634,6 @@ fn enqueue_or_start_stream_command(
                 command,
                 running,
                 streamed_commands,
-                results,
                 output_bindings,
             );
         }
@@ -657,7 +651,6 @@ fn start_ready_stream_commands(
     active_step: &mut Option<u64>,
     running: &mut usize,
     streamed_commands: &[Value],
-    results: &[Value],
     output_bindings: &mut code_tools::command_run::CommandRunOutputBindings,
     pending_binding_results: &mut Vec<Value>,
 ) {
@@ -692,7 +685,6 @@ fn start_ready_stream_commands(
             command,
             running,
             streamed_commands,
-            results,
             output_bindings,
         );
     }
@@ -740,7 +732,6 @@ fn start_stream_command(
     queued: QueuedStreamCommand,
     running: &mut usize,
     streamed_commands: &[Value],
-    results: &[Value],
     output_bindings: &code_tools::command_run::CommandRunOutputBindings,
 ) {
     let command_started_at = Utc::now();
@@ -775,13 +766,14 @@ fn start_stream_command(
                 .then(|| CommandRunTerminalStatusGuard::ORDER_ERROR.to_string())
         });
     let publish_started = || {
-        let mut live_results = results.to_vec();
-        live_results.push(command_run_live_delta_result(
+        // A start notice carries only the started command; completed results were
+        // already published once with their own completion.
+        let live_results = [command_run_live_delta_result(
             &live_command,
             "",
             "",
             command_started_at,
-        ));
+        )];
         if let Err(error) = publish_streamed_command_run_update(StreamedCommandRunUpdate {
             session_id: &input.session_id,
             runtime_id: &input.runtime_id,
@@ -813,6 +805,7 @@ fn start_stream_command(
     let session_directory = input.session_directory.clone();
     let allowed_commands = input.allowed_command_run_commands.clone();
     let jspace_contract = input.jspace_contract.clone();
+    let capsule_source_read_binding = input.capsule_source_read_binding.clone();
     let session_id = input.session_id.clone();
     let runtime_id = input.runtime_id.clone();
     let order = queued.order;
@@ -834,13 +827,14 @@ fn start_stream_command(
             }
         } else {
             match tokio::runtime::Runtime::new() {
-                Ok(runtime) => runtime.block_on(execute_command_value_results(
+                Ok(runtime) => runtime.block_on(crate::router_command_run::execute_command_value_results_with_source_binding(
                     command,
                     session_directory,
                     Some(&session_id),
                     Some(&runtime_id),
                     allowed_commands,
                     jspace_contract,
+                    capsule_source_read_binding,
                 )),
                 Err(error) => crate::router_command_run::RouterCommandRunCommandResult {
                     results: vec![serde_json::json!({
@@ -1149,7 +1143,58 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
-    static STREAMING_TEST_ENV: Mutex<()> = Mutex::new(());
+    use crate::ROUTER_TEST_ENV as STREAMING_TEST_ENV;
+
+    #[test]
+    fn capsule_source_binding_reaches_normal_and_streamed_router_context() {
+        let _guard = STREAMING_TEST_ENV.lock().unwrap_or_else(|error| error.into_inner());
+        let router = MockStreamingRouter::start();
+        let _router_env = EnvGuard::set("TURA_ROUTER_ADDR", &router.addr);
+        let _gateway_env = EnvGuard::set("TURA_GATEWAY_CALLBACKS", "off");
+        let root = std::path::PathBuf::from("/workspace");
+        let (contract, binding) = crate::provider_flow::call::tests::capsule_source_fixture(&root);
+        let tools = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tools.path().join("command_run")).unwrap();
+        std::fs::write(tools.path().join("command_run/schema.json"), "{}").unwrap();
+        let command = |label: &str| json!({"label":label,"step":1,"command_type":"source_read",
+            "command_line":json!({"path":"src/one.py","start_line":1,"end_line":1,
+                "expected_sha256_ref":"admitted"}).to_string(),
+            "capsule_source_read_context":{"runtime_id":"model-foreign"}});
+        let normal = tokio::runtime::Runtime::new().unwrap().block_on(
+            crate::tool_router::execute_tool::execute_tool_with_source_binding(
+                crate::tool_router::execute_tool::ExecuteToolInput {
+                    tool_name:"command_run".into(), arguments:json!({"commands":[command("capsule-normal")]}),
+                    session_id:"stream-session".into(), runtime_id:"stream-runtime".into(),
+                    session_directory:root.clone(), tools_directory:tools.path().to_path_buf(),
+                    disable_permission_restrictions:false, allowed_command_run_commands:None,
+                    jspace_contract:Some(contract.clone()),
+                }, Some(binding.clone()))).unwrap();
+        assert!(normal.success, "{normal:?}");
+        let (stream_tx, stream_rx) = mpsc::channel();
+        let state = StreamedCommandRunState::new();
+        let handle = spawn_streamed_command_run_task(SpawnStreamedCommandRunTask {
+            stream_rx,session_directory:root,allowed_command_run_commands:None,
+            jspace_contract:Some(contract), capsule_source_read_binding:Some(binding.clone()),
+            session_id:"stream-session".into(),runtime_id:"stream-runtime".into(),provider:json!({}),
+            call_id:"capsule-stream-call".into(),started_at:Utc::now(),state:state.clone(),
+            runtime_status:runtime().lifecycle_projection(),feed_publisher:None,require_startup_task_state:false,
+        });
+        stream_tx.send(stream_command_value_event(command("capsule-stream"),0)).unwrap();
+        state.mark_provider_completed_healthy();
+        drop(stream_tx);
+        let results = handle.join().unwrap();
+        assert_eq!(results.len(),1);
+        assert_eq!(results[0]["success"],true);
+        let expected = serde_json::to_value(runtime_contract::CapsuleSourceReadContext {
+            session_id:"stream-session".into(),runtime_id:"stream-runtime".into(),binding,
+        }).unwrap();
+        let payloads = router.state.received_payloads.lock().unwrap();
+        assert_eq!(payloads.len(),2);
+        for payload in payloads.iter() {
+            assert_eq!(payload["capsule_source_read_context"], expected);
+            assert_ne!(payload["capsule_source_read_context"]["runtime_id"], "model-foreign");
+        }
+    }
 
     #[test]
     fn streaming_positional_range_preserves_payload_identity_and_steps() {
@@ -1389,6 +1434,7 @@ mod tests {
             session_directory: std::env::temp_dir(),
             allowed_command_run_commands: None,
             jspace_contract: None,
+            capsule_source_read_binding: None,
             session_id: "stream-session".to_string(),
             runtime_id: "stream-runtime".to_string(),
             provider: json!({ "provider": "test" }),
@@ -1461,6 +1507,7 @@ mod tests {
             session_directory: std::env::temp_dir(),
             allowed_command_run_commands: None,
             jspace_contract: None,
+            capsule_source_read_binding: None,
             session_id: "stream-session-binding".to_string(),
             runtime_id: "stream-runtime-binding".to_string(),
             provider: json!({ "provider": "test" }),
@@ -1524,6 +1571,7 @@ mod tests {
             session_directory: std::env::temp_dir(),
             allowed_command_run_commands: None,
             jspace_contract: None,
+            capsule_source_read_binding: None,
             session_id: "stream-session-late-lower".to_string(),
             runtime_id: "stream-runtime-late-lower".to_string(),
             provider: json!({ "provider": "test" }),
@@ -1612,6 +1660,7 @@ mod tests {
             session_directory: std::env::temp_dir(),
             allowed_command_run_commands: None,
             jspace_contract: None,
+            capsule_source_read_binding: None,
             session_id: "stream-session-callback".to_string(),
             runtime_id: "stream-runtime-callback".to_string(),
             provider: json!({ "provider": "test" }),
@@ -1652,6 +1701,7 @@ mod tests {
             session_directory: std::env::temp_dir(),
             allowed_command_run_commands: None,
             jspace_contract: None,
+            capsule_source_read_binding: None,
             session_id: "stream-session-startup-discard".to_string(),
             runtime_id: "stream-runtime-startup-discard".to_string(),
             provider: json!({ "provider": "test" }),
@@ -1989,6 +2039,7 @@ mod tests {
             session_directory: std::env::temp_dir(),
             allowed_command_run_commands: None,
             jspace_contract: None,
+            capsule_source_read_binding: None,
             session_id: "stream-terminal-session".to_string(),
             runtime_id: "stream-terminal-runtime".to_string(),
             provider: json!({"provider": "test"}),
@@ -2122,6 +2173,7 @@ mod tests {
     struct MockStreamingRouterState {
         started: Mutex<Vec<String>>,
         received: Mutex<Vec<Value>>,
+        received_payloads: Mutex<Vec<Value>>,
         release_step1: AtomicBool,
         release_step2: AtomicBool,
         active: AtomicUsize,
@@ -2143,6 +2195,7 @@ mod tests {
             let state = Arc::new(MockStreamingRouterState {
                 started: Mutex::new(Vec::new()),
                 received: Mutex::new(Vec::new()),
+                received_payloads: Mutex::new(Vec::new()),
                 release_step1: AtomicBool::new(false),
                 release_step2: AtomicBool::new(false),
                 active: AtomicUsize::new(0),
@@ -2238,6 +2291,7 @@ mod tests {
                 .pointer("/payload/arguments/commands/0")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            self.received_payloads.lock().unwrap().push(request["payload"].clone());
             let label = command
                 .get("label")
                 .and_then(Value::as_str)

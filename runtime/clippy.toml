@@ -1,0 +1,2 @@
+# Crates deny clippy::unwrap_used for production code; test assertions may unwrap.
+allow-unwrap-in-tests = true

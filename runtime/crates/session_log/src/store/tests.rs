@@ -646,6 +646,42 @@ fn execution_evidence_pages_keep_prefix_usage_and_provider_facts_through_two_com
 }
 
 #[test]
+fn execution_evidence_keeps_pre_model_classification_after_compaction() {
+    let (_root, store) = execution_evidence_store_fixture();
+    let auth = json!({"type":"runtime_provider_observation", "runtime_id":"auth",
+        "session_id":"evidence-history", "status":"Failed", "error_code":"CALL_FAILED",
+        "provider_observation":null, "provider_call_observation":{
+            "schema_version":"provider_call_observation_v1", "scope":"runtime_provider_call",
+            "stage":"authentication", "model_provider_invoked":false}}).to_string();
+    append_execution_fixture(&store, 0, 0, 0, std::slice::from_ref(&auth));
+    let tail = vec![json!({"type":"runtime_usage","runtime_id":"model",
+        "usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}).to_string()];
+    append_execution_fixture(&store, 1, 1, 1, &tail);
+    let retained = store.read_context_slice(ReadContextSliceRequest {
+        session_id:"evidence-history".into(), max_estimated_tokens:u64::MAX }).unwrap();
+    assert!(!retained.records.iter().any(|record| record.raw_record == auth));
+    let head = store.read_execution_evidence(execution_fixture_read(None, 0, true)).unwrap();
+    let usage = head.summary.unwrap().usage;
+    assert_eq!(usage["total_tokens"], 10);
+    assert_eq!(usage["coverage"]["status"], "incomplete");
+    assert_eq!(usage["model_usage_coverage"]["status"], "complete");
+    assert_eq!(usage["model_usage_coverage"]["verified_pre_model_failure_count"], 1);
+    assert_eq!(usage["model_usage_coverage"]["expected_usage_runtime_count"], 1);
+    let original: serde_json::Value = serde_json::from_str(&head.records[0].raw_record).unwrap();
+    assert!(original.get("usage").is_none());
+
+    // Contradictory late evidence invalidates the classification, not the raw history.
+    append_execution_fixture(&store, 2, 2, 1, &[
+        json!({"type":"runtime_usage","runtime_id":"auth",
+            "usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}).to_string()]);
+    let contradicted = store.read_execution_evidence(execution_fixture_read(None, 3, true)).unwrap();
+    let usage = contradicted.summary.unwrap().usage;
+    assert_eq!(usage["model_usage_coverage"]["status"], "incomplete");
+    assert_eq!(usage["model_usage_coverage"]["verified_pre_model_failure_count"], 0);
+    assert_eq!(usage["total_tokens"], 10);
+}
+
+#[test]
 fn execution_evidence_summary_has_exact_distinct_counts_with_bounded_display_and_runtime_state() {
     let (_root, store) = execution_evidence_store_fixture();
     let records = (0..40).flat_map(|index| {

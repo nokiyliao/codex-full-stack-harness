@@ -171,6 +171,7 @@ pub(crate) enum MockMode {
     TaskStatusDoneWithShortVisibleReply,
     TaskStatusDoneWithLongVisibleReply,
     NoToolVisibleReplyWithSyntheticCompactionUsage,
+    TaskStatusWithVisibleReplyAndCompactContext(&'static str),
     TerminalEvidence(TerminalEvidenceScenario),
 }
 
@@ -183,10 +184,13 @@ pub(crate) enum TerminalEvidenceScenario {
     UnresolvedEffect,
     PendingCompact,
     AutoCompact,
+    QuestionAutoCompact,
+    DoingAutoCompact,
     ForeignMarker,
     MissingTerminalStatus,
     UnsafeTerminalBatch,
     Ordered(OrderedEvidenceScenario),
+    OrderedFinalReply(OrderedEvidenceScenario),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -248,6 +252,15 @@ impl MockProvider {
 
     pub(crate) fn start_no_tool_visible_reply_with_synthetic_compaction_usage() -> Self {
         Self::start_with_mode(MockMode::NoToolVisibleReplyWithSyntheticCompactionUsage, None)
+    }
+
+    pub(crate) fn start_task_status_with_visible_reply_and_compact_context(
+        status: &'static str,
+    ) -> Self {
+        Self::start_with_mode(
+            MockMode::TaskStatusWithVisibleReplyAndCompactContext(status),
+            None,
+        )
     }
 
     fn start_with_mode(mode: MockMode, workspace: Option<PathBuf>) -> Self {
@@ -359,6 +372,9 @@ pub(crate) fn handle_provider_connection(
         MockMode::TaskStatusDoneWithLongVisibleReply => {
             write_command_run_responses(stream, &response);
         }
+        MockMode::TaskStatusWithVisibleReplyAndCompactContext(_) => {
+            write_command_run_responses(stream, &response);
+        }
         MockMode::NoToolVisibleReplyWithSyntheticCompactionUsage => {
             if index == 0 {
                 write_command_run_responses(stream, &response);
@@ -406,6 +422,9 @@ pub(crate) fn provider_response(index: usize, mode: MockMode) -> Value {
         }
         MockMode::TaskStatusDoneWithLongVisibleReply => {
             task_status_done_with_long_visible_reply_response(index)
+        }
+        MockMode::TaskStatusWithVisibleReplyAndCompactContext(status) => {
+            task_status_with_visible_reply_and_compact_context_response(index, status)
         }
         MockMode::NoToolVisibleReplyWithSyntheticCompactionUsage => {
             let mut response = assistant_response(MOCK_COMPACTION_REPLY);
@@ -1111,11 +1130,49 @@ pub(crate) fn task_status_done_with_short_visible_reply_response(index: usize) -
 }
 
 pub(crate) const TERMINAL_EVIDENCE_FINAL_REPLY: &str = "Terminal evidence fixture final assistant reply.";
+
+pub(crate) const COMPACTION_VISIBLE_REPLY: &str =
+    "Capability gap: focused_verifier is not admitted here; the parent must rerun it.";
+pub(crate) const COMPACTION_FOLLOW_UP_REPLY: &str = "Follow-up turn after requested compaction.";
+
+pub(crate) fn task_status_with_visible_reply_and_compact_context_response(
+    index: usize,
+    status: &str,
+) -> Value {
+    match index {
+        // I17 shape: a visible reply, then one command_run whose only command
+        // is task_status with a requested compact_context handoff.
+        0 => tool_response_with_content(
+            "call_task_status_compact_visible",
+            "command_run",
+            json!({
+                "commands": [
+                    {
+                        "step": 1,
+                        "command_type": "task_status",
+                        "command_line": json!({
+                            "status": status,
+                            "compact_context": "Offline fixture handoff; the visible reply already reported the blocker."
+                        }).to_string()
+                    }
+                ]
+            }),
+            COMPACTION_VISIBLE_REPLY,
+        ),
+        _ => assistant_response(COMPACTION_FOLLOW_UP_REPLY),
+    }
+}
+
 pub(crate) const TERMINAL_EVIDENCE_PROGRESS_REPLY: &str = "Offline fixture: the actual patch and verification will follow.";
+pub(crate) const ORDERED_PREAUTHORED_REPLY: &str = "Predetermined patch and exact check completed; parent acceptance pending.";
 
 fn terminal_evidence_response(index: usize, scenario: TerminalEvidenceScenario) -> Value {
-    if let TerminalEvidenceScenario::Ordered(ordered) = scenario {
-        return ordered_evidence_response(index, ordered);
+    match scenario {
+        TerminalEvidenceScenario::Ordered(ordered) =>
+            return ordered_evidence_response(index, ordered, false),
+        TerminalEvidenceScenario::OrderedFinalReply(ordered) =>
+            return ordered_evidence_response(index, ordered, true),
+        _ => {}
     }
     match index {
         // Use the existing actual task-status, patch, and verification loop.
@@ -1153,7 +1210,8 @@ fn terminal_evidence_response(index: usize, scenario: TerminalEvidenceScenario) 
                 }]}));
             }
             let mut status = json!({"status":match scenario {
-                TerminalEvidenceScenario::Question => "question",
+                TerminalEvidenceScenario::Question | TerminalEvidenceScenario::QuestionAutoCompact => "question",
+                TerminalEvidenceScenario::DoingAutoCompact => "doing",
                 _ => "done",
             }});
             if matches!(scenario, TerminalEvidenceScenario::PendingCompact) {
@@ -1168,17 +1226,34 @@ fn terminal_evidence_response(index: usize, scenario: TerminalEvidenceScenario) 
                 json!([{"step":1, "command_type":"task_status", "command_line":status.to_string()}])
             };
             let mut response = tool_response("call_terminal_evidence_status", "command_run", json!({"commands":commands}));
-            if matches!(scenario, TerminalEvidenceScenario::AutoCompact) {
+            if matches!(scenario, TerminalEvidenceScenario::AutoCompact
+                | TerminalEvidenceScenario::QuestionAutoCompact | TerminalEvidenceScenario::DoingAutoCompact) {
                 response["usage"] = json!({"prompt_tokens":MOCK_COMPACTION_INPUT_TOKENS,
                     "completion_tokens":1, "total_tokens":MOCK_COMPACTION_INPUT_TOKENS + 1});
             }
             response
         }
+        3 if matches!(scenario, TerminalEvidenceScenario::PendingCompact
+            | TerminalEvidenceScenario::AutoCompact | TerminalEvidenceScenario::QuestionAutoCompact
+            | TerminalEvidenceScenario::DoingAutoCompact) => {
+            // Deliberately attempt another task-state effect after compaction,
+            // even if tools were disabled. Settled terminal delivery must ignore
+            // it; an ongoing doing task must still execute its legitimate done.
+            let status = match scenario {
+                TerminalEvidenceScenario::DoingAutoCompact => "done",
+                TerminalEvidenceScenario::QuestionAutoCompact => "doing",
+                _ => "question",
+            };
+            tool_response_with_content("call_post_compact_status", "command_run", json!({"commands":[{
+                "step":1, "command_type":"task_status",
+                "command_line":json!({"status":status}).to_string()
+            }]}), TERMINAL_EVIDENCE_FINAL_REPLY)
+        }
         _ => assistant_response(TERMINAL_EVIDENCE_FINAL_REPLY),
     }
 }
 
-fn ordered_evidence_response(index: usize, scenario: OrderedEvidenceScenario) -> Value {
+fn ordered_evidence_response(index: usize, scenario: OrderedEvidenceScenario, final_reply: bool) -> Value {
     match index {
         0 => terminal_evidence_response(0, TerminalEvidenceScenario::Done),
         1 => {
@@ -1211,8 +1286,12 @@ fn ordered_evidence_response(index: usize, scenario: OrderedEvidenceScenario) ->
                 verify["timeout_ms"] = json!(100);
             }
             let commands = arguments["commands"].as_array_mut().expect("fixture commands");
+            let mut status = json!({"status":"done"});
+            if final_reply {
+                status["final_reply"] = json!(ORDERED_PREAUTHORED_REPLY);
+            }
             let mut done = json!({"step":3,
-                "command_type":"task_status", "command_line":json!({"status":"done"}).to_string()});
+                "command_type":"task_status", "command_line":status.to_string()});
             match scenario {
                 OrderedEvidenceScenario::SeparateDone => {}
                 OrderedEvidenceScenario::SameStep => {

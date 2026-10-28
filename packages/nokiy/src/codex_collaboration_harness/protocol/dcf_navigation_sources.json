@@ -1,0 +1,15 @@
+{
+  "schema_version": "dcf_navigation_source_snapshot_v1",
+  "maintenance": "Generated snapshots for immutable packaging. Edit canonical DCF then resync; no independent parser implementation.",
+  "sources": {
+    "dcf_navigation_extract.py": {
+      "path": "/Users/nokiy/Documents/unified_trading_model/scripts/ops/dcf/symbol_extract.py",
+      "sha256": "e2a12cd5039c952da8d0920a927a42e0866de6f472403108d7b09b36402b0e4a"
+    },
+    "dcf_navigation_resolve.py": {
+      "path": "/Users/nokiy/Documents/unified_trading_model/scripts/ops/dcf/symbol_resolve.py",
+      "sha256": "bb889ca5d5d559410fcca9597df5c525227113d6d1ad57d0dedf92b0605bda55"
+    }
+  },
+  "license": "dcf_navigation_LICENSE.txt"
+}

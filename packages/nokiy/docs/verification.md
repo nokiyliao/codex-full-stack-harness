@@ -103,13 +103,13 @@ documentation. Its direct evidence is:
 | Scanner exclusions | Repo-local virtual-environment variants are excluded as build state |
 | Packaging metadata exclusion | Generated `*.egg-info` metadata is excluded while authored `src/` remains scanned |
 | Scanner inclusion | Public source remains inside the review-readiness scan boundary |
-| Nokiy adapter success | A bounded task/lease maps deterministically to a Nokiy request and a settled terminal envelope maps to the core result |
-| Nokiy wire contract | Packaged request/terminal schemas and golden vectors bind the exact protocol version and request digest |
-| Nokiy unsettled effect | The exact effect identity remains unsettled for core reconciliation rather than being retried |
-| Nokiy transport/terminal failure | Transport exceptions and explicit terminal failures become deterministic typed failures |
-| Nokiy identity closure | Packet, lease, request, and executor drift is rejected before becoming a core result |
-| Nokiy/core failure composition | Execution failures and typed rejections preserve the exact failure code, detail digest, and observed effect across the adapter-to-core boundary; a second execution is blocked until explicit `NONE` or `SETTLED` reconciliation |
-| Native Nokiy task bootstrap | A canonical Native task name resolves the unique highest immutable capsule revision; TaskPacket, callback, revision, content digest, file mode, link count, duplicate-key, tamper, traversal, stale-revision, and same-revision conflict checks fail closed before execution. Historical digest-only v1 filenames are readable but remain unprofiled and non-dispatchable. |
+| Tura adapter success | A bounded task/lease maps deterministically to a Tura request and a settled terminal envelope maps to the core result |
+| Tura wire contract | Packaged request/terminal schemas and golden vectors bind the exact protocol version and request digest |
+| Tura unsettled effect | The exact effect identity remains unsettled for core reconciliation rather than being retried |
+| Tura transport/terminal failure | Transport exceptions and explicit terminal failures become deterministic typed failures |
+| Tura identity closure | Packet, lease, request, and executor drift is rejected before becoming a core result |
+| Tura/core failure composition | Execution failures and typed rejections preserve the exact failure code, detail digest, and observed effect across the adapter-to-core boundary; a second execution is blocked until explicit `NONE` or `SETTLED` reconciliation |
+| Native Tura task bootstrap | A canonical Native task name resolves the unique highest immutable capsule revision; TaskPacket, callback, revision, content digest, file mode, link count, duplicate-key, tamper, traversal, stale-revision, and same-revision conflict checks fail closed before execution. Historical digest-only v1 filenames are readable but remain unprofiled and non-dispatchable. |
 | Native packet inventory | Read-only inspection classifies every revision as `CURRENT_PROFILED`, `LEGACY_READABLE`, or `REJECTED` and binds the complete deterministic result to one digest without migration. |
 | Native execution profile | `inherit`, mutable initial `preferred`, and reproducible `pinned` policies compile with the official task target, Skill-contract digest, prompt digest, exact UTF-8 size metrics, and callback identity into one deterministic `create_thread` plan; unsupported pinned `ultra` is rejected rather than downgraded. |
 | Native callback intake | Only the exact marker plus canonical terminal JSON is accepted; callback, parent, and task identity mismatches fail before mission intake, callbacks over 65,536 UTF-8 bytes fail, and evidence is capped at 32 items. |
@@ -164,7 +164,7 @@ workflow additionally requires an annotated tag matching `pyproject.toml` and
 emits GitHub build provenance for those checksums.
 
 `make check-components` is a separate networked predicate that verifies the
-optional public Nokiy branch, exact commit trees, ancestry, license, and
+optional public Tura branch, exact commit trees, ancestry, license, and
 modification notice. It runs in a scheduled/manual component-conformance
 workflow rather than gating Native CI or release. Its success establishes source
 lineage only, never installed/runtime acceptance.

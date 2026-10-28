@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use lifecycle::RuntimeState;
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -27,7 +28,7 @@ use crate::provider_flow::provider_response::apply_provider_response_with_option
 use crate::provider_flow::streamed_command_run::{
     command_run_stream_events_from_provider_content, streamed_command_run_call_id,
 };
-use crate::provider_flow::usage::{provider_observation, usage_report_from_metrics};
+use crate::provider_flow::usage::{response_observation, usage_report_from_metrics};
 use crate::runtime_event_writer::RuntimeEventWriter;
 use lifecycle::RuntimeAggregate;
 
@@ -40,12 +41,13 @@ pub(crate) struct RuntimeStreamingInput {
     pub(crate) require_startup_task_state: bool,
 }
 
-pub(crate) async fn call_runtime_streaming(
+pub(crate) async fn call_runtime_streaming_with_source_binding(
     runtime: &mut RuntimeAggregate,
     route_config: &tura_llm_rust::RouteConfig,
     tura_config: &Arc<tura_llm_rust::TuraConfig>,
     input: RuntimeStreamingInput,
     mut runtime_event_writer: Option<&mut RuntimeEventWriter>,
+    capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
 ) -> Result<(), String> {
     let started_at = Utc::now();
     let timeout_duration = runtime_timeout(runtime);
@@ -106,6 +108,7 @@ pub(crate) async fn call_runtime_streaming(
         session_directory: input.session_directory,
         allowed_command_run_commands: input.allowed_command_run_commands,
         jspace_contract: input.jspace_contract,
+        capsule_source_read_binding,
         session_id: gateway_session_id,
         runtime_id: gateway_runtime_id.clone(),
         provider: gateway_provider,
@@ -177,10 +180,18 @@ pub(crate) async fn call_runtime_streaming(
                     Ok(Ok(response)) => response,
                     Ok(Err(e)) => {
                         let finished_at = Utc::now();
+                        let command_effect_observed = command_effect_started.load(Ordering::SeqCst);
                         error!(error = %e, "runtime call failed");
-                        runtime.set_output(serde_json::json!({
-                            "error": e.to_string()
-                        }))?;
+                        let failure_output = super::errors::provider_failure_output_with_runtime_context(
+                            &e, &runtime.runtime_id, command_effect_observed,
+                        );
+                        if let Some(snapshot) = failure_output.get("provider_stream_failure") {
+                            let _ = writeln!(std::io::stderr().lock(), "[provider] stream-failure-snapshot={snapshot}");
+                        }
+            runtime.set_output_with_provider_observation(
+                failure_output,
+                super::errors::provider_failure_observation(&e),
+            )?;
                         flush_runtime_events(&mut runtime_event_writer, runtime)?;
                         if command_effect_started.load(Ordering::SeqCst) {
                             finish_provider_call_failure_after_command_effect(
@@ -380,12 +391,12 @@ pub(crate) async fn call_runtime_streaming(
         }
     }
     runtime.set_output_with_provider_observation(
-        super::responses_continuity::capture_reasoning(
+        super::usage::attach_transport_timing(super::responses_continuity::capture_reasoning(
             runtime_output,
             &response.raw,
             &runtime.provider,
-        ),
-        Some(provider_observation(&response.raw)),
+        ), response.metrics.as_ref()),
+        Some(response_observation(&response)),
     )?;
     apply_provider_response_with_options(
         runtime,

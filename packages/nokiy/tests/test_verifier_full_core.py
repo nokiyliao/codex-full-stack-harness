@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 import test_full_core as fixtures
 from test_postimage_context import dcf_generation
-from codex_collaboration_harness import embedded_nokiy as caller, full_core, local_context
+from codex_collaboration_harness import embedded_nokiy as caller, full_core, local_context, result_inspection
 
 
 class FullCoreDcfPostimageBindingTests(unittest.TestCase):
@@ -43,7 +43,7 @@ class FullCoreDcfPostimageBindingTests(unittest.TestCase):
                 path = workspace / "contract.json"
                 path.write_text(json.dumps(contract))
                 request = SimpleNamespace(
-                    artifact_root=artifacts, request_id="run", workspace=workspace,
+                    artifact_root=artifacts, request_id="run", request_sha256="b" * 64, workspace=workspace,
                     jspace_contract=caller.FileIdentity(path, caller._file_sha256(path)),
                     prompt="Capture at the validated pre-worker boundary.", timeout_seconds=None,
                     terminal_delivery="assistant_reply",
@@ -61,7 +61,8 @@ class FullCoreDcfPostimageBindingTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "capture boundary"):
                         full_core.execute_full_core(request)
                 constructor.assert_called_once_with(workspace, contract, router, None,
-                    validated_dcf_generation=capsule["dcf_generation"] if name == "dcf" else None)
+                    validated_dcf_generation=capsule["dcf_generation"] if name == "dcf" else None,
+                    diagnostic_root=artifacts / "run", request_id="run", request_sha256="b" * 64)
                 self.assertEqual(contract, original)
                 self.assertNotIn("source_snapshot", contract["dcf_generation"])
 
@@ -219,7 +220,7 @@ class VerifierPromptTests(unittest.TestCase):
                         "read_scopes": before["read_scopes"],
                         "source_read_example": {
                             "commands": [{"command_type": "source_read",
-                                          "command_line": '{"end_line":80,"path":"a.py","start_line":1}',
+                                          "command_line": '["a.py",1,80]',
                                           "step": 1}],
                         },
                     }
@@ -265,8 +266,8 @@ class VerifierPromptTests(unittest.TestCase):
                     "No task rewrites/invented capabilities.",
                     "Reuse caller-verified current pre-edit baseline; reproduce if required; "
                     "run required focused post-edit verification.",
-                    "Verifier success + semantically reviewed fresh scoped postimage readback "
-                    "covers only the exact unchanged state: no redundant tests/reads/status polls.",
+                    "tests are not the specification.",
+                    "Cover required interactions before patching",
                     "Reverify after relevant source/test/config changes, failure, "
                     "unknown/mismatched evidence or explicit task requirements.",
                     "Reuse evidence, never ownership/permission clearance.",
@@ -276,8 +277,18 @@ class VerifierPromptTests(unittest.TestCase):
                     "exact-write patches precede the admitted focused_verifier "
                     "at a strictly later positive step in the same command_run response.",
                     "No dependent same-step verification or missing-evidence edits.",
+                    "Include task_status done alone at a strictly later final positive step "
+                    "in that SAME commands array.",
+                    "Required checks/readbacks and conclusions must be known, not result-dependent.",
+                    "Failed/timed-out/unknown results block done; interpretation requires a later model turn.",
                 ):
                     self.assertIn(fence, guidance)
+
+    def test_verifier_environment_reaches_the_worker_that_writes_tests(self):
+        task = "Patch and verify answer.txt."
+        _, guidance = self._prompt_parts(task, full_core._provider_prompt(task, self.jspace))
+        self.assertIn("Verifier sandbox: cwd draft.workspace; writes only its scratch, TMPDIR.", guidance)
+        self.assertIn("resolve fixture/helper/data paths from their own file's directory, never cwd.", guidance)
 
     def test_source_postimages_context_is_review_evidence_not_authority_or_auto_done(self):
         task = "Review optional post-edit verifier context."
@@ -293,20 +304,19 @@ class VerifierPromptTests(unittest.TestCase):
         self.assertEqual(self.jspace, before)
         for fence in (
             "Optional source_postimages: known exit0/reaped/group-empty success only.",
-            "Semantically review complete definitions/bindings + support, or all-text delta "
+            "When the task requires review, semantically review complete definitions/bindings + support, or all-text delta "
             "on definition-size overflow (not complete definitions).",
             "No dependency/file proof; exact paths/postimage SHA/lines only.",
             "Missing/overflow/stale/uncovered evidence: ordinary granted source_read.",
             "Preserve raw stdout/stderr, verifier/receipt/cleanup facts; "
             "no new authority, acceptance or automatic done.",
-            "If post-edit evidence is present, review:",
+            "If task-required post-edit review remains:",
             "Mechanical missing readbacks only; mandatory task_status done "
-            "at a strictly later positive step in the same existing command_run.",
-            "Else propose fully-known mechanical checks/readbacks "
-            "in strict later steps per guidance.",
-            "No output-dependent decisions; safe exact read+write paths only.",
-            "Result-dependent review: later model round.",
-            "Keep publication fences; no failed/unknown-effect closure or expanded grants.",
+            "in later positive steps of the same command_run, exact read+write paths only.",
+            "Batch only fully-known mechanical work; result-dependent review needs a later model round.",
+            "Task-permitted mixed responses: Once final patches are fully known",
+            "No dependent same-step verification or missing-evidence edits.",
+            "No failed/unknown-effect closure; keep publication fences.",
             "Mandatory status updates and terminal fences.",
         ):
             with self.subTest(fence=fence):
@@ -328,10 +338,10 @@ class VerifierPromptTests(unittest.TestCase):
                     prefix += full_core._EVIDENCE_ONLY_COMPLETION_GUIDANCE
                 text = full_core._provider_prompt(task, self.jspace, terminal_delivery=mode)
                 _, guidance = self._prompt_parts(prefix, text)
-                condition = "If post-edit evidence is present, review:"
+                condition = "If task-required post-edit review remains:"
                 readbacks = "Mechanical missing readbacks only; mandatory task_status done"
-                pending = ("Else propose fully-known mechanical checks/readbacks "
-                           "in strict later steps per guidance.")
+                pending = ("Batch only fully-known mechanical work; "
+                           "result-dependent review needs a later model round.")
                 self.assertLess(guidance.index(condition), guidance.index(readbacks))
                 self.assertLess(guidance.index(readbacks), guidance.index(pending))
                 self.assertNotIn("required verification must have passed", guidance)
@@ -340,10 +350,8 @@ class VerifierPromptTests(unittest.TestCase):
                     "exact-write patches precede the admitted focused_verifier "
                     "at a strictly later positive step in the same command_run response.",
                     "No dependent same-step verification or missing-evidence edits.",
-                    "at a strictly later positive step in the same existing command_run.",
-                    "No output-dependent decisions; safe exact read+write paths only.",
-                    "Result-dependent review: later model round.",
-                    "Keep publication fences; no failed/unknown-effect closure or expanded grants.",
+                    "in later positive steps of the same command_run, exact read+write paths only.",
+                    "No failed/unknown-effect closure; keep publication fences.",
                     "Mandatory status updates and terminal fences.",
                 ):
                     self.assertIn(fence, guidance)
@@ -377,9 +385,9 @@ class VerifierPromptTests(unittest.TestCase):
                 for mode, text in (("assistant_reply", explicit), ("evidence_only", evidence)):
                     with self.subTest(mode=mode):
                         for rule in (
-                            "If post-edit evidence is present, review:",
+                            "If task-required post-edit review remains:",
                             "Mechanical missing readbacks only; mandatory task_status done",
-                            "Else propose fully-known mechanical checks/readbacks",
+                            "Batch only fully-known mechanical work",
                         ):
                             self.assertEqual(rule in text, has_finish)
                         self.assertEqual(full_core._EVIDENCE_ONLY_COMPLETION_GUIDANCE in text,
@@ -404,10 +412,13 @@ class VerifierPromptTests(unittest.TestCase):
             }],
         }
         # Preserve source-read ceilings; projection JSON and the handoff suffix are separate.
+        # v316 spends 122 bytes so a passing verifier ends the worker without a readback round.
+        # Exact same-array conditions and task-only review add at most 211 bytes.
+        # v422 spends 182 bytes on the verifier sandbox facts where workers write tests.
         cases = (
             ("read-only", self._source_read_cases()[0][1], 994),
-            ("edit+verifier", self.jspace, 2352),
-            ("edit+verifier+sha", mixed_with_sha, 2439),
+            ("edit+verifier", self.jspace, 3039),
+            ("edit+verifier+sha", mixed_with_sha, 3126),
         )
         for label, contract, guidance_cap in cases:
             with self.subTest(case=label):
@@ -418,7 +429,7 @@ class VerifierPromptTests(unittest.TestCase):
                     self.assertEqual(projection["known_source_sha256_by_path"], {"verify.py": "a" * 64})
                     self.assertEqual(projection["source_read_example"], {
                         "commands": [{"command_type": "source_read",
-                                      "command_line": '{"end_line":80,"path":"answer.txt","start_line":1}',
+                                      "command_line": '["answer.txt",1,80]',
                                       "step": 1}],
                     })
                 for fence in (
@@ -449,8 +460,8 @@ class VerifierPromptTests(unittest.TestCase):
                         "Never borrow another file's SHA.",
                         "Page: returned SHA/next_line.",
                         "runtime rechecks every read; no new grants.",
-                        "Verifier success + semantically reviewed fresh scoped postimage readback "
-                        "covers only the exact unchanged state: no redundant tests/reads/status polls.",
+                        "tests are not the specification.",
+                        "Cover required interactions before patching",
                         "Reverify after relevant source/test/config changes, failure, "
                         "unknown/mismatched evidence or explicit task requirements.",
                     )
@@ -472,7 +483,7 @@ class VerifierFullCoreTests(unittest.TestCase):
                           ("tura_session_db", "NOKIY_VERIFIER_TEST_SESSION_DB")):
             shutil.copy2(Path(os.environ[key]).resolve(), f.runtime / name)
         solution = f.workspace / "answer.txt"
-        solution.write_text("broken")
+        solution.write_text("broken\n")
         script = f.workspace / "verify.py"
         scratch = f.artifacts / "verifier"
         scratch.mkdir()
@@ -480,7 +491,7 @@ class VerifierFullCoreTests(unittest.TestCase):
                           f"counter=Path({str(scratch / 'runs')!r})\n"
                           "counter.write_text(counter.read_text()+'x' if counter.exists() else 'x')\n"
                           "print('public-test', flush=True)\n"
-                          "sys.exit(0 if Path('answer.txt').read_text() == 'fixed' else 1)\n")
+                          "sys.exit(0 if Path('answer.txt').read_text() == 'fixed\\n' else 1)\n")
         python = Path(sys.executable).resolve()
         action = {
             "mission":{"mission_id":"full-verifier-test","task_id":"exact-fixture",
@@ -507,20 +518,30 @@ assert 'NOKIY_VERIFIER_FD' not in os.environ
 contract=json.loads(pathlib.Path(value('--jspace-contract')).read_text())
 workspace=pathlib.Path(value('-C'))
 host,port=value('--router-address').rsplit(':',1)
-def call(execution_id, request_id):
+def call_commands(execution_id, request_id, commands):
     payload={'session_id':value('--session-id'),'runtime_id':'synthetic-runtime',
         'session_directory':str(workspace),'arguments':{'execution_id':execution_id,
-        'commands':[{'command':'focused_verifier','command_line':'{"verifier_index":0}',
-                     'command_id':execution_id,'command_run_id':execution_id,
-                     'provider_tool_call_id':'fixture-tool','command_index':0}]},
-        'allowed_commands':['focused_verifier'],'jspace_contract':contract,'sandbox':True}
+        'commands':[{**command,'command_id':execution_id+'-'+str(index),
+                     'command_run_id':execution_id,'provider_tool_call_id':'fixture-tool',
+                     'command_index':index} for index,command in enumerate(commands)]},
+        'allowed_commands':['focused_verifier','apply_patch'],
+        'jspace_contract':contract,'sandbox':True}
     request={'request_id':request_id,'kind':'call','method':'execution.command_run','payload':payload}
     with socket.create_connection((host,int(port)),timeout=20) as connection:
         connection.sendall((json.dumps(request)+'\n').encode())
         with connection.makefile('rb') as stream: reply=json.loads(stream.readline(1048576))
     assert reply['ok'],reply
-    return reply['payload']['result']['results'][0]
+    return reply['payload']['result']['results']
+def call(execution_id, request_id):
+    return call_commands(execution_id,request_id,[{
+        'command':'focused_verifier','command_line':'{"verifier_index":0}'}])[0]
+patch_command={'command_type':'apply_patch','command_line':
+    '*** Begin Patch\n*** Update File: answer.txt\n@@\n-broken\n+fixed\n*** End Patch'}
+denied_command={'command_type':'apply_patch','command_line':
+    '*** Begin Patch\n*** Update File: verify.py\n@@\n+raise SystemExit(0)\n*** End Patch'}
 results=[]
+patch_result=None
+denied=None
 for batch,expected in [('public-first',1),('public-second',0)]:
     result=call(batch,batch)
     output=result['output'];receipt=output['terminal_receipt']
@@ -528,12 +549,27 @@ for batch,expected in [('public-first',1),('public-second',0)]:
     assert receipt['outcome']=='known' and receipt['process_reaped'] and receipt['process_group_empty'],result
     results.append(result)
     print(json.dumps({'type':'item.completed','item':{'type':'command_execution',
-        'status':'completed','command':'focused_verifier','aggregated_output':json.dumps(output)}}),flush=True)
-    if expected: (workspace/'answer.txt').write_text('fixed')
+        'status':'completed' if result['success'] else 'failed',
+        'command_type':'focused_verifier','command':'{"verifier_index":0}',
+        'aggregated_output':json.dumps(output)}}),flush=True)
+    if expected:
+        verifier_before=(workspace/'verify.py').read_bytes()
+        denied=call_commands('scope-denied','scope-denied',[patch_command,denied_command])
+        assert not denied[0]['success'] and 'JSPACE' in json.dumps(denied),denied
+        assert (workspace/'answer.txt').read_text()=='broken\n'
+        assert (workspace/'verify.py').read_bytes()==verifier_before
+        patch_result=call_commands('source-repair','source-repair',[patch_command])[0]
+        assert patch_result['success'],patch_result
+        assert (workspace/'answer.txt').read_text()=='fixed\n'
+        print(json.dumps({'type':'item.completed','item':{'type':'file_change',
+            'id':'source-repair','changes':[{'kind':'update','path':str(workspace/'answer.txt')}],
+            'status':'completed','success':True,'command_type':'apply_patch',
+            'aggregated_output':json.dumps(patch_result['output'])}}),flush=True)
 replay=call('public-second','replay-second')
 assert not replay['success'] and 'COMMAND_EXECUTION_ALREADY_CLAIMED' in json.dumps(replay),replay
 state=pathlib.Path(os.environ['TURA_HOME'])
-(state/'verifier-readback.json').write_text(json.dumps({'results':results,'replay':replay}))
+(state/'verifier-readback.json').write_text(json.dumps({
+    'results':results,'replay':replay,'patch':patch_result,'denied_patch_batch':denied}))
 print(json.dumps({'type':'item.completed','item':{'type':'assistant_message','text':'verified public feedback loop'}}))
 print(json.dumps({'type':'turn.completed','status':'completed','usage':None,
     'model':value('-m'),'agent':value('-a'),'session_id':value('--session-id'),'cwd':value('-C'),
@@ -548,13 +584,37 @@ print(json.dumps({'type':'turn.completed','status':'completed','usage':None,
         terminal = caller.execute(request)
         self.assertEqual(terminal["status"], "RESULT_AVAILABLE", terminal)
         self.assertTrue(terminal["cleanup_pass"], terminal)
-        self.assertEqual(terminal["tool_loop"], {"completed_count":2,"successful_count":1})
-        self.assertEqual(solution.read_text(), "fixed")
+        self.assertEqual(terminal["tool_loop"], {"completed_count":3,"successful_count":2})
+        self.assertEqual(solution.read_text(), "fixed\n")
         self.assertEqual((scratch / "runs").read_text(), "xx")
         run = request.artifact_root / request.request_id
         readback = json.loads((run / "execution-state/verifier-readback.json").read_text())
         ids = [item["call_id"] for item in readback["results"]]
         self.assertEqual(len(set(ids)), 2)
+        self.assertTrue(readback["patch"]["success"])
+        self.assertFalse(readback["denied_patch_batch"][0]["success"])
         self.assertFalse((scratch / ".tura").exists())
         self.assertEqual(caller.execute(request), terminal)
         self.assertEqual((scratch / "runs").read_text(), "xx")
+        evidence = result_inspection.inspect(request.artifact_root, request.request_id,
+                                             request.native_thread_id)
+        self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED", evidence)
+        self.assertEqual(evidence["file_change_success"], "known_success")
+        self.assertEqual(evidence["verifier_failure_resolution"], {
+            "schema_version": "nokiy_focused_verifier_resolution_v1", "resolved_count": 1,
+            "unresolved_count": 0, "effective_command_success": "known_success"})
+        self.assertEqual((scratch / "runs").read_text(), "xx")
+        terminal_bytes = (run / "terminal.json").read_bytes()
+        # Historical recovery must not reopen or recreate the execution workspace.
+        moved = f.workspace.with_name(f.workspace.name + "-retired")
+        f.workspace.rename(moved)
+        with patch.object(caller, "execute", side_effect=AssertionError("no reexecution")), \
+                patch.object(caller, "_prepare", side_effect=AssertionError("no admission")):
+            recovered = result_inspection.inspect(request.artifact_root, request.request_id,
+                                                  request.native_thread_id)
+        self.assertEqual(recovered["status"], "EVIDENCE_VERIFIED", recovered)
+        self.assertEqual(recovered["verifier_failure_resolution"], evidence["verifier_failure_resolution"])
+        self.assertEqual(recovered["file_changes"], evidence["file_changes"])
+        self.assertEqual((scratch / "runs").read_text(), "xx")
+        self.assertEqual((run / "terminal.json").read_bytes(), terminal_bytes)
+        self.assertFalse(f.workspace.exists())

@@ -5,8 +5,10 @@ import hashlib
 import io
 import json
 import os
+from pathlib import Path
 import subprocess
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
@@ -25,6 +27,11 @@ class FullStackTests(unittest.TestCase):
         process_api = patch.object(stack, "subprocess", SimpleNamespace(**vars(subprocess)))
         process_api.start()
         self.addCleanup(process_api.stop)
+        # These tests cover exact preparation and its refusals. The read-only fallback
+        # that reprepares a refused action as inspect is covered by ReadOnlyRouteTests.
+        self.exact_only = patch.object(stack, "_read_commands_as_inspect", return_value=None)
+        self.exact_only.start()
+        self.addCleanup(self.exact_only.stop)
         self.core = fixtures.FullCoreTests()
         self.core.setUp()
         self.addCleanup(self.core.doCleanups)
@@ -33,12 +40,21 @@ class FullStackTests(unittest.TestCase):
         for key in ("context_capsule", "jspace_contract", "execution_profile",
                     "model", "reasoning_effort", "service_tier", "model_acceleration"):
             self.draft.pop(key, None)
+        self.base_action = {
+            "mission": {"mission_id": "fixture-mission", "task_id": "test", "mode": "DELIVERY",
+                        "objective": "Inspect bounded fixture inputs", "current_predicate": "fixture_unknown"},
+            "context_summary": "Inspect bounded fixture inputs.", "operations": ["read"],
+        }
         self.action = self.f.root / "action.json"
-        self.action.write_text(json.dumps({"mission": {"task_id": "test"}, "operations": ["read"]}))
+        self.action.write_text(json.dumps(self.base_action))
         self.output = self.f.root / "prepared"
         compiler = self.f.workspace / "scripts/ops/dcf.py"
         compiler.parent.mkdir(parents=True)
         compiler.write_text("# synthetic DCF entry\n")
+        # DCF checkouts without a J-Space compiler intentionally use local context.
+        jspace = compiler.with_suffix("") / "jspace.py"
+        jspace.parent.mkdir()
+        jspace.write_text("# synthetic J-Space compiler\n")
         python = self.f.workspace / ".venv/bin/python"
         python.parent.mkdir(parents=True)
         python.write_text("synthetic interpreter")
@@ -52,6 +68,356 @@ class FullStackTests(unittest.TestCase):
     def compiler(self):
         return patch.object(stack.subprocess, "run", return_value=subprocess.CompletedProcess(
             [], 0, json.dumps(self.compiled), ""))
+
+    def thin_worktree(self):
+        local = self.f.workspace / ".venv"
+        (local / "bin/python").unlink()
+        (local / "bin").rmdir()
+        local.rmdir()
+        primary = self.f.root / "primary"
+        common = primary / ".git"
+        git_dir = common / "worktrees/fixture"
+        git_dir.mkdir(parents=True)
+        (self.f.workspace / ".git").write_text(f"gitdir: {git_dir}\n")
+        (git_dir / "gitdir").write_text(f"{self.f.workspace / '.git'}\n")
+        (git_dir / "commondir").write_text("../..\n")
+        python = primary / ".venv/bin/python"
+        python.parent.mkdir(parents=True)
+        python.write_text("synthetic shared interpreter")
+        return SimpleNamespace(primary=primary, common=common, git_dir=git_dir, python=python,
+                               registered=True, primary_common=common)
+
+    def shared_git(self, fixture, worker=None):
+        def run(argv, **kwargs):
+            if argv[0] != "/usr/bin/git":
+                if worker is not None:
+                    return worker(argv, **kwargs)
+                return subprocess.CompletedProcess(argv, 0, json.dumps(self.compiled), "")
+            if argv[1] == "rev-parse":
+                root = kwargs["cwd"]
+                rows = ((self.f.workspace, fixture.common, fixture.git_dir)
+                        if root == self.f.workspace else
+                        (fixture.primary, fixture.primary_common, fixture.primary_common))
+                return subprocess.CompletedProcess(argv, 0, "\n".join(map(str, rows)) + "\n", "")
+            self.assertEqual(argv, ["/usr/bin/git", "worktree", "list", "--porcelain", "-z"])
+            self.assertEqual(kwargs["cwd"], fixture.primary)
+            rows = [f"worktree {fixture.primary}\0HEAD {'a' * 40}\0\0"]
+            if fixture.registered:
+                rows.append(f"worktree {self.f.workspace}\0HEAD {'b' * 40}\0detached\0\0")
+            return subprocess.CompletedProcess(argv, 0, "".join(rows).encode(), b"")
+        return patch.object(stack.subprocess, "run", side_effect=run)
+
+    def test_dcf_interpreter_local_existing_path_is_unchanged(self):
+        with patch.object(stack.subprocess, "run") as run:
+            self.assertEqual(stack._dcf_interpreter(self.f.workspace),
+                             self.f.workspace / ".venv/bin/python")
+            run.assert_not_called()
+
+    def test_shared_interpreter_git_proofs_ignore_untrusted_path(self):
+        fixture = self.thin_worktree()
+        with patch.dict(os.environ, {"PATH": "/untrusted"}), self.shared_git(fixture) as run:
+            self.assertEqual(stack._dcf_interpreter(self.f.workspace), fixture.python)
+        self.assertEqual(run.call_count, 3)
+        self.assertTrue(all(call.args[0][0] == "/usr/bin/git" for call in run.call_args_list))
+
+    def test_registered_worktree_pointer_fifo_is_rejected_without_blocking(self):
+        fifo = self.f.root / "pointer-fifo"
+        os.mkfifo(fifo)
+        with self.assertRaisesRegex(caller.EmbeddedNokiyError, "bounded regular file"):
+            stack._git_pointer(fifo)
+
+    def test_dcf_interpreter_absent_only_shared_selection_and_backpointer_checks(self):
+        fixture = self.thin_worktree()
+        with self.shared_git(fixture):
+            self.assertEqual(stack._dcf_interpreter(self.f.workspace), fixture.python)
+        self.assertFalse((self.f.workspace / ".venv").exists())
+        for pointer, text in ((self.f.workspace / ".git", "gitdir: /unrelated\n"),
+                              (fixture.git_dir / "gitdir", f"{fixture.primary / '.git'}\n"),
+                              (fixture.git_dir / "commondir", "../../unrelated\n")):
+            original = pointer.read_text()
+            pointer.write_text(text)
+            with self.subTest(pointer=pointer), self.shared_git(fixture):
+                with self.assertRaisesRegex(caller.EmbeddedNokiyError, "DCF_UNAVAILABLE"):
+                    stack._dcf_interpreter(self.f.workspace)
+            pointer.write_text(original)
+
+    def test_dcf_interpreter_broken_or_incomplete_local_environment_never_falls_back(self):
+        fixture = self.thin_worktree()
+        local = self.f.workspace / ".venv"
+        local.symlink_to(self.f.root / "missing-environment")
+        with patch.object(stack.subprocess, "run") as run:
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "no shared fallback"):
+                stack._dcf_interpreter(self.f.workspace)
+            run.assert_not_called()
+        local.unlink()
+        local.mkdir()
+        with patch.object(stack.subprocess, "run") as run:
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "no shared fallback"):
+                stack._dcf_interpreter(self.f.workspace)
+            run.assert_not_called()
+        self.assertTrue(fixture.python.is_file())
+
+    def test_dcf_interpreter_rejects_unrelated_primary_unregistered_and_missing_shared(self):
+        fixture = self.thin_worktree()
+        unrelated = self.f.root / "unrelated/.git"
+        unrelated.mkdir(parents=True)
+        fixture.primary_common = unrelated
+        with self.shared_git(fixture):
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "backpointers"):
+                stack._dcf_interpreter(self.f.workspace)
+        fixture.primary_common = fixture.common
+        fixture.registered = False
+        with self.shared_git(fixture):
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "currently registered"):
+                stack._dcf_interpreter(self.f.workspace)
+        fixture.registered = True
+        fixture.python.unlink()
+        with self.shared_git(fixture):
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "primary DCF interpreter unavailable"):
+                stack._dcf_interpreter(self.f.workspace)
+
+    def test_shared_interpreter_is_used_by_surface_prepare_and_freshness_callers(self):
+        fixture = self.thin_worktree()
+        paths = ["src/one.py"]
+        self.surface_action(paths)
+        calls = []
+
+        def worker(argv, **kwargs):
+            calls.append((argv, kwargs))
+            payload = (self.surface_response(paths, [["fixture"]])
+                       if argv[-1] == stack._SURFACE_QUERY else self.compiled)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+        with self.shared_git(fixture, worker), patch.object(caller, "execute") as execute:
+            surface = stack.query_surface_candidates(self.f.workspace, paths)
+            prepared = self.run_prepare(surface_id=None)
+            stack.verify_action_freshness(self.f.workspace, {})
+        execute.assert_not_called()
+
+        self.assertEqual(surface["status"], "SURFACE_CANDIDATES")
+        self.assertEqual(prepared["status"], "PREPARED")
+        self.assertEqual(len(calls), 4)
+        for argv, kwargs in calls:
+            self.assertEqual(argv[0], str(fixture.python))
+            self.assertEqual(kwargs["cwd"], self.f.workspace)
+            # The inherited environment, plus only the DCF implementation root.
+            env = dict(kwargs.get("env", os.environ))
+            self.assertIn(env.pop("NOKIY_DCF_CODE_ROOT", str(self.f.workspace)), {str(self.f.workspace)})
+            self.assertEqual(env, dict(os.environ))
+        self.assertEqual(calls[2][0][-1], str(Path(stack.__file__).with_name("dcf_prepare.py")))
+        self.assertFalse((self.f.workspace / ".venv").exists())
+
+    def test_thin_worktree_compiles_with_committed_primary_dcf_code(self):
+        fixture = self.thin_worktree()
+        jspace = fixture.primary / "scripts/ops/dcf/jspace.py"
+        jspace.parent.mkdir(parents=True)
+        jspace.write_text("# primary J-Space\n")
+        (fixture.primary / "scripts/ops/dcf.py").write_text("# primary DCF\n")
+        status = []
+        with self.shared_git(fixture) as fake:
+            git = fake.side_effect
+
+            def run(argv, **kwargs):
+                if argv[:2] == ["/usr/bin/git", "status"]:
+                    self.assertEqual(kwargs["cwd"], fixture.primary)
+                    self.assertEqual(argv[-len(stack._DCF_CODE_PATHS):], list(stack._DCF_CODE_PATHS))
+                    return subprocess.CompletedProcess(argv, 0, "".join(status), "")
+                return git(argv, **kwargs)
+
+            fake.side_effect = run
+            self.assertEqual(stack._dcf_code_root(self.f.workspace), fixture.primary)
+            status.append(" M scripts/ops/dcf/jspace.py\n")
+            self.assertEqual(stack._dcf_code_root(self.f.workspace), self.f.workspace)
+            status.clear()
+            jspace.unlink()
+            self.assertEqual(stack._dcf_code_root(self.f.workspace), self.f.workspace)
+            # A .venv linked to the primary's environment shares it; a link elsewhere does not.
+            jspace.write_text("# primary J-Space\n")
+            (fixture.primary / ".venv").mkdir(exist_ok=True)
+            (self.f.workspace / ".venv").symlink_to(fixture.primary / ".venv", target_is_directory=True)
+            self.assertEqual(stack._dcf_code_root(self.f.workspace), fixture.primary)
+            (self.f.workspace / ".venv").unlink()
+            (self.f.root / "other-venv").mkdir()
+            (self.f.workspace / ".venv").symlink_to(self.f.root / "other-venv", target_is_directory=True)
+            self.assertEqual(stack._dcf_code_root(self.f.workspace), self.f.workspace)
+        self.assertTrue(stack._SURFACE_QUERY.startswith(stack._DCF_PATH))
+        self.assertTrue(stack._with_verifier_grammar("pass").startswith(stack._DCF_PATH))
+        self.assertEqual(stack._dcf_env(fixture.primary)["NOKIY_DCF_CODE_ROOT"], str(fixture.primary))
+
+    def test_independent_project_keeps_its_own_dcf_code_without_git(self):
+        with patch.object(stack.subprocess, "run") as run:
+            self.assertEqual(stack._dcf_code_root(self.f.workspace), self.f.workspace)
+            run.assert_not_called()
+
+    def test_recursive_reads_and_discovery_roots_pair_both_ways(self):
+        for name in ("src", "docs", ".cache", "real"):
+            (self.f.workspace / name).mkdir(exist_ok=True)
+        (self.f.workspace / "linked").symlink_to(self.f.workspace / "real", target_is_directory=True)
+        base = {"operations": ["read", "command"], "source_read": True}
+        adapted, repairs = stack.pair_discovery(
+            dict(base, read_scopes=["a.py", "src/**"], read_directories=["docs"]), self.f.workspace)
+        self.assertEqual(adapted["read_directories"], ["docs", "src"])
+        self.assertEqual(adapted["read_scopes"], ["a.py", "src/**", "docs/**"])
+        self.assertEqual([r["rule"] for r in repairs],
+                         ["recursive_reads_to_discovery", "discovery_roots_to_recursive_reads"])
+        for scopes in (["a.py", ".cache/**"], ["a.py", "linked/**"], ["a.py", "missing/**"], ["a.py"]):
+            with self.subTest(scopes=scopes):
+                action = dict(base, read_scopes=scopes)
+                self.assertEqual(stack.pair_discovery(action, self.f.workspace), (action, []))
+        many = dict(base, read_scopes=["src/**"], read_directories=[f"d{i}" for i in range(8)])
+        self.assertEqual(stack.pair_discovery(many, self.f.workspace), (many, []))
+        reads_only = {"operations": ["read"], "read_scopes": ["src/**"]}
+        self.assertEqual(stack.pair_discovery(reads_only, self.f.workspace), (reads_only, []))
+
+    def test_missing_source_read_of_a_writing_action_is_dropped_with_a_note(self):
+        (self.f.workspace / "src").mkdir(exist_ok=True)
+        (self.f.workspace / "src/kept.py").write_text("x = 1\n")
+        action = dict(self.base_action, operations=["read", "command", "modify"], source_read=True,
+                      read_scopes=["src/kept.py", "src/gone.py"], write_scopes=["src/kept.py"],
+                      target_paths=["src/kept.py"])
+        error = caller.EmbeddedNokiyError("NOKIY_FULL_STACK_PREPARATION_FAILED", "refused", diagnostics={
+            "child_error_code": "JSPACE_SOURCE_READ_FILE_INVALID"})
+        adapted, repair = stack._dcf_compile_repair(action, error, self.f.workspace)
+        self.assertEqual(adapted["read_scopes"], ["src/kept.py"])
+        self.assertIn("src/gone.py", adapted["context_summary"])
+        self.assertEqual(repair["path"], "action.read_scopes")
+        # A present file refused for another reason (link, permission) has nothing to drop.
+        present = dict(action, read_scopes=["src/kept.py"])
+        self.assertEqual(stack._dcf_compile_repair(present, error, self.f.workspace), (present, None))
+
+    def test_linked_read_dcf_cannot_map_is_dropped_with_a_note(self):
+        # 2026-10-23: output/exact598_reference linked to a sibling worktree whose mapping
+        # contract was older, and a one-file test edit was refused as a whole.
+        (self.f.workspace / "src").mkdir(exist_ok=True)
+        (self.f.workspace / "src/kept.py").write_text("x = 1\n")
+        elsewhere = self.f.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "ref.py").write_text("y = 2\n")
+        (self.f.workspace / "linked").symlink_to(elsewhere, target_is_directory=True)
+        action = dict(self.base_action, operations=["read", "command", "modify"], source_read=True,
+                      read_scopes=["src/kept.py", "linked/ref.py"], write_scopes=["src/kept.py"],
+                      target_paths=["src/kept.py"])
+        error = caller.EmbeddedNokiyError("NOKIY_FULL_STACK_PREPARATION_FAILED", "refused", diagnostics={
+            "child_error_code": "MAPPED_SOURCE_READ_CONTRACT_INVALID"})
+        adapted, repair = stack._dcf_compile_repair(action, error, self.f.workspace)
+        self.assertEqual(adapted["read_scopes"], ["src/kept.py"])
+        self.assertIn("linked/ref.py", adapted["context_summary"])
+        self.assertEqual(repair["rule"], "unmappable_reads_to_note")
+        read_only = dict(action, operations=["read", "command"], write_scopes=[], target_paths=[])
+        self.assertEqual(stack._dcf_compile_repair(read_only, error, self.f.workspace), (read_only, None))
+
+    def test_projection_conflict_with_a_null_summary_states_the_mission(self):
+        error = caller.EmbeddedNokiyError("NOKIY_FULL_STACK_PREPARATION_FAILED", "refused", diagnostics={
+            "child_error_code": "TASK_CONTEXT_PROJECTION_CONFLICT"})
+        for summary in (None, "  "):
+            with self.subTest(summary=summary):
+                adapted, repair = stack._dcf_compile_repair(
+                    dict(self.base_action, context_summary=summary), error, self.f.workspace)
+                self.assertEqual(repair["rule"], "projection_conflict_to_mission_summary")
+                self.assertTrue(adapted["context_summary"].strip())
+        stated = dict(self.base_action, context_summary="Stated.")
+        self.assertEqual(stack._dcf_compile_repair(stated, error, self.f.workspace), (stated, None))
+
+    def test_null_blank_and_empty_fields_state_omission(self):
+        action = dict(self.base_action, context_summary=None, task_projection="  ", verifier_commands=[],
+                      source_sections=[], read_scopes=[], focused_verifiers=None)
+        adapted, repairs = stack._normalize_action_input(action)
+        for key in ("context_summary", "task_projection", "verifier_commands", "source_sections",
+                    "focused_verifiers"):
+            self.assertNotIn(key, adapted)
+        # An empty list keeps its meaning where empty is a valid statement.
+        self.assertEqual(adapted["read_scopes"], [])
+        self.assertEqual(sorted(r["path"] for r in repairs if r["rule"] == "empty_to_omission"),
+                         ["action.context_summary", "action.focused_verifiers", "action.source_sections",
+                          "action.task_projection", "action.verifier_commands"])
+        self.assertEqual(stack._normalize_action_input(adapted)[1], [])
+
+    def test_source_sections_take_one_spelling_and_stop_at_the_last_line(self):
+        (self.f.workspace / "src").mkdir(exist_ok=True)
+        (self.f.workspace / "src/short.py").write_text("".join(f"line{i}\n" for i in range(1, 11)))
+        action = {"source_sections": [
+            {"path": str(self.f.workspace / "src/short.py"), "start_line": 2, "end_line": 4},
+            {"path": "src/short.py", "start_line": 8, "end_line": 30},
+            {"path": "src/short.py", "start_line": 12, "end_line": 14}]}
+        adapted, repairs = stack._source_sections_spelled(action, self.f.workspace)
+        self.assertEqual(adapted["source_sections"], [
+            {"path": "src/short.py", "start_line": 2, "end_line": 4},
+            {"path": "src/short.py", "start_line": 8, "end_line": 10},
+            # A range starting past the end names no lines; it keeps its refusal.
+            {"path": "src/short.py", "start_line": 12, "end_line": 14}])
+        self.assertEqual(repairs, [{"path": "action.source_sections", "rule": "source_sections_spelled",
+                                    "fields": ["end_line", "path"]}])
+        self.assertEqual(stack._source_sections_spelled(adapted, self.f.workspace), (adapted, []))
+
+    def test_declared_exact_writes_take_their_write_operations(self):
+        (self.f.workspace / "src").mkdir(exist_ok=True)
+        (self.f.workspace / "src/old.py").write_text("x = 1\n")
+        base = dict(self.base_action, operations=["read", "command"])
+        for writes, added in ((["src/old.py"], ["modify"]), (["src/new.py"], ["create"]),
+                              (["src/old.py", "src/new.py"], ["modify", "create"])):
+            with self.subTest(writes=writes):
+                adapted, repairs = stack._declared_writes_operable(dict(base, write_scopes=writes),
+                                                                   self.f.workspace)
+                self.assertEqual(adapted["operations"], ["read", "command", *added])
+                self.assertEqual(repairs, [{"path": "action.operations",
+                                            "rule": "write_scopes_to_" + "_".join(added)}])
+        for changes in ({"write_scopes": ["src/*.py"]}, {"write_scopes": []},
+                        {"write_scopes": ["src/old.py"], "forbidden_effects": ["modify"]},
+                        {"write_scopes": ["src/old.py"], "forbidden_effects": ["write"]},
+                        {"write_scopes": ["src/old.py"], "operations": ["read", "modify"]},
+                        {"write_scopes": ["src/old.py"], "inspect": {}}):
+            with self.subTest(changes=changes):
+                action = dict(base, **changes)
+                self.assertEqual(stack._declared_writes_operable(action, self.f.workspace), (action, []))
+
+    def test_unmanaged_surface_query_cli_succeeds_end_to_end(self):
+        root = self.f.root / "unmanaged"
+        root.mkdir()
+        (root / "source.py").write_text("content\n")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = caller.main(["query-surfaces", "--workspace", str(root), "--target", "source.py"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue())["status"], "CONTEXT_ROUTE_AVAILABLE")
+
+    def test_shared_interpreter_rechecks_registration_and_content_after_query(self):
+        fixture = self.thin_worktree()
+        paths = ["src/one.py"]
+        self.surface_action(paths)
+        original = fixture.python.read_text()
+        for drift in ("registration", "interpreter", "backpointer"):
+            fixture.registered = True
+            fixture.python.write_text(original)
+            (fixture.git_dir / "gitdir").write_text(f"{self.f.workspace / '.git'}\n")
+
+            def worker(argv, **kwargs):
+                if drift == "registration":
+                    fixture.registered = False
+                elif drift == "interpreter":
+                    fixture.python.write_text("replaced shared interpreter")
+                else:
+                    (fixture.git_dir / "gitdir").write_text(f"{fixture.primary / '.git'}\n")
+                return subprocess.CompletedProcess(argv, 0,
+                    json.dumps(self.surface_response(paths, [["fixture"]])), "")
+
+            with self.subTest(drift=drift), self.shared_git(fixture, worker):
+                with self.assertRaisesRegex(caller.EmbeddedNokiyError, "DCF_UNAVAILABLE"):
+                    stack.query_surface_candidates(self.f.workspace, paths)
+            self.assertFalse(self.output.exists())
+
+    def test_shared_interpreter_rechecks_binding_before_preparation_publication(self):
+        fixture = self.thin_worktree()
+        compile_dcf = stack._compile_dcf
+
+        def drift(*args, **kwargs):
+            result = compile_dcf(*args, **kwargs)
+            fixture.registered = False
+            return result
+
+        with self.shared_git(fixture), patch.object(stack, "_compile_dcf", side_effect=drift):
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "currently registered"):
+                self.run_prepare()
+        self.assertFalse(self.output.exists())
 
     def compiled_navigation(self, action, navigation):
         from codex_collaboration_harness.dcf_prepare import bind_locators
@@ -86,13 +452,18 @@ class FullStackTests(unittest.TestCase):
         execute.assert_not_called()
         self.assertEqual(compiler.call_count, 1)  # legacy exact ID pays no lookup
         self.assertEqual(result["status"], "PREPARED")
+        self.assertEqual(result["context_mode"], "dcf_jspace_required")
         self.assertEqual(result["execution_profile"], "direct")
         request = caller.load_request(self.output / "request.json")
         self.assertEqual((request.model, request.reasoning_effort, request.service_tier),
                          ("gpt-6.1-sol", "max", "default"))
         self.assertEqual(request.max_trajectory_bytes, self.draft["max_trajectory_bytes"])
         self.assertEqual(caller.preflight(request)["status"], "READY")
-        self.assertIn("--action-stdin", compiler.call_args.args[0])
+        self.assertEqual(compiler.call_args.args[0][-1],
+                         str(Path(stack.__file__).with_name("dcf_prepare.py")))
+        self.assertEqual(json.loads(compiler.call_args.kwargs["input"]),
+                         {"surface_id": "research_execution_engine",
+                          "action": json.loads(self.action.read_text())})
         self.assertFalse(result["provider_execution_started"])
 
     def test_terminal_delivery_is_derived_from_action_only_and_not_sent_to_compiler(self):
@@ -100,8 +471,7 @@ class FullStackTests(unittest.TestCase):
             with self.subTest(profile=profile):
                 self.output = self.f.root / ("prepared-terminal-" + profile)
                 self.draft["execution_profile"] = profile
-                action = {"mission": {"task_id": "test"}, "operations": ["read"],
-                          "terminal_delivery": "evidence_only"}
+                action = {**self.base_action, "terminal_delivery": "evidence_only"}
                 self.action.write_text(json.dumps(action))
                 with self.compiler() as compiler, patch.object(caller, "execute") as execute:
                     result = self.run_prepare()
@@ -117,7 +487,7 @@ class FullStackTests(unittest.TestCase):
                 self.assertFalse(result["provider_execution_started"])
 
     def test_terminal_delivery_explicit_default_is_omitted_from_prepared_wire(self):
-        self.action.write_text(json.dumps({"mission": {"task_id": "test"}, "operations": ["read"],
+        self.action.write_text(json.dumps({**self.base_action,
                                           "terminal_delivery": "assistant_reply"}))
         with self.compiler():
             self.run_prepare()
@@ -128,15 +498,17 @@ class FullStackTests(unittest.TestCase):
         self.assertEqual(request.terminal_delivery, "assistant_reply")
 
     def test_terminal_delivery_invalid_action_or_draft_does_not_compile_or_publish(self):
-        for mode in (None, "unknown", "", 1, True, {}, []):
-            self.action.write_text(json.dumps({"mission": {"task_id": "test"}, "operations": ["read"],
+        # None and "" state omission, which takes the assistant_reply default
+        # (test_null_blank_and_empty_fields_state_omission); other values stay refused.
+        for mode in ("unknown", 1, True, {}, []):
+            self.action.write_text(json.dumps({**self.base_action,
                                               "terminal_delivery": mode}))
             with self.subTest(mode=mode), self.compiler() as compiler:
                 with self.assertRaisesRegex(caller.EmbeddedNokiyError, "terminal_delivery"):
                     self.run_prepare()
                 compiler.assert_not_called()
                 self.assertFalse(self.output.exists())
-        self.action.write_text(json.dumps({"mission": {"task_id": "test"}, "operations": ["read"]}))
+        self.action.write_text(json.dumps(self.base_action))
         self.draft["terminal_delivery"] = "evidence_only"
         with self.compiler() as compiler:
             with self.assertRaisesRegex(caller.EmbeddedNokiyError, "terminal_delivery belongs in action"):
@@ -145,7 +517,7 @@ class FullStackTests(unittest.TestCase):
             self.assertFalse(self.output.exists())
 
     def test_terminal_delivery_action_requires_v3_full_core_profile(self):
-        self.action.write_text(json.dumps({"mission": {"task_id": "test"}, "operations": ["read"],
+        self.action.write_text(json.dumps({**self.base_action,
                                           "terminal_delivery": "evidence_only"}))
         for changes in ({"schema_version": caller.LEGACY_REQUEST_SCHEMA_VERSION},
                         {"schema_version": caller.PREVIOUS_REQUEST_SCHEMA_VERSION},
@@ -203,7 +575,7 @@ class FullStackTests(unittest.TestCase):
     def test_dcf_prepare_cli_omits_raw_action_but_preserves_durable_inputs(self):
         summary = "DCF_CONTEXT_SENTINEL_" + "x" * 11900
         projection = "DCF_PROJECTION_SENTINEL_" + "y" * 1000
-        action = {"mission": {"task_id": "test"}, "operations": ["read"],
+        action = {**self.base_action,
                   "context_summary": summary, "task_projection": {"note": projection}}
         self.action.write_text(json.dumps(action))
         self.f.request_path.write_text(json.dumps(self.draft))
@@ -219,6 +591,7 @@ class FullStackTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         public_json = stdout.getvalue()
         result = json.loads(public_json)
+        self.assertEqual(result["context_mode"], "dcf_jspace_required")
         self.assert_public_action_identity(result, action)
         self.assertNotIn("DCF_CONTEXT_SENTINEL_", public_json)
         self.assertNotIn("DCF_PROJECTION_SENTINEL_", public_json)
@@ -268,7 +641,8 @@ class FullStackTests(unittest.TestCase):
     def test_action_focused_verifiers_is_rejected_before_local_or_dcf_preparation(self):
         base_action = json.loads(self.action.read_text())
         for managed in (False, True):
-            for value in ([], [{"argv": ["/usr/bin/true"]}], None):
+            # A null states omission (test_null_blank_and_empty_fields_state_omission).
+            for value in ([], [{"argv": ["/usr/bin/true"]}]):
                 for with_supported in (False, True):
                     action = {**base_action, "focused_verifiers": value}
                     if with_supported:
@@ -318,7 +692,7 @@ class FullStackTests(unittest.TestCase):
                 self.assertFalse(result["provider_execution_started"])
                 self.assertTrue((self.output / "request.json").is_file())
                 self.assertTrue((self.output / "preparation.json").is_file())
-                submitted = json.loads(compiler.call_args_list[0].kwargs["input"])
+                submitted = json.loads(compiler.call_args_list[0].kwargs["input"])["action"]
                 self.assertEqual(submitted["verifier_artifact_root"], self.draft["artifact_root"])
                 self.assertEqual(submitted["verifier_commands"], action["verifier_commands"])
                 contract = json.loads((self.output / "jspace.json").read_text())
@@ -362,7 +736,7 @@ class FullStackTests(unittest.TestCase):
     def test_exact_dcf_navigation_adds_locator_without_widening_action(self):
         target = "symbol:scripts.ops.dcf.jspace.render_task_context_capsule"
         generation = self.compiled["contract"]["dcf_generation"]["generation_id"]
-        action = {"mission": {"task_id": "test"}, "operations": ["read"],
+        action = {**self.base_action,
                   "read_scopes": ["scripts/ops/dcf/jspace.py"],
                   "context_summary": "Inspect the admitted function.",
                   "navigation_targets": [target]}
@@ -387,7 +761,7 @@ class FullStackTests(unittest.TestCase):
         self.assertEqual(prepared["navigation_locators"][0]["generation_id"], generation)
 
     def navigation_pages(self, target="symbol:scripts.ops.dcf.jspace.render_task_context_capsule"):
-        action = {"mission": {"task_id": "test"}, "operations": ["read"],
+        action = {**self.base_action,
                   "read_scopes": ["scripts/ops/dcf/jspace.py"], "write_scopes": [],
                   "context_summary": "Inspect the admitted function.", "navigation_targets": [target]}
         symbol = {"entity_id": target, "payload": {"path": "scripts/ops/dcf/jspace.py", "line": 1233}}
@@ -437,7 +811,7 @@ class FullStackTests(unittest.TestCase):
         for call in run.call_args_list[:2]:
             self.assertEqual(call.kwargs, {"cwd": self.f.workspace, "capture_output": True,
                                            "text": True, "timeout": 15})
-        compiled_action = json.loads(run.call_args_list[2].kwargs["input"])
+        compiled_action = json.loads(run.call_args_list[2].kwargs["input"])["action"]
         expected = dict(action)
         expected.pop("navigation_targets")
         expected["context_summary"] += (
@@ -582,7 +956,7 @@ class FullStackTests(unittest.TestCase):
             target = self.f.workspace / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("# source\n")
-        action = {"mission": {"task_id": "test"}, "operations": ["read"],
+        action = {**self.base_action,
                   "read_scopes": [paths[0]], "context_summary": "Inspect bounded inputs.",
                   "surface_targets": paths}
         self.action.write_text(json.dumps(action))
@@ -600,6 +974,254 @@ class FullStackTests(unittest.TestCase):
                            "paths": paths, "matches": matches, "complete": True}}
         wire.update(changes)
         return wire
+
+    def test_surface_query_returns_candidates_without_selection_or_preparation(self):
+        paths = ["src/one.py", "src/two.py"]
+        self.surface_action(paths)
+        for matches, common in (([["other", "fixture"], ["fixture", "other"]], ["fixture", "other"]),
+                                ([[], ["fixture"]], []),
+                                ([["fixture"], ["fixture"]], ["fixture"])):
+            with (self.subTest(matches=matches),
+                  patch.object(stack.subprocess, "run", return_value=subprocess.CompletedProcess(
+                      [], 0, json.dumps(self.surface_response(paths, matches)), "")) as run,
+                  patch.object(stack, "prepare_request") as prepare,
+                  patch.object(caller, "execute") as execute):
+                result = stack.query_surface_candidates(self.f.workspace, paths)
+            self.assertEqual(run.call_count, 1)
+            prepare.assert_not_called()
+            execute.assert_not_called()
+            self.assertEqual(result["status"], "SURFACE_CANDIDATES")
+            self.assertEqual(result["common_surface_ids"], common)
+            self.assertEqual(result["candidates"], [sorted(row) for row in matches])
+            self.assertEqual(result["authority_effect"], "none")
+            self.assertFalse(result["selection_grants_read_write"])
+            self.assertFalse(result["provider_execution_started"])
+            self.assertEqual(result["native_mutation_count"], 0)
+            self.assertNotIn("selected_surface_id", result)
+            self.assertNotIn("request", result)
+            self.assertFalse(self.output.exists())
+
+    def test_unmanaged_surface_query_reports_existing_route_without_execution(self):
+        root = self.f.root / "unmanaged"
+        root.mkdir()
+        (root / "source.py").write_text("not exposed by metadata query\n")
+        with (patch.object(stack.subprocess, "run") as run,
+              patch.object(stack, "prepare_request") as prepare,
+              patch.object(caller, "execute") as execute):
+            result = stack.query_surface_candidates(root, ["source.py"])
+        self.assertEqual(result["status"], "CONTEXT_ROUTE_AVAILABLE")
+        self.assertEqual(result["context_mode"], local_context.MODE)
+        self.assertEqual(result["dcf_state"], "not_configured")
+        self.assertEqual(result["map_cache_state"], "not_applicable")
+        self.assertFalse(result["surface_required"])
+        self.assertFalse(result["selection_grants_read_write"])
+        self.assertFalse(result["provider_execution_started"])
+        self.assertEqual(result["native_mutation_count"], 0)
+        self.assertEqual(result["authority_effect"], "none")
+        self.assertNotIn("not exposed", json.dumps(result))
+        run.assert_not_called()
+        prepare.assert_not_called()
+        execute.assert_not_called()
+
+    def test_unmanaged_surface_query_still_validates_targets(self):
+        root = self.f.root / "unmanaged"
+        root.mkdir()
+        source = root / "source.py"
+        source.write_text("content\n")
+        (root / "link.py").symlink_to(source)
+        os.link(source, root / "hard.py")
+        for targets in ([], ["missing.py"], ["../outside"], ["*"], ["link.py"],
+                        ["source.py", "source.py"], ["source.py", "hard.py"], [None]):
+            with self.subTest(targets=targets), patch.object(stack.subprocess, "run") as run:
+                with self.assertRaisesRegex(caller.EmbeddedNokiyError, "SURFACE_TARGET_INVALID"):
+                    stack.query_surface_candidates(root, targets)
+                run.assert_not_called()
+
+    def test_broken_dcf_marker_is_not_unmanaged(self):
+        root = self.f.root / "broken"
+        marker = root / "scripts/ops/dcf.py"
+        marker.parent.mkdir(parents=True)
+        marker.symlink_to(root / "missing.py")
+        (root / "source.py").write_text("content\n")
+        with patch.object(stack.subprocess, "run") as run:
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "DCF_UNAVAILABLE"):
+                stack.query_surface_candidates(root, ["source.py"])
+            run.assert_not_called()
+
+    def test_surface_query_keeps_validation_and_no_local_downgrade(self):
+        paths = ["src/one.py"]
+        self.surface_action(paths)
+        for changes in ({"freshness_status": "stale"}, {"domain_verdict": "blocked"},
+                        {"result": {"complete": False}}):
+            with (self.subTest(changes=changes), patch.object(stack.subprocess, "run", return_value=
+                  subprocess.CompletedProcess([], 0, json.dumps(self.surface_response(paths, [["fixture"]],
+                                                                            **changes)), ""))):
+                with self.assertRaisesRegex(caller.EmbeddedNokiyError, "SURFACE_UNVERIFIED"):
+                    stack.query_surface_candidates(self.f.workspace, paths)
+        for targets in ([], ["../outside.py"], ["src/**"], paths * 2, ["src/missing.py"],
+                        ["src/one.py"] * 5):
+            with self.subTest(targets=targets), patch.object(stack.subprocess, "run") as run:
+                with self.assertRaisesRegex(caller.EmbeddedNokiyError, "SURFACE_TARGET_INVALID"):
+                    stack.query_surface_candidates(self.f.workspace, targets)
+                run.assert_not_called()
+        with patch.object(stack.subprocess, "run") as run:
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "DCF_UNAVAILABLE"):
+                stack.query_surface_candidates(self.f.workspace / "src", ["one.py"])
+            (self.f.workspace / ".venv/bin/python").unlink()
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "DCF_UNAVAILABLE"):
+                stack.query_surface_candidates(self.f.workspace, paths)
+            run.assert_not_called()
+
+    def test_surface_query_rejects_link_and_target_replacement(self):
+        paths = ["src/one.py"]
+        self.surface_action(paths)
+        (self.f.workspace / "src/link.py").symlink_to("one.py")
+        with patch.object(stack.subprocess, "run") as run:
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "SURFACE_TARGET_INVALID"):
+                stack.query_surface_candidates(self.f.workspace, ["src/link.py"])
+            run.assert_not_called()
+
+        def replaced(*args, **kwargs):
+            target = self.f.workspace / paths[0]
+            target.rename(target.with_name("old.py"))
+            target.write_text("# replacement\n")
+            return subprocess.CompletedProcess([], 0, json.dumps(self.surface_response(paths, [["fixture"]])), "")
+
+        with patch.object(stack.subprocess, "run", side_effect=replaced):
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "SURFACE_UNVERIFIED"):
+                stack.query_surface_candidates(self.f.workspace, paths)
+
+    def test_cli_surface_query_has_no_action_surface_id_or_worker(self):
+        result = {"status": "SURFACE_CANDIDATES", "common_surface_ids": [],
+                  "authority_effect": "none", "selection_grants_read_write": False}
+        output = io.StringIO()
+        with (patch.object(stack, "query_surface_candidates", return_value=result) as query,
+              patch.object(stack, "prepare_request") as prepare,
+              patch.object(caller, "execute") as execute, redirect_stdout(output)):
+            code = caller.main(["query-surfaces", "--workspace", str(self.f.workspace),
+                                "--target", "src/one.py", "--target", "src/two.py"])
+        query.assert_called_once_with(self.f.workspace, ["src/one.py", "src/two.py"])
+        prepare.assert_not_called()
+        execute.assert_not_called()
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue()), result)
+
+    def test_surface_query_uses_complete_legacy_or_advertised_full_api(self):
+        for explicit_full in (False, True):
+            with self.subTest(explicit_full=explicit_full):
+                data = {"surfaces": [{"surface_id": "fixture", "display": "\u5de5\u4f5c\U0001f680"}]}
+                wire = {"freshness_status": "current", "projection_status": "pass",
+                        "domain_verdict": "pass", "result": data}
+                response = SimpleNamespace(**wire, model_dump=lambda **kwargs: dict(wire))
+                calls = []
+
+                def legacy(runtime, *, capability_id):
+                    calls.append({"capability_id": capability_id})
+                    return response, 0
+
+                def current(runtime, *, capability_id, full_output=False):
+                    calls.append({"capability_id": capability_id, "full_output": full_output})
+                    return response, 0
+
+                modules = {name: ModuleType(name) for name in (
+                    "scripts.ops.dcf.collectors", "scripts.ops.dcf.query", "scripts.ops.dcf.runtime",
+                    "scripts.ops.dcf.storage")}
+                modules["scripts.ops.dcf.storage"].GenerationUnavailable = type("GenerationUnavailable", (Exception,), {})
+                modules["scripts.ops.dcf.collectors"].path_matches_surface = lambda path, row: True
+                modules["scripts.ops.dcf.query"].query_capability = current if explicit_full else legacy
+                modules["scripts.ops.dcf.runtime"].DcfRuntime = lambda root: root
+                output = io.StringIO()
+                with (patch.dict(sys.modules, modules), patch.object(sys, "stdin", io.StringIO('["src/one.py"]')),
+                      redirect_stdout(output)):
+                    exec(stack._SURFACE_QUERY, {})
+                result = json.loads(output.getvalue())["result"]
+                expected = {"capability_id": "surface-map"}
+                if explicit_full:
+                    expected["full_output"] = True
+                self.assertEqual(calls, [expected])
+                self.assertTrue(result["complete"])
+                self.assertEqual(result["matches"], [["fixture"]])
+                self.assertEqual(result["full_result_sha256"], hashlib.sha256(json.dumps(
+                    data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+
+    def test_surface_query_reports_writable_membership_without_read_only_surfaces(self):
+        data = {"surfaces": [{"surface_id": "projection", "read_only": True, "allowed_write_scopes": []},
+                             {"surface_id": "runtime", "allowed_write_scopes": ["engine/**"]}]}
+        wire = {"freshness_status": "current", "projection_status": "pass", "domain_verdict": "pass", "result": data}
+        response = SimpleNamespace(**wire, model_dump=lambda **kwargs: dict(wire))
+        modules = {name: ModuleType(name) for name in (
+            "scripts.ops.dcf.collectors", "scripts.ops.dcf.query", "scripts.ops.dcf.runtime",
+            "scripts.ops.dcf.storage")}
+        modules["scripts.ops.dcf.storage"].GenerationUnavailable = type("GenerationUnavailable", (Exception,), {})
+        modules["scripts.ops.dcf.collectors"].path_matches_surface = lambda path, row: True
+        modules["scripts.ops.dcf.query"].query_capability = lambda runtime, *, capability_id: (response, 0)
+        modules["scripts.ops.dcf.runtime"].DcfRuntime = lambda root: root
+        output = io.StringIO()
+        with (patch.dict(sys.modules, modules), patch.object(sys, "stdin", io.StringIO('["ui/app.py"]')),
+              redirect_stdout(output)):
+            exec(stack._SURFACE_QUERY, {})
+        result = json.loads(output.getvalue())["result"]
+        self.assertEqual(result["matches"], [["projection", "runtime"]])
+        self.assertEqual(result["write_matches"], [[]])
+        self.assertEqual(result["writable_matches"], [["runtime"]])
+
+    def test_surface_generation_unavailable_is_typed_without_worker_or_fallback(self):
+        paths = ["src/one.py"]
+        self.surface_action(paths)
+        modules = {name: ModuleType(name) for name in (
+            "scripts.ops.dcf.collectors", "scripts.ops.dcf.query", "scripts.ops.dcf.runtime",
+            "scripts.ops.dcf.storage")}
+        missing = type("GenerationUnavailable", (Exception,), {})
+        modules["scripts.ops.dcf.storage"].GenerationUnavailable = missing
+        modules["scripts.ops.dcf.collectors"].path_matches_surface = lambda path, row: True
+        modules["scripts.ops.dcf.runtime"].DcfRuntime = lambda root: root
+
+        def unavailable(runtime, *, capability_id):
+            raise missing("private-path-and-detail-must-not-be-returned")
+
+        modules["scripts.ops.dcf.query"].query_capability = unavailable
+        output = io.StringIO()
+        with (patch.dict(sys.modules, modules), patch.object(sys, "stdin", io.StringIO(json.dumps(paths))),
+              redirect_stdout(output), self.assertRaises(SystemExit) as exited):
+            exec(stack._SURFACE_QUERY, {})
+        self.assertEqual(exited.exception.code, 2)
+        envelope = output.getvalue()
+        output = io.StringIO()
+        with (patch.object(stack.subprocess, "run", return_value=
+                subprocess.CompletedProcess([], 2, envelope, "")) as run,
+              patch.object(stack, "prepare_request") as prepare,
+              patch.object(caller, "execute") as execute, redirect_stdout(output)):
+            self.assertEqual(caller.main(["query-surfaces", "--workspace", str(self.f.workspace),
+                                          "--target", paths[0]]), 2)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["first_typed_blocker"], "NOKIY_FULL_STACK_DCF_GENERATION_UNAVAILABLE")
+        self.assertEqual(result["diagnostics"]["stage"], "dcf_surface_query")
+        self.assertEqual(result["diagnostics"]["stdout_sha256"], hashlib.sha256(envelope.encode()).hexdigest())
+        self.assertFalse(result["fallback_used"])
+        self.assertNotIn("private-path", output.getvalue())
+        self.assertEqual(run.call_count, 1)
+        prepare.assert_not_called()
+        execute.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_surface_missing_generation_requires_exact_typed_envelope(self):
+        paths = ["src/one.py"]
+        self.surface_action(paths)
+        valid = {"schema_version": "nokiy_surface_query_error_v1",
+                 "error_code": "DCF_GENERATION_UNAVAILABLE", "authority_effect": "none", "no_apply": True}
+        for rc, stdout in ((1, json.dumps(valid)), (2, "GenerationUnavailable"),
+                           (2, json.dumps({**valid, "no_apply": 1})),
+                           (2, json.dumps({**valid, "authority_effect": "workspace"})),
+                           (2, json.dumps({**valid, "extra": "value"})),
+                           (2, json.dumps(valid)[:-1] + ', "no_apply": true}')):
+            with (self.subTest(rc=rc, stdout=stdout), patch.object(stack.subprocess, "run",
+                  return_value=subprocess.CompletedProcess([], rc, stdout, "private stderr"))):
+                with self.assertRaises(caller.EmbeddedNokiyError) as failure:
+                    stack.query_surface_candidates(self.f.workspace, paths)
+            self.assertEqual(failure.exception.code, "NOKIY_FULL_STACK_SURFACE_UNVERIFIED")
+            result = caller._failure(failure.exception)
+            self.assertEqual(result["diagnostics"]["stderr_bytes"], len("private stderr"))
+            self.assertNotIn("private stderr", json.dumps(result))
 
     def test_surface_unique_omitted_id_is_diagnostic_only(self):
         paths = ["src/one.py", "src/two.py"]
@@ -619,9 +1241,9 @@ class FullStackTests(unittest.TestCase):
         self.assertIn("path_matches_surface", run.call_args_list[0].args[0][3])
         self.assertEqual(run.call_args_list[0].kwargs["timeout"], 30)
         self.assertEqual(run.call_args_list[0].kwargs["input"], json.dumps(paths))
-        self.assertEqual(run.call_args_list[1].args[0][run.call_args_list[1].args[0].index("--surface-id") + 1],
-                         "fixture")
-        compiled_action = json.loads(run.call_args_list[1].kwargs["input"])
+        compile_envelope = json.loads(run.call_args_list[1].kwargs["input"])
+        self.assertEqual(compile_envelope["surface_id"], "fixture")
+        compiled_action = compile_envelope["action"]
         self.assertNotIn("surface_targets", compiled_action)
         self.assertEqual(compiled_action["read_scopes"], action["read_scopes"])
         self.assertEqual(compiled_action["operations"], ["read"])
@@ -750,6 +1372,16 @@ class FullStackTests(unittest.TestCase):
                 stack.prepare_request(self.f.request_path, self.action, None, self.output)
         self.assertEqual(run.call_count, 1)
 
+    def test_missing_dcf_surface_reports_a_typed_issue(self):
+        self.f.request_path.write_text(json.dumps(self.draft))
+        with self.assertRaises(caller.EmbeddedNokiyError) as caught:
+            stack.prepare_request(self.f.request_path, self.action, None, self.output)
+        self.assertEqual(caught.exception.detail, "DCF-managed workspace requires an exact surface")
+        issue = [{"path": "surface_id", "reason": "surface_required"}]
+        self.assertEqual(caught.exception.issues, issue)
+        self.assertEqual(caller._failure(caught.exception)["issues"], issue)
+        self.assertFalse(self.output.exists())
+
     def test_surface_generation_drift_blocks_after_compilation(self):
         paths = ["src/one.py"]
         self.surface_action(paths)
@@ -805,8 +1437,7 @@ class FullStackTests(unittest.TestCase):
         self.f.request_path.write_text(json.dumps(self.draft))
         for i, paths in enumerate(bad):
             with self.subTest(paths=paths):
-                self.action.write_text(json.dumps({"mission": {"task_id": "test"},
-                                                   "operations": ["read"], "surface_targets": paths}))
+                self.action.write_text(json.dumps({**self.base_action, "surface_targets": paths}))
                 with patch.object(stack.subprocess, "run") as run:
                     with self.assertRaisesRegex(caller.EmbeddedNokiyError, "SURFACE_TARGET_INVALID"):
                         stack.prepare_request(self.f.request_path, self.action, None,
@@ -855,7 +1486,9 @@ class FullStackTests(unittest.TestCase):
         def run(argv, **kwargs):
             calls.append((argv, kwargs))
             if argv[-1].endswith("dcf_prepare.py"):
-                compiled = self.compiled_navigation(json.loads(kwargs["input"])["action"], navigation)
+                action = json.loads(kwargs["input"])["action"]
+                compiled = (self.compiled_navigation(action, navigation)
+                            if "navigation_targets" in action else self.compiled)
                 return subprocess.CompletedProcess(argv, 0, json.dumps(compiled), "")
             if "source-navigation" in argv:
                 return subprocess.CompletedProcess(argv, 0, json.dumps(navigation), "")
@@ -890,6 +1523,8 @@ class FullStackTests(unittest.TestCase):
             result = self.run_prepare()
         execute.assert_not_called()
         extract.assert_called_once()
+        self.assertEqual(extract.call_args.kwargs, {})
+        self.assertEqual(result["source_excerpt_decision"], "explicit")
         self.assertEqual(run.call_count, 2)
         self.assertEqual(sum(argv[-1].endswith("dcf_prepare.py") for argv, _ in calls), 1)
         first_action = json.loads(calls[0][1]["input"])["action"]
@@ -951,11 +1586,221 @@ class FullStackTests(unittest.TestCase):
               patch("codex_collaboration_harness.source_excerpt.still_current", return_value=True),
               patch.object(caller, "preflight", return_value={"status": "READY"})):
             result = self.run_prepare()
-        self.assertEqual(extract.call_args.kwargs, {"include_dependencies": True})
+        self.assertEqual(extract.call_args.kwargs,
+                         {"include_dependencies": True, "allow_definitions_only": True})
         self.assertEqual(result["source_excerpt_decision"], "auto")
         self.assertIn('"supporting_spans": []',
                       json.loads((self.output / "capsule.json").read_text())["context_summary"])
         self.assertEqual(json.loads((self.output / "jspace.json").read_text()), self.compiled["contract"])
+
+    def readonly_excerpt_inputs(self, target_source):
+        navigation, _ = self.excerpt_inputs()
+        payload = navigation["result"]["resolved"][0]["payload"]
+        payload["line"] = 2
+        path = self.f.workspace / payload["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(target_source + "\ndef helper():\n" + "    pass\n" * 130, encoding="utf-8")
+        action = json.loads(self.action.read_text())
+        action.pop("include_source_excerpt")
+        self.action.write_text(json.dumps(action))
+        return navigation, path
+
+    def outline_inputs(self):
+        navigation, path = self.readonly_excerpt_inputs("VALUE = 1\ndef target(): return VALUE\n")
+        action = json.loads(self.action.read_text())
+        action.pop("navigation_targets")
+        action["operations"] = ["read", "command"]
+        action["source_read"] = True
+        second = path.with_name("second.py")
+        second.write_text("def related(): return 'not context evidence'\n")
+        action["read_scopes"].append(str(second.relative_to(self.f.workspace)))
+        self.action.write_text(json.dumps(action))
+        self.draft["require_tool_call"] = True
+        self.compiled["contract"].update(source_read=True,
+            allowed_operations=["read", "command"], denied_operations=["modify", "create", "delete"],
+            read_scopes=action["read_scopes"])
+        return navigation, path
+
+    def test_exact_file_readonly_dcf_prepare_supplies_navigation_before_provider(self):
+        from codex_collaboration_harness import source_excerpt
+        navigation, path = self.outline_inputs()
+        original = json.loads(json.dumps(self.compiled["contract"]))
+        run_process, calls = self.excerpt_process(navigation)
+        def preflight(request):
+            capsule = json.loads((self.output / "capsule.json").read_text())
+            source_excerpt.verify_context_excerpt(self.f.workspace, capsule, original)
+            self.assertTrue(request.require_tool_call)
+            return {"status": "READY"}
+        with (patch.object(stack.subprocess, "run", side_effect=run_process),
+              patch.object(caller, "preflight", side_effect=preflight),
+              patch.object(caller, "execute") as execute):
+            result = self.run_prepare()
+        execute.assert_not_called()
+        self.assertEqual(result["source_excerpt_decision"], "auto_outline")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.compiled["contract"], original)
+        self.assertEqual(result["navigation_locators"], [])
+        capsule = json.loads((self.output / "capsule.json").read_text())
+        outline = json.loads(capsule["context_summary"].split(source_excerpt.CONTEXT_MARKER)[1])
+        self.assertEqual(outline["files"][0]["definitions"][0], ["target", "f", 2, 2])
+        self.assertEqual(outline["files"][0]["globals"], [[["VALUE"], 1, 1]])
+        self.assertEqual(capsule["context_summary"].split(source_excerpt.CONTEXT_MARKER)[1],
+                         source_excerpt.encode_context(outline))
+        self.assertEqual(outline["files"][0]["source_sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertNotIn("definitions", json.dumps(result))
+        self.assertFalse(result["provider_execution_started"])
+
+    def test_optional_outline_failure_preserves_ordinary_preparation(self):
+        from codex_collaboration_harness import source_excerpt
+        for name, error, expected in (
+            ("capacity", source_excerpt.ExcerptBudgetExceeded(source_excerpt.CODE, "full"), "capacity_exceeded"),
+            ("unavailable", caller.EmbeddedNokiyError(source_excerpt.CODE, "parse unavailable"), "outline_unavailable"),
+        ):
+            with self.subTest(name=name):
+                navigation, _ = self.outline_inputs()
+                self.output = self.f.root / ("outline-" + name)
+                run_process, calls = self.excerpt_process(navigation)
+                with (patch.object(stack.subprocess, "run", side_effect=run_process),
+                      patch.object(source_excerpt, "extract_outline", side_effect=error),
+                      patch.object(caller, "preflight", return_value={"status": "READY"})):
+                    result = self.run_prepare()
+                self.assertEqual(result["status"], "PREPARED")
+                self.assertEqual(result["source_excerpt_decision"], expected)
+                self.assertNotIn("source_excerpt", result)
+                self.assertEqual(len(calls), 1)
+
+    def test_outline_skips_explicit_disable_single_file_and_non_readonly_requests(self):
+        from codex_collaboration_harness import source_excerpt
+        for case in ("disabled", "single", "write"):
+            with self.subTest(case=case):
+                navigation, _ = self.outline_inputs()
+                self.output = self.f.root / ("outline-" + case)
+                action = json.loads(self.action.read_text())
+                if case == "disabled":
+                    action["include_source_excerpt"] = False
+                elif case == "single":
+                    self.compiled["contract"]["read_scopes"] = action["read_scopes"][:1]
+                else:
+                    self.compiled["contract"]["write_scopes"] = action["read_scopes"][:1]
+                self.action.write_text(json.dumps(action))
+                run_process, calls = self.excerpt_process(navigation)
+                with (patch.object(stack.subprocess, "run", side_effect=run_process),
+                      patch.object(source_excerpt, "extract_outline") as extract,
+                      patch.object(caller, "preflight", return_value={"status": "READY"})):
+                    result = self.run_prepare()
+                self.assertEqual(result["status"], "PREPARED")
+                self.assertNotIn("source_excerpt", result)
+                self.assertEqual(len(calls), 1)
+                extract.assert_not_called()
+
+    def test_optional_outline_cannot_overflow_existing_context_budget(self):
+        from codex_collaboration_harness import source_excerpt
+        navigation, _ = self.outline_inputs()
+        action = json.loads(self.action.read_text())
+        action["context_summary"] = "x" * source_excerpt.MAX_ENVELOPE_BYTES
+        self.action.write_text(json.dumps(action))
+        run_process, calls = self.excerpt_process(navigation)
+        with (patch.object(stack.subprocess, "run", side_effect=run_process),
+              patch.object(caller, "preflight", return_value={"status": "READY"})):
+            result = self.run_prepare()
+        self.assertEqual(result["status"], "PREPARED")
+        self.assertEqual(result["source_excerpt_decision"], "capacity_exceeded")
+        self.assertNotIn("source_excerpt", result)
+        self.assertEqual(len(calls), 1)
+
+    def test_auto_readonly_support_overflow_rebinds_complete_target_once_without_provider(self):
+        from codex_collaboration_harness import source_excerpt
+        target = "@decorate\ndef render_task_context_capsule():\n    return helper()\n"
+        navigation, path = self.readonly_excerpt_inputs(target)
+        original = json.loads(json.dumps(self.compiled["contract"]))
+        run_process, calls = self.excerpt_process(navigation)
+        def preflight(request):
+            source_excerpt.verify_context_excerpt(self.f.workspace,
+                json.loads((self.output / "capsule.json").read_text()), original)
+            self.assertFalse(request.require_tool_call)
+            self.assertEqual(request.authority_effect, "none")
+            return {"status": "READY"}
+        with (patch.object(stack.subprocess, "run", side_effect=run_process),
+              patch.object(caller, "preflight", side_effect=preflight),
+              patch.object(caller, "execute") as execute):
+            result = self.run_prepare()
+        execute.assert_not_called()
+        self.assertFalse(result["provider_execution_started"])
+        self.assertEqual(result["source_excerpt_decision"], "auto_definitions_only")
+        self.assertEqual(len(calls), 2)
+        capsule = json.loads((self.output / "capsule.json").read_text())
+        summary = capsule["context_summary"]
+        self.assertEqual(summary.count(source_excerpt.CONTEXT_MARKER), 1)
+        self.assertEqual(summary.count("def render_task_context_capsule("), 1)
+        self.assertEqual(summary.count("@decorate"), 1)
+        excerpt = json.loads(summary.split(source_excerpt.CONTEXT_MARKER, 1)[1])
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        self.assertEqual(excerpt["kind"], source_excerpt.READONLY_PARTIAL_KIND)
+        self.assertEqual(excerpt["notice"], source_excerpt.PARTIAL_READONLY_NOTICE)
+        self.assertEqual(excerpt["locator"], {"path": original["read_scopes"][0], "line": 2,
+            "generation_id": original["dcf_generation"]["generation_id"]})
+        self.assertEqual(excerpt["files"], [{"path": original["read_scopes"][0],
+            "source_sha256": digest, "spans": [{"start_line": 1, "end_line": 3, "text": target}]}])
+        self.assertEqual([row["name"] for row in excerpt["support_navigation"]["locators"]], ["helper"])
+        self.assertNotIn("def helper(", json.dumps(excerpt["files"]))
+        self.assertEqual(result["source_excerpt"], {"kind": source_excerpt.READONLY_PARTIAL_KIND,
+            "files": [{"path": original["read_scopes"][0], "source_sha256": digest,
+                       "spans": [{"start_line": 1, "end_line": 3}]}]})
+        self.assertNotIn('"text"', json.dumps(result))
+        self.assertNotIn("def render_task_context_capsule(", json.dumps(result))
+        self.assert_public_action_identity(result, json.loads(calls[1][1]["input"])["action"])
+        self.assertEqual(json.loads((self.output / "jspace.json").read_text()), original)
+
+    def test_auto_readonly_decorated_target_and_partial_envelope_capacity_use_read_fallback(self):
+        from codex_collaboration_harness import source_excerpt
+        targets = {
+            "lines": "@decorate\ndef render_task_context_capsule():\n"
+                     + "    pass\n" * 118 + "    return helper()\n",
+            "bytes": "@decorate('" + "x" * source_excerpt.MAX_EXCERPT_BYTES
+                     + "')\ndef render_task_context_capsule():\n    return helper()\n",
+            "envelope": "@decorate\ndef render_task_context_capsule():\n    return helper('"
+                        + "é" * 5000 + "')\n",
+        }
+        for capacity, target in targets.items():
+            with self.subTest(capacity=capacity):
+                self.output = self.f.root / ("readonly-capacity-" + capacity)
+                navigation, _ = self.readonly_excerpt_inputs(target)
+                original = json.loads(json.dumps(self.compiled["contract"]))
+                run_process, calls = self.excerpt_process(navigation)
+                with (patch.object(stack.subprocess, "run", side_effect=run_process),
+                      patch.object(source_excerpt, "extract", wraps=source_excerpt.extract) as extract,
+                      patch.object(source_excerpt, "still_current") as current,
+                      patch.object(caller, "preflight", return_value={"status": "READY"}),
+                      patch.object(caller, "execute") as execute):
+                    result = self.run_prepare()
+                extract.assert_called_once()
+                current.assert_not_called()
+                execute.assert_not_called()
+                self.assertEqual(result["source_excerpt_decision"], "capacity_exceeded")
+                self.assertNotIn("source_excerpt", result)
+                self.assertFalse(result["provider_execution_started"])
+                self.assertEqual(len(calls), 1)
+                summary = json.loads((self.output / "capsule.json").read_text())["context_summary"]
+                self.assertNotIn(source_excerpt.CONTEXT_MARKER, summary)
+                self.assertEqual(json.loads((self.output / "jspace.json").read_text()), original)
+
+    def test_readonly_tool_required_preparation_remains_ineligible_for_auto_excerpt(self):
+        from codex_collaboration_harness import source_excerpt
+        navigation, _ = self.readonly_excerpt_inputs(
+            "@decorate\ndef render_task_context_capsule():\n    return helper()\n")
+        self.draft["require_tool_call"] = True
+        run_process, calls = self.excerpt_process(navigation)
+        with (patch.object(stack.subprocess, "run", side_effect=run_process),
+              patch.object(source_excerpt, "extract") as extract,
+              patch.object(caller, "preflight", return_value={"status": "READY"}),
+              patch.object(caller, "execute") as execute):
+            result = self.run_prepare()
+        extract.assert_not_called()
+        execute.assert_not_called()
+        self.assertEqual(result["source_excerpt_decision"], "ineligible")
+        self.assertNotIn("source_excerpt", result)
+        self.assertEqual(len(calls), 1)
+        self.assertIs(json.loads((self.output / "request.json").read_text())["require_tool_call"], True)
 
     def test_explicit_false_does_not_extract_or_rebind(self):
         navigation, _ = self.excerpt_inputs()
@@ -1417,8 +2262,7 @@ class FullStackTests(unittest.TestCase):
 
     def test_navigation_generation_drift_blocks_before_request(self):
         target = "symbol:scripts.ops.dcf.jspace.render_task_context_capsule"
-        self.action.write_text(json.dumps({"mission": {"task_id": "test"},
-                                           "operations": ["read"], "context_summary": "Inspect it.",
+        self.action.write_text(json.dumps({**self.base_action, "context_summary": "Inspect it.",
                                            "navigation_targets": [target]}))
         navigation = {"capability_id": "source-navigation", "target": target,
                       "freshness_status": "current", "domain_verdict": "pass",
@@ -1435,8 +2279,7 @@ class FullStackTests(unittest.TestCase):
 
     def test_partial_dcf_navigation_blocks_before_compilation(self):
         target = "symbol:scripts.ops.dcf.jspace.render_task_context_capsule"
-        self.action.write_text(json.dumps({"mission": {"task_id": "test"},
-                                           "operations": ["read"], "context_summary": "Inspect it.",
+        self.action.write_text(json.dumps({**self.base_action, "context_summary": "Inspect it.",
                                            "navigation_targets": [target]}))
         partial = {"capability_id": "source-navigation", "target": target,
                    "freshness_status": "current", "domain_verdict": "pass",
@@ -1450,8 +2293,7 @@ class FullStackTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
 
     def test_navigation_never_falls_back_to_non_dcf_context(self):
-        self.action.write_text(json.dumps({"mission": {"task_id": "test"},
-                                           "operations": ["read"], "context_summary": "Inspect it.",
+        self.action.write_text(json.dumps({**self.base_action, "context_summary": "Inspect it.",
                                            "navigation_targets": ["symbol:package.item"]}))
         (self.f.workspace / "scripts/ops/dcf.py").unlink()
         with patch.object(stack.subprocess, "run") as run:
@@ -1465,6 +2307,78 @@ class FullStackTests(unittest.TestCase):
             with self.assertRaises(caller.EmbeddedNokiyError):
                 self.run_prepare()
         self.assertFalse(self.output.exists())
+
+    def test_typed_compiler_failure_preserves_safe_cause_and_stream_identities(self):
+        secret = "NOKIY_DCF_FAILURE_SECRET_SENTINEL"
+        stdout = json.dumps({"schema_version": "jspace_error_v1", "status": "blocked",
+                             "error_code": "JSPACE_SOURCE_READ_FILE_INVALID", "error": secret,
+                             "authority_effect": "none", "no_apply": True})
+        with (patch.object(stack.subprocess, "run", return_value=subprocess.CompletedProcess([], 2, stdout, secret)) as run,
+              patch.object(caller, "execute") as execute):
+            with self.assertRaises(caller.EmbeddedNokiyError) as error:
+                self.run_prepare()
+        failure = caller._failure(error.exception)
+        self.assertEqual(failure["first_typed_blocker"], "NOKIY_FULL_STACK_PREPARATION_FAILED")
+        self.assertEqual(failure["diagnostics"], {
+            "stage": "dcf_compile", "returncode": 2,
+            "stdout_bytes": len(stdout.encode()), "stderr_bytes": len(secret.encode()),
+            "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+            "stderr_sha256": hashlib.sha256(secret.encode()).hexdigest(),
+            "child_error_code": "JSPACE_SOURCE_READ_FILE_INVALID",
+        })
+        self.assertEqual(failure["issues"], [{"path": "action.read_scopes", "reason": "exact_file_unavailable"}])
+        self.assertNotIn(secret, json.dumps(failure))
+        run.assert_called_once()
+        execute.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_out_of_namespace_or_malformed_compiler_error_never_becomes_a_typed_cause(self):
+        payload = {"schema_version": "jspace_error_v1", "status": "blocked",
+                   "error_code": "JSPACE_SOURCE_READ_FILE_INVALID",
+                   "authority_effect": "none", "no_apply": True}
+        outputs = ["not json", "null", "[]", "{}", json.dumps({**payload, "error_code": "UNKNOWN_FAILURE"}),
+                   json.dumps({**payload, "error_code": "JSPACE_failure"}),
+                   json.dumps({**payload, "error_code": "JSPACE_FAILURE\n"}),
+                   json.dumps({**payload, "error_code": "JSPACE_" + "A" * 97}),
+                   json.dumps({**payload, "authority_effect": "workspace"}),
+                   json.dumps({**payload, "no_apply": False}),
+                   json.dumps({**payload, "status": "ok"}),
+                   json.dumps({**payload, "schema_version": "unknown"}),
+                   json.dumps({**payload, "extra": "secret"}),
+                   json.dumps(payload)[:-1] + ',"error_code":"JSPACE_READ_SCOPE_MISSING"}',
+                   json.dumps(payload)[:-1] + ',"error":NaN}',
+                   "x" * (caller.MAX_REQUEST_BYTES + 1)]
+        for stdout in outputs:
+            with self.subTest(output_prefix=stdout[:40]), patch.object(
+                    stack.subprocess, "run", return_value=subprocess.CompletedProcess([], 2, stdout, "secret")) as run:
+                with self.assertRaises(caller.EmbeddedNokiyError) as error:
+                    self.run_prepare()
+            failure = caller._failure(error.exception)
+            self.assertNotIn("child_error_code", failure["diagnostics"])
+            self.assertNotIn("issues", failure)
+            self.assertEqual(failure["diagnostics"]["stdout_bytes"], len(stdout.encode()))
+            run.assert_called_once()
+            self.assertFalse(self.output.exists())
+
+    def test_canonical_compiler_new_codes_remain_blocked_without_fallback(self):
+        for code in ("JSPACE_COMMAND_EFFECT_UNVERIFIED", "JSPACE_REQUIRED_CAPABILITY_NOT_CURRENT",
+                     "TASK_CONTEXT_FIELDS_INVALID", "JSPACE_FUTURE_DIAGNOSTIC"):
+            stdout = json.dumps({"schema_version": "jspace_error_v1", "status": "blocked",
+                                 "error_code": code, "error": "private detail",
+                                 "authority_effect": "none", "no_apply": True})
+            with (self.subTest(code=code),
+                  patch.object(stack.subprocess, "run", return_value=subprocess.CompletedProcess([], 2, stdout, "")) as run,
+                  patch.object(caller, "execute") as execute):
+                with self.assertRaises(caller.EmbeddedNokiyError) as error:
+                    self.run_prepare()
+                failure = caller._failure(error.exception)
+                self.assertEqual(failure["first_typed_blocker"], "NOKIY_FULL_STACK_PREPARATION_FAILED")
+                self.assertEqual(failure["diagnostics"]["child_error_code"], code)
+                self.assertNotIn("private detail", json.dumps(failure))
+                self.assertNotIn("issues", failure)
+                run.assert_called_once()
+                execute.assert_not_called()
+                self.assertFalse(self.output.exists())
 
     def test_corrupt_contract_never_publishes_executable_request(self):
         self.compiled["contract"]["semantic_sha256"] = "0" * 64
@@ -1544,3 +2458,75 @@ class FullStackTests(unittest.TestCase):
         with patch.object(stack.subprocess, 'run', return_value=subprocess.CompletedProcess([], 2, '', 'stale')):
             with self.assertRaisesRegex(caller.EmbeddedNokiyError, 'FRESHNESS_UNVERIFIED'):
                 stack.verify_action_freshness(self.f.workspace, {})
+
+
+class ReadOnlyRouteTests(unittest.TestCase):
+    """prepare_request reprepares a refused read-only action once as inspect."""
+
+    def setUp(self):
+        self.fixture = FullStackTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.fixture.exact_only.stop()
+        self.f = self.fixture.f
+        self.f.request_path.write_text(json.dumps(self.fixture.draft))
+
+    def test_refused_read_only_action_is_prepared_once_as_inspect(self):
+        action = {**self.fixture.surface_action(), "surface_targets": ["src/missing.py"]}
+        self.fixture.action.write_text(json.dumps(action))
+        with patch.object(stack.subprocess, "run") as run:
+            result = stack.prepare_request(self.f.request_path, self.fixture.action, None, self.fixture.output)
+        run.assert_not_called()  # the invalid target never reaches a DCF query
+        self.assertEqual((result["status"], result["context_mode"]), ("PREPARED", "inspect_workspace_jspace"))
+        routes = [row for row in result["input_adaptations"] if row["rule"] == stack.READ_ONLY_ROUTE_RULE]
+        self.assertEqual(len(routes), 1)
+        self.assertTrue(routes[0]["refused"].startswith("NOKIY_FULL_STACK_SURFACE_TARGET_INVALID"))
+        request = json.loads((self.fixture.output / "request.json").read_text())
+        contract = json.loads(Path(request["jspace_contract"]["path"]).read_text())
+        self.assertEqual((contract["write_scopes"], contract["allowed_operations"]), ([], ["command", "read"]))
+        summary = json.loads(Path(request["context_capsule"]["path"]).read_text())["context_summary"]
+        self.assertIn("NOKIY_FULL_STACK_SURFACE_TARGET_INVALID", summary)
+        self.assertIn("Requested surface targets: src/missing.py", summary)
+
+    def test_refusals_that_cannot_be_routed_keep_their_exact_cause(self):
+        surface = self.fixture.surface_action()
+        cases = {
+            "may_write": {**surface, "operations": ["read", "modify"], "write_scopes": ["src/one.py"],
+                          "target_paths": ["src/one.py"], "surface_targets": ["src/missing.py"]},
+            "explicit_excerpt": {**surface, "surface_targets": ["src/missing.py"],
+                                 "include_source_excerpt": True},
+            "incomplete_mission": {"mission": {"task_id": "test"}, "operations": ["read"],
+                                   "surface_targets": ["src/missing.py"]},
+        }
+        for name, action in cases.items():
+            output = self.f.root / ("unrouted-" + name)
+            self.fixture.action.write_text(json.dumps(action))
+            with self.subTest(case=name), patch.object(stack.subprocess, "run") as run:
+                with self.assertRaisesRegex(caller.EmbeddedNokiyError, "SURFACE_TARGET_INVALID"):
+                    stack.prepare_request(self.f.request_path, self.fixture.action, None, output)
+                run.assert_not_called()
+                self.assertFalse(output.exists())
+
+    def test_compiler_refusal_routes_unless_it_shows_the_action_may_write(self):
+        # New refusal kinds route without enumeration; only a not-read-only cause keeps it.
+        for code, routed in (("JSPACE_FUTURE_DIAGNOSTIC", True), ("JSPACE_COMMAND_EFFECT_UNDERDECLARED", False)):
+            stdout = json.dumps({"schema_version": "jspace_error_v1", "status": "blocked",
+                                 "error_code": code, "error": "private detail",
+                                 "authority_effect": "none", "no_apply": True})
+            self.fixture.output = self.f.root / ("compiler-" + code)
+            with (self.subTest(code=code), patch.object(
+                    stack.subprocess, "run", return_value=subprocess.CompletedProcess([], 2, stdout, "")) as run):
+                if routed:
+                    result = self.fixture.run_prepare()
+                    self.assertEqual(result["context_mode"], "inspect_workspace_jspace")
+                    routes = [row for row in result["input_adaptations"]
+                              if row["rule"] == stack.READ_ONLY_ROUTE_RULE]
+                    self.assertEqual(len(routes), 1)
+                    self.assertIn(code, routes[0]["refused"])
+                    self.assertNotIn("private detail", json.dumps(result))
+                else:
+                    with self.assertRaises(caller.EmbeddedNokiyError) as error:
+                        self.fixture.run_prepare()
+                    self.assertEqual(caller._failure(error.exception)["diagnostics"]["child_error_code"], code)
+                    self.assertFalse(self.fixture.output.exists())
+                run.assert_called_once()

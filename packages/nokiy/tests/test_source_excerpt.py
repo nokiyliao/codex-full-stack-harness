@@ -348,6 +348,14 @@ class SupportNavigationTests(unittest.TestCase):
         self.assertEqual(result["files"], legacy["files"])
         self.verify(result, self.edit_contract())
 
+        # Reuse the same large candidate set for the read-only partial shape.
+        readonly = source_excerpt.extract(self.workspace, self.contract,
+            {**self.locator, "line": 1}, include_dependencies=True, allow_definitions_only=True)
+        self.assertEqual(readonly["kind"], source_excerpt.READONLY_PARTIAL_KIND)
+        self.assertEqual(readonly["files"], result["files"])
+        self.assertEqual(readonly["support_navigation"], navigation)
+        self.verify(readonly, self.contract)
+
     def test_tampering_is_integrity_failure_not_navigation_fallback(self):
         result = self.prepare(self.partial_source())
         original = result["support_navigation"]
@@ -390,6 +398,218 @@ class SupportNavigationTests(unittest.TestCase):
                 source_excerpt.extract_edits(self.workspace,
                     {**self.edit_contract(), "read_scopes": ["pkg/**"]}, rows, support_navigation=True)
         read.assert_not_called()
+
+
+class ReadonlyPartialSourceExcerptTests(unittest.TestCase):
+    setUp = SourceExcerptTests.setUp
+    write_source = SourceExcerptTests.write_source
+    verify = SourceExcerptTests.verify
+    partial_source = SupportNavigationTests.partial_source
+
+    def prepare(self, source):
+        locator = self.write_source(source)
+        with patch.object(source_excerpt, "_read_exact", wraps=source_excerpt._read_exact) as read:
+            result = source_excerpt.extract(self.workspace, self.contract, locator,
+                include_dependencies=True, allow_definitions_only=True)
+        read.assert_called_once_with(self.workspace, self.name)
+        return result
+
+    def test_support_capacity_retains_complete_decorated_target(self):
+        target = "@decorate\ndef target(value):\n    return helper(value)\n"
+        for capacity, body in (("lines", "    pass\n" * 130),
+                               ("bytes", "    return '" + "x" * source_excerpt.MAX_EXCERPT_BYTES + "'\n")):
+            with self.subTest(capacity=capacity):
+                source = target + "\ndef helper(value):\n" + body
+                original = copy.deepcopy(self.contract)
+                result = self.prepare(source)
+                self.assertEqual(result["kind"], source_excerpt.READONLY_PARTIAL_KIND)
+                self.assertEqual(result["notice"], source_excerpt.PARTIAL_READONLY_NOTICE)
+                self.assertEqual(result["locator"], {**self.locator, "line": 2})
+                self.assertEqual(result["files"], [{"path": self.name,
+                    "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                    "spans": [{"start_line": 1, "end_line": 3, "text": target}]}])
+                self.assertNotIn("supporting_spans", result)
+                self.assertEqual(result["support_navigation"], {
+                    "kind": source_excerpt.SUPPORT_NAVIGATION_KIND, "candidate_count": 1,
+                    "locators": [{"path": self.name, "name": "helper", "kind": "function",
+                                  "start_line": 5, "end_line": len(source.splitlines())}]})
+                self.assertTrue(source_excerpt.still_current(self.workspace, result))
+                with patch.object(source_excerpt, "_read_exact", wraps=source_excerpt._read_exact) as read:
+                    self.verify(result)
+                read.assert_called_once_with(self.workspace, self.name)
+                for options in ({}, {"allow_definitions_only": False}):
+                    with self.assertRaises(source_excerpt.ExcerptBudgetExceeded):
+                        source_excerpt.extract(self.workspace, self.contract, result["locator"],
+                            include_dependencies=True, **options)
+                body_only = source_excerpt.extract(self.workspace, self.contract, result["locator"])
+                self.assertEqual(body_only["text"], target.removeprefix("@decorate\n"))
+                self.assertNotIn("supporting_spans", body_only)
+                self.assertEqual(self.contract, original)
+
+    def test_partial_tampering_and_required_field_deletion_are_integrity_failures(self):
+        result = self.prepare("@decorate\n" + self.partial_source())
+        file = result["files"][0]
+        span = file["spans"][0]
+        locator = result["locator"]
+        navigation = result["support_navigation"]
+        row = navigation["locators"][0]
+        changes = (
+            {"notice": "complete dependency evidence"}, {"notice": None},
+            {"target": "symbol:pkg.example.other"}, {"files": None}, {"files": []},
+            {"files": [{**file, "path": "pkg/other.py"}]},
+            {"files": [{**file, "source_sha256": "0" * 64}]},
+            {"files": [{**file, "spans": []}]},
+            {"files": [{**file, "spans": [{**span, "text": "def target(): pass\n"}]}]},
+            {"files": [{**file, "spans": [{**span, "start_line": span["start_line"] + 1}]}]},
+            {"files": [{**file, "spans": [{**span, "end_line": span["end_line"] + 1}]}]},
+            {"files": [{**file, "spans": [{**span, "start_line": True}]}]},
+            {"locator": {**locator, "path": "pkg/other.py"}},
+            {"locator": {**locator, "line": 5}}, {"locator": {**locator, "line": True}},
+            {"locator": {**locator, "generation_id": "old"}},
+            {"support_navigation": None}, {"support_navigation": {}},
+            {"support_navigation": {**navigation, "kind": "complete_dependencies"}},
+            {"support_navigation": {**navigation, "candidate_count": True}},
+            {"support_navigation": {**navigation, "candidate_count": 1.0}},
+            {"support_navigation": {**navigation, "locators": []}},
+            {"support_navigation": {**navigation, "locators": [row, row]}},
+            {"support_navigation": {**navigation, "locators": [{**row, "path": "pkg/other.py"}]}},
+            {"support_navigation": {**navigation, "locators": [{**row, "name": "unknown"}]}},
+            {"support_navigation": {**navigation, "locators": [{**row, "start_line": True}]}},
+            {"support_navigation": {**navigation, "locators": [{**row, "end_line": row["end_line"] + 1}]}},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                with self.assertRaises(caller.EmbeddedNokiyError) as error:
+                    self.verify({**result, **change})
+                self.assertNotIsInstance(error.exception, source_excerpt.ExcerptBudgetExceeded)
+        for field in ("notice", "locator", "files", "support_navigation"):
+            with self.subTest(deleted=field):
+                with self.assertRaises(caller.EmbeddedNokiyError) as error:
+                    self.verify({key: value for key, value in result.items() if key != field})
+                self.assertNotIsInstance(error.exception, source_excerpt.ExcerptBudgetExceeded)
+
+    def test_partial_source_drift_is_not_capacity_or_edit_postimage_fallback(self):
+        result = self.prepare(self.partial_source())
+        with (self.workspace / self.name).open("a", encoding="utf-8") as stream:
+            stream.write("\nUNRELATED = 9\n")
+        self.assertFalse(source_excerpt.still_current(self.workspace, result))
+        for after_execution in (False, True):
+            with self.subTest(after_execution=after_execution):
+                with self.assertRaises(caller.EmbeddedNokiyError) as error:
+                    source_excerpt.verify_context_excerpt(self.workspace,
+                        {"context_summary": source_excerpt.CONTEXT_MARKER + json.dumps(result)},
+                        self.contract, after_execution=after_execution)
+                self.assertNotIsInstance(error.exception, source_excerpt.ExcerptBudgetExceeded)
+
+    def test_partial_requires_current_exact_read_admission_before_any_read(self):
+        result = self.prepare(self.partial_source())
+        for change in ({"read_scopes": ["pkg/**"]}, {"read_scopes": []},
+                       {"denied_operations": ["read"]},
+                       {"dcf_generation": {"generation_id": "old"}}):
+            with self.subTest(change=change):
+                contract = {**self.contract, **change}
+                with patch.object(source_excerpt, "_read_exact") as read:
+                    for operation in (
+                        lambda: source_excerpt.extract(self.workspace, contract, result["locator"],
+                            include_dependencies=True, allow_definitions_only=True),
+                        lambda: self.verify(result, contract),
+                    ):
+                        with self.assertRaises(caller.EmbeddedNokiyError) as error:
+                            operation()
+                        self.assertNotIsInstance(error.exception, source_excerpt.ExcerptBudgetExceeded)
+                    read.assert_not_called()
+
+    def test_partial_symlink_invalid_utf8_and_ast_errors_are_not_capacity(self):
+        path = self.workspace / self.name
+        for failure in ("symlink", "invalid_utf8", "ast"):
+            with self.subTest(failure=failure):
+                if path.is_symlink():
+                    path.unlink()
+                result = self.prepare(self.partial_source())
+                if failure == "symlink":
+                    referent = path.with_name("real.py")
+                    path.rename(referent)
+                    path.symlink_to(referent.name)
+                elif failure == "invalid_utf8":
+                    path.write_bytes(b"\xff")
+                else:
+                    path.write_text("def target(:\n", encoding="utf-8")
+                for operation in (
+                    lambda: source_excerpt.extract(self.workspace, self.contract, result["locator"],
+                        include_dependencies=True, allow_definitions_only=True),
+                    lambda: self.verify(result),
+                ):
+                    with self.assertRaises(caller.EmbeddedNokiyError) as error:
+                        operation()
+                    self.assertNotIsInstance(error.exception, source_excerpt.ExcerptBudgetExceeded)
+
+    def test_oversized_decorated_target_is_never_truncated(self):
+        targets = (
+            "@decorate\ndef target():\n" + "    pass\n" * 118 + "    return helper()\n",
+            "@decorate('" + "x" * source_excerpt.MAX_EXCERPT_BYTES
+            + "')\ndef target():\n    return helper()\n",
+        )
+        for index, target in enumerate(targets):
+            with self.subTest(index=index):
+                locator = self.write_source(target + "def helper():\n    pass\n")
+                # The undecorated body fits; the complete decorated target does not.
+                source_excerpt.extract(self.workspace, self.contract, locator)
+                with self.assertRaises(source_excerpt.ExcerptBudgetExceeded):
+                    source_excerpt.extract(self.workspace, self.contract, locator,
+                        include_dependencies=True, allow_definitions_only=True)
+
+    def test_partial_serialized_envelope_overflow_is_capacity(self):
+        target = "@decorate\ndef target():\n    return helper('" + "é" * 5000 + "')\n"
+        self.assertLessEqual(len(target.encode("utf-8")), source_excerpt.MAX_EXCERPT_BYTES)
+        self.assertGreater(len(json.dumps(target, ensure_ascii=True).encode()),
+                           source_excerpt.MAX_ENVELOPE_BYTES)
+        locator = self.write_source(target + "def helper(value):\n" + "    pass\n" * 130)
+        with self.assertRaises(source_excerpt.ExcerptBudgetExceeded):
+            source_excerpt.extract(self.workspace, self.contract, locator,
+                include_dependencies=True, allow_definitions_only=True)
+
+    def test_automatic_full_roundtrip_preserves_legacy_line_splitting(self):
+        for separator in ("\f", "\u2028", "\u2029"):
+            with self.subTest(separator=repr(separator)):
+                source = (f"VALUE = 'a{separator}b'\r\n@decorate\r\ndef target():\r\n"
+                          f"    value = 'c{separator}d'\r\n    return value + VALUE\r\n")
+                (self.workspace / self.name).write_bytes(source.encode("utf-8"))
+                locator = {**self.locator, "line": 3}
+                legacy = source_excerpt.extract(self.workspace, self.contract, locator,
+                    include_dependencies=True)
+                automatic = source_excerpt.extract(self.workspace, self.contract, locator,
+                    include_dependencies=True, allow_definitions_only=True)
+                self.assertEqual(automatic, legacy)
+                self.assertNotIn("kind", automatic)
+                self.assertEqual(legacy["text"], "".join(source.splitlines(keepends=True)[2:5]))
+                body_only = source_excerpt.extract(self.workspace, self.contract, locator)
+                self.assertEqual(body_only["text"], legacy["text"])
+                self.assertNotIn("supporting_spans", body_only)
+                self.verify(automatic)
+
+    def test_partial_roundtrip_retains_exact_physical_lines_and_line_endings(self):
+        for separator in ("\f", "\u2028", "\u2029"):
+            for newline in ("\n", "\r\n", "\r"):
+                with self.subTest(separator=repr(separator), newline=repr(newline)):
+                    target = (f"@decorate{newline}def target(value):{newline}"
+                              f"    label = 'a{separator}b'{newline}"
+                              f"    return helper(value, label){newline}")
+                    source = (f"VALUE = 'c{separator}d'{newline}" + target + newline
+                              + f"def helper(value, label):{newline}" + f"    pass{newline}" * 130)
+                    raw = source.encode("utf-8")
+                    (self.workspace / self.name).write_bytes(raw)
+                    locator = {**self.locator, "line": 3}
+                    with patch.object(source_excerpt, "_read_exact", wraps=source_excerpt._read_exact) as read:
+                        result = source_excerpt.extract(self.workspace, self.contract, locator,
+                            include_dependencies=True, allow_definitions_only=True)
+                    read.assert_called_once_with(self.workspace, self.name)
+                    self.assertEqual(result["kind"], source_excerpt.READONLY_PARTIAL_KIND)
+                    self.assertEqual(result["locator"], locator)
+                    self.assertEqual(result["files"], [{"path": self.name,
+                        "source_sha256": hashlib.sha256(raw).hexdigest(),
+                        "spans": [{"start_line": 2, "end_line": 5, "text": target}]}])
+                    self.assertTrue(source_excerpt.still_current(self.workspace, result))
+                    self.verify(result)
 
 
 class EditSourceExcerptTests(unittest.TestCase):
@@ -991,6 +1211,210 @@ class EditSourceExcerptTests(unittest.TestCase):
         with self.assertRaises(caller.EmbeddedNokiyError):
             source_excerpt.verify_context_excerpt(
                 self.workspace, context, self.contract, after_execution=True)
+
+
+class ReadonlyOutlineTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.workspace = Path(self.temporary.name)
+        self.source = self.workspace / "example.py"
+        self.source.write_text(
+            "@decorate\nclass Service:\n    async def run(self):\n"
+            "        def inner():\n            return 'PRIVATE_BODY'\n"
+            "        return inner()\n\ndef standalone():\n    pass\n"
+        )
+        self.contract = {"source_read": True, "allowed_operations": ["read", "command"],
+                         "denied_operations": ["modify", "create", "delete"],
+                         "read_scopes": ["example.py"], "write_scopes": [],
+                         "command_templates": [], "dcf_generation": {"generation_id": "current"}}
+
+    def write_sources(self, sources):
+        self.contract["read_scopes"] = list(sources)
+        for name, text in sources.items():
+            path = self.workspace / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+
+    def test_exact_source_outline_contains_all_qualified_ranges_but_no_bodies(self):
+        before = copy.deepcopy(self.contract)
+        with patch.object(source_excerpt, "_read_exact", wraps=source_excerpt._read_exact) as read:
+            result = source_excerpt.extract_outline(self.workspace, self.contract)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(result["files"], [{"path": "example.py",
+            "source_sha256": hashlib.sha256(self.source.read_bytes()).hexdigest(),
+            "definitions": [["Service", "c", 1, 6],
+                            ["Service.run", "f", 3, 6],
+                            ["Service.run.inner", "f", 4, 5],
+                            ["standalone", "f", 8, 9]]}])
+        self.assertNotIn("PRIVATE_BODY", json.dumps(result))
+        self.assertEqual(self.contract, before)
+        context = {"context_summary": source_excerpt.CONTEXT_MARKER + json.dumps(result)}
+        source_excerpt.verify_context_excerpt(self.workspace, context, self.contract)
+
+    def test_outline_rejects_tampering_and_source_drift_before_and_after_execution(self):
+        result = source_excerpt.extract_outline(self.workspace, self.contract)
+        changed = copy.deepcopy(result)
+        changed["files"][0]["definitions"][0][2] = True
+        for after in (False, True):
+            with self.subTest(after=after), self.assertRaises(caller.EmbeddedNokiyError):
+                source_excerpt.verify_context_excerpt(self.workspace,
+                    {"context_summary": source_excerpt.CONTEXT_MARKER + json.dumps(changed)},
+                    self.contract, after_execution=after)
+        self.source.write_text("def replaced(): pass\n")
+        for after in (False, True):
+            with self.subTest(after=after), self.assertRaises(caller.EmbeddedNokiyError):
+                source_excerpt.verify_context_excerpt(self.workspace,
+                    {"context_summary": source_excerpt.CONTEXT_MARKER + json.dumps(result)},
+                    self.contract, after_execution=after)
+
+    def test_outline_never_probes_ungranted_or_mutable_scopes(self):
+        changes = [{"read_scopes": ["../example.py"]}, {"read_scopes": ["*.py"]},
+                   {"read_scopes": ["example.py", "example.py"]}, {"read_scopes": ["a.txt"]},
+                   {"read_scopes": []}, {"write_scopes": ["example.py"]},
+                   {"source_read": False}, {"allowed_operations": ["read", "command", "modify"]},
+                   {"denied_operations": ["read"]}, {"denied_operations": ["command"]},
+                   {"dcf_generation": {}}, {"command_templates": ["anything"]},
+                   {"verifier_commands": [{"argv": ["any"]}]}]
+        for change in changes:
+            with self.subTest(change=change), patch.object(source_excerpt, "_read_exact") as read:
+                with self.assertRaises(caller.EmbeddedNokiyError):
+                    source_excerpt.extract_outline(self.workspace, {**self.contract, **change})
+                read.assert_not_called()
+
+    def test_outline_has_no_import_execution_and_no_partial_truncation(self):
+        self.source.write_text("raise RuntimeError('must not execute')\ndef valid(): pass\n")
+        result = source_excerpt.extract_outline(self.workspace, self.contract)
+        self.assertEqual(result["files"][0]["definitions"], [["valid", "f", 2, 2]])
+        with patch.object(source_excerpt, "MAX_ENVELOPE_BYTES", 50):
+            with self.assertRaises(source_excerpt.ExcerptBudgetExceeded):
+                source_excerpt.extract_outline(self.workspace, self.contract)
+        self.source.unlink()
+        self.source.symlink_to("/etc/passwd")
+        with self.assertRaises(caller.EmbeddedNokiyError):
+            source_excerpt.extract_outline(self.workspace, self.contract)
+
+    def test_outline_supplies_import_tuple_alias_and_constant_locations_together(self):
+        self.write_sources({
+            "example.py": (
+                "from pkg import common\n"
+                "import pkg.engine as direct\n"
+                "from pkg.engine import compute\n"
+                "from outside import forbidden\n"
+                "m, require = common.m, common.require\n"
+                "RAW_PINS = {'sensitive': '/never/open/this'}\n"
+                "THREAD_ENV = ('PRIVATE_VALUE',)\n"
+                "def target(): return m.compute()\n"
+            ),
+            "pkg/common.py": "from pkg import engine as m\nrequire = m.check\n",
+            "pkg/engine.py": "raise RuntimeError('must not execute')\ndef compute(): pass\n",
+        })
+        (self.workspace / "outside.py").write_text("PRIVATE_UNGRANTED_SOURCE\n")
+        with patch.object(source_excerpt, "_read_exact", wraps=source_excerpt._read_exact) as read:
+            result = source_excerpt.extract_outline(self.workspace, self.contract)
+        self.assertEqual([call.args[1] for call in read.call_args_list], sorted(self.contract["read_scopes"]))
+        first = result["files"][0]
+        self.assertEqual(first["imports"], [
+            [1, 1, "from pkg import common"],
+            [2, 2, "import pkg.engine as direct"],
+            [3, 3, "from pkg.engine import compute"],
+        ])
+        self.assertEqual(first["aliases"], [[5, 5, "m, require = (common.m, common.require)"]])
+        self.assertEqual(first["globals"], [[["RAW_PINS"], 6, 6], [["THREAD_ENV"], 7, 7]])
+        self.assertEqual(result["files"][1]["imports"], [[1, 1, "from pkg import engine as m"]])
+        self.assertEqual(result["files"][1]["aliases"], [[2, 2, "require = m.check"]])
+        for excluded in ("PRIVATE_VALUE", "PRIVATE_UNGRANTED_SOURCE", "/never/open/this", "forbidden"):
+            self.assertNotIn(excluded, source_excerpt.encode_context(result))
+        source_excerpt.verify_context_excerpt(self.workspace,
+            {"context_summary": source_excerpt.CONTEXT_MARKER + source_excerpt.encode_context(result)},
+            self.contract)
+
+    def test_relative_import_matching_uses_only_declared_granted_paths(self):
+        self.write_sources({
+            "pkg/sub/a.py": "from . import b\nfrom .. import root\nfrom .... import invalid\n",
+            "pkg/sub/b.py": "pass\n",
+            "pkg/root.py": "pass\n",
+            "pkg/__init__.py": "from . import root\n",
+        })
+        result = source_excerpt.extract_outline(self.workspace, self.contract)
+        rows = {row["path"]: row for row in result["files"]}
+        self.assertEqual(rows["pkg/sub/a.py"]["imports"], [
+            [1, 1, "from . import b"], [2, 2, "from .. import root"]])
+        self.assertEqual(rows["pkg/__init__.py"]["imports"], [[1, 1, "from . import root"]])
+
+    def test_bindings_do_not_resolve_dynamic_or_conditional_values_or_erase_rebindings(self):
+        self.write_sources({
+            "example.py": (
+                "from pkg import common\n"
+                "m = common.m\n"
+                "m = other.m\n"
+                "dynamic = load_module()\n"
+                "if enabled:\n    conditional = common.m\n"
+                "class Service:\n    nested = common.m\n"
+                "annotated: object = common.m\n"
+                "count += other.count\n"
+                "def target():\n    local = common.m\n"
+            ), "pkg/common.py": "pass\n",
+        })
+        row = source_excerpt.extract_outline(self.workspace, self.contract)["files"][0]
+        self.assertEqual(row["aliases"], [
+            [2, 2, "m = common.m"], [3, 3, "m = other.m"], [9, 9, "annotated: object = common.m"]])
+        self.assertEqual(row["globals"], [[["dynamic"], 4, 4], [["count"], 10, 10]])
+        self.assertNotIn("load_module", json.dumps(row))
+        self.assertNotIn("conditional", json.dumps(row))
+        self.assertNotIn("nested =", json.dumps(row))
+        self.assertNotIn("local =", json.dumps(row))
+
+    def test_import_alias_and_global_metadata_are_authenticated(self):
+        self.write_sources({"example.py": "import common\nm = common.m\nVALUE = 42\n",
+                            "common.py": "pass\n"})
+        result = source_excerpt.extract_outline(self.workspace, self.contract)
+        for key in ("imports", "aliases", "globals"):
+            changed = copy.deepcopy(result)
+            next(row for row in changed["files"] if row["path"] == "example.py")[key][0][-1] = "tampered"
+            for after in (False, True):
+                with self.subTest(key=key, after=after), self.assertRaises(caller.EmbeddedNokiyError):
+                    source_excerpt.verify_context_excerpt(self.workspace,
+                        {"context_summary": source_excerpt.CONTEXT_MARKER + source_excerpt.encode_context(changed)},
+                        self.contract, after_execution=after)
+
+    def test_outline_distinguishes_verified_syntax_from_unread_implementation(self):
+        self.write_sources({
+            "example.py": "import common\ncheck = common.check\nVALUE = 42\n"
+                          "def target(): return check(VALUE)\n",
+            "common.py": "def check(value):\n    return value > 0\n",
+        })
+        result = source_excerpt.extract_outline(self.workspace, self.contract)
+        notice = result["notice"]
+        self.assertIn("verified source syntax", notice)
+        self.assertIn("without rereading solely to confirm that syntax", notice)
+        self.assertIn("locators, not body/value evidence", notice)
+        self.assertIn("do not prove runtime resolution or absence of rebinding", notice)
+        self.assertIn("helper/exception definitions with their callers before final synthesis", notice)
+        self.assertIn("not every symbol or whole files", notice)
+        encoded = source_excerpt.encode_context(result)
+        self.assertNotIn("return value > 0", encoded)
+        self.assertNotIn("VALUE = 42", encoded)
+        source_excerpt.verify_context_excerpt(self.workspace,
+            {"context_summary": source_excerpt.CONTEXT_MARKER + encoded}, self.contract)
+
+    def test_outline_evidence_guidance_cannot_be_replaced_by_a_claim_of_complete_bodies(self):
+        result = source_excerpt.extract_outline(self.workspace, self.contract)
+        result["notice"] = "All listed definitions have already been read in full."
+        for after in (False, True):
+            with self.subTest(after=after), self.assertRaises(caller.EmbeddedNokiyError):
+                source_excerpt.verify_context_excerpt(self.workspace,
+                    {"context_summary": source_excerpt.CONTEXT_MARKER
+                     + source_excerpt.encode_context(result)},
+                    self.contract, after_execution=after)
+
+    def test_compact_encoding_preserves_outline_data_and_other_excerpt_wire_format(self):
+        result = source_excerpt.extract_outline(self.workspace, self.contract)
+        encoded = source_excerpt.encode_context(result)
+        self.assertEqual(json.loads(encoded), result)
+        self.assertLess(len(encoded), len(json.dumps(result, sort_keys=True, ensure_ascii=True)))
+        legacy = {"path": "example.py", "text": "def target(): return 1\n", "start_line": 1}
+        self.assertEqual(source_excerpt.encode_context(legacy), json.dumps(legacy, sort_keys=True, ensure_ascii=True))
 
 
 if __name__ == "__main__":

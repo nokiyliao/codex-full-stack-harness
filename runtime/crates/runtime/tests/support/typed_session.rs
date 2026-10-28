@@ -4,8 +4,9 @@ use anyhow::{Context, Result, bail};
 use lifecycle::{SessionCommand, SessionInput, SessionManagement, TaskPlan};
 use session_log_contract::{
     CreateSessionRequest, ExecuteSessionCommandRequest, GetSessionRequest,
-    PersistSessionDeltaRequest, ReadContextSliceRequest, SessionContextRecord, SessionDeltaEntry,
-    SessionLogCommand, SessionLogResponse, SessionRecordProjection,
+    MarkSessionInterruptedRequest, PersistSessionDeltaRequest, ReadContextSliceRequest,
+    SessionContextRecord, SessionDeltaEntry, SessionLogCommand, SessionLogResponse,
+    SessionRecordProjection,
 };
 
 pub fn create_request(
@@ -203,6 +204,17 @@ pub fn execute_via_service(session_id: &str, session_command: SessionCommand) ->
         SessionLogResponse::SessionCommandApplied { .. } => Ok(()),
         SessionLogResponse::Error { error } => bail!("execute session command failed: {error}"),
         other => bail!("unexpected execute session command response: {other:?}"),
+    }
+}
+
+/// The service no longer interrupts running sessions at start; recovery does it explicitly.
+pub fn interrupt_via_service(session_id: &str) -> Result<()> {
+    match session_log_contract::client::call_service(&SessionLogCommand::MarkSessionInterrupted(
+        MarkSessionInterruptedRequest { session_id: session_id.to_string() },
+    ))? {
+        SessionLogResponse::Ok => Ok(()),
+        SessionLogResponse::Error { error } => bail!("mark session interrupted failed: {error}"),
+        other => bail!("unexpected mark session interrupted response: {other:?}"),
     }
 }
 

@@ -3,11 +3,11 @@
 //! Pure text-processing layer with no external state. Exposed only inside
 //! `context::*` via `pub(super)`.
 
-use super::char_budget::formatted_truncate_text;
+use super::char_budget::{formatted_truncate_text, within_char_budget};
 use crate::prompt_style::context_blocks;
 
 pub(super) fn environment_context_message(cwd: &std::path::Path) -> String {
-    let timezone = std::env::var("TZ").unwrap_or_else(|_| "Europe/Paris".to_string());
+    let timezone = context_blocks::system_timezone();
     let system_language = session_language();
     context_blocks::environment_context(
         cwd,
@@ -55,7 +55,7 @@ pub(super) fn command_run_truncate_text(
     command_line: Option<&str>,
 ) -> String {
     let effective_max_chars = command_run_effective_max_chars(max_chars, command_line);
-    if content.len() <= effective_max_chars {
+    if within_char_budget(content, effective_max_chars) {
         return content.to_string();
     }
     truncate_marker_sections_for_command_run(content, effective_max_chars, command_line)

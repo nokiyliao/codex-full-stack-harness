@@ -1,5 +1,6 @@
 mod execution;
 mod focused_verifier;
+mod inspect_sandbox;
 mod process;
 mod read_batch;
 mod readonly;
@@ -12,7 +13,7 @@ pub use execution::{
     terminalize_interrupted_command_run_claims,
 };
 pub use focused_verifier::{
-    VerifierObservation, execute_remote_focused_verifier, focused_verifier_policy,
+    VerifierObservation, execute_remote_focused_verifier, execute_remote_parent_shell, focused_verifier_policy,
     execute_focused_verifier, focused_verifier_not_started, focused_verifier_sandbox_available,
 };
 pub(crate) use execution::{
@@ -64,7 +65,14 @@ pub fn execute(
     shell_kind: ShellKind,
 ) -> CommandResponse {
     let request = request::parse_shell_request(command_line, session_dir, timeout_secs);
+    let inspect = match inspect_sandbox::bound() {
+        Ok(inspect) => inspect,
+        Err(reason) => return response::blocked_command_response(&request.command, &reason),
+    };
     if let Some(patch_text) = request::embedded_apply_patch_text(&request.command) {
+        if inspect.is_some() {
+            return response::blocked_command_response(&request.command, "apply_patch is not available in an inspect shell");
+        }
         return apply_patch::execute(&patch_text, session_dir);
     }
     if let Some(reason) = command_safety::is_dangerous_command_with_workspace(
@@ -134,8 +142,19 @@ pub fn execute(
             .arg(&command_text);
         command
     };
+    if let Some(sandbox) = &inspect {
+        command = match sandbox.wrap(command) {
+            Ok(command) => command,
+            Err(reason) => return response::blocked_command_response(&request.command, &reason),
+        };
+    }
     command.current_dir(&request.cwd);
     apply_merged_env(&mut command, &merged_env, task_git_config_env.as_deref());
+    if let Some(sandbox) = &inspect {
+        for (key, value) in sandbox.environment() {
+            command.env(key, value);
+        }
+    }
     command.env(
         BACKGROUND_PROCESS_KIND_ENV,
         RUNTIME_SHELL_BACKGROUND_PROCESS_KIND,
@@ -152,7 +171,26 @@ pub async fn execute_async(
     ctx: &ToolContext,
 ) -> CommandResponse {
     let request = request::parse_shell_request(command_line, session_dir, timeout_secs);
+    let inspect = match inspect_sandbox::bound() {
+        Ok(inspect) => inspect,
+        Err(reason) => {
+            return terminalize_pre_execution_zero_effect(
+                ctx,
+                response::blocked_command_response(&request.command, &reason),
+                request.timeout_secs,
+                request.stall_timeout_secs,
+            );
+        }
+    };
     if let Some(patch_text) = request::embedded_apply_patch_text(&request.command) {
+        if inspect.is_some() {
+            return terminalize_pre_execution_zero_effect(
+                ctx,
+                response::blocked_command_response(&request.command, "apply_patch is not available in an inspect shell"),
+                request.timeout_secs,
+                request.stall_timeout_secs,
+            );
+        }
         return run_in_process_command_with_terminal_receipt(ctx, "in_process_apply_patch", || {
             apply_patch::execute(&patch_text, session_dir)
         });
@@ -245,8 +283,26 @@ pub async fn execute_async(
             .arg(&command_text);
         command
     };
+    if let Some(sandbox) = &inspect {
+        command = match sandbox.wrap_async(command) {
+            Ok(command) => command,
+            Err(reason) => {
+                return terminalize_pre_execution_zero_effect(
+                    ctx,
+                    response::blocked_command_response(&request.command, &reason),
+                    request.timeout_secs,
+                    request.stall_timeout_secs,
+                );
+            }
+        };
+    }
     command.current_dir(&request.cwd);
     apply_merged_env_async(&mut command, &merged_env, task_git_config_env.as_deref());
+    if let Some(sandbox) = &inspect {
+        for (key, value) in sandbox.environment() {
+            command.env(key, value);
+        }
+    }
     command.env(
         BACKGROUND_PROCESS_KIND_ENV,
         RUNTIME_SHELL_BACKGROUND_PROCESS_KIND,

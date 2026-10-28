@@ -81,6 +81,10 @@ pub fn process_from_gateway_session_with_lease_and_lifecycle_in_directory(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the gateway entry point forwards session, lease, lifecycle and J-Space bindings explicitly"
+)]
 pub fn process_from_gateway_session_with_lease_and_lifecycle_and_jspace_in_directory(
     session_id: String,
     runtime_id: RuntimeId,
@@ -91,7 +95,25 @@ pub fn process_from_gateway_session_with_lease_and_lifecycle_and_jspace_in_direc
     lifecycle: runtime_contract::LifecycleExecutionContext,
     jspace_contract: Option<serde_json::Value>,
 ) -> Result<ManoProcessResult, String> {
-    orchestrate_for_session_with_lease_and_lifecycle_and_jspace_in_directory(
+    process_from_gateway_session_with_source_binding(
+        session_id, runtime_id, fallback_from_id, lease_id, input, session_directory,
+        lifecycle, jspace_contract, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn process_from_gateway_session_with_source_binding(
+    session_id: String,
+    runtime_id: RuntimeId,
+    fallback_from_id: Option<RuntimeId>,
+    lease_id: String,
+    input: SessionInput,
+    session_directory: PathBuf,
+    lifecycle: runtime_contract::LifecycleExecutionContext,
+    jspace_contract: Option<serde_json::Value>,
+    capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
+) -> Result<ManoProcessResult, String> {
+    process::orchestrate_for_session_with_source_binding(
         input,
         session_id,
         runtime_id,
@@ -100,6 +122,7 @@ pub fn process_from_gateway_session_with_lease_and_lifecycle_and_jspace_in_direc
         Some(lifecycle),
         jspace_contract,
         fallback_from_id,
+        capsule_source_read_binding,
     )
 }
 

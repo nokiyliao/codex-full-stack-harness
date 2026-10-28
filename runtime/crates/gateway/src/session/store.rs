@@ -23,6 +23,7 @@ use session_log_contract::{
     UpdateSessionRequest as UpdateSessionDbRequest,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -151,7 +152,15 @@ impl Default for SessionStore {
 impl SessionStore {
     pub fn new() -> Self {
         let store = Self::empty();
-        store.init_default_session();
+        store.init_default_session(None);
+        store
+    }
+
+    /// A store whose initial session lives in `directory` instead of `sessions` under the
+    /// working directory, so a caller such as a test controls where its repository is created.
+    pub fn with_default_directory(directory: impl AsRef<Path>) -> Self {
+        let store = Self::empty();
+        store.init_default_session(Some(directory.as_ref().to_string_lossy().into_owned()));
         store
     }
 
@@ -171,8 +180,9 @@ impl SessionStore {
         }
     }
 
-    fn init_default_session(&self) {
-        let info = SessionManager::create_session(None, None, None, Some("coding".to_string()));
+    fn init_default_session(&self, directory: Option<String>) {
+        let info =
+            SessionManager::create_session(directory, None, None, Some("coding".to_string()));
         let session_id = info.id.clone();
         let summary = api_session_from_info(&info, None);
         self.summaries.write().insert(session_id.clone(), summary);

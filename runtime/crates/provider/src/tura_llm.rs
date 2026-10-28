@@ -43,6 +43,8 @@ pub enum ProviderStreamEvent {
 
 pub type ProviderStreamEventSink = Arc<dyn Fn(ProviderStreamEvent) + Send + Sync>;
 
+pub use crate::failure_usage::ProviderStreamFailureSnapshot;
+
 #[derive(Debug, Error)]
 pub enum TuraError {
     #[error("config error: {message}")]
@@ -60,6 +62,24 @@ pub enum TuraError {
     #[error("network error: {message}")]
     Network { message: String },
 
+    #[error("{source}")]
+    StreamFailure {
+        source: Box<TuraError>,
+        snapshot: ProviderStreamFailureSnapshot,
+    },
+
+    #[error(transparent)]
+    AuthenticationBeforeModel { source: Box<TuraError> },
+
+    #[error("native authentication requires owner repair: {source}")]
+    NativeAuthRepairRequired { source: Box<TuraError> },
+
+    #[error("{source}")]
+    ObservedFailure {
+        source: Box<TuraError>,
+        attempts: Vec<crate::failure_usage::FailedProviderAttempt>,
+    },
+
     #[error("provider '{provider}' request failed: {message}")]
     ProviderRequest { provider: String, message: String },
 
@@ -74,6 +94,68 @@ pub enum TuraError {
 }
 
 impl TuraError {
+    pub fn model_attempt_not_started(&self) -> bool {
+        match self {
+            Self::AuthenticationBeforeModel { .. } => true,
+            Self::ObservedFailure { source, .. } => source.model_attempt_not_started(),
+            Self::StreamFailure { source, .. } => source.model_attempt_not_started(),
+            _ => false,
+        }
+    }
+
+    pub fn failed_attempts(&self) -> &[crate::failure_usage::FailedProviderAttempt] {
+        match self {
+            Self::ObservedFailure { attempts, .. } => attempts,
+            Self::AuthenticationBeforeModel { source } => source.failed_attempts(),
+            Self::StreamFailure { source, .. } => source.failed_attempts(),
+            _ => &[],
+        }
+    }
+
+    pub fn stream_failure_snapshot(&self) -> Option<&ProviderStreamFailureSnapshot> {
+        match self {
+            Self::StreamFailure { snapshot, .. } => Some(snapshot),
+            Self::ObservedFailure { source, attempts } => source.stream_failure_snapshot()
+                .or_else(|| attempts.iter().rev().find_map(|attempt| attempt.stream_failure_snapshot.as_ref())),
+            Self::AuthenticationBeforeModel { source } => source.stream_failure_snapshot(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn with_stream_request_id(mut self, request_id: Option<&str>) -> Self {
+        if let Self::StreamFailure { snapshot, .. } = &mut self {
+            snapshot.request_id = crate::failure_usage::bounded_identity(request_id);
+        }
+        self
+    }
+
+    pub(crate) fn with_failed_attempts(self, attempts: Vec<crate::failure_usage::FailedProviderAttempt>) -> Self {
+        if attempts.is_empty() { return self; }
+        let source = match self {
+            Self::ObservedFailure { source, .. } => source,
+            other => Box::new(other),
+        };
+        Self::ObservedFailure { source, attempts }
+    }
+
+    pub(crate) fn before_model_authentication(self) -> Self {
+        Self::AuthenticationBeforeModel { source: Box::new(self) }
+    }
+
+    pub(crate) fn after_prior_model_attempt(self, prior_attempt_possible: bool) -> Self {
+        match self {
+            Self::ObservedFailure { source, attempts } => Self::ObservedFailure {
+                source: Box::new(source.after_prior_model_attempt(prior_attempt_possible)), attempts,
+            },
+            Self::StreamFailure { source, snapshot } => Self::StreamFailure {
+                source: Box::new(source.after_prior_model_attempt(prior_attempt_possible)), snapshot,
+            },
+            Self::AuthenticationBeforeModel { source } if prior_attempt_possible =>
+                source.after_prior_model_attempt(true),
+            error => error,
+        }
+    }
+
     pub fn io(err: std::io::Error) -> Self {
         Self::Io {
             message: err.to_string(),
@@ -82,6 +164,10 @@ impl TuraError {
 
     pub fn is_non_retryable_provider_failure(&self) -> bool {
         match self {
+            Self::NativeAuthRepairRequired { .. } => true,
+            Self::AuthenticationBeforeModel { source } => source.is_non_retryable_provider_failure(),
+            Self::ObservedFailure { source, .. } => source.is_non_retryable_provider_failure(),
+            Self::StreamFailure { source, .. } => source.is_non_retryable_provider_failure(),
             Self::HttpStatus { status, .. } => matches!(*status, 401..=404),
             Self::Config { message } => is_missing_provider_key_message(message),
             Self::ProviderRequest { message, .. } => is_billing_or_key_failure_text(message),
@@ -136,6 +222,14 @@ pub struct CostDetails {
     pub currency: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransportTiming {
+    pub transport: String,
+    pub response_headers_ms: u64,
+    pub first_output_event_ms: Option<u64>,
+    pub completed_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CallMetrics {
     pub usage: UsageDetails,
@@ -146,6 +240,12 @@ pub struct CallMetrics {
     pub finish_reason: Option<String>,
     pub provider_request_id: Option<String>,
     pub raw_usage: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_timing: Option<TransportTiming>,
+    /// Local provenance of what this request sent (e.g. which official base
+    /// instructions); persisted with the runtime record, never model context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_profile: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -154,6 +254,8 @@ pub struct ProviderResponse {
     pub raw: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<CallMetrics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_attempts: Vec<crate::failure_usage::FailedProviderAttempt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,7 +311,7 @@ impl ProviderConfig {
         let runtime_provider = self.runtime_provider();
         let _parameter_policy = providers::parameter_policy(runtime_provider);
         let api_key = if should_use_openai_oauth(&self.provider, &self.base_url, conf) {
-            refresh_openai_access_token_if_needed(conf).await?
+            refresh_openai_access_token_if_needed(conf).await?.token
         } else {
             self.get_api_key(conf)?
         };
@@ -259,18 +361,18 @@ impl ProviderConfig {
         self.validate()?;
         let runtime_provider = self.runtime_provider().to_ascii_lowercase();
         let _parameter_policy = providers::parameter_policy(&runtime_provider);
-        let mut api_key = if should_use_openai_oauth(&self.provider, &self.base_url, conf) {
-            refresh_openai_access_token_if_needed(conf).await?
+        let use_openai_oauth = should_use_openai_oauth(&self.provider, &self.base_url, conf);
+        let mut access = if use_openai_oauth {
+            refresh_openai_access_token_if_needed(conf).await
         } else {
-            self.get_api_key(conf)?
-        };
+            self.get_api_key(conf).map(SelectedAccess::provider_owned)
+        }.map_err(TuraError::before_model_authentication)?;
         let call_id = Uuid::new_v4().simple().to_string();
         let started_at = Utc::now();
         let request_params = serde_json::to_value(&options).unwrap_or(Value::Null);
 
-        // Reactive OAuth refresh: if the first attempt fails with an
-        // authentication error (expired/invalid token), refresh the provider's
-        // OAuth access token using its registered refresh token and retry once.
+        // Native Codex owns its login: only a changed token from that same login
+        // may recover a 401. Provider-owned OAuth retains its refresh path.
         let mut refreshed = false;
         let result = loop {
             let attempt = match runtime_provider.as_str() {
@@ -278,7 +380,7 @@ impl ProviderConfig {
                     providers::google::call(
                         &self.base_url,
                         &self.model,
-                        &api_key,
+                        &access.token,
                         &messages,
                         &options,
                     )
@@ -288,7 +390,7 @@ impl ProviderConfig {
                     providers::bedrock::call(
                         &self.base_url,
                         &self.model,
-                        &api_key,
+                        &access.token,
                         &messages,
                         &options,
                     )
@@ -298,7 +400,7 @@ impl ProviderConfig {
                     providers::codex::call_with_stream_events(
                         &self.base_url,
                         &self.model,
-                        &api_key,
+                        &access.token,
                         &messages,
                         &options,
                         stream_events.clone(),
@@ -309,7 +411,7 @@ impl ProviderConfig {
                     providers::minimax::call_with_stream_events(
                         &self.base_url,
                         &self.model,
-                        &api_key,
+                        &access.token,
                         &messages,
                         &options,
                         stream_events.clone(),
@@ -320,18 +422,18 @@ impl ProviderConfig {
                     providers::claude_code::call_with_stream_events(
                         &self.base_url,
                         &self.model,
-                        &api_key,
+                        &access.token,
                         &messages,
                         &options,
                         stream_events.clone(),
                     )
                     .await
                 }
-                "openai" if should_use_openai_oauth(&self.provider, &self.base_url, conf) => {
+                "openai" if use_openai_oauth => {
                     providers::codex::call_with_stream_events(
                         &self.base_url,
                         &self.model,
-                        &api_key,
+                        &access.token,
                         &messages,
                         &options,
                         stream_events.clone(),
@@ -342,7 +444,7 @@ impl ProviderConfig {
                     providers::openai::call_with_stream_events(
                         &self.base_url,
                         &self.model,
-                        &api_key,
+                        &access.token,
                         &messages,
                         &options,
                         stream_events.clone(),
@@ -353,7 +455,7 @@ impl ProviderConfig {
                     providers::xai::call_with_stream_events(
                         &self.base_url,
                         &self.model,
-                        &api_key,
+                        &access.token,
                         &messages,
                         &options,
                         stream_events.clone(),
@@ -364,7 +466,7 @@ impl ProviderConfig {
                     providers::qwen::call_with_stream_events(
                         &self.base_url,
                         &self.model,
-                        &api_key,
+                        &access.token,
                         &messages,
                         &options,
                         stream_events.clone(),
@@ -376,7 +478,7 @@ impl ProviderConfig {
                         &self.base_url,
                         &self.model,
                         other,
-                        &api_key,
+                        &access.token,
                         &messages,
                         &options,
                         stream_events.clone(),
@@ -386,13 +488,18 @@ impl ProviderConfig {
             };
 
             if !refreshed && is_auth_expired_error(&attempt) {
-                match try_refresh_oauth_access_token(&self.provider, conf).await {
+                let status = match &attempt {
+                    Err(TuraError::HttpStatus { status, .. }) => *status,
+                    _ => unreachable!("auth failure must have an HTTP status"),
+                };
+                match try_refresh_oauth_access_token(&self.provider, conf, &access, status).await {
                     Ok(Some(new_key)) => {
-                        warn!(
-                            provider = %self.provider,
-                            "provider call hit auth error; refreshed OAuth token and retrying"
-                        );
-                        api_key = new_key;
+                        if matches!(&access.owner, AccessOwner::NativeCodex { .. }) {
+                            warn!(provider = %self.provider, "provider call hit 401; reloaded native token and retrying");
+                        } else {
+                            warn!(provider = %self.provider, "provider call hit auth error; refreshed OAuth token and retrying");
+                        }
+                        access.token = new_key;
                         refreshed = true;
                         continue;
                     }
@@ -501,7 +608,83 @@ fn openai_oauth_base_url_allowed(base_url: &str) -> bool {
     )
 }
 
-async fn refresh_openai_access_token_if_needed(conf: &TuraConfig) -> Result<String, TuraError> {
+#[derive(Debug)]
+enum AccessOwner {
+    Provider,
+    NativeCodex {
+        auth_path: PathBuf,
+        account_id: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+struct SelectedAccess {
+    token: String,
+    owner: AccessOwner,
+}
+
+impl SelectedAccess {
+    fn provider_owned(token: String) -> Self {
+        Self { token, owner: AccessOwner::Provider }
+    }
+}
+
+fn select_openai_access_token(conf: &TuraConfig) -> Result<SelectedAccess, TuraError> {
+    if let Some(auth_path) = codex_auth_json_path()
+        && let Some(tokens) = load_codex_auth_tokens_at(&auth_path)?
+    {
+        apply_codex_account_env(&tokens);
+        return Ok(SelectedAccess {
+            token: tokens.access_token,
+            owner: AccessOwner::NativeCodex { auth_path, account_id: tokens.account_id },
+        });
+    }
+    conf.get("OPENAI_API_KEY")
+        .filter(|value| !value.trim().is_empty())
+        .map(SelectedAccess::provider_owned)
+        .ok_or_else(|| TuraError::Config {
+            message: "Configuration key 'OPENAI_API_KEY' not found".to_string(),
+        })
+}
+
+/// Native Codex rewrites auth.json when it refreshes tokens, so a reader can briefly find the file
+/// missing or half-written. Wait for the rewrite to settle when failing now is the only other
+/// outcome: a missing file with no provider API key to fall back on, or unreadable native auth.
+/// (2026-10-22, Nokiy I-11: 1 of 552 workers stopped on "Configuration key 'OPENAI_API_KEY' not
+/// found" and its coordinator abandoned the mission.)
+const NATIVE_AUTH_SETTLE_ATTEMPTS: u32 = 20;
+const NATIVE_AUTH_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+async fn select_openai_access_token_settled(conf: &TuraConfig) -> Result<SelectedAccess, TuraError> {
+    let api_key_configured = conf.get("OPENAI_API_KEY").is_some_and(|value| !value.trim().is_empty());
+    let mut attempt = 1;
+    loop {
+        let selected = select_openai_access_token(conf);
+        let transient = match &selected {
+            Err(TuraError::Config { .. }) => !api_key_configured,
+            Err(TuraError::NativeAuthRepairRequired { .. }) => true,
+            _ => false,
+        };
+        if !transient || attempt >= NATIVE_AUTH_SETTLE_ATTEMPTS {
+            return selected;
+        }
+        attempt += 1;
+        tokio::time::sleep(NATIVE_AUTH_SETTLE_DELAY).await;
+    }
+}
+
+fn openai_access_needs_refresh(access: &SelectedAccess, conf: &TuraConfig) -> bool {
+    matches!(&access.owner, AccessOwner::Provider)
+        && conf.get("OPENAI_TOKEN_EXPIRES")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default() <= Utc::now().timestamp_millis() + 60_000
+}
+
+async fn refresh_openai_access_token_if_needed(conf: &TuraConfig) -> Result<SelectedAccess, TuraError> {
+    let access = select_openai_access_token_settled(conf).await?;
+    if !openai_access_needs_refresh(&access, conf) {
+        return Ok(access);
+    }
     // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
     #[allow(
         unsafe_code,
@@ -510,42 +693,11 @@ async fn refresh_openai_access_token_if_needed(conf: &TuraConfig) -> Result<Stri
     unsafe {
         std::env::set_var("OPENAI_LOGIN", "oauth")
     };
-    let codex_auth = load_codex_auth_tokens();
-    let access = conf
-        .get("OPENAI_API_KEY")
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            codex_auth
-                .as_ref()
-                .map(|tokens| tokens.access_token.clone())
-        })
-        .ok_or_else(|| TuraError::Config {
-            message: "Configuration key 'OPENAI_API_KEY' not found".to_string(),
-        })?;
-    let expires = conf
-        .get("OPENAI_TOKEN_EXPIRES")
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or_default();
     let now = Utc::now().timestamp_millis();
-    if let Some(tokens) = codex_auth.as_ref() {
-        // Codex may rotate auth.json independently; keep this call aligned with that shared login.
-        apply_codex_auth_env(tokens);
-        if tokens.access_token != access {
-            return Ok(tokens.access_token.clone());
-        }
-    }
-    if expires > now + 60_000 {
-        return Ok(access);
-    }
 
     let refresh = conf
         .get("OPENAI_REFRESH_TOKEN")
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            codex_auth
-                .as_ref()
-                .map(|tokens| tokens.refresh_token.clone())
-        })
         .ok_or_else(|| TuraError::Config {
             message: "Configuration key 'OPENAI_REFRESH_TOKEN' not found".to_string(),
         })?;
@@ -567,32 +719,6 @@ async fn refresh_openai_access_token_if_needed(conf: &TuraConfig) -> Result<Stri
         message: err.to_string(),
     })?;
     if !status.is_success() {
-        if let Some(access) = codex_auth
-            .as_ref()
-            .map(|tokens| tokens.access_token.clone())
-        {
-            if let Some(tokens) = codex_auth.as_ref() {
-                apply_codex_auth_env(tokens);
-            } else {
-                // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
-                #[allow(
-                    unsafe_code,
-                    reason = "Rust 2024 process-environment mutation audited at the caller"
-                )]
-                unsafe {
-                    std::env::set_var("OPENAI_API_KEY", &access)
-                };
-                // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
-                #[allow(
-                    unsafe_code,
-                    reason = "Rust 2024 process-environment mutation audited at the caller"
-                )]
-                unsafe {
-                    std::env::set_var("OPENAI_REFRESH_TOKEN", &refresh)
-                };
-            }
-            return Ok(access);
-        }
         return Err(TuraError::HttpStatus {
             status: status.as_u16(),
             body: body.to_string(),
@@ -615,18 +741,6 @@ async fn refresh_openai_access_token_if_needed(conf: &TuraConfig) -> Result<Stri
     unsafe {
         std::env::set_var("OPENAI_API_KEY", &next_access)
     };
-    if let Some(tokens) = codex_auth.as_ref()
-        && let Some(account_id) = tokens.account_id.as_deref()
-    {
-        // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
-        #[allow(
-            unsafe_code,
-            reason = "Rust 2024 process-environment mutation audited at the caller"
-        )]
-        unsafe {
-            std::env::set_var("OPENAI_ACCOUNT_ID", account_id)
-        };
-    }
     if let Some(refresh) = body.get("refresh_token").and_then(Value::as_str) {
         // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
         #[allow(
@@ -651,7 +765,7 @@ async fn refresh_openai_access_token_if_needed(conf: &TuraConfig) -> Result<Stri
     unsafe {
         std::env::set_var("OPENAI_TOKEN_EXPIRES", next_expires.to_string())
     };
-    Ok(next_access)
+    Ok(SelectedAccess::provider_owned(next_access))
 }
 
 /// Whether a provider call result is an authentication failure that an OAuth
@@ -663,19 +777,24 @@ fn is_auth_expired_error<T>(result: &Result<T, TuraError>) -> bool {
     )
 }
 
-/// Reactively refresh an OAuth access token for `provider` using its registered
-/// refresh token. Returns `Ok(Some(new_access))` on success, `Ok(None)` when the
+/// Reload a changed native token on 401, or refresh a provider-owned OAuth token
+/// using its registered refresh token. Returns `Ok(Some(new_access))` on success, `Ok(None)` when the
 /// provider does not support OAuth refresh or has no refresh token configured,
 /// and `Err(_)` when the refresh attempt itself failed.
 ///
-/// On success the new access token (and any rotated refresh token / expiry) is
+/// For provider-owned tokens only, the new access token (and rotated refresh token / expiry) is
 /// written both to the process environment and persisted to the `.env` file so
 /// it survives a restart. OpenAI/Codex, Anthropic (claude-code) and Google OAuth
 /// providers are all supported via the provider auth registry.
 async fn try_refresh_oauth_access_token(
     provider: &str,
     conf: &TuraConfig,
+    access: &SelectedAccess,
+    status: u16,
 ) -> Result<Option<String>, TuraError> {
+    if matches!(&access.owner, AccessOwner::NativeCodex { .. }) {
+        return Ok(reload_native_access_token(access, status));
+    }
     let Some(entry) = crate::auth_registry::provider_auth_registry_entry(provider) else {
         return Ok(None);
     };
@@ -903,79 +1022,99 @@ fn persist_env_var(env_path: &std::path::Path, key: &str, value: &str) {
 #[derive(Debug, Clone)]
 struct CodexAuthTokens {
     access_token: String,
-    refresh_token: String,
     account_id: Option<String>,
 }
 
 fn load_codex_auth_tokens() -> Option<CodexAuthTokens> {
     let path = codex_auth_json_path()?;
-    let value: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    let tokens = value.get("tokens")?;
+    load_codex_auth_tokens_at(&path).ok().flatten()
+}
+
+fn load_codex_auth_tokens_at(path: &std::path::Path) -> Result<Option<CodexAuthTokens>, TuraError> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(native_auth_read_error(err)),
+    };
+    let invalid_auth = || TuraError::NativeAuthRepairRequired {
+        source: Box::new(TuraError::Config {
+            message: "Native Codex auth is invalid; its owner must repair the login".to_string(),
+        }),
+    };
+    let value: Value = serde_json::from_str(&content).map_err(|_| invalid_auth())?;
+    let tokens = value.get("tokens").ok_or_else(invalid_auth)?;
     let access_token = tokens
         .get("access_token")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())?
-        .to_string();
-    let refresh_token = tokens
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(invalid_auth)?
         .to_string();
     let account_id = tokens
         .get("account_id")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string);
-    Some(CodexAuthTokens {
+    Ok(Some(CodexAuthTokens {
         access_token,
-        refresh_token,
         account_id,
-    })
+    }))
+}
+
+fn native_auth_read_error(error: std::io::Error) -> TuraError {
+    // Permission and encoding failures cannot recover through provider retries.
+    let requires_repair = matches!(error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidData);
+    let source = TuraError::io(error);
+    if requires_repair {
+        TuraError::NativeAuthRepairRequired { source: Box::new(source) }
+    } else {
+        source
+    }
+}
+
+fn reload_native_access_token(access: &SelectedAccess, status: u16) -> Option<String> {
+    let AccessOwner::NativeCodex { auth_path, account_id: Some(account_id) } = &access.owner else {
+        return None;
+    };
+    if status != 401 {
+        return None;
+    }
+    let tokens = load_codex_auth_tokens_at(auth_path).ok().flatten()?;
+    if tokens.access_token == access.token || tokens.account_id.as_ref() != Some(account_id) {
+        return None;
+    }
+    apply_codex_account_env(&tokens);
+    Some(tokens.access_token)
+}
+
+/// The caller's Codex home: `CODEX_HOME`, else `~/.codex`.
+pub(crate) fn codex_home_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(PathBuf::from(home).join(".codex"))
 }
 
 fn codex_auth_json_path() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(home).join("auth.json"));
-    }
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    Some(PathBuf::from(home).join(".codex").join("auth.json"))
+    Some(codex_home_dir()?.join("auth.json"))
 }
 
-fn apply_codex_auth_env(tokens: &CodexAuthTokens) {
+fn apply_codex_account_env(tokens: &CodexAuthTokens) {
+    // The request header still uses this environment field; native access and
+    // refresh tokens are never copied into the worker's credential cache.
     // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
     #[allow(
         unsafe_code,
         reason = "Rust 2024 process-environment mutation audited at the caller"
     )]
     unsafe {
-        std::env::set_var("OPENAI_LOGIN", "oauth")
+        if let Some(account_id) = tokens.account_id.as_deref() {
+            std::env::set_var("OPENAI_ACCOUNT_ID", account_id);
+        } else {
+            std::env::remove_var("OPENAI_ACCOUNT_ID");
+        }
     };
-    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
-    #[allow(
-        unsafe_code,
-        reason = "Rust 2024 process-environment mutation audited at the caller"
-    )]
-    unsafe {
-        std::env::set_var("OPENAI_API_KEY", &tokens.access_token)
-    };
-    // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
-    #[allow(
-        unsafe_code,
-        reason = "Rust 2024 process-environment mutation audited at the caller"
-    )]
-    unsafe {
-        std::env::set_var("OPENAI_REFRESH_TOKEN", &tokens.refresh_token)
-    };
-    if let Some(account_id) = tokens.account_id.as_deref() {
-        // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
-        #[allow(
-            unsafe_code,
-            reason = "Rust 2024 process-environment mutation audited at the caller"
-        )]
-        unsafe {
-            std::env::set_var("OPENAI_ACCOUNT_ID", account_id)
-        };
-    }
 }
 
 fn openai_provider_auth_config_login_is_oauth() -> bool {

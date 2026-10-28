@@ -69,6 +69,7 @@ pub fn runtime_provider_config_from_tura(
         )
     })?;
     let explicit_selection = explicit_model_selection(provider_config)?;
+    let explicit = explicit_selection.is_some();
     let (selected, provider_name) = match explicit_selection {
         Some((provider, model)) => {
             let base_url = provider_base_url(settings, &provider).ok_or_else(|| {
@@ -97,6 +98,11 @@ pub fn runtime_provider_config_from_tura(
     let tier_timeouts = tura_llm_rust::apply_latency_for_tier(&latency_tier);
 
     let mut base = provider_config.clone();
+    if explicit {
+        // Telemetry reports the model actually selected: a session override must not leave
+        // the agent config's default model in runtime_created events.
+        base.current_model = Some(provider_name.clone());
+    }
     let provider_total_timeout_ms = std::env::var("TURA_PROVIDER_TOTAL_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())

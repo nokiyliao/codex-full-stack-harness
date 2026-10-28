@@ -5,6 +5,7 @@
 
 use code_tools::command_run::CommandRunTerminalStatusGuard;
 use router_contract::{IpcRequest, IpcResponse};
+use runtime_contract::{CapsuleSourceReadBinding, CapsuleSourceReadContext};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -35,12 +36,13 @@ pub async fn execute_command_run_value(
     runtime_id: Option<&str>,
     allowed_commands: Option<BTreeSet<String>>,
 ) -> Result<Value, String> {
-    execute_command_run_value_with_jspace(
+    execute_command_run_value_with_source_binding(
         arguments,
         session_directory,
         session_id,
         runtime_id,
         allowed_commands,
+        None,
         None,
     )
     .await
@@ -54,13 +56,54 @@ pub async fn execute_command_run_value_with_jspace(
     allowed_commands: Option<BTreeSet<String>>,
     jspace_contract: Option<Value>,
 ) -> Result<Value, String> {
+    execute_command_run_value_with_source_binding(
+        arguments,
+        session_directory,
+        session_id,
+        runtime_id,
+        allowed_commands,
+        jspace_contract,
+        None,
+    )
+    .await
+}
+
+pub async fn execute_command_run_value_with_source_binding(
+    arguments: Value,
+    session_directory: PathBuf,
+    session_id: Option<&str>,
+    runtime_id: Option<&str>,
+    allowed_commands: Option<BTreeSet<String>>,
+    jspace_contract: Option<Value>,
+    capsule_source_read_binding: Option<CapsuleSourceReadBinding>,
+) -> Result<Value, String> {
+    let capsule_source_read_context = match capsule_source_read_binding {
+        Some(binding) => {
+            let session_id = session_id
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    "capsule source read binding requires a nonblank session_id".to_string()
+                })?;
+            let runtime_id = runtime_id
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    "capsule source read binding requires a nonblank runtime_id".to_string()
+                })?;
+            Some(CapsuleSourceReadContext {
+                session_id: session_id.to_string(),
+                runtime_id: runtime_id.to_string(),
+                binding,
+            })
+        }
+        None => None,
+    };
     let addr = std::env::var(ROUTER_ADDR_ENV).map_err(|_| {
         format!("{ROUTER_ADDR_ENV} is not set; command_run must be owned by router")
     })?;
     let addr = addr
         .parse::<SocketAddr>()
         .map_err(|error| format!("invalid {ROUTER_ADDR_ENV}: {error}"))?;
-    let payload = json!({
+    let mut payload = json!({
         "session_id": session_id,
         "runtime_id": runtime_id,
         "session_directory": session_directory,
@@ -70,6 +113,10 @@ pub async fn execute_command_run_value_with_jspace(
         "command_env": command_run_environment(),
         "sandbox": command_run_sandbox_enabled(),
     });
+    if let Some(context) = capsule_source_read_context {
+        payload["capsule_source_read_context"] = serde_json::to_value(context)
+            .map_err(|error| format!("failed to encode capsule source read context: {error}"))?;
+    }
     let request_id = command_run_request_id(&arguments);
     let execution_id = request_id.clone();
     let request = IpcRequest::call(request_id, "execution.command_run", payload);
@@ -131,16 +178,16 @@ pub async fn execute_command_run_value_or_error(
     runtime_id: Option<&str>,
     allowed_commands: Option<BTreeSet<String>>,
 ) -> Value {
-    execute_command_run_value_with_jspace(
+    execute_command_run_value_or_error_with_source_binding(
         arguments,
         session_directory,
         session_id,
         runtime_id,
         allowed_commands,
         None,
+        None,
     )
     .await
-    .unwrap_or_else(command_run_error_payload)
 }
 
 pub async fn execute_command_run_value_or_error_with_jspace(
@@ -151,13 +198,35 @@ pub async fn execute_command_run_value_or_error_with_jspace(
     allowed_commands: Option<BTreeSet<String>>,
     jspace_contract: Option<Value>,
 ) -> Value {
-    execute_command_run_value_with_jspace(
+    execute_command_run_value_or_error_with_source_binding(
         arguments,
         session_directory,
         session_id,
         runtime_id,
         allowed_commands,
         jspace_contract,
+        None,
+    )
+    .await
+}
+
+pub async fn execute_command_run_value_or_error_with_source_binding(
+    arguments: Value,
+    session_directory: PathBuf,
+    session_id: Option<&str>,
+    runtime_id: Option<&str>,
+    allowed_commands: Option<BTreeSet<String>>,
+    jspace_contract: Option<Value>,
+    capsule_source_read_binding: Option<CapsuleSourceReadBinding>,
+) -> Value {
+    execute_command_run_value_with_source_binding(
+        arguments,
+        session_directory,
+        session_id,
+        runtime_id,
+        allowed_commands,
+        jspace_contract,
+        capsule_source_read_binding,
     )
     .await
     .unwrap_or_else(command_run_error_payload)
@@ -170,12 +239,13 @@ pub async fn execute_streamed_command_value_or_error(
     runtime_id: Option<&str>,
     allowed_commands: Option<BTreeSet<String>>,
 ) -> Value {
-    execute_streamed_command_value_or_error_with_jspace(
+    execute_streamed_command_value_or_error_with_source_binding(
         command,
         session_directory,
         session_id,
         runtime_id,
         allowed_commands,
+        None,
         None,
     )
     .await
@@ -189,6 +259,27 @@ pub async fn execute_streamed_command_value_or_error_with_jspace(
     allowed_commands: Option<BTreeSet<String>>,
     jspace_contract: Option<Value>,
 ) -> Value {
+    execute_streamed_command_value_or_error_with_source_binding(
+        command,
+        session_directory,
+        session_id,
+        runtime_id,
+        allowed_commands,
+        jspace_contract,
+        None,
+    )
+    .await
+}
+
+pub async fn execute_streamed_command_value_or_error_with_source_binding(
+    command: Value,
+    session_directory: PathBuf,
+    session_id: Option<&str>,
+    runtime_id: Option<&str>,
+    allowed_commands: Option<BTreeSet<String>>,
+    jspace_contract: Option<Value>,
+    capsule_source_read_binding: Option<CapsuleSourceReadBinding>,
+) -> Value {
     let execution_id = command
         .get("command_id")
         .and_then(Value::as_str)
@@ -201,13 +292,14 @@ pub async fn execute_streamed_command_value_or_error_with_jspace(
         }),
         None => json!({ "commands": [command] }),
     };
-    execute_command_run_value_or_error_with_jspace(
+    execute_command_run_value_or_error_with_source_binding(
         arguments,
         session_directory,
         session_id,
         runtime_id,
         allowed_commands,
         jspace_contract,
+        capsule_source_read_binding,
     )
     .await
 }
@@ -216,6 +308,7 @@ pub struct RouterCommandRunExecutor {
     session_directory: PathBuf,
     allowed_commands: Option<BTreeSet<String>>,
     jspace_contract: Option<Value>,
+    capsule_source_read_binding: Option<CapsuleSourceReadBinding>,
     ctx: code_tools::runtime::tool::ToolContext,
     session_id: String,
     runtime_id: String,
@@ -239,11 +332,12 @@ impl RouterCommandRunExecutor {
         session_id: String,
         runtime_id: String,
     ) -> Self {
-        Self::new_with_allowed_and_jspace(
+        Self::new_with_allowed_and_source_binding(
             session_directory,
             allowed_commands,
             session_id,
             runtime_id,
+            None,
             None,
         )
     }
@@ -255,11 +349,30 @@ impl RouterCommandRunExecutor {
         runtime_id: String,
         jspace_contract: Option<Value>,
     ) -> Self {
+        Self::new_with_allowed_and_source_binding(
+            session_directory,
+            allowed_commands,
+            session_id,
+            runtime_id,
+            jspace_contract,
+            None,
+        )
+    }
+
+    pub fn new_with_allowed_and_source_binding(
+        session_directory: PathBuf,
+        allowed_commands: Option<BTreeSet<String>>,
+        session_id: String,
+        runtime_id: String,
+        jspace_contract: Option<Value>,
+        capsule_source_read_binding: Option<CapsuleSourceReadBinding>,
+    ) -> Self {
         Self {
             ctx: code_tools::runtime::tool::ToolContext::new(session_directory.clone()),
             session_directory,
             allowed_commands,
             jspace_contract,
+            capsule_source_read_binding,
             session_id,
             runtime_id,
             active_step: None,
@@ -285,7 +398,7 @@ impl RouterCommandRunExecutor {
             finished.push(result);
         }
         let step = command_step(&command);
-        let forward_step = !self.active_step.is_some_and(|active| step < active);
+        let forward_step = self.active_step.is_none_or(|active| step >= active);
         if self.active_step.is_some_and(|active| active != step) {
             self.publish_pending_bindings();
         }
@@ -317,13 +430,14 @@ impl RouterCommandRunExecutor {
 
     async fn run_command(&mut self, command: Value) -> Vec<Value> {
         let command_metadata = command.clone();
-        let mut result = execute_command_value_results(
+        let mut result = execute_command_value_results_with_source_binding(
             command,
             self.session_directory.clone(),
             Some(&self.session_id),
             Some(&self.runtime_id),
             self.allowed_commands.clone(),
             self.jspace_contract.clone(),
+            self.capsule_source_read_binding.clone(),
         )
         .await;
         annotate_router_results_from_command(&mut result.results, &command_metadata);
@@ -446,13 +560,14 @@ fn annotate_router_results(
     }
 }
 
-pub(crate) async fn execute_command_value_results(
+pub(crate) async fn execute_command_value_results_with_source_binding(
     command: Value,
     session_directory: PathBuf,
     session_id: Option<&str>,
     runtime_id: Option<&str>,
     allowed_commands: Option<BTreeSet<String>>,
     jspace_contract: Option<Value>,
+    capsule_source_read_binding: Option<CapsuleSourceReadBinding>,
 ) -> RouterCommandRunCommandResult {
     let fallback_command = command.clone();
     let execution_id = command
@@ -467,13 +582,14 @@ pub(crate) async fn execute_command_value_results(
         }),
         None => json!({ "commands": [command] }),
     };
-    let output = match execute_command_run_value_with_jspace(
+    let output = match execute_command_run_value_with_source_binding(
         arguments,
         session_directory,
         session_id,
         runtime_id,
         allowed_commands,
         jspace_contract,
+        capsule_source_read_binding,
     )
     .await
     {
@@ -626,6 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn router_executor_halts_after_failed_apply_patch() {
+        let _guard = crate::ROUTER_TEST_ENV.lock().unwrap_or_else(|err| err.into_inner());
         let _router_addr = EnvGuard::remove("TURA_ROUTER_ADDR");
         let workspace = tempfile::tempdir().expect("workspace");
         let mut executor = RouterCommandRunExecutor::new_with_allowed(

@@ -61,6 +61,7 @@ pub fn run_session(
             initial_retry_provider_input: None,
             runtime_event_writer: None,
             session_delta_writer: None,
+            capsule_source_read_binding: None,
         },
         overrides,
     )

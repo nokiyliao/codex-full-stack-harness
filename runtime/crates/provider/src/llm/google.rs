@@ -152,6 +152,7 @@ pub async fn call(
         content,
         raw: data,
         metrics: Some(metrics),
+        failed_attempts: Vec::new(),
     })
 }
 

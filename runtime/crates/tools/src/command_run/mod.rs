@@ -2,8 +2,10 @@ pub const TOOL_NAME: &str = "command_run";
 
 mod handler;
 mod output_binding;
+mod policy_denial;
 
 pub use output_binding::CommandRunOutputBindings;
+pub use policy_denial::{JSpacePolicyDenial, POLICY_DENIAL_SCHEMA, policy_denial_receipt_name};
 
 pub use handler::{
     CommandRunPreflightCommand, CommandRunTerminalStatusGuard, StreamingCommandRunExecutor,
@@ -12,5 +14,8 @@ pub use handler::{
     execute_async_value_with_allowed_lock_scope_and_sandbox,
     execute_async_value_with_allowed_lock_scope_sandbox_and_cancellation,
     execute_async_value_with_lock_scope, execute_async_value_with_source_read_admission,
+    execute_async_value_with_mapped_source_read_admission,
+    execute_async_value_with_patch_readback_admission,
+    execute_async_value_with_source_digest_admission,
     execute_streamed_command_value, normalize_command_value_for_execution,
 };

@@ -35,6 +35,10 @@ impl SessionStore {
                     "Session message projection envelope does not match its payload for session {session_id}"
                 ));
             }
+            if message.role == MessageRole::System {
+                // Validated, but runtime-owned: the gateway projection never hydrates system context.
+                continue;
+            }
             refreshed.push(message);
         }
         self.messages
@@ -237,6 +241,11 @@ impl SessionStore {
     }
 
     pub fn upsert_feed_message(&self, session_id: &str, message: Message) -> bool {
+        // Internal system context is runtime-owned: the gateway projection never hydrates it,
+        // so restored sessions cannot push system prompts into frontend events or counts.
+        if message.role == MessageRole::System {
+            return false;
+        }
         let mut messages = self.messages.write();
         let session_messages = messages.entry(session_id.to_string()).or_default();
         let (projected, changed) = if let Some(existing) = session_messages

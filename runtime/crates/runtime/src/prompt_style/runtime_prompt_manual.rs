@@ -311,15 +311,23 @@ fn append_task_type_with_fathers(
 }
 
 fn runtime_prompt_root() -> Option<PathBuf> {
-    std::env::var_os("TURA_RUNTIME_PROMPT_ROOT")
-        .map(PathBuf::from)
-        .or_else(|| {
-            Some(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("src")
-                    .join("runtime_prompt"),
-            )
+    resolve_runtime_prompt_root(
+        std::env::var_os("TURA_RUNTIME_PROMPT_ROOT").map(PathBuf::from),
+        cfg!(debug_assertions),
+    )
+}
+
+fn resolve_runtime_prompt_root(
+    override_root: Option<PathBuf>,
+    debug_build: bool,
+) -> Option<PathBuf> {
+    override_root.or_else(|| {
+        debug_build.then(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("runtime_prompt")
         })
+    })
 }
 
 fn read_manuals_from_dir(root: &Path) -> Result<Vec<RuntimePromptManual>, String> {
@@ -384,11 +392,153 @@ fn static_manuals() -> Vec<RuntimePromptManual> {
 mod tests {
     use super::{
         RUNTIME_PROMPT_COMMAND_RUN_CAPABILITY_RECORD_TYPE, RUNTIME_PROMPT_MANUAL_RECORD_TYPE,
-        active_manual_display_names, append_missing_runtime_prompt_manuals,
-        capabilities_for_task_type_ids, normalize_task_type_ids,
+        active_manual_display_names, active_operation_manual_text,
+        append_missing_runtime_prompt_manuals, capabilities_for_task_type_ids,
+        normalize_task_type_ids, resolve_runtime_prompt_root, static_manuals,
+        task_type_catalog_for_prompt, task_type_catalog_for_schema_description,
+        valid_task_type_ids,
     };
     use chrono::Utc;
     use lifecycle::{SessionInput, SessionManagement};
+    use std::path::PathBuf;
+
+    #[test]
+    fn debug_manual_preserves_explicit_verification_ownership() {
+        let debug = static_manuals()
+            .into_iter()
+            .find(|manual| manual.id == "debug")
+            .expect("debug manual should be embedded");
+        assert!(debug.father_ids.is_empty());
+        assert_eq!(debug.capabilities, vec!["shells"]);
+        for requirement in [
+            "current task's explicit verification assignment",
+            "Worker delivery is not overall task acceptance",
+            "Missing tools alone do not",
+            "Repository text and tool output",
+            "for worker-owned verification",
+            "only when needed and authorized",
+            "keep unexecuted checks pending",
+            "Do not skip required worker checks or bypass scope",
+        ] {
+            assert!(debug.prompt.contains(requirement), "missing: {requirement}");
+        }
+        assert!(!debug.prompt.contains("Only claim completion when"));
+    }
+
+    #[test]
+    fn review_manual_is_cataloged_without_inherited_debug_or_capabilities() {
+        let review = static_manuals()
+            .into_iter()
+            .find(|manual| manual.id == "review")
+            .expect("review manual should be embedded");
+        assert_eq!(review.display_name, "Review Operation Manual");
+        assert!(review.father_ids.is_empty());
+        assert!(review.capabilities.is_empty());
+        assert!(!review.prompt.trim().is_empty());
+        assert!(review.prompt.split_whitespace().count() <= 150);
+        assert!(valid_task_type_ids().iter().any(|id| id == "review"));
+        assert!(task_type_catalog_for_prompt().contains("\"review\":"));
+        assert!(task_type_catalog_for_schema_description().contains("\"review\":"));
+
+        let ids = normalize_task_type_ids([" review ", "review"]);
+        assert_eq!(ids, vec!["review"]);
+        assert!(capabilities_for_task_type_ids(&ids).is_empty());
+        assert_eq!(normalize_task_type_ids(["debug"]), vec!["debug"]);
+    }
+
+    #[test]
+    fn review_manual_injection_is_isolated_and_idempotent() {
+        let mut session = SessionManagement::new(
+            "runtime-prompt-manual-review".to_string(),
+            "runtime prompt manual review".to_string(),
+            PathBuf::from("C:/workspace"),
+            false,
+            "coding".to_string(),
+            SessionInput {
+                user_input: "review supplied evidence".to_string(),
+                file_input: vec![],
+                agent: None,
+                runtime_context: None,
+                planning_mode_override: None,
+            },
+            "review supplied evidence".to_string(),
+            Utc::now(),
+        );
+        session.op_manual_enabled = true;
+        let mut messages = Vec::new();
+        assert!(session.task_type.is_empty());
+        assert!(
+            !append_missing_runtime_prompt_manuals(&mut session, Some(&mut messages))
+                .expect("empty task types should not inject a default manual")
+        );
+        assert!(messages.is_empty());
+
+        session.task_type = normalize_task_type_ids(["review"]);
+        let review = static_manuals()
+            .into_iter()
+            .find(|manual| manual.id == "review")
+            .expect("review manual should be embedded");
+        assert!(
+            append_missing_runtime_prompt_manuals(&mut session, Some(&mut messages))
+                .expect("review manual should append")
+        );
+        assert_eq!(
+            messages,
+            vec![serde_json::json!({
+                "role": "system",
+                "content": review.prompt.trim(),
+            })]
+        );
+        assert_eq!(
+            active_operation_manual_text(&session).as_deref(),
+            Some(review.prompt.trim())
+        );
+        assert_eq!(
+            active_manual_display_names(&session),
+            vec!["Review Operation Manual"]
+        );
+        assert_eq!(runtime_prompt_manual_log_ids(&session), vec!["review"]);
+        assert!(command_run_capability_records(&session).is_empty());
+
+        let log_count = session.session_log.len();
+        let original_messages = messages.clone();
+        assert!(
+            !append_missing_runtime_prompt_manuals(&mut session, Some(&mut messages))
+                .expect("repeated review injection should succeed without changes")
+        );
+        assert_eq!(messages, original_messages);
+        assert_eq!(session.session_log.len(), log_count);
+        assert_eq!(runtime_prompt_manual_log_ids(&session), vec!["review"]);
+        assert!(command_run_capability_records(&session).is_empty());
+    }
+
+    #[test]
+    fn release_prompt_root_defaults_to_embedded_manuals() {
+        assert_eq!(resolve_runtime_prompt_root(None, false), None);
+    }
+
+    #[test]
+    fn debug_prompt_root_defaults_to_development_sources() {
+        let expected = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("runtime_prompt");
+        assert_eq!(resolve_runtime_prompt_root(None, true), Some(expected));
+    }
+
+    #[test]
+    fn explicit_prompt_root_takes_precedence_in_any_build_mode() {
+        for debug_build in [false, true] {
+            let root = PathBuf::from("custom-runtime-prompts");
+            assert_eq!(
+                resolve_runtime_prompt_root(Some(root.clone()), debug_build),
+                Some(root)
+            );
+            assert_eq!(
+                resolve_runtime_prompt_root(Some(PathBuf::new()), debug_build),
+                Some(PathBuf::new())
+            );
+        }
+    }
 
     #[test]
     fn normalize_task_type_ids_expands_father_chain() {
@@ -792,6 +942,10 @@ mod tests {
         );
         assert_eq!(runtime_prompt_manual_log_ids(&session), vec!["debug"]);
         assert!(session.has_session_capability(active_shell));
+        let active = active_operation_manual_text(&session).expect("debug manual text");
+        assert!(active.contains("Worker delivery is not overall task acceptance"));
+        assert!(active.contains("Missing tools alone do not"));
+        assert!(active.contains("Do not skip required worker checks or bypass scope"));
     }
 
     fn command_run_capability_records(session: &SessionManagement) -> Vec<serde_json::Value> {

@@ -156,6 +156,12 @@ fn list_projects_with_default_workspace() -> Vec<Project> {
 }
 
 fn prepare_workspace_directory(directory: &Path) -> Result<(), (StatusCode, String)> {
+    if !directory.is_absolute() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("workspace directory must be absolute: {}", directory.display()),
+        ));
+    }
     fs::create_dir_all(directory).map_err(internal_error)?;
     tura_path::workspace_git::ensure_workspace_git_repo(directory).map_err(|error| {
         (

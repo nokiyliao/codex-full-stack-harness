@@ -568,6 +568,7 @@ pub(crate) fn worker_env_from_current_process() -> serde_json::Map<String, Value
         "TURA_BASH_DOCKER_CONTAINER",
         "TURA_BASH_DOCKER_WORKDIR",
         "TURA_COMMAND_RUN_SANDBOX",
+        "TURA_INSPECT_SANDBOX_PROFILE",
         "TURA_COMMAND_RUN_STRICT_JSON",
         "TURA_COMMAND_RUN_DISABLE_STRICT_JSON",
         "TURA_FORCED_CAPABILITY_DIRECTORIES",

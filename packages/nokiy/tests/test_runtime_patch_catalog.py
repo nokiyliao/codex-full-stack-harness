@@ -47,6 +47,19 @@ class RuntimePatchCatalogTests(unittest.TestCase):
             with self.subTest(example=example):
                 self.assert_current_shape(example)
 
+    def test_delta_readback_rules_preserve_coverage_identity_and_acceptance_boundaries(self):
+        for rule in (
+            "coverage: all_text_changes",
+            "postimage_sha256",
+            "already-read source matching its `preimage_sha256`",
+            "Missing, omitted, unseen, mismatched or later-changed context requires granted source reads",
+            "not verifier success",
+            "current-state proof after later edits",
+            "semantic acceptance or permission to skip explicit task requirements",
+        ):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, self.text)
+
     def test_patch_payload_is_raw_not_shell(self):
         for example in self.examples:
             for command in example["commands"]:

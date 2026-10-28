@@ -20,10 +20,11 @@ import sys
 import threading
 import time
 from typing import Any
+from types import SimpleNamespace
 
 from . import embedded_nokiy as caller
 from . import file_change_evidence
-from .graph_process import supervise
+from .graph_process import ProcessScopeError, current_process_is_sandboxed, inherited_root_parent, supervise
 
 MODULE = "codex_collaboration_harness.full_core"
 EXECUTOR_NAME = "nokiy"
@@ -42,6 +43,8 @@ MAX_SUPERVISION_BYTES = 2 * 1024 * 1024
 RECEIPT_ROOT_ENV = "TURA_COMMAND_RECEIPT_ROOT"
 RECEIPT_WORKSPACE_ENV = "TURA_COMMAND_RECEIPT_WORKSPACE"
 RECEIPT_CAPABILITY = b"nokiy_command_receipt_binding_v1"
+SOURCE_DIGEST_CAPABILITY = b"nokiy_admitted_source_digest_v1"
+CAPSULE_DIGEST_CAPABILITY = b"nokiy_capsule_source_digest_v1"
 BUDGET_ENV = "NOKIY_EXECUTION_BUDGET"
 BUDGET_SCHEMA = "nokiy_execution_budget_v1"
 INITIAL_TASK_STATE_ENV = "TURA_NOKIY_INITIAL_TASK_STATE"
@@ -144,7 +147,7 @@ def _known_source_sha256_by_path(jspace: dict[str, Any],
         if not isinstance(pins, list):
             return {}
         for pin in pins:
-            if not isinstance(pin, dict):
+            if not isinstance(pin, dict) or pin.get("scope") == "verifier_only":
                 continue
             path = pin.get("path")
             sha256 = pin.get("sha256")
@@ -175,6 +178,90 @@ def _known_source_sha256_by_path(jspace: dict[str, Any],
         presented[path] = digest
         size += pair_size
     return presented
+
+
+def _admitted_digest_paths(jspace: dict[str, Any]) -> list[str]:
+    if jspace.get("schema_version") != "jspace_contract_v2":
+        return []
+    verifiers = jspace.get("verifier_commands")
+    if not isinstance(verifiers, list) or not all(isinstance(item, dict) for item in verifiers):
+        return []
+    mapped = jspace.get("mapped_source_reads", [])
+    if not isinstance(mapped, list) or not all(isinstance(item, dict) for item in mapped):
+        return []
+    aliases = {item.get(key) for item in mapped
+               for key in ("logical_path", "requested_logical_path")
+               if isinstance(item.get(key), str)}
+    return [path for path in _known_source_sha256_by_path(jspace, verifiers)
+            if path not in aliases]
+
+
+def _supports_admitted_digest(runtime, jspace: dict[str, Any], environment: dict[str, str]) -> bool:
+    if not _admitted_digest_paths(jspace):
+        return False
+    try:
+        result = subprocess.run([str(runtime.artifacts["tura_router"].path),
+                                 "source-read-capabilities"],
+                                capture_output=True, timeout=10, env=environment)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout == SOURCE_DIGEST_CAPABILITY + b"\n"
+
+
+def _observed_digest_eligible(jspace: dict[str, Any]) -> bool:
+    operations = jspace.get("allowed_operations")
+    denied = jspace.get("denied_operations", [])
+    return (jspace.get("schema_version") == "jspace_contract_v2"
+            and jspace.get("source_read") is True
+            and isinstance(operations, list) and "read" in operations and "command" in operations
+            and isinstance(denied, list) and all(isinstance(item, str) for item in denied)
+            and not {"read", "command"}.intersection(denied)
+            and jspace.get("write_scopes") == []
+            and jspace.get("mapped_source_reads", []) == [])
+
+
+def _capsule_digest_paths(capsule, jspace):
+    from .source_excerpt import readonly_outline_pins
+    if not _observed_digest_eligible(jspace):
+        return []
+    return list(readonly_outline_pins(capsule, jspace))
+
+
+def _supports_capsule_digest(runtime, capsule, jspace, environment):
+    if not _capsule_digest_paths(capsule, jspace):
+        return False
+    try:
+        result = subprocess.run([str(runtime.artifacts["tura_router"].path),
+                                 "capsule-source-read-capabilities"],
+                                capture_output=True, timeout=10, env=environment)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout == CAPSULE_DIGEST_CAPABILITY + b"\n"
+
+
+def _supports_observed_digest(runtime, jspace: dict[str, Any], environment: dict[str, str]) -> bool:
+    if not _observed_digest_eligible(jspace):
+        return False
+    try:
+        result = subprocess.run([str(runtime.artifacts["tura_router"].path),
+                                 "observed-source-read-capabilities"],
+                                capture_output=True, timeout=10, env=environment)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout == b"nokiy_observed_source_digest_v1\n"
+
+
+def _supports_directory_source_read(runtime, jspace: dict[str, Any], environment: dict[str, str]) -> bool:
+    if (jspace.get("schema_version") != "jspace_contract_v2"
+            or _directory_read_presentation(jspace) is None):
+        return False
+    try:
+        result = subprocess.run([str(runtime.artifacts["tura_router"].path),
+                                 "directory-source-read-capabilities"],
+                                capture_output=True, timeout=10, env=environment)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout == b"nokiy_directory_source_read_v1\n"
 
 
 def _directory_read_presentation(jspace: dict[str, Any]) -> dict[str, Any] | None:
@@ -256,14 +343,49 @@ _EVIDENCE_ONLY_COMPLETION_GUIDANCE = (
 
 
 def _provider_prompt(prompt: str, jspace: dict[str, Any],
-                     terminal_delivery: str = "assistant_reply") -> str:
+                     terminal_delivery: str = "assistant_reply", *,
+                     admitted_digest_reference: bool = False,
+                     observed_digest_reference: bool = False,
+                     directory_source_read: bool = False,
+                     capsule: dict | None = None,
+                     capsule_digest_reference: bool = False) -> str:
     """Present verified tool capabilities, without changing their enforcement."""
     if terminal_delivery == "evidence_only":
         prompt += _EVIDENCE_ONLY_COMPLETION_GUIDANCE
     operations = jspace.get("allowed_operations", [])
     command_allowed = isinstance(operations, list) and "command" in operations
+    inspect_shell = jspace.get("inspect_shell")
+    if command_allowed and "read" in operations and isinstance(inspect_shell, dict):
+        projection = {
+            "jspace_semantic_sha256": jspace.get("authorization_semantic_sha256"),
+            "allowed_operations": operations, "denied_operations": jspace.get("denied_operations", []),
+            "inspect_shell": {key: inspect_shell.get(key) for key in ("evidence_root", "network")},
+        }
+        return _capability_gap_prompt(
+            prompt + "\n\nVerified execution capability (caller projection):\n"
+            + json.dumps(projection, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            + "\nInspect shell: command_run shell lines of any form (pipelines, heredocs, python3 -c, git, rg, "
+              "curl to localhost) run inside an OS sandbox: reads except credential stores, writes only under "
+              "evidence_root and $TMPDIR, network only to localhost when network is loopback. Repository writes "
+              "and apply_patch fail; a sandbox denial is a boundary, not a path to retry. Write and edit "
+              "task-local files (scripts, notes, evidence) with shell lines under evidence_root, also where the "
+              "task names apply_patch: that is this action's admitted route, not a switched path. For multi-step "
+              "analysis, write shared setup (paths, imports, loaders, helpers) once to a module under evidence_root "
+              "and import it in later steps instead of retyping it: command text is model output, the slowest part "
+              "of a run. A command that "
+              "exits 0 despite a reported denied write (such as a CLI's alias or cache setup) still produced its "
+              "output. Batch related checks into few command lines, open SQLite as "
+              "file:<path>?mode=ro with PRAGMA query_only=ON so committed WAL data remains visible. "
+              "Use immutable=1 only for a verified immutable snapshot, never a live database. "
+              "If the sandbox cannot read the live WAL state, report unavailable evidence rather than "
+              "retrying with immutable=1 or treating missing rows as zero. "
+              "Finish with findings that cite evidence paths.\n")
     read_allowed = (command_allowed and jspace.get("source_read") is True
                     and "read" in operations)
+    parent_shell = jspace.get("parent_shell")
+    if command_allowed and "read" in operations and isinstance(parent_shell, dict):
+        from .parent_shell import NOTICE as parent_shell_notice
+        prompt += parent_shell_notice + f" Shell evidence root: {parent_shell.get('evidence_root')}.\n"
     verifiers = jspace.get("verifier_commands")
     verifier_allowed = (command_allowed and isinstance(verifiers, list) and bool(verifiers)
                         and all(isinstance(command, dict)
@@ -281,13 +403,33 @@ def _provider_prompt(prompt: str, jspace: dict[str, Any],
     }
     if directory_routes:
         projection["read_commands"] = directory_routes
+        if directory_source_read is True and jspace.get("schema_version") == "jspace_contract_v2":
+            projection["directory_source_read"] = {
+                "roots": directory_routes["roots"], "authority": "read_commands.cat",
+            }
     if read_allowed:
         projection.update(schema_version="nokiy_source_read_presentation_v1",
                           source_read=True, read_scopes=jspace.get("read_scopes", []))
+        if observed_digest_reference is True and _observed_digest_eligible(jspace):
+            projection["observed_source_digest_reference"] = True
+        if capsule_digest_reference is True:
+            paths = _capsule_digest_paths(capsule, jspace)
+            if paths:
+                projection["admitted_source_digest_paths"] = paths
         if verifier_allowed:
             known = _known_source_sha256_by_path(jspace, verifiers)
             if known:
                 projection["known_source_sha256_by_path"] = known
+            if admitted_digest_reference is True:
+                referenced = _admitted_digest_paths(jspace)
+                if referenced:
+                    projection["admitted_source_digest_paths"] = referenced
+                    remaining = {path: digest for path, digest in known.items()
+                                 if path not in referenced}
+                    if remaining:
+                        projection["known_source_sha256_by_path"] = remaining
+                    else:
+                        projection.pop("known_source_sha256_by_path", None)
         scopes = projection["read_scopes"]
         denied = projection["denied_operations"]
         if (isinstance(scopes, list) and isinstance(denied, list)
@@ -301,10 +443,13 @@ def _provider_prompt(prompt: str, jspace: dict[str, Any],
                         continue
                 except UnicodeEncodeError:
                     continue
-                arguments = {"path": path, "start_line": 1, "end_line": 80}
+                arguments = [path, 1, 80]
                 known = projection.get("known_source_sha256_by_path", {})
                 if path in known:
-                    arguments["expected_sha256"] = known[path]
+                    arguments.append(known[path])
+                if path in projection.get("admitted_source_digest_paths", []):
+                    arguments = {"path": path, "start_line": 1, "end_line": 80,
+                                 "expected_sha256_ref": "admitted"}
                 projection["source_read_example"] = {
                     "commands": [{"command_type": "source_read",
                                   "command_line": json.dumps(arguments, sort_keys=True,
@@ -346,11 +491,18 @@ def _provider_prompt(prompt: str, jspace: dict[str, Any],
             + json.dumps(projection, sort_keys=True, separators=(",", ":"), ensure_ascii=True))
     if read_allowed:
         if verifier_allowed:
+            digest_guidance = (
+                'For admitted_source_digest_paths use expected_sha256_ref:"admitted", '
+                "not expected_sha256; runtime resolves and checks the exact read-only pin. "
+                "For other paths, expected_sha256: current verbatim 64-hex SHA; omit iff unknown. "
+                if projection.get("admitted_source_digest_paths") else
+                "expected_sha256: this path's current verbatim 64-hex SHA; omit iff unknown. "
+            )
             text += ("\nCapsule: evidence, not a read grant. Empty declared_targets or "
                      "evidence_refs do not revoke scopes. "
                      "source_read: bounded exact scoped JSON path/lines/search_terms. "
                      "Batch independent reads; no speculative dependencies/whole-file dumps. "
-                     "expected_sha256: this path's current verbatim 64-hex SHA; omit iff unknown. "
+                     + digest_guidance +
                      "Never borrow another file's SHA. "
                      "Page: returned SHA/next_line. After mutation: fresh scoped readback, "
                      "not preimage SHA. runtime rechecks every read; no new grants.\n")
@@ -370,13 +522,47 @@ def _provider_prompt(prompt: str, jspace: dict[str, Any],
                 "or explicit task requirements. Respect tool limits/pagination. "
                 "Missing DCF locators do not block exact granted paths. "
                 "runtime rechecks every read; no added operation/shell/path/write.\n")
+        if not verifier_allowed and projection.get("admitted_source_digest_paths"):
+            text = text.replace(
+                "First read: omit expected_sha256 only if no current exact-path SHA is known. ",
+                'For admitted_source_digest_paths use expected_sha256_ref:"admitted"; '
+                "the runtime checks this request's readonly capsule pin against the read buffer. "
+                "Omit expected_sha256 when using the reference; explicit wrong hashes still reject. ")
+        if projection.get("observed_source_digest_reference") is True:
+            text = text.replace(
+                "Page same file: expected_sha256=returned SHA, start_line=next_line. ",
+                'Page same file after a successful read: expected_sha256_ref:"observed", '
+                "start_line=next_line; omit expected_sha256. ")
+            text += ('For another range/search/JSON selection of a file already successfully '
+                     'read by this worker, use expected_sha256_ref:"observed" instead of copying '
+                     "the SHA. The runtime retains the first observed version and checks the new "
+                     "read buffer; this grants no path and does not refresh changed content. "
+                     "Use a literal current SHA for explicit post-edit reads; do not use observed "
+                     "before the first successful read.\n")
         if "known_source_sha256_by_path" in projection:
             text += ("Use known_source_sha256_by_path only for the matching path's "
                      "pre-edit expected_sha256.\n")
     if directory_routes:
         text += ("\nread_commands: bash listing_example; shell-quote pinned cat_argv_prefix "
-                 "plus a discovered path. source_read requires source_read:true and an exact "
-                 "read_scopes path; directory scopes never qualify. No guessed paths, hidden "
+                 "plus a discovered path. ")
+        generation = jspace.get("dcf_generation")
+        if "directory_source_read" in projection:
+            text += ("For a discovered file use command_run command_type=source_read, "
+                     "command_line=JSON [path,start_line,end_line]. Only the same "
+                     "pinned-cat file/root authority applies, not other exact scopes. "
+                     "Resume with [path,next_line,end_line,returned source_sha256]; "
+                     "changed content must not be combined with an earlier page. ")
+        elif (read_allowed and jspace.get("schema_version") == "jspace_contract_v2"
+                and isinstance(generation, dict)
+                and generation.get("context_mode") == "local_workspace_jspace"
+                and generation.get("dcf_available") is False):
+            text += ("Use ranged source_read on discovered regular files under these roots; "
+                     "runtime pinned cat/file/root checks must pass. Resume with "
+                     "expected_sha256=returned SHA, start_line=next_line. ")
+        else:
+            text += ("source_read requires source_read:true and an exact "
+                     "read_scopes path; directory scopes never qualify. ")
+        text += ("No guessed paths, hidden "
                  "files, symlinks, traversal, pipelines, substitution, --pre or --follow; "
                  "runtime pins/limits apply. No new read/write authority.\n")
     if verifier_allowed:
@@ -385,16 +571,22 @@ def _provider_prompt(prompt: str, jspace: dict[str, Any],
                  "whole-array task limits prevail. No task rewrites/invented capabilities. "
                  "Reuse caller-verified current pre-edit baseline; reproduce if required; "
                  "run required focused post-edit verification. "
-                 "Verifier success + semantically reviewed fresh scoped postimage readback "
-                 "covers only the exact unchanged state: no redundant tests/reads/status polls. "
+                 "Cover required interactions before patching; tests are not the specification. "
+                 "Once covered and verified, no extra review round; "
+                 "no redundant tests/reads/status polls. "
                  "Reverify after relevant source/test/config changes, failure, "
                  "unknown/mismatched evidence or explicit task requirements. "
                  "Reuse evidence, never ownership/permission clearance. "
                  "Mandatory status updates and terminal fences. "
-                 "No argv/cwd/timeout overrides or blocked/cancel bypass.\n")
+                 "No argv/cwd/timeout overrides or blocked/cancel bypass.\n"
+                 # Measured I23 Ultra worker: two corrective verifier rounds came from these facts,
+                 # which coordinators relay inconsistently; state them where tests are written.
+                 "Verifier sandbox: cwd draft.workspace; writes only its scratch, TMPDIR. Added tests "
+                 "use tempfile/TMPDIR and resolve fixture/helper/data paths from their own file's "
+                 "directory, never cwd.\n")
         if read_write_allowed:
             text += ("Optional source_postimages: known exit0/reaped/group-empty success only. "
-                     "Semantically review complete definitions/bindings + support, or all-text delta "
+                     "When the task requires review, semantically review complete definitions/bindings + support, or all-text delta "
                      "on definition-size overflow (not complete definitions). "
                      "No dependency/file proof; exact paths/postimage SHA/lines only. "
                      "Missing/overflow/stale/uncovered evidence: ordinary granted source_read. "
@@ -407,25 +599,29 @@ def _provider_prompt(prompt: str, jspace: dict[str, Any],
             text += ("Task-permitted mixed responses: Once final patches are fully known, "
                      "exact-write patches precede the admitted focused_verifier "
                      "at a strictly later positive step in the same command_run response. "
-                     "No dependent same-step verification or missing-evidence edits.\n")
+                     "No dependent same-step verification or missing-evidence edits. "
+                     "Include task_status done alone at a strictly later final positive step "
+                     "in that SAME commands array. Required checks/readbacks and conclusions must be known, "
+                     "not result-dependent. Failed/timed-out/unknown results block done; "
+                     "interpretation requires a later model turn. In evidence_only delivery, omit final_reply "
+                     "when native receipts contain the required result; add only task-required conclusions "
+                     "absent from those receipts. Other delivery modes retain their final_reply contract.\n")
     if read_write_allowed:
+        text += ("Complete source_delta: readback per apply_patch rules; else source_read. "
+                 "Task-required reads prevail.\n")
         if verifier_allowed:
-            text += ("If post-edit evidence is present, review: "
+            text += ("If task-required post-edit review remains: "
                      "Mechanical missing readbacks only; mandatory task_status done "
-                     "at a strictly later positive step in the same existing command_run. "
-                     "Else propose fully-known mechanical checks/readbacks "
-                     "in strict later steps per guidance. "
-                     "No output-dependent decisions; safe exact read+write paths only. "
-                     "Result-dependent review: later model round. Keep publication fences; "
-                     "no failed/unknown-effect closure or expanded grants.\n")
+                     "in later positive steps of the same command_run, exact read+write paths only. "
+                     "Batch only fully-known mechanical work; result-dependent review needs "
+                     "a later model round. No failed/unknown-effect closure; keep publication fences.\n")
         else:
             text += ("Source-read-only final edits: when task instructions permit a mixed response, "
-                     "put only fully-known admitted final patches in earlier positive steps and "
-                     "fully-known bounded fresh postimage source_read requests at a strictly later "
-                     "positive step in the same command_run response. Use only safe exact write "
-                     "paths also granted for read. Never use preimage SHA after mutation, "
+                     "put fully-known admitted patches in earlier positive steps; still-required "
+                     "bounded postimage source_read at a strictly later positive step in the "
+                     "same command_run. Exact read+write paths only; no preimage SHA after mutation, "
                      "same-step dependent reads, speculative ranges or scope expansion. "
-                     "Do not skip required verification, readback, status updates or terminal fences.\n")
+                     "Keep required verification, readback, status updates and terminal fences.\n")
     return _capability_gap_prompt(text)
 
 
@@ -439,7 +635,28 @@ def _verifier_fd() -> tuple[int, ...]:
     return (fd,)
 
 
-def prepare(request: caller.EmbeddedNokiyRequest):
+def verifier_dispatch_blocker(jspace: dict) -> str | None:
+    """Public dispatch readiness, not an internal engine/channel admission."""
+    if not jspace.get("verifier_commands"):
+        return None
+    try:
+        if current_process_is_sandboxed():
+            return "NOKIY_FULL_CORE_VERIFIER_OUTER_SCOPE_REQUIRED"
+    except (OSError, ProcessScopeError):
+        return "NOKIY_FULL_CORE_NATIVE_SCOPE_UNAVAILABLE"
+    return None
+
+
+def preflight(request: caller.EmbeddedNokiyRequest, *, post_batch_verifier: bool = False) -> dict[str, Any]:
+    ready, _, _, jspace = prepare(request, **({"post_batch_verifier": True} if post_batch_verifier else {}))
+    if ready["status"] == "READY":
+        blocker = verifier_dispatch_blocker(jspace)
+        if blocker:
+            return {**ready, "status": "BLOCKED", "first_typed_blocker": blocker}
+    return ready
+
+
+def prepare(request: caller.EmbeddedNokiyRequest, *, post_batch_verifier: bool = False):
     caller._verify_native_thread_binding(request)
     if request.schema_version != caller.REQUEST_SCHEMA_VERSION or request.execution_profile not in {"direct", "balanced"}:
         raise caller.EmbeddedNokiyError("NOKIY_FULL_CORE_PROFILE_INVALID", "explicit current request required")
@@ -467,7 +684,12 @@ def prepare(request: caller.EmbeddedNokiyRequest):
     actual.discard(request.runtime_image.path)
     if actual != bound or any(path.is_symlink() for path in actual):
         raise caller.EmbeddedNokiyError("NOKIY_FULL_CORE_IMAGE_INVENTORY_MISMATCH", "unbound or missing image files")
-    context, capsule, jspace = caller._verify_context(request)
+    context, capsule, jspace = caller._verify_context(request,
+        **({"post_batch_verifier": True} if post_batch_verifier else {}))
+    if post_batch_verifier and (request.authority_effect != "none" or request.execution_profile != "direct"
+            or jspace.get("dcf_generation", {}).get("context_mode") != "local_workspace_jspace"):
+        raise caller.EmbeddedNokiyError("NOKIY_POST_BATCH_PREPARATION_UNSUPPORTED",
+                                       "post-batch preparation requires a read-only local direct request")
     tier = request.service_tier or ("priority" if request.model_acceleration else "default")
     ready = {
         "schema_version": caller.PREFLIGHT_SCHEMA_VERSION, "status": "READY",
@@ -507,11 +729,23 @@ def prepare(request: caller.EmbeddedNokiyRequest):
             supported = False
         if not supported and ready["status"] == "READY":
             ready.update(status="BLOCKED", first_typed_blocker="NOKIY_FULL_CORE_VERIFIER_PARENT_CHANNEL_REQUIRED")
+    ready["admitted_source_digest_reference"] = (
+        ready["status"] == "READY" and _supports_admitted_digest(runtime, jspace, capability_env)
+    )
+    ready["capsule_source_digest_reference"] = (
+        ready["status"] == "READY" and _supports_capsule_digest(runtime, capsule, jspace, capability_env)
+    )
+    ready["observed_source_digest_reference"] = (
+        ready["status"] == "READY" and _supports_observed_digest(runtime, jspace, capability_env)
+    )
+    ready["directory_source_read"] = (
+        ready["status"] == "READY" and _supports_directory_source_read(runtime, jspace, capability_env)
+    )
     return ready, runtime, capsule, jspace
 
 
-def _supervisor_environment(request) -> dict[str, str]:
-    env = dict(os.environ)
+def _supervisor_environment(request, environment=None) -> dict[str, str]:
+    env = dict(os.environ if environment is None else environment)
     env.pop(BUDGET_ENV, None)
     if request.timeout_seconds is None:
         return env
@@ -524,8 +758,11 @@ def _supervisor_environment(request) -> dict[str, str]:
     return env
 
 
-def _environment(request, runtime, state: Path, *, execution_budget: str | None = None) -> dict[str, str]:
+def _environment(request, runtime, state: Path, *, execution_budget: str | None = None,
+                 navigation_contract: dict | None = None) -> dict[str, str]:
+    from . import source_navigation
     env = _scrub_receipt_binding(os.environ)
+    env.pop(source_navigation.ENV, None)
     for key in tuple(env):
         if key.startswith("TURA_") or key in {"SESSION_LOG_DB_ROOT", "LOG_PATH", "NOKIY_VERIFIER_FD", BUDGET_ENV}:
             env.pop(key)
@@ -558,6 +795,16 @@ def _environment(request, runtime, state: Path, *, execution_budget: str | None 
         env[INITIAL_TASK_STATE_ENV] = initial_state
     if request.timeout_seconds is not None:
         env["TURA_EXEC_ROUTER_READ_TIMEOUT_SECS"] = str(request.timeout_seconds)
+    from .inspect_context import FENCE_ENV, PROFILE_ENV, profile_path
+    inspect_profile = profile_path(navigation_contract)
+    inspect_policy = (navigation_contract or {}).get("inspect_shell") if inspect_profile is not None else None
+    if inspect_policy is not None and os.environ.get(FENCE_ENV) == inspect_policy.get("profile_sha256"):
+        # The engine runs under this profile; the router binds every shell it starts to it and
+        # J-Space rechecks its digest. Without the applied fence, inspect shells fail closed.
+        env[PROFILE_ENV] = str(inspect_profile)
+    navigation = source_navigation.build(request.workspace, navigation_contract)
+    if navigation is not None:
+        env[source_navigation.ENV] = navigation
     return env
 
 
@@ -924,6 +1171,199 @@ class _TerminalEvidence:
             raise caller.EmbeddedNokiyError("NOKIY_FULL_CORE_TERMINAL_EVIDENCE_INVALID", "terminal delivery projection differs")
 
 
+class _EvidenceHandoff:
+    """Spool accepted task-status text; authenticate it in existing evidence passes.
+
+    This is optional model content, never an execution observation or acceptance.
+    Only bounded text, source identity and a digest survive the current JSONL event.
+    """
+
+    def __init__(self, request, run: Path, *, persist=False, readback=False):
+        self.request = (request.to_wire() if isinstance(request, caller.EmbeddedNokiyRequest)
+                        else request or {})
+        self.enabled = self.request.get("terminal_delivery") == "evidence_only"
+        self.path, self.persist = run / "worker-handoff.txt", persist
+        self.readback = readback
+        self.runtime, self.count = None, 0
+        self.source, self.reference, self.reason = None, None, "HANDOFF_MISSING"
+        self.reply = None
+
+    @staticmethod
+    def unavailable(reason):
+        return {"result_artifact": None, "result_artifact_source": {
+            "schema_version": "nokiy_result_artifact_source_v1", "kind": "worker_final_report",
+            "status": "UNAVAILABLE", "reason": reason, "parent_acceptance_required": True}}
+
+    def observe(self, event, index):
+        item = event.get("item") if event.get("type") == "item.completed" else None
+        if (not self.enabled or not isinstance(item, dict)
+                or item.get("type") != "command_execution" or item.get("command_type") != "task_status"):
+            return
+        runtime = item.get("runtime_id")
+        self.runtime = runtime
+        self.source, self.reference, self.reason = None, None, "HANDOFF_MISSING"
+        self.reply = None
+        try:
+            output = _structured_output(item)
+            control = output.get("task_status")
+            if not isinstance(control, dict) or set(output) != {"task_status"}:
+                self.count += 1
+                raise ValueError("ambiguous task status")
+            if control.get("status") != "done":
+                if "final_reply" in control:
+                    raise ValueError("unaccepted report")
+                return
+            self.count += 1
+            if self.count != 1:
+                self.reason = "HANDOFF_AMBIGUOUS"
+                return
+            from .result_inspection import _native_task_status, _own_edit_observation_settled
+            def identity(value):
+                return (isinstance(value, str) and 0 < len(value) <= 256 and value.isascii()
+                        and all(32 < ord(char) < 127 for char in value))
+            provider, step, position = (item.get(key) for key in ("provider_tool_call_id", "step", "command_index"))
+            session = "full-" + self.request["request_sha256"]
+            command_run = str(runtime) + ".tool.command_run"
+            command_id = f"{command_run}:{provider}:{position}"
+            if (not all(identity(value) for value in (runtime, provider, item.get("id"), command_id))
+                    or item.get("command_run_id") != command_run or item.get("command_id") != command_id
+                    or type(step) is not int or not 0 < step < 2**64
+                    or type(position) is not int or not 0 <= position < 512
+                    or item.get("status") != "completed"
+                    or not _own_edit_observation_settled(item, False)
+                    or any(key in item and item[key] != expected for key, expected in (
+                        ("session_id", session), ("request_id", self.request["request_id"]),
+                        ("request_sha256", self.request["request_sha256"]),
+                        ("native_thread_id", self.request.get("native_thread_id"))))):
+                self.reason = "HANDOFF_IDENTITY_INVALID"
+                return
+            native_reply = item.get("command") not in ("", "task_status")
+            if native_reply:
+                self.reason = "HANDOFF_IDENTITY_INVALID"
+                if not self.readback or not _native_task_status(event, {command_id: 1}):
+                    return
+            text = control.get("final_reply")
+            if text is None:
+                return
+            format_name = control.get("final_reply_format", "text")
+            if (not isinstance(text, str) or not text.strip() or format_name not in ("text", "json")
+                    or "compact_context" in control):
+                raise ValueError("invalid report content")
+            if format_name == "json" and not native_reply:
+                decoded = json.loads(text, object_pairs_hook=caller._unique_object,
+                                     parse_constant=caller._invalid_constant)
+                if not isinstance(decoded, (dict, list)) or not decoded:
+                    raise ValueError("invalid structured report")
+                del decoded
+            reference = _message_reference(self.path, text)  # Strict, complete UTF-8, without retaining text.
+            source = {key: self.request[key] for key in ("request_id", "request_sha256")}
+            source.update(session_id=session, runtime_id=runtime, command_id=command_id,
+                          provider_tool_call_id=provider, command_index=position, step=step,
+                          item_id=item["id"], event_index=index, event_sha256=caller._canonical_sha256(event),
+                          final_reply_format=format_name)
+            if native_reply:
+                # The native JSON command is not a legacy artifact handoff. Expose
+                # only its observed content; retain the original unavailable reason.
+                preview, truncated = _text_preview(text, self.request["max_result_bytes"])
+                self.reply = {
+                    "schema_version": "nokiy_task_status_final_reply_v1", "status": "MODEL_REPORTED",
+                    "binding": {**source, "native_thread_id": self.request.get("native_thread_id")},
+                    "output_json_pointer": "/task_status/final_reply",
+                    "content_sha256": reference["sha256"], "content_bytes": reference["bytes"],
+                    "text": preview, "complete": not truncated, "truncated": truncated,
+                    "truncation_reason": "MAX_RESULT_BYTES" if truncated else None,
+                    "parent_acceptance_required": True}
+                return
+            if self.persist:
+                try:
+                    with self.path.open("xb") as output:
+                        for raw in _text_chunks(text):
+                            output.write(raw)
+                        output.flush()
+                        os.fsync(output.fileno())
+                        if _artifact_stamp(os.fstat(output.fileno())) != _artifact_stamp(self.path.lstat()):
+                            raise OSError("report artifact replaced")
+                except OSError:
+                    self.reason = "HANDOFF_ARTIFACT_UNAVAILABLE"
+                    return
+            self.source, self.reference = source, reference
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, caller.EmbeddedNokiyError):
+            self.count = max(1, self.count)
+            self.reason = "HANDOFF_CONTENT_INVALID"
+
+    def events(self, events, delivery):
+        for index, event in enumerate(events):
+            delivery.observe(event)
+            self.observe(event, index)
+            yield event
+
+    def reply_fields(self, value, marker, trajectory, command_ids):
+        """Readback from the checked trajectory, never a replacement artifact store."""
+        if self.reply is None or marker is None or self.count != 1:
+            return {}
+        source = self.reply["binding"]
+        if (self.request.get("request_id") != "tura_embedded_" + str(self.request.get("request_sha256"))
+                or self.path.parent.name != self.request.get("request_id")
+                or source["session_id"] != marker["session_id"] or source["runtime_id"] != marker["runtime_id"]
+                or command_ids.get(source["command_id"]) != 1
+                or value.get("requested_terminal_delivery") != "evidence_only"
+                or value.get("observed_terminal_delivery") != "evidence_only"
+                or caller._canonical_bytes(value.get("terminal_evidence")) != caller._canonical_bytes(marker)):
+            return {}
+        reference = _artifact_reference(self.path.with_name("core.jsonl"), trajectory)
+        return {"task_status_final_reply": {**self.reply, "source_artifact": reference}}
+
+    def fields(self, marker, *, verify=True):
+        if marker is None:
+            return {}
+        if (self.request.get("request_id") != "tura_embedded_" + str(self.request.get("request_sha256"))
+                or self.path.parent.name != self.request.get("request_id")
+                or marker["session_id"] != "full-" + str(self.request.get("request_sha256"))):
+            return self.unavailable("HANDOFF_IDENTITY_INVALID")
+        if self.runtime is not None and self.runtime != marker["runtime_id"]:
+            return self.unavailable("HANDOFF_FOREIGN_RUNTIME")
+        if self.source is None or self.reference is None:
+            return self.unavailable(self.reason)
+        if verify:
+            try:
+                _record_artifact(self.path, reference=self.reference)
+            except (OSError, caller.EmbeddedNokiyError):
+                return self.unavailable("HANDOFF_ARTIFACT_UNAVAILABLE")
+        return {"result_artifact": self.reference, "result_artifact_source": {
+            "schema_version": "nokiy_result_artifact_source_v1", "kind": "worker_final_report",
+            "status": "MODEL_REPORTED", "binding": self.source, "parent_acceptance_required": True}}
+
+    def project(self, value, marker, *, inline_limit: int | None = None):
+        # Old receipts remain read-only; an absent optional report never requires replay.
+        if "result_artifact_source" not in value and value.get("result_artifact") is None:
+            return {}
+        expected = self.fields(marker, verify=False)
+        try:
+            matches = (expected and caller._canonical_bytes(value.get("terminal_evidence")) == caller._canonical_bytes(marker)
+                       and value.get("requested_terminal_delivery") == "evidence_only"
+                       and value.get("observed_terminal_delivery") == "evidence_only"
+                       and caller._canonical_bytes(expected) == caller._canonical_bytes({key: value.get(key) for key in expected}))
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            matches = False
+        if not matches:
+            return self.unavailable("HANDOFF_BINDING_MISMATCH")
+        reference = expected.get("result_artifact")
+        if inline_limit is None or reference is None or reference["bytes"] > inline_limit:
+            return self.fields(marker)
+        # Reuse the artifact verification pass, retaining only a complete small
+        # body. No preview survives until descriptor, bytes and digest checks pass.
+        try:
+            with _ArtifactReader(self.path, limit=inline_limit, reference=reference) as artifact:
+                raw = b"".join(artifact.chunks())
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeError, caller.EmbeddedNokiyError):
+            return self.unavailable("HANDOFF_ARTIFACT_UNAVAILABLE")
+        return {**expected, "result_artifact_preview": {
+            "schema_version": "nokiy_result_artifact_preview_v1", "kind": "worker_final_report",
+            "status": "MODEL_REPORTED", "encoding": "utf-8", "complete": True,
+            "artifact": reference, "text": text, "parent_acceptance_required": True}}
+
+
 class _TurnSummary:
     def __init__(self, expected=None, *, require_completed=True):
         self.expected, self.count, self.usage = expected, 0, None
@@ -949,6 +1389,156 @@ class _TurnSummary:
     def finish(self):
         if self.count != 1:
             raise caller.EmbeddedNokiyError("NOKIY_FULL_CORE_TERMINAL_INVALID", "expected exactly one completed turn")
+
+
+_FAILED_TRANSPORT_ERROR = (
+    "manas processing failed: network error: provider transport failure: "
+    "phase=responses-sse category=decode cause=unexpected-eof"
+)
+_FAILED_TRANSPORT = {"phase": "responses-sse", "category": "decode", "cause": "unexpected-eof"}
+_PREFIX_KEYS = {"schema_version", "session_id", "status", "from_sequence",
+                "next_sequence", "terminal_boundary_verified"}
+
+
+def _valid_failure_prefix(value, session_id):
+    return (type(value) is dict and set(value) == _PREFIX_KEYS
+            and value["schema_version"] == "execution_evidence_v1"
+            and value["session_id"] == session_id and value["status"] == "persisted_prefix"
+            and type(value["from_sequence"]) is int and value["from_sequence"] == 0
+            and type(value["next_sequence"]) is int and 0 <= value["next_sequence"] <= 2**63 - 1
+            and value["terminal_boundary_verified"] is False)
+
+
+def valid_provider_failure_diagnostic(value, terminal):
+    """Validate metadata only; never grant execution or complete failed effects."""
+    keys = {"schema_version", "event_index", "trajectory_artifact", "transport",
+            "execution_evidence", "model_request_started", "effect_outcome", "parent_acceptance_required"}
+    request_id, digest = terminal.get("request_id"), terminal.get("request_sha256")
+    reference = value.get("trajectory_artifact") if type(value) is dict else None
+    if (type(value) is not dict or set(value) not in (keys, keys | {"stream_failure_snapshot"})
+            or value["schema_version"] != "nokiy_provider_failure_diagnostic_v1"
+            or terminal.get("status") != "BLOCKED" or terminal.get("cleanup_pass") is not True
+            or not isinstance(terminal.get("first_typed_blocker"), str) or not terminal["first_typed_blocker"]
+            or not isinstance(request_id, str) or not caller.REQUEST_ID_PATTERN.fullmatch(request_id)
+            or not isinstance(digest, str)
+            or request_id != "tura_embedded_" + str(digest)
+            or type(value["event_index"]) is not int or not 0 <= value["event_index"] <= 2**63 - 1
+            or type(value["transport"]) is not dict or value["transport"] != _FAILED_TRANSPORT
+            or not _valid_failure_prefix(value["execution_evidence"], "full-" + str(digest))
+            or value["model_request_started"] != "UNKNOWN" or value["effect_outcome"] != "UNKNOWN"
+            or value["parent_acceptance_required"] is not True
+            or type(reference) is not dict or set(reference) != {"path", "sha256", "bytes"}
+            or reference != terminal.get("trajectory_artifact")
+            or not isinstance(reference["path"], str) or not Path(reference["path"]).is_absolute()
+            or any(ord(char) < 32 for char in reference["path"])
+            or Path(reference["path"]).name != "core.jsonl" or Path(reference["path"]).parent.name != request_id
+            or not isinstance(reference["sha256"], str) or len(reference["sha256"]) != 64
+            or any(char not in "0123456789abcdef" for char in reference["sha256"])
+            or type(reference["bytes"]) is not int or not 0 <= reference["bytes"] <= 2**63 - 1):
+        return None
+    if "stream_failure_snapshot" in value and not _valid_stream_failure_evidence(
+            value["stream_failure_snapshot"], value["execution_evidence"]["session_id"]):
+        return None
+    return {**value, "trajectory_artifact": dict(reference), "transport": dict(_FAILED_TRANSPORT),
+            "execution_evidence": dict(value["execution_evidence"])}
+
+
+def _valid_stream_failure_evidence(value, session):
+    keys = {"snapshot", "session_id", "output_event_seq", "failure_event_seq", "last_event_seq",
+            "index_artifact", "database_artifact"}
+    if type(value) is not dict or set(value) != keys or value["session_id"] != session:
+        return False
+    integer = lambda n: type(n) is int and 0 <= n <= 2**63 - 1
+    if (not all(integer(value[k]) for k in ("output_event_seq", "failure_event_seq", "last_event_seq"))
+            or not value["output_event_seq"] < value["failure_event_seq"] <= value["last_event_seq"]):
+        return False
+    snapshot = value["snapshot"]
+    fields = {"schema_version", "event_count", "completed_seen", "completion_valid", "completed_frame_ended",
+              "pending_bytes", "request_id", "runtime_id", "command_effect_started"}
+    if (type(snapshot) is not dict or set(snapshot) != fields
+            or snapshot["schema_version"] != "provider_stream_failure_snapshot_v1"
+            or not all(integer(snapshot[k]) for k in ("event_count", "pending_bytes"))
+            or not all(type(snapshot[k]) is bool for k in
+                       ("completed_seen", "completion_valid", "completed_frame_ended", "command_effect_started"))
+            or (snapshot["completion_valid"] or snapshot["completed_frame_ended"]) and not snapshot["completed_seen"]
+            or snapshot["completed_seen"] and snapshot["event_count"] == 0):
+        return False
+    runtime = snapshot["runtime_id"]
+    request = snapshot["request_id"]
+    if (not isinstance(runtime, str) or not runtime.startswith("runtime-") or not 8 <= len(runtime) <= 128
+            or not runtime.isascii() or any(not (c.isalnum() or c in "-_") for c in runtime)
+            or request is not None and (not isinstance(request, str) or not 1 <= len(request) <= 256
+                                       or not request.isascii() or any(ord(c) < 33 or ord(c) == 127 for c in request))):
+        return False
+    for key in ("index_artifact", "database_artifact"):
+        ref = value[key]
+        if (type(ref) is not dict or set(ref) != {"path", "sha256", "bytes"}
+                or not isinstance(ref["path"], str) or not isinstance(ref["sha256"], str)
+                or len(ref["sha256"]) != 64 or any(c not in "0123456789abcdef" for c in ref["sha256"])
+                or not integer(ref["bytes"]) or ref["bytes"] > 64 * 1024 * 1024):
+            return False
+    parts = Path(value["database_artifact"]["path"]).parts
+    return (value["index_artifact"]["path"] == "execution-state/session_log/index.sqlite3"
+            and len(parts) == 6 and parts[:3] == ("execution-state", "session_log", "workspaces")
+            and len(parts[3]) == 64 and all(c in "0123456789abcdef" for c in parts[3])
+            and parts[4:] == (".tura", "session_log.sqlite3"))
+
+
+def provider_failure_diagnostic_with_snapshot(value, terminal, run, *, require_existing=False):
+    """Supplement a proved failed prefix; optional evidence never replaces its blocker."""
+    value = valid_provider_failure_diagnostic(value, terminal)
+    existing = terminal.get("provider_failure_diagnostic")
+    if value is None or require_existing and (type(existing) is not dict or "stream_failure_snapshot" not in existing):
+        return value
+    base = {k: v for k, v in value.items() if k != "stream_failure_snapshot"}
+    scope = terminal.get("cleanup")
+    if (not isinstance(scope, dict) or scope.get("engine_reaped") is not True
+            or scope.get("no_live_descendants") is not True or scope.get("cleanup_error") is not None):
+        return base
+    from . import durable_recovery, result_inspection
+    try:
+        evidence = durable_recovery.provider_stream_failure_evidence(
+            run, base["execution_evidence"], result_inspection)
+        candidate = {**base, "stream_failure_snapshot": evidence}
+        return valid_provider_failure_diagnostic(candidate, terminal) or base
+    except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        return base
+
+
+class _FailedTurnDiagnostic:
+    """Accumulate one failed terminal during the existing complete evidence pass."""
+
+    def __init__(self, request):
+        self.expected = _terminal_identity(request)
+        self.summary = _TurnSummary(self.expected, require_completed=False)
+        self.valid, self.complete, self.candidate = True, False, None
+
+    def events(self, events):
+        for index, event in enumerate(events):
+            if event.get("type") == "turn.completed" and self.valid:
+                try:
+                    self.summary.observe(event)
+                except (ValueError, TypeError, caller.EmbeddedNokiyError):
+                    self.valid = False
+                if (self.valid and event.get("status") == "failed"
+                        and event.get("error") == _FAILED_TRANSPORT_ERROR
+                        and _valid_failure_prefix(event.get("execution_evidence"), self.expected["session_id"])):
+                    self.candidate = {"event_index": index,
+                                      "execution_evidence": dict(event["execution_evidence"])}
+            yield event
+        self.complete = True
+
+    def finish(self, reference):
+        if not self.valid or not self.complete or self.candidate is None:
+            return None
+        try:
+            self.summary.finish()
+        except caller.EmbeddedNokiyError:
+            return None
+        return {"schema_version": "nokiy_provider_failure_diagnostic_v1", **self.candidate,
+                "trajectory_artifact": reference, "transport": dict(_FAILED_TRANSPORT),
+                "model_request_started": "UNKNOWN", "effect_outcome": "UNKNOWN",
+                "parent_acceptance_required": True}
 
 
 def _text_preview(text: str, limit: int) -> tuple[str, bool]:
@@ -1008,10 +1598,10 @@ def _events(path: Path, limit: int | None, request: caller.EmbeddedNokiyRequest)
     result_path = path.parent / "last-message.txt"
     output = None
     with ExitStack() as stack:
+        handoff = _EvidenceHandoff(request, path.parent, persist=True)
         def observations():
             nonlocal preview, truncated, result_ref, tools, successful, output
-            for event in items:
-                delivery.observe(event)
+            for event in handoff.events(items, delivery):
                 turn.observe(event)
                 item = event.get("item") if event.get("type") == "item.completed" else None
                 if isinstance(item, dict) and item.get("type") == "assistant_message":
@@ -1053,7 +1643,8 @@ def _events(path: Path, limit: int | None, request: caller.EmbeddedNokiyRequest)
             "trajectory_artifact": items.reference, "usage": turn.usage,
             "provider_observation": turn.provider_observation,
             "tool_loop": {"completed_count": tools, "successful_count": successful},
-            "command_evidence": evidence, "turn_completed": True, **delivery.fields()}
+            "command_evidence": evidence, "turn_completed": True, **delivery.fields(),
+            **handoff.fields(delivery.marker)}
 
 
 class _PhaseTiming:
@@ -1155,6 +1746,28 @@ def _phase_intervals(observed: dict[str, Any] | None) -> dict[str, int | None]:
             for name, (start, end) in pairs.items()}
 
 
+class _ServiceStartupError(caller.EmbeddedNokiyError):
+    def __init__(self, service: str, reason: str, *, exit_code=None, os_errno=None):
+        super().__init__("NOKIY_FULL_CORE_SERVICE_NOT_READY", service)
+        self.diagnostic = {"schema_version": "nokiy_full_core_startup_failure_v1",
+                           "service": service, "reason": reason, "exit_code": exit_code,
+                           "os_errno": os_errno, "log_artifact": None, "log_tail": None,
+                           "log_truncated": None, "log_capture_blocker": None}
+
+
+def _startup_log(run: Path, service: str, *, reference=None) -> dict[str, Any]:
+    if service not in {"tura_session_db", "tura_router"}:
+        raise caller.EmbeddedNokiyError("STARTUP_DIAGNOSTIC_INVALID", "unknown service")
+    tail = b""
+    with _ArtifactReader(run / (service + ".log"), limit=4 * 1024 * 1024,
+                         reference=reference) as source:
+        for raw in source.chunks():
+            tail = (tail + raw)[-4096:]
+    text, truncated = _text_preview(tail.decode("utf-8", errors="replace"), 4096)
+    return {"log_artifact": source.record, "log_tail": text,
+            "log_truncated": source.size > len(tail) or truncated}
+
+
 def _engine(spec_path: Path) -> dict[str, Any]:
     started_at = time.monotonic()
     spec = caller._load_json(spec_path, limit=caller.MAX_REQUEST_BYTES, code="NOKIY_FULL_CORE_SPEC_INVALID")
@@ -1166,14 +1779,15 @@ def _engine(spec_path: Path) -> dict[str, Any]:
     result: dict[str, Any] = {}
     try:
         # Inputs are checked again after entering the isolated process scope.
-        ready, runtime, _, _ = prepare(request)
+        ready, runtime, _, jspace = prepare(request)
         if ready["status"] != "READY":
             raise caller.EmbeddedNokiyError(ready["first_typed_blocker"],
                                             "required router capability unavailable")
         timing.observe("prepare")
         state = run / "execution-state"
         state.mkdir(mode=0o700)
-        env = _environment(request, runtime, state, execution_budget=os.environ.get(BUDGET_ENV))
+        env = _environment(request, runtime, state, execution_budget=os.environ.get(BUDGET_ENV),
+                           navigation_contract=jspace)
         # Same CLI store-open path as the router's runtime calls. Fail before
         # starting services or invoking the provider if the binding is invalid.
         try:
@@ -1197,17 +1811,23 @@ def _engine(spec_path: Path) -> dict[str, Any]:
             service_env = dict(env)
             if fds:
                 service_env["NOKIY_VERIFIER_FD"] = str(fds[0])
-            process = subprocess.Popen([str(runtime.artifacts[name].path), *arguments],
-                                       cwd=request.workspace, env=service_env, stdin=subprocess.DEVNULL,
-                                       stdout=log, stderr=log, pass_fds=fds)
-            for fd in fds:
-                os.close(fd)
+            try:
+                process = subprocess.Popen([str(runtime.artifacts[name].path), *arguments],
+                                           cwd=request.workspace, env=service_env, stdin=subprocess.DEVNULL,
+                                           stdout=log, stderr=log, pass_fds=fds)
+            except OSError as error:
+                raise _ServiceStartupError(name, "spawn_failed", os_errno=error.errno) from error
+            finally:
+                for fd in fds:
+                    os.close(fd)
             processes.append(process)
             deadline = time.monotonic() + (15 if request.timeout_seconds is None else min(15, request.timeout_seconds))
             endpoint_path = state / "session_log" / marker
             while not endpoint_path.is_file():
-                if process.poll() is not None or time.monotonic() > deadline:
-                    raise caller.EmbeddedNokiyError("NOKIY_FULL_CORE_SERVICE_NOT_READY", name)
+                exit_code = process.poll()
+                if exit_code is not None or time.monotonic() > deadline:
+                    raise _ServiceStartupError(name, "process_exited" if exit_code is not None
+                                               else "readiness_timeout", exit_code=exit_code)
                 time.sleep(.05)
             endpoint = caller._load_json(endpoint_path, limit=16384, code="NOKIY_FULL_CORE_ENDPOINT_INVALID")
             _verify_service_owner(name, endpoint, process, state)
@@ -1259,6 +1879,13 @@ def _engine(spec_path: Path) -> dict[str, Any]:
                 log.close()
             except OSError as error:
                 cleanup_error = cleanup_error or error
+        if isinstance(original_error, _ServiceStartupError):
+            # Read only after cleanup has stopped the writer. Diagnostics never
+            # replace a startup refusal or retry it in a different directory.
+            try:
+                original_error.diagnostic.update(_startup_log(run, original_error.diagnostic["service"]))
+            except caller.EmbeddedNokiyError as error:
+                original_error.diagnostic["log_capture_blocker"] = error.code
         if cleanup_error is None:
             timing.observe("cleanup")
         elif original_error is None:
@@ -1275,14 +1902,29 @@ def execute_full_core(request: caller.EmbeddedNokiyRequest) -> dict[str, Any]:
         raise caller.EmbeddedNokiyError("NOKIY_EMBEDDED_UNCERTAIN_PRIOR_ATTEMPT", "symlink run directory")
     if (run / "terminal.json").is_file():
         return caller.read_terminal(request.artifact_root, request.request_id)
+    try:
+        root_parent = inherited_root_parent()
+    except (OSError, ProcessScopeError) as error:
+        raise caller.EmbeddedNokiyError("NOKIY_FULL_CORE_NATIVE_SCOPE_UNAVAILABLE", str(error)) from error
     ready, runtime, capsule, jspace = prepare(request)
     if ready["status"] != "READY":
         raise caller.EmbeddedNokiyError(ready["first_typed_blocker"],
                                       "scoped verifier cannot start inside the inherited process fence")
+    if root_parent is not None and jspace.get("verifier_commands"):
+        raise caller.EmbeddedNokiyError("NOKIY_FULL_CORE_VERIFIER_OUTER_SCOPE_REQUIRED",
+                                      "focused verifiers still require an external parent scope")
     try:
         run.mkdir(mode=0o700)
     except FileExistsError as error:
         raise caller.EmbeddedNokiyError("NOKIY_EMBEDDED_UNCERTAIN_PRIOR_ATTEMPT", "run exists without terminal") from error
+    # Held until the terminal is sealed, so read-result waits for this live run instead of
+    # reporting it as interrupted; the kernel releases the lock if this process dies.
+    with caller.execution_lock(run):
+        return _execute_created_run(request, run, root_parent, ready, runtime, capsule, jspace)
+
+
+def _execute_created_run(request: caller.EmbeddedNokiyRequest, run: Path, root_parent, ready: dict[str, Any],
+                         runtime, capsule: dict[str, Any], jspace: dict[str, Any]) -> dict[str, Any]:
     caller._write_create_only(run / "request-identity.json", request.to_wire())
     caller._write_create_only(run / "capsule.json", capsule)
     caller._write_create_only(run / "jspace.json", jspace)
@@ -1300,47 +1942,102 @@ def execute_full_core(request: caller.EmbeddedNokiyRequest) -> dict[str, Any]:
     caller._write_create_only(run / "execution.json", {"request": request.to_wire(include_identity=False)})
     with (run / "prompt.txt").open("xb") as output:
         output.write(_provider_prompt(request.prompt, jspace,
-                                     terminal_delivery=request.terminal_delivery).encode())
+                                     terminal_delivery=request.terminal_delivery,
+                                     admitted_digest_reference=ready.get(
+                                         "admitted_source_digest_reference") is True,
+                                     observed_digest_reference=ready.get(
+                                         "observed_source_digest_reference") is True,
+                                     directory_source_read=ready.get("directory_source_read") is True,
+                                     capsule=capsule,
+                                     capsule_digest_reference=ready.get(
+                                         "capsule_source_digest_reference") is True).encode())
     # Add a signal-only fence; do not relax inherited filesystem/network policy.
     # Actual tool writes remain under the full core's sandbox and J-Space contract.
     fence = "(version 1) (allow default) (deny signal) (allow signal (target same-sandbox))"
     command = ["/usr/bin/sandbox-exec", "-p", fence, sys.executable, "-B", "-m",
                MODULE, "--supervise", str(run / "execution.json"), "--parent-pid", str(os.getpid())]
+    from .inspect_context import FENCE_ENV, profile_path, tool_env as inspect_tool_env
+    inspect_profile = profile_path(jspace)
+    if inspect_profile is not None:
+        # Inspect runs replace the signal-only fence with the bound write-confined profile,
+        # which keeps the same signal rules; every engine process and worker shell inherits it.
+        command[1:3] = ["-f", str(inspect_profile)]
     trajectory, errors = run / "supervision.json", run / "supervision.stderr"
     engine, scope = {}, {}
     supervision_reference = trajectory_reference = None
     failure = None
     wall = 0.0
     code = -1
-    channel = verifier = None
+    channel = verifier = parent_shell = None
     env = _scrub_receipt_binding(os.environ)
     env.pop("NOKIY_VERIFIER_FD", None)
     kwargs = {}
     try:
-        if jspace.get("verifier_commands"):
+        if jspace.get("verifier_commands") or jspace.get("parent_shell"):
             from .verifier_channel import VerifierChannel
-            from .verifier_parent import ParentVerifier
             deadline = None if request.timeout_seconds is None else time.monotonic() + request.timeout_seconds
-            # prepare/_verify_context already checked authority/content digests
-            # and live DCF freshness for precisely this action-scoped generation.
-            generation = capsule.get("dcf_generation", {})
-            validated_dcf_generation = (generation
-                if jspace.get("schema_version") == "jspace_contract_v2"
-                and ready.get("context", {}).get("context_mode") == "dcf_jspace_required"
-                and "action_freshness" in generation else None)
-            verifier = ParentVerifier(request.workspace, jspace, runtime.artifacts["tura_router"],
-                                      deadline, validated_dcf_generation=validated_dcf_generation)
+            if jspace.get("verifier_commands"):
+                from .verifier_parent import ParentVerifier
+                # prepare/_verify_context already checked authority/content digests
+                # and live DCF freshness for precisely this action-scoped generation.
+                generation = capsule.get("dcf_generation", {})
+                validated_dcf_generation = (generation
+                    if jspace.get("schema_version") == "jspace_contract_v2"
+                    and ready.get("context", {}).get("context_mode") == "dcf_jspace_required"
+                    and "action_freshness" in generation else None)
+                verifier = ParentVerifier(request.workspace, jspace, runtime.artifacts["tura_router"],
+                                          deadline, validated_dcf_generation=validated_dcf_generation,
+                                          diagnostic_root=run, request_id=request.request_id,
+                                          request_sha256=request.request_sha256)
+            if jspace.get("parent_shell"):
+                # Shell lines of a writing action run here, under the profile the contract binds.
+                from .parent_shell import ParentShell
+                parent_shell = ParentShell(request.workspace, jspace, request.artifact_root)
             # Transport/handler limits are per operation, never an idle lifetime.
-            channel_timeout = (max(grant["timeout_seconds"] for grant in jspace["verifier_commands"])
+            channel_timeout = (max([grant["timeout_seconds"] for grant in jspace.get("verifier_commands") or []]
+                                   or [300])
                                if request.timeout_seconds is None else request.timeout_seconds) + 20
-            channel = VerifierChannel(verifier.binding, len(jspace["verifier_commands"]), verifier,
-                                      timeout_seconds=channel_timeout).__enter__()
+            channel = VerifierChannel(jspace["authorization_semantic_sha256"],
+                                      len(jspace.get("verifier_commands") or []),
+                                      verifier.handle_request if verifier is not None else None,
+                                      timeout_seconds=channel_timeout,
+                                      shell_handler=parent_shell.handle_request if parent_shell else None,
+                                      ).__enter__()
             env["NOKIY_VERIFIER_FD"] = str(channel.router_fd)
             kwargs = {"pass_fds":(channel.router_fd,), "on_spawn":channel.release_router_copy}
-        code, wall, failure, _ = caller._run_process(command, cwd=request.workspace,
-            env=env, stdin_path=run / "prompt.txt", stdout_path=trajectory,
-            stderr_path=errors, timeout=None if request.timeout_seconds is None else request.timeout_seconds + 30,
-            output_limit=MAX_SUPERVISION_BYTES, **kwargs)
+        if root_parent is None:
+            with ExitStack() as fence_services:
+                if inspect_profile is not None:
+                    env[FENCE_ENV] = jspace["inspect_shell"]["profile_sha256"]
+                    env["TMPDIR"] = str(inspect_profile.parent / "scratch")
+                    env["TMPPREFIX"] = str(inspect_profile.parent / "scratch" / "zsh")
+                    env.update(inspect_tool_env(inspect_profile.parent))
+                    # Seatbelt refuses setuid /bin/ps; serve ps from outside the fence for this run.
+                    from .process_broker import ProcessBroker, shell_env
+                    try:
+                        env.update(shell_env(inspect_profile.parent, sys.executable, env.get("PATH", "")))
+                    except OSError:
+                        pass
+                    fence_services.enter_context(ProcessBroker.for_root(inspect_profile.parent))
+                code, wall, failure, _ = caller._run_process(command, cwd=request.workspace,
+                    env=env, stdin_path=run / "prompt.txt", stdout_path=trajectory,
+                    stderr_path=errors, timeout=None if request.timeout_seconds is None else request.timeout_seconds + 30,
+                    output_limit=MAX_SUPERVISION_BYTES, **kwargs)
+        else:
+            # The caller already owns the native command's kernel signal scope.
+            # Stay at that root; a child supervisor would also own this caller.
+            started = time.monotonic()
+            with caller._cancellation_signals() as cancelled, trajectory.open("xb") as output, errors.open("xb") as stderr:
+                if cancelled:
+                    raise caller.EmbeddedNokiyError("NOKIY_EMBEDDED_CANCELLED", "cancelled before spawn")
+                supervised, summary = _supervise_request(request, run / "execution.json", root_parent,
+                    SimpleNamespace(is_set=lambda: bool(cancelled)), environment=env)
+                summary["scope"]["isolation_source"] = "native_command_root"
+                output.write((_summary_json(summary, MAX_SUPERVISION_BYTES) + "\n").encode())
+                stderr.write(supervised.stderr)
+                failure = "NOKIY_EMBEDDED_CANCELLED" if cancelled else None
+                code = 2 if failure or summary["failure"] else 0
+            wall = time.monotonic() - started
         outcome, supervision_raw = caller._load_json_snapshot(
             trajectory, limit=MAX_SUPERVISION_BYTES, code="NOKIY_FULL_CORE_SUPERVISION_INVALID")
         supervision_reference = {"path": str(trajectory),
@@ -1366,11 +2063,16 @@ def execute_full_core(request: caller.EmbeddedNokiyRequest) -> dict[str, Any]:
             except RuntimeError:
                 failure = failure or "NOKIY_VERIFIER_CHANNEL_CLEANUP_UNPROVEN"
             failure = failure or channel.failure
+        if parent_shell is not None:
+            parent_shell.close()
     cleanup = scope.get("engine_reaped") is True and scope.get("no_live_descendants") is True and not scope.get("cleanup_error")
     if verifier is not None:
         scope["parent_verifier"] = {"calls":verifier.calls, "cleanup_pass":verifier.cleanup_pass,
                                     "channel_failure":(channel.failure or "")[:2048] if channel else None}
         cleanup = cleanup and verifier.cleanup_pass
+    if parent_shell is not None:
+        scope["parent_shell"] = {"calls": parent_shell.calls,
+                                 "channel_failure": (channel.failure or "")[:2048] if channel else None}
     if not cleanup:
         failure = failure or "NOKIY_EMBEDDED_CLEANUP_UNPROVEN"
     if request.require_tool_call and engine.get("tool_loop", {}).get("successful_count", 0) == 0:
@@ -1382,27 +2084,31 @@ def execute_full_core(request: caller.EmbeddedNokiyRequest) -> dict[str, Any]:
             request.workspace, capsule, jspace, after_execution=True)
     except caller.EmbeddedNokiyError as error:
         failure = failure or error.code
-    preview, truncated, result_artifact = "", False, None
-    try:
-        preview, truncated, result_artifact = _result_projection(
-            run, engine.get("final_text", ""), engine.get("result_truncated", False),
-            engine.get("result_artifact"), request.max_result_bytes)
-    except (OSError, UnicodeError, caller.EmbeddedNokiyError) as error:
-        failure = failure or getattr(error, "code", "NOKIY_FULL_CORE_RESULT_INVALID")
-    if not preview:
-        failure = failure or "NOKIY_EMBEDDED_RESULT_MISSING"
     delivery = _TerminalEvidence(request)
+    delivery_failure = None
     try:
         if engine.get("turn_completed") is True:
             if engine.get("terminal_evidence") is not None:
                 delivery.observe(engine["terminal_evidence"])
             delivery.validate_projection(engine)
-            evidence_text = delivery.result_text()
-            if evidence_text is not None and (preview != evidence_text or truncated or result_artifact is not None):
-                raise caller.EmbeddedNokiyError("NOKIY_FULL_CORE_RESULT_INVALID", "terminal marker result differs")
     except caller.EmbeddedNokiyError as error:
-        failure = failure or error.code
+        delivery_failure = error.code
         delivery = _TerminalEvidence(request)
+    preview, truncated, result_artifact = "", False, None
+    try:
+        preview, truncated, result_artifact = _result_projection(
+            run, engine.get("final_text", ""), engine.get("result_truncated", False),
+            None if delivery.marker is not None else engine.get("result_artifact"), request.max_result_bytes)
+    except (OSError, UnicodeError, caller.EmbeddedNokiyError) as error:
+        failure = failure or getattr(error, "code", "NOKIY_FULL_CORE_RESULT_INVALID")
+    if not preview:
+        failure = failure or "NOKIY_EMBEDDED_RESULT_MISSING"
+    failure = failure or delivery_failure
+    evidence_text = delivery.result_text()
+    if evidence_text is not None and (preview != evidence_text or truncated):
+        failure = failure or "NOKIY_FULL_CORE_RESULT_INVALID"
+    handoff_fields = (_EvidenceHandoff.unavailable("HANDOFF_EVIDENCE_UNAVAILABLE")
+                      if delivery.marker is not None and "result_artifact_source" in engine else {})
     command_evidence = engine.get("command_evidence")
     evidence_artifact = None
     if isinstance(command_evidence, dict):
@@ -1411,6 +2117,7 @@ def execute_full_core(request: caller.EmbeddedNokiyRequest) -> dict[str, Any]:
         evidence_artifact = caller._record(evidence_path)
     file_evidence = None
     file_artifact = None
+    failure_diagnostic = None
     core_path = run / "core.jsonl"
     if core_path.exists() or core_path.is_symlink() or engine.get("turn_completed") is True:
         try:
@@ -1418,13 +2125,25 @@ def execute_full_core(request: caller.EmbeddedNokiyRequest) -> dict[str, Any]:
                              if engine.get("turn_completed") is True else None)
             trajectory_reference = _record_artifact(core_path, reference=expected_core)
             events = _Trajectory(core_path, request.max_trajectory_bytes, reference=trajectory_reference)
-            file_evidence = file_change_evidence.produce(events, request, jspace)
+            diagnostic = _FailedTurnDiagnostic(request) if failure is not None else None
+            observed_events = diagnostic.events(events) if diagnostic is not None else events
+            correlated_delivery = _TerminalEvidence(request)
+            handoff = _EvidenceHandoff(request, run)
+            file_evidence = file_change_evidence.produce(
+                handoff.events(observed_events, correlated_delivery), request, jspace)
+            if engine.get("turn_completed") is True:
+                correlated_delivery.validate_projection(engine)
+                if correlated_delivery.marker is not None:
+                    handoff_fields = handoff.project(engine, correlated_delivery.marker)
+            if diagnostic is not None:
+                failure_diagnostic = diagnostic.finish(trajectory_reference)
             if file_evidence is not None:
                 file_path = run / "file-change-evidence.json"
                 caller._write_create_only(file_path, file_evidence)
                 file_artifact = caller._record(file_path)
         except (OSError, ValueError, TypeError, KeyError, UnicodeError,
                 caller.EmbeddedNokiyError) as error:
+            failure_diagnostic = None
             failure = failure or (str(error) if isinstance(error, file_change_evidence.EffectError)
                                   else getattr(error, "code", "FILE_CHANGE_CAPTURE_UNAVAILABLE"))
     # Closeout binds the same physical evidence read by the engine and parent.
@@ -1437,6 +2156,7 @@ def execute_full_core(request: caller.EmbeddedNokiyRequest) -> dict[str, Any]:
             elif artifact_path == trajectory and (artifact_path.exists() or artifact_path.is_symlink()):
                 supervision_reference = _record_artifact(artifact_path, limit=artifact_limit)
         except caller.EmbeddedNokiyError as error:
+            failure_diagnostic = None
             failure = failure or error.code
     provider_observation = _provider_observation(engine.get("provider_observation"))
     phase_observation = _recover_phase_timing(run, request, engine)
@@ -1467,7 +2187,14 @@ def execute_full_core(request: caller.EmbeddedNokiyRequest) -> dict[str, Any]:
         "trajectory_artifact": trajectory_reference,
         "supervision_artifact": supervision_reference,
         **delivery.fields(),
+        **handoff_fields,
     }
+    failure_diagnostic = valid_provider_failure_diagnostic(failure_diagnostic, receipt)
+    if isinstance(engine.get("startup_failure_diagnostic"), dict):
+        receipt["startup_failure_diagnostic"] = engine["startup_failure_diagnostic"]
+    if failure_diagnostic is not None:
+        failure_diagnostic = provider_failure_diagnostic_with_snapshot(failure_diagnostic, receipt, run)
+        receipt["provider_failure_diagnostic"] = failure_diagnostic
     if file_artifact is not None:
         receipt["file_change_evidence_artifact"] = file_artifact
         receipt["original_jspace_artifact"] = caller._record(run / "jspace-original.json")
@@ -1478,6 +2205,8 @@ def execute_full_core(request: caller.EmbeddedNokiyRequest) -> dict[str, Any]:
     if len(caller._canonical_bytes(receipt)) > caller.MAX_TERMINAL_BYTES:
         raise caller.EmbeddedNokiyError("NOKIY_EMBEDDED_TERMINAL_TOO_LARGE", "full-core terminal too large")
     caller._write_create_only(run / "terminal.json", receipt)
+    from .session_log_retention import retire
+    retire(run, receipt)
     return receipt
 
 
@@ -1486,6 +2215,20 @@ def _summary_json(value: dict[str, Any], limit: int) -> str:
     if len(encoded) + 1 > limit:
         raise caller.EmbeddedNokiyError("NOKIY_FULL_CORE_SUMMARY_LIMIT_EXCEEDED", "supervision summary too large")
     return encoded.decode("utf-8")
+
+
+def _supervise_request(request, spec, parent_pid, cancelled, *, environment=None, pass_fds=()):
+    outcome = supervise([sys.executable, "-B", "-m", MODULE, "--engine", str(spec)],
+        cwd=str(request.workspace), env=_supervisor_environment(request, environment),
+        input_bytes=b"", timeout=request.timeout_seconds, cancelled=cancelled,
+        max_stdout=MAX_ENGINE_SUMMARY_BYTES, max_stderr=65536,
+        parent_pid=parent_pid, pass_fds=pass_fds)
+    result = json.loads(outcome.stdout, object_pairs_hook=caller._unique_object,
+                        parse_constant=caller._invalid_constant) if outcome.stdout else {}
+    failure = outcome.failure or result.get("failure")
+    if outcome.returncode != 0:
+        failure = failure or "NOKIY_FULL_CORE_ENGINE_FAILED"
+    return outcome, {"result": result, "scope": outcome.scope, "failure": failure}
 
 
 def main() -> int:
@@ -1500,7 +2243,10 @@ def main() -> int:
             print(_summary_json(_engine(args.engine), MAX_ENGINE_SUMMARY_BYTES))
             return 0
         except Exception as error:
-            print(json.dumps({"failure": getattr(error, "code", type(error).__name__)}))
+            result = {"failure": getattr(error, "code", type(error).__name__)}
+            if isinstance(error, _ServiceStartupError):
+                result["startup_failure_diagnostic"] = error.diagnostic
+            print(_summary_json(result, MAX_ENGINE_SUMMARY_BYTES))
             return 2
     spec = caller._load_json(args.supervise, limit=caller.MAX_REQUEST_BYTES, code="NOKIY_FULL_CORE_SPEC_INVALID")
     request = caller.decode_request(spec["request"])
@@ -1508,17 +2254,10 @@ def main() -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda _sig, _frame: cancelled.set())
     try:
-        outcome = supervise([sys.executable, "-B", "-m", MODULE, "--engine", str(args.supervise)],
-            cwd=str(request.workspace), env=_supervisor_environment(request), input_bytes=b"", timeout=request.timeout_seconds,
-            cancelled=cancelled, max_stdout=MAX_ENGINE_SUMMARY_BYTES, max_stderr=65536,
-            parent_pid=args.parent_pid, pass_fds=_verifier_fd())
-        result = json.loads(outcome.stdout, object_pairs_hook=caller._unique_object,
-                            parse_constant=caller._invalid_constant) if outcome.stdout else {}
-        failure = outcome.failure or result.get("failure")
-        if outcome.returncode != 0:
-            failure = failure or "NOKIY_FULL_CORE_ENGINE_FAILED"
-        print(_summary_json({"result": result, "scope": outcome.scope, "failure": failure}, MAX_SUPERVISION_BYTES))
-        return 2 if failure else 0
+        _, summary = _supervise_request(request, args.supervise, args.parent_pid, cancelled,
+                                       pass_fds=_verifier_fd())
+        print(_summary_json(summary, MAX_SUPERVISION_BYTES))
+        return 2 if summary["failure"] else 0
     except Exception as error:
         print(json.dumps({"failure": getattr(error, "code", type(error).__name__), "scope": {}}))
         return 2

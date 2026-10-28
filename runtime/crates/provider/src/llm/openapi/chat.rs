@@ -142,6 +142,7 @@ pub async fn call_with_stream_events(
         content,
         raw: data,
         metrics: Some(metrics),
+        failed_attempts: Vec::new(),
     })
 }
 
@@ -512,6 +513,8 @@ async fn stream_call(
             finish_reason: stream_state.finish_reason.clone(),
             provider_request_id: None,
             raw_usage: None,
+            transport_timing: None,
+            request_profile: None,
         }
     };
     record_context_utilization(&mut metrics);
@@ -520,6 +523,7 @@ async fn stream_call(
         content,
         raw: json!({ "tool_calls": tool_calls, "usage": stream_state.stream_usage }),
         metrics: Some(metrics),
+        failed_attempts: Vec::new(),
     })
 }
 
@@ -886,6 +890,7 @@ pub(crate) async fn force_search(
         content,
         raw: data,
         metrics: Some(metrics),
+        failed_attempts: Vec::new(),
     })
 }
 

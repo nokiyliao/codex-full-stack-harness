@@ -94,6 +94,10 @@ class DcfBoundary:
         for module in (self.jspace, runtime_module):
             if not Path(module.__file__).resolve().is_relative_to(self.root):
                 raise GraphEntryError("GRAPH_DCF_IMPORT_ROOT_MISMATCH")
+        # Verifier grants follow the installed runtime's grammar, not this DCF's generation.
+        from .dcf_prepare import install_operator_write_admission, install_verifier_grammar
+        install_verifier_grammar(self.jspace)
+        install_operator_write_admission(self.jspace, self.root)
         self.runtime = runtime_module.DcfRuntime(self.root)
 
     def verify(self, contract: dict[str, Any]) -> None:

@@ -464,6 +464,11 @@ fn runtime_session_log_business_flow_restart_marks_running_session_interrupted()
 
     let restarted = ServiceThread::start()?;
     wait_for_session(&client, &session_id, |snapshot| {
+        snapshot.lifecycle_projection.state == SessionState::Running
+            && snapshot.message_count == 1
+    })?;
+    typed_session::interrupt_via_service(&session_id)?;
+    wait_for_session(&client, &session_id, |snapshot| {
         snapshot.lifecycle_projection.state == SessionState::Interrupted
             && snapshot.message_count == 1
     })?;
@@ -532,6 +537,11 @@ fn runtime_session_log_business_flow_resumes_interrupted_session_without_losing_
     })?;
 
     let restarted = ServiceThread::start()?;
+    wait_for_session(&client, &session_id, |snapshot| {
+        snapshot.lifecycle_projection.state == SessionState::Running
+            && snapshot.message_count == 2
+    })?;
+    typed_session::interrupt_via_service(&session_id)?;
     wait_for_session(&client, &session_id, |snapshot| {
         snapshot.lifecycle_projection.state == SessionState::Interrupted
             && snapshot.message_count == 2

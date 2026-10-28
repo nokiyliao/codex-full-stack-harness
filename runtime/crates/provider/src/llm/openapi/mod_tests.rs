@@ -6,12 +6,12 @@ use crate::tura_llm::CallOptions;
 use serde_json::json;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::{OnceLock, mpsc};
-use tokio::sync::Mutex;
+use std::sync::mpsc;
 
+/// The crate-wide env lock: auth tests also set OPENAI_ACCOUNT_ID, so a
+/// module-private lock let them overwrite it mid-request.
 async fn codex_endpoint_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().await
+    crate::test_support::env_lock_async().await
 }
 
 #[test]
@@ -247,7 +247,10 @@ fn provider_payload_keeps_explicit_ultra_reasoning_for_gpt_6() {
     };
     let messages = vec![json!({"role": "user", "content": "ping"})];
     for model in ["gpt-6-astra", "gpt-6.1-sol"] {
-        assert_eq!(build_codex_oauth_payload(model, &messages, &options)["reasoning"]["effort"], "ultra");
+        assert_eq!(
+            build_codex_oauth_payload(model, &messages, &options)["reasoning"]["effort"],
+            "ultra"
+        );
     }
 }
 
@@ -713,8 +716,7 @@ async fn assert_codex_oauth_request(model: &str, effort: &str) {
         ..CallOptions::default()
     };
 
-    let result =
-        super::codex_oauth_call(model, "test-token", &messages, &options, None).await;
+    let result = super::codex_oauth_call(model, "test-token", &messages, &options, None).await;
 
     match previous_endpoint {
         // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
@@ -910,6 +912,10 @@ async fn codex_oauth_stream_reads_completed_usage_after_tool_call() {
 
     let metrics = result.expect("codex oauth call").metrics.expect("metrics");
     assert_eq!(metrics.usage.cached_input_tokens, Some(2048));
+    let timing = metrics.transport_timing.expect("local transport timing");
+    assert_eq!(timing.transport, "http_sse");
+    assert!(timing.response_headers_ms <= timing.completed_ms);
+    assert_eq!(timing.first_output_event_ms, None);
     assert!(metrics.cache_hit);
 }
 
@@ -1030,7 +1036,7 @@ fn codex_oauth_payload_keeps_system_messages_in_input() {
 
     assert_eq!(
         payload["instructions"],
-        "Follow the user request and Operation Manual, and answer concisely."
+        "Follow the user request and Operation Manual. Provide the requested deliverable, coverage, format, and detail; be concise when requested."
     );
     assert_eq!(payload["input"][0]["role"], "system");
     assert_eq!(
@@ -1055,6 +1061,169 @@ fn codex_oauth_payload_keeps_system_messages_in_input() {
     assert_eq!(payload["tool_choice"], "auto");
 }
 
+#[test]
+fn responses_payload_preserves_structured_review_request_and_evidence_history() {
+    let system = "Read-only review; parent owns acceptance.";
+    let runtime = "Runtime mode: evidence_only. No mutation authority.";
+    let request = concat!(
+        "Review the change and provide substantive analysis, not a completion report.\r\n",
+        "## Findings\r\nExplain the cause with source citations.\r\n",
+        "## Alternatives\r\nCompare trade-offs in a Markdown table.\r\n",
+        "## Recommendation\r\nState uncertainties and a prioritized next step.\r\n",
+        "Preserve detail and symbols: café → Δ.  \r\n",
+    );
+    let messages = vec![
+        json!({"role": "system", "content": system}),
+        json!({"role": "user", "content": request}),
+        json!({"role": "system", "content": runtime}),
+        json!({"type": "function_call", "call_id": "call_review", "name": "source_read", "arguments": "{\"path\":\"src/lib.rs\"}"}),
+        json!({"type": "function_call_output", "call_id": "call_review", "output": "src/lib.rs:8: observed ≠ requested\nNo permission granted.\n"}),
+    ];
+
+    for (provider, model) in [
+        ("codex", "gpt-6.1-sol"),
+        ("chatgpt", "gpt-6.1-sol"),
+        ("grok", "grok-4.3"),
+        ("qwen", "qwen3.7-max"),
+    ] {
+        let payload = build_responses_payload_for_provider(
+            provider,
+            model,
+            &messages,
+            &CallOptions::default(),
+        );
+        let input = payload["input"].as_array().expect("input");
+        assert_eq!(input.len(), messages.len(), "{provider}");
+        for (index, text) in [(0, system), (2, runtime)] {
+            assert_eq!(input[index]["role"], "system", "{provider}");
+            let expected_content = if provider == "codex" {
+                json!([{ "type": "input_text", "text": text }])
+            } else {
+                json!(text)
+            };
+            assert_eq!(input[index]["content"], expected_content, "{provider}");
+        }
+        assert_eq!(input[1]["role"], "user", "{provider}");
+        let delivered_request = if provider == "codex" {
+            input[1]["content"][0]["text"].as_str()
+        } else {
+            input[1]["content"].as_str()
+        }
+        .expect("user text");
+        assert_eq!(
+            delivered_request.as_bytes(),
+            request.as_bytes(),
+            "{provider}"
+        );
+        assert_eq!(input[3], messages[3], "{provider}");
+        assert_eq!(input[4], messages[4], "{provider}");
+    }
+}
+
+#[test]
+fn responses_payload_delivery_guidance_preserves_options_without_extra_turns() {
+    let messages = vec![json!({"role": "user", "content": "Return a concise review."})];
+    for (provider, model, effort) in [
+        ("codex", "gpt-6.1-sol", "max"),
+        ("chatgpt", "gpt-6.1-sol", "max"),
+        ("grok", "grok-4.3", "high"),
+        ("qwen", "qwen3.7-max", "high"),
+    ] {
+        let default_payload = build_responses_payload_for_provider(
+            provider,
+            model,
+            &messages,
+            &CallOptions::default(),
+        );
+        let options = CallOptions {
+            reasoning_effort: Some(effort.to_string()),
+            extra_body: Some(json!({"max_output_tokens": 4096})),
+            ..CallOptions::default()
+        };
+        let explicit_payload =
+            build_responses_payload_for_provider(provider, model, &messages, &options);
+
+        for payload in [&default_payload, &explicit_payload] {
+            assert_eq!(
+                payload["instructions"],
+                "Follow the user request and Operation Manual. Provide the requested deliverable, coverage, format, and detail; be concise when requested."
+            );
+            assert_eq!(payload["model"], model, "{provider}");
+            assert_eq!(
+                payload["input"].as_array().expect("input").len(),
+                messages.len(),
+                "{provider}"
+            );
+            assert_eq!(payload["tool_choice"], "auto", "{provider}");
+            assert_eq!(payload["store"], false, "{provider}");
+            assert_eq!(payload["stream"], true, "{provider}");
+        }
+        assert!(default_payload.get("reasoning").is_none(), "{provider}");
+        assert!(
+            default_payload.get("max_output_tokens").is_none(),
+            "{provider}"
+        );
+        assert_eq!(
+            explicit_payload["reasoning"],
+            json!({"effort": effort}),
+            "{provider}"
+        );
+        assert_eq!(explicit_payload["max_output_tokens"], 4096, "{provider}");
+    }
+}
+
+#[test]
+fn responses_terminal_tool_choice_preserves_provider_tool_schema() {
+    let messages = vec![json!({"role": "user", "content": "Return the final answers."})];
+    let tools = vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "command_run",
+                "description": "keep the ordinary schema",
+                "parameters": {"type": "object", "additionalProperties": false}
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {"name": "retry_tool", "parameters": {"type": "object"}}
+        }),
+    ];
+    for provider in ["codex", "chatgpt"] {
+        let normal = build_responses_payload_for_provider(
+            provider,
+            "gpt-6.1-sol",
+            &messages,
+            &CallOptions {
+                tools: Some(tools.clone()),
+                ..CallOptions::default()
+            },
+        );
+        let terminal = build_responses_payload_for_provider(
+            provider,
+            "gpt-6.1-sol",
+            &messages,
+            &CallOptions {
+                tools: Some(tools.clone()),
+                tool_choice: Some(json!("none")),
+                ..CallOptions::default()
+            },
+        );
+        assert_eq!(normal["tool_choice"], "auto", "{provider}");
+        assert_eq!(terminal["tool_choice"], "none", "{provider}");
+        assert_eq!(
+            terminal["tools"].as_array().expect("retained tools").len(),
+            2
+        );
+        let mut expected = normal;
+        expected["tool_choice"] = json!("none");
+        assert_eq!(
+            terminal, expected,
+            "only tool_choice may change: {provider}"
+        );
+    }
+}
+
 fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
     headers.lines().find_map(|line| {
         let (candidate, value) = line.split_once(':')?;
@@ -1073,6 +1242,35 @@ fn command_run_streaming_waits_for_complete_json_arguments() {
     });
 
     assert!(super::ready_streaming_tool_call(call).is_none());
+}
+
+#[test]
+fn command_run_command_streaming_preserves_structured_terminal_arguments() {
+    let command = json!({"command_type":"task_status", "command_line":"", "step":1,
+        "arguments":{"status":"done", "final_reply":{"answer":"Braces {} and [] with \"quote\" and slash \\ and newline\n", "label":"\u{4f60}\u{597d}"}}});
+    let arguments = json!({"commands":[command.clone()]}).to_string();
+    let boundaries = arguments.char_indices().map(|(index, _)| index)
+        .chain(std::iter::once(arguments.len()));
+    for boundary in boundaries {
+        let mut collector = super::CodexCommandRunCommandCollector::default();
+        collector.push_event(&json!({"type":"response.output_item.added", "item":{
+            "id":"fc_structured", "call_id":"call_structured", "type":"function_call", "name":"command_run"}}));
+        let mut ready = collector.push_event(&json!({"type":"response.function_call_arguments.delta",
+            "item_id":"fc_structured", "delta":&arguments[..boundary]}));
+        ready.extend(collector.push_event(&json!({"type":"response.function_call_arguments.delta",
+            "item_id":"fc_structured", "delta":&arguments[boundary..]})));
+        assert_eq!(ready.len(), 1, "one terminal command at split {boundary}");
+        match &ready[0] {
+            crate::tura_llm::ProviderStreamEvent::CommandRunCommandReady { command: received, .. } => {
+                assert_eq!(received["arguments"], command["arguments"]);
+                assert_eq!(received["command_line"], "");
+                assert_eq!(received["command_type"], "task_status");
+            }
+            other => panic!("unexpected provider event: {other:?}"),
+        }
+        assert!(collector.push_event(&json!({"type":"response.function_call_arguments.done",
+            "item_id":"fc_structured", "arguments":arguments})).is_empty());
+    }
 }
 
 #[test]
@@ -1435,6 +1633,130 @@ fn codex_responses_stream_preserves_tool_call_after_completed_message_item() {
 }
 
 #[test]
+fn codex_normalization_retains_only_safe_public_message_phase_and_text() {
+    for phase in ["commentary", "final_answer"] {
+        let message = json!({
+            "type": "message", "role": "assistant", "phase": phase,
+            "content": [
+                {"type": "output_text", "text": "Done."},
+                {"type": "reasoning_text", "text": "PRIVATE_PART_SENTINEL"}
+            ],
+            "summary": "PRIVATE_SUMMARY_SENTINEL",
+            "encrypted_content": "PRIVATE_ENCRYPTED_SENTINEL"
+        });
+        let reasoning = json!({
+            "type": "reasoning", "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "PRIVATE_REASONING_SENTINEL"}]
+        });
+        let tool = json!({
+            "type": "function_call", "call_id": "call_done", "name": "command_run",
+            "arguments": "{\"commands\":[{\"command_type\":\"task_status\",\"command_line\":\"{\\\"status\\\":\\\"done\\\"}\",\"step\":1}]}"
+        });
+        for data in [
+            json!({"output": [reasoning, message, tool]}),
+            json!({"output_text": "Done.", "events": [
+                {"type": "response.output_item.done", "item": reasoning},
+                {"type": "response.output_item.done", "item": message},
+                {"type": "response.output_item.done", "item": tool}
+            ]}),
+        ] {
+            let normalized = super::normalize_codex_response_content(&data);
+            assert_eq!(normalized["text"], "Done.");
+            assert_eq!(
+                normalized["public_messages"],
+                json!([{"phase": phase, "text": "Done."}])
+            );
+            assert_eq!(normalized["tool_calls"][0]["id"], "call_done");
+            assert_eq!(
+                normalized["tool_calls"][0]["function"]["name"],
+                "command_run"
+            );
+            assert!(!normalized.to_string().contains("PRIVATE_"));
+            assert_eq!(
+                crate::response_extraction::extract_response_text(&normalized).as_deref(),
+                Some("Done.")
+            );
+            assert_eq!(
+                crate::response_extraction::extract_tool_calls(&normalized).len(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_mixed_phases_preserve_each_public_message_and_all_text() {
+    let normalized = super::normalize_codex_response_content(&json!({"output": [
+        {"type": "message", "role": "assistant", "phase": "commentary",
+         "content": [{"type": "output_text", "text": "Progress."}]},
+        {"type": "message", "role": "assistant", "phase": "final_answer", "content": []},
+        {"type": "message", "role": "assistant", "phase": "final_answer",
+         "content": [{"type": "output_text", "text": "Answer."}]},
+        {"type": "message", "role": "assistant",
+         "content": [{"type": "output_text", "text": "Legacy."}]}
+    ]}));
+    assert_eq!(normalized["text"], "Progress.\nAnswer.\nLegacy.");
+    assert_eq!(
+        normalized["public_messages"],
+        json!([
+            {"phase": "commentary", "text": "Progress."},
+            {"phase": "final_answer", "text": ""},
+            {"phase": "final_answer", "text": "Answer."},
+            {"phase": null, "text": "Legacy."}
+        ])
+    );
+}
+
+#[test]
+fn codex_unphased_normalization_keeps_legacy_content_shapes() {
+    for phase in [serde_json::Value::Null, json!("UNKNOWN_PHASE_SENTINEL")] {
+        assert_eq!(
+            super::normalize_codex_response_content(&json!({"output": [
+                {"type": "message", "role": "assistant", "phase": phase,
+                 "content": [{"type": "output_text", "text": "Legacy."}]}
+            ]})),
+            json!("Legacy.")
+        );
+    }
+    assert_eq!(
+        super::normalize_codex_response_content(&json!({"output_text": "Legacy."})),
+        json!("Legacy.")
+    );
+    assert_eq!(
+        super::normalize_codex_response_content(&json!({"output": [], "output_text": ""})),
+        json!("")
+    );
+}
+
+#[test]
+fn codex_empty_phased_messages_and_final_json_fences_remain_compatible() {
+    let empty = super::normalize_codex_response_content(&json!({"output": [
+        {"type": "message", "role": "assistant", "phase": "commentary", "content": []},
+        {"type": "message", "role": "assistant", "phase": "final_answer",
+         "content": [{"type": "output_text", "text": " \t"}]}
+    ]}));
+    assert!(
+        empty["text"]
+            .as_str()
+            .expect("public text")
+            .trim()
+            .is_empty()
+    );
+    assert_eq!(
+        empty["public_messages"],
+        json!([
+            {"phase": "commentary", "text": ""},
+            {"phase": "final_answer", "text": " \t"}
+        ])
+    );
+    let final_json = super::normalize_codex_response_content(&json!({"output": [
+        {"type": "message", "role": "assistant", "phase": "final_answer",
+         "content": [{"type": "output_text", "text": "```json\n{\"answer\":42}\n```"}]}
+    ]}));
+    assert_eq!(final_json["text"], "{\"answer\":42}");
+}
+
+#[test]
 fn codex_event_tool_calls_does_not_emit_incomplete_command_run_arguments() {
     let events = vec![
         json!({
@@ -1583,7 +1905,72 @@ fn responses_transport_fixture(
     (format!("http://{addr}/URL_SENTINEL"), join)
 }
 
+#[tokio::test]
+async fn failure_usage_survives_responses_stream_and_route_fallback() {
+    let _lock = crate::test_support::env_lock_async().await;
+    struct RestoreKey(Option<std::ffi::OsString>);
+    impl Drop for RestoreKey {
+        fn drop(&mut self) {
+            #[allow(unsafe_code, reason = "serialized fixture environment restoration")]
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("QWEN_API_KEY", v),
+                    None => std::env::remove_var("QWEN_API_KEY"),
+                }
+            }
+        }
+    }
+    let _restore = RestoreKey(std::env::var_os("QWEN_API_KEY"));
+    #[allow(unsafe_code, reason = "serialized loopback fixture key, never a real credential")]
+    unsafe { std::env::set_var("QWEN_API_KEY", "fixture-key"); }
+    let conf = crate::TuraConfig::new(".env.missing-failure-usage-fixture");
+    for final_success in [false, true] {
+        let failed = json!({"type":"response.failed","response":{
+            "id":"failed-1","model":"fixture-model","status":"failed",
+            "error":{"code":"server_error","message":"fixture"},
+            "usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,
+                "input_tokens_details":{"cached_tokens":3}}
+        }});
+        let final_event = if final_success {
+            json!({"type":"response.completed","response":{"status":"completed","output":[],
+                "usage":{"input_tokens":20,"output_tokens":4,"total_tokens":24}}})
+        } else {
+            json!({"type":"response.failed","response":{"status":"failed",
+                "error":{"code":"server_error","message":"unknown usage"}}})
+        };
+        let (first, j1) = responses_transport_fixture(200, &format!("data: {failed}\n\ndata: [DONE]\n\n"), 0);
+        let (second, j2) = responses_transport_fixture(200, &format!("data: {final_event}\n\ndata: [DONE]\n\n"), 0);
+        let route = crate::RouteConfig { default_temperature: 0.2,
+            providers: [first, second].into_iter().map(|base_url| crate::ProviderConfig {
+                provider:"qwen".into(), model:"fixture-model".into(), base_url, temperature:0.2,
+            }).collect()
+        };
+        let result = route.run(&conf, vec![json!({"role":"user","content":"fixture"})], CallOptions::default()).await;
+        j1.join().expect("first fixture joined");
+        j2.join().expect("second fixture joined");
+        let attempts = if final_success {
+            let result = result.expect("fallback succeeds");
+            assert_eq!(result.metrics.unwrap().usage.total_tokens, Some(24));
+            result.failed_attempts
+        } else {
+            let error = result.expect_err("both fail");
+            assert!(error.to_string().contains("all providers failed"));
+            assert!(!error.is_non_retryable_provider_failure());
+            assert!(!error.model_attempt_not_started());
+            error.failed_attempts().to_vec()
+        };
+        assert_eq!(attempts.len(), if final_success { 1 } else { 2 });
+        assert_eq!(attempts[0].usage.as_ref().unwrap().total_tokens, Some(12));
+        assert_eq!(attempts[0].response_id.as_deref(), Some("failed-1"));
+        if !final_success { assert!(attempts[1].usage.is_none()); }
+    }
+}
+
 fn assert_safe_transport_message(error: crate::tura_llm::TuraError) -> String {
+    let error = match error {
+        crate::tura_llm::TuraError::StreamFailure { source, .. } => *source,
+        error => error,
+    };
     let crate::tura_llm::TuraError::Network { message } = error else {
         panic!("expected transport failure");
     };
@@ -1601,6 +1988,42 @@ fn assert_safe_transport_message(error: crate::tura_llm::TuraError) -> String {
         assert!(!message.contains(sensitive));
     }
     message
+}
+
+#[tokio::test]
+async fn responses_sse_failure_snapshot_distinguishes_uncommitted_boundaries_without_content() {
+    let delta = json!({"type":"response.output_text.delta", "delta":"PROMPT_SENTINEL REASONING_SENTINEL"});
+    let completed = json!({"type":"response.completed", "response":{
+        "id":"resp_fixture", "status":"completed", "output":[], "private":"AUTH_SENTINEL"}});
+    for (body, completed_seen, completion_valid, framed, pending_bytes) in [
+        (format!("data: {delta}\n\ndata: {{"), false, false, false, 7),
+        (format!("data: {completed}\n"), true, true, false, 0),
+        (format!("data: {completed}\n\n:unfinished"), true, true, true, 11),
+    ] {
+        let transport_error = reqwest::Client::new()
+            .get("http://[invalid-URL_SENTINEL")
+            .build()
+            .expect_err("offline transport-error fixture");
+        let chunks = futures_util::stream::iter([
+            Ok::<_, reqwest::Error>(body.as_bytes()), Err(transport_error),
+        ]);
+        let error = super::response::parse_codex_response_chunks(chunks, None)
+            .await.expect_err("uncommitted stream must remain a failure")
+            .with_stream_request_id(Some("req_fixture"));
+        let snapshot = error.stream_failure_snapshot().expect("parser failure snapshot");
+        assert_eq!(snapshot.event_count, 1);
+        assert_eq!(snapshot.completed_seen, completed_seen);
+        assert_eq!(snapshot.completion_valid, completion_valid);
+        assert_eq!(snapshot.completed_frame_ended, framed);
+        assert_eq!(snapshot.pending_bytes, pending_bytes);
+        assert_eq!(snapshot.request_id.as_deref(), Some("req_fixture"));
+        assert!(snapshot.runtime_id.is_none());
+        assert!(snapshot.command_effect_started.is_none());
+        let serialized = serde_json::to_string(snapshot).expect("snapshot JSON");
+        assert!(!serialized.contains("SENTINEL"));
+        assert_eq!(assert_safe_transport_message(error),
+            "provider transport failure: phase=responses-sse category=builder cause=unknown");
+    }
 }
 
 #[tokio::test]
@@ -1697,8 +2120,8 @@ async fn responses_sse_bytewise_command_arguments_remain_exact_and_stream_early(
     let sink: crate::tura_llm::ProviderStreamEventSink = std::sync::Arc::new(move |event| {
         tx.send(event).expect("stream event receiver");
     });
-    let chunks = futures_util::stream::iter(
-        body.as_bytes().chunks(1).enumerate().map(|(index, chunk)| {
+    let chunks =
+        futures_util::stream::iter(body.as_bytes().chunks(1).enumerate().map(|(index, chunk)| {
             if index == prefix.len() {
                 // Check before arguments.done or response.completed is even read.
                 let ready: Vec<_> = rx
@@ -1717,8 +2140,7 @@ async fn responses_sse_bytewise_command_arguments_remain_exact_and_stream_early(
                 assert_eq!(ready[0].1["command_line"], command["command_line"]);
             }
             Ok::<_, reqwest::Error>(chunk)
-        }),
-    );
+        }));
     let root = super::response::parse_codex_response_chunks(chunks, Some(sink))
         .await
         .expect("bytewise command stream");
@@ -1733,25 +2155,272 @@ async fn responses_sse_bytewise_command_arguments_remain_exact_and_stream_early(
 }
 
 #[tokio::test]
+async fn responses_sse_completed_boundary_returns_without_polling_pending_transport() {
+    use futures_util::{FutureExt, StreamExt};
+
+    let command = json!({"step": 1, "command_type": "shell_command",
+        "command_line": "printf '\u{e9} \u{4e2d} \u{1f680}\\n'"});
+    let arguments = json!({"commands": [command]}).to_string();
+    let item = json!({"id": "fc_terminal", "call_id": "call_terminal",
+        "type": "function_call", "name": "command_run", "arguments": arguments});
+    let created = json!({"type": "response.created",
+        "response": {"id": "resp_terminal", "status": "in_progress"}});
+    let added = json!({"type": "response.output_item.added", "response_id": "resp_terminal",
+        "item": {"id": "fc_terminal", "call_id": "call_terminal",
+            "type": "function_call", "name": "command_run", "arguments": ""}});
+    let delta = json!({"type": "response.function_call_arguments.delta",
+        "item_id": "fc_terminal", "delta": arguments});
+    let done = json!({"type": "response.function_call_arguments.done",
+        "item_id": "fc_terminal", "arguments": arguments});
+    let item_done = json!({"type": "response.output_item.done", "item": item});
+    let commentary = json!({"type": "response.output_item.done", "item": {
+        "id": "msg_commentary", "type": "message", "role": "assistant", "phase": "commentary",
+        "content": [{"type": "output_text", "text": "still working"}]}});
+    let prefix = format!(
+        "data: {created}\n\ndata: {added}\n\ndata: {delta}\n\ndata: {done}\n\ndata: {item_done}\n\ndata: {commentary}\n\ndata: [DONE]\n\n"
+    );
+    let response = json!({"id": "resp_terminal", "status": "completed", "model": "fixture-model",
+        "output": [item, {"id": "msg_final", "type": "message", "role": "assistant",
+            "phase": "final_answer", "content": [{"type": "output_text", "text": "authoritative final"}]}],
+        "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18,
+            "input_tokens_details": {"cached_tokens": 3},
+            "output_tokens_details": {"reasoning_tokens": 2}}});
+    let completed = json!({"type": "response.completed", "response": response});
+
+    // Tool readiness, item.done, commentary and [DONE] do not complete a response.
+    let chunks = futures_util::stream::iter([Ok::<_, reqwest::Error>(prefix.as_bytes())])
+        .chain(futures_util::stream::pending());
+    assert!(
+        super::response::parse_codex_response_chunks(chunks, None)
+            .now_or_never()
+            .is_none()
+    );
+    // Even a completed JSON line needs a frame boundary; do not drop a partial tail.
+    for ending in ["", "\n", "\n\n: unterminated tail"] {
+        let body = format!("{prefix}data: {completed}{ending}");
+        let chunks = futures_util::stream::iter([Ok::<_, reqwest::Error>(body.as_bytes())])
+            .chain(futures_util::stream::pending());
+        assert!(
+            super::response::parse_codex_response_chunks(chunks, None)
+                .now_or_never()
+                .is_none(),
+            "unfinished frame/tail: {ending:?}"
+        );
+    }
+    for (ending, bytewise) in [
+        ("\n\n", false),
+        ("\r\n\r\n", false),
+        ("\n\n: heartbeat\n", false),
+        ("\n\ndata: [DONE]\n", false),
+        ("\n\n", true),
+        ("\r\n\r\n", true),
+    ] {
+        let body = format!("{prefix}data: {completed}{ending}");
+        let (tx, rx) = mpsc::channel();
+        let sink: crate::tura_llm::ProviderStreamEventSink = std::sync::Arc::new(move |event| {
+            tx.send(event).expect("stream event receiver");
+        });
+        let mut tail_polled = false;
+        let tail = futures_util::stream::poll_fn(|_| {
+            tail_polled = true;
+            std::task::Poll::Pending
+        });
+        let chunks: Vec<_> = if bytewise {
+            body.as_bytes().chunks(1).collect()
+        } else {
+            vec![body.as_bytes()]
+        };
+        let chunks =
+            futures_util::stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>)).chain(tail);
+        let root = super::response::parse_codex_response_chunks(chunks, Some(sink))
+            .now_or_never()
+            .expect("a framed completion must return without EOF")
+            .expect("valid completed response");
+        assert!(
+            !tail_polled,
+            "terminal response must not poll the transport again"
+        );
+        assert_eq!(root["output"], response["output"]);
+        assert_eq!(root["usage"], response["usage"]);
+        assert_eq!(root["model"], response["model"]);
+        assert_eq!(
+            root["events"],
+            json!([
+                created, added, delta, done, item_done, commentary, completed
+            ])
+        );
+        let commands: Vec<_> = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                crate::tura_llm::ProviderStreamEvent::CommandRunCommandReady {
+                    tool_call_id,
+                    command_index,
+                    command,
+                } => Some((tool_call_id, command_index, command)),
+                _ => None,
+            })
+            .collect();
+        let mut normalized_command = command.clone();
+        normalized_command["command"] = json!("shell_command");
+        assert_eq!(
+            commands,
+            vec![("call_terminal".to_string(), 0, normalized_command)]
+        );
+        let calls = super::response::complete_codex_tool_calls(&root);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["arguments"]["commands"][0], command);
+    }
+}
+
+#[tokio::test]
+async fn responses_sse_completed_boundary_ignores_subsequent_transport_failure() {
+    use futures_util::StreamExt;
+
+    let (endpoint, join) = responses_transport_fixture(200, "fixture", 1);
+    let transport_error = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("fixture client")
+        .get(&endpoint)
+        .send()
+        .await
+        .expect("fixture response")
+        .bytes()
+        .await
+        .expect_err("truncated HTTP body");
+    join.join().expect("fixture server");
+    assert!(transport_error.is_body() || transport_error.is_decode());
+
+    let response = json!({"id": "resp_terminal", "status": "completed",
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7}});
+    let completed = json!({"type": "response.completed", "response": response});
+    let body = format!("data: {completed}\n\n");
+    let mut chunks_read = 0;
+    let chunks = futures_util::stream::iter([
+        Ok::<_, reqwest::Error>(body.as_bytes()),
+        Err(transport_error),
+    ])
+    .inspect(|_| chunks_read += 1);
+    let root = super::response::parse_codex_response_chunks(chunks, None)
+        .await
+        .expect("completed response is independent of a later transport failure");
+    assert_eq!(chunks_read, 1);
+    assert_eq!(root["output"], response["output"]);
+    assert_eq!(root["usage"], response["usage"]);
+    assert_eq!(root["events"], json!([completed]));
+}
+
+#[tokio::test]
+async fn responses_sse_rejects_prior_failures_identity_conflicts_and_reopening() {
+    let completed = json!({"type": "response.completed",
+        "response": {"id": "resp_terminal", "status": "completed", "output": []}});
+    for prior in [
+        json!({"type": "response.failed", "response": {"id": "resp_terminal", "status": "failed"}}),
+        json!({"type": "response.incomplete", "response": {"id": "resp_terminal", "status": "incomplete"}}),
+        json!({"type": "error", "message": "AUTH_SENTINEL"}),
+        json!({"type": "response.created", "response": {"id": "resp_terminal", "status": "failed"}}),
+        json!({"type": "response.created", "response": {"id": "resp_terminal", "status": "incomplete"}}),
+        json!({"type": "response.created", "response": {"id": "resp_terminal", "error": {"message": "AUTH_SENTINEL"}}}),
+        json!({"type": "response.created", "response": {"id": "other", "status": "in_progress"}}),
+        json!({"type": "response.output_text.delta", "response_id": "other", "delta": "AUTH_SENTINEL"}),
+        json!({"type": "response.created", "response": {"id": null, "status": "in_progress"}}),
+        json!({"type": "response.created", "response": null}),
+        json!({"type": "response.completed"}),
+        json!({"type": "response.completed", "response": {"id": "resp_terminal", "status": "in_progress"}}),
+    ] {
+        let prefix = format!("data: {prior}\n\n");
+        let terminal = format!("data: {completed}\n\n");
+        let body = format!("{prefix}{terminal}");
+        for split in [false, true] {
+            let chunks = if split {
+                vec![prefix.as_bytes(), terminal.as_bytes()]
+            } else {
+                vec![body.as_bytes()]
+            };
+            let error = super::response::parse_codex_response_chunks(
+                futures_util::stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>)),
+                None,
+            )
+            .await
+            .expect_err("completion must not erase earlier invalid evidence");
+            assert_eq!(
+                assert_safe_transport_message(error),
+                "provider stream failure: phase=responses-sse category=protocol cause=missing-completed"
+            );
+        }
+    }
+    for after in [
+        json!({"type": "error", "message": "AUTH_SENTINEL"}),
+        json!({"type": "response.incomplete"}),
+        json!({"type": "response.created", "response": {"id": "resp_terminal", "status": "in_progress"}}),
+        json!({"type": "response.output_text.delta", "response_id": "resp_terminal", "delta": "AUTH_SENTINEL"}),
+        json!({"type": "response.completed", "response": {"id": "resp_terminal", "status": "completed", "output": [{"type": "message"}]}}),
+    ] {
+        for ending in ["", "\n\n"] {
+            let body = format!("data: {completed}\n\ndata: {after}{ending}");
+            let error = super::response::parse_codex_response_chunks(
+                futures_util::stream::iter([Ok::<_, reqwest::Error>(body.as_bytes())]),
+                None,
+            )
+            .await
+            .expect_err("same-chunk contradiction must not be hidden by completion");
+            assert_eq!(
+                assert_safe_transport_message(error),
+                "provider stream failure: phase=responses-sse category=protocol cause=missing-completed"
+            );
+        }
+    }
+    for ending in ["", "\n\n"] {
+        let body = format!("data: {completed}\n\ndata: {{{ending}");
+        let error = super::response::parse_codex_response_chunks(
+            futures_util::stream::iter([Ok::<_, reqwest::Error>(body.as_bytes())]),
+            None,
+        )
+        .await
+        .expect_err("same-chunk malformed JSON must not be hidden by completion");
+        assert!(matches!(error, crate::tura_llm::TuraError::Json(_)));
+    }
+}
+
+#[tokio::test]
 async fn responses_sse_rejects_invalid_and_partial_utf8_even_after_completion() {
     for line in [
-        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"PROMPT_SENTINEL \xff\"}\n".as_slice(),
-        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"AUTH_SENTINEL \xff\"}".as_slice(),
+        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"PROMPT_SENTINEL \xff\"}\n"
+            .as_slice(),
+        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"AUTH_SENTINEL \xff\"}"
+            .as_slice(),
         b": REASONING_SENTINEL \xc0\xaf\r\n".as_slice(),
         b": COOKIE_SENTINEL \xed\xa0\x80\n".as_slice(),
         b": PROMPT_SENTINEL AUTH_SENTINEL \xf0\x9f".as_slice(),
-        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"COOKIE_SENTINEL \xe2\x82".as_slice(),
+        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"COOKIE_SENTINEL \xe2\x82"
+            .as_slice(),
     ] {
-        let mut body = b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n".to_vec();
-        body.extend_from_slice(line);
-        let chunks = futures_util::stream::iter(body.chunks(1).map(Ok::<_, reqwest::Error>));
-        let error = super::response::parse_codex_response_chunks(chunks, None)
+        let completed = b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+        // Reject invalid bytes already delivered after completion in the same
+        // chunk, and bytewise invalid input before any terminal boundary.
+        for after_completion in [false, true] {
+            let body = if after_completion {
+                [completed.as_slice(), line].concat()
+            } else {
+                line.to_vec()
+            };
+            let chunks = if after_completion {
+                vec![body.as_slice()]
+            } else {
+                body.chunks(1).collect()
+            };
+            let error = super::response::parse_codex_response_chunks(
+                futures_util::stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>)),
+                None,
+            )
             .await
             .expect_err("invalid UTF-8 must not become replacement characters or success");
-        assert_eq!(
-            assert_safe_transport_message(error),
-            "provider stream failure: phase=responses-sse category=decode cause=invalid-utf8"
-        );
+            assert_eq!(
+                assert_safe_transport_message(error),
+                "provider stream failure: phase=responses-sse category=decode cause=invalid-utf8"
+            );
+        }
     }
 }
 
@@ -1807,12 +2476,9 @@ async fn responses_sse_accepts_completed_crlf_and_unterminated_lines_with_option
     ] {
         let completed = json!({"type": "response.completed", "response": response});
         for ending in ["", "\r", "\n", "\r\n", "\r\n\r\ndata: [DONE]"] {
-            let body = format!(
-                ": heartbeat\r\n\r\ndata: {delta}\r\n\r\ndata: {completed}{ending}"
-            );
-            let chunks = futures_util::stream::iter(
-                body.as_bytes().chunks(1).map(Ok::<_, reqwest::Error>),
-            );
+            let body = format!(": heartbeat\r\n\r\ndata: {delta}\r\n\r\ndata: {completed}{ending}");
+            let chunks =
+                futures_util::stream::iter(body.as_bytes().chunks(1).map(Ok::<_, reqwest::Error>));
             let root = super::response::parse_codex_response_chunks(chunks, None)
                 .await
                 .expect("completed stream with compatible line endings and status");
@@ -1881,10 +2547,9 @@ async fn responses_sse_decode_failure_keeps_safe_phase_category_and_cause() {
 }
 
 #[tokio::test]
-async fn responses_truncated_stream_keeps_safe_phase_and_transport_category() {
+async fn responses_truncated_stream_before_completion_keeps_safe_phase_and_transport_category() {
     let body = concat!(
         "data: {\"type\":\"response.output_text.delta\",\"delta\":\"PROMPT_SENTINEL REASONING_SENTINEL AUTH_SENTINEL COOKIE_SENTINEL\"}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
         "data: [DONE]\n\n",
     );
     let (endpoint, join) = responses_transport_fixture(200, body, 1);
@@ -1899,12 +2564,13 @@ async fn responses_truncated_stream_keeps_safe_phase_and_transport_category() {
     )
     .await;
     join.join().expect("fixture server");
-    let message = assert_safe_transport_message(result.err().expect("truncated HTTP body"));
+    let message = assert_safe_transport_message(result.expect_err("truncated HTTP body"));
     // reqwest can expose a wire-body error directly or wrap it as a decode
     // error. Neither representation establishes the historical upstream cause.
     assert!(
         message.starts_with("provider transport failure: phase=responses-sse category=body ")
-            || message.starts_with("provider transport failure: phase=responses-sse category=decode ")
+            || message
+                .starts_with("provider transport failure: phase=responses-sse category=decode ")
     );
 }
 

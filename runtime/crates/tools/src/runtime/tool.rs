@@ -1,10 +1,11 @@
 use serde_json::Value;
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 use tura_path::command_receipts::ReceiptStore;
+use tura_path::mapped_source_read::MappedSourceReadBinding;
 
 use super::file_locks;
 
@@ -40,6 +41,11 @@ pub struct ToolContext {
     current_call_id: Option<String>,
     lock_scope: Option<String>,
     source_read_root: Option<Arc<File>>,
+    source_read_digests: Arc<std::collections::BTreeMap<String, String>>,
+    source_navigation: Option<Arc<crate::commands::source_navigation::Catalog>>,
+    source_observation_owner: Option<String>,
+    patch_readback_paths: Arc<Vec<PathBuf>>,
+    mapped_source_reads: Option<Arc<(PathBuf, Vec<MappedSourceReadBinding>)>>,
     receipt_store: Option<Arc<ReceiptStore>>,
 }
 
@@ -70,6 +76,11 @@ impl ToolContext {
             current_call_id: None,
             lock_scope: normalize_lock_scope(lock_scope),
             source_read_root: None,
+            source_read_digests: Arc::new(std::collections::BTreeMap::new()),
+            source_navigation: crate::commands::source_navigation::from_environment(),
+            source_observation_owner: None,
+            patch_readback_paths: Arc::new(Vec::new()),
+            mapped_source_reads: None,
             receipt_store: None,
         }
     }
@@ -84,6 +95,11 @@ impl ToolContext {
             current_call_id: self.current_call_id.clone(),
             lock_scope: self.lock_scope.clone(),
             source_read_root: self.source_read_root.clone(),
+            source_read_digests: self.source_read_digests.clone(),
+            source_navigation: self.source_navigation.clone(),
+            source_observation_owner: self.source_observation_owner.clone(),
+            patch_readback_paths: self.patch_readback_paths.clone(),
+            mapped_source_reads: self.mapped_source_reads.clone(),
             receipt_store: self.receipt_store.clone(),
         }
     }
@@ -105,6 +121,60 @@ impl ToolContext {
 
     pub fn source_read_root(&self) -> Option<&File> {
         self.source_read_root.as_deref()
+    }
+
+    /// Host-resolved JSpace pins, never a map supplied by command arguments.
+    pub fn with_source_read_digests(mut self, digests: std::collections::BTreeMap<String, String>) -> Self {
+        self.source_read_digests = Arc::new(digests);
+        self
+    }
+
+    pub fn source_read_digest(&self, path: &str) -> Option<&str> {
+        self.source_read_digests.get(path).map(String::as_str)
+    }
+
+    pub fn source_navigation(&self) -> Option<&crate::commands::source_navigation::Catalog> {
+        self.source_navigation.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn with_source_navigation(mut self, value: crate::commands::source_navigation::Catalog) -> Self {
+        self.source_navigation = Some(Arc::new(value));
+        self
+    }
+
+    /// Router-bound runtime identity, not a source_read argument or session label.
+    pub fn with_source_observation_owner(mut self, owner: Option<String>) -> Self {
+        self.source_observation_owner = owner.filter(|value|
+            !value.trim().is_empty() && value.len() <= 256);
+        self
+    }
+
+    pub fn source_observation_owner(&self) -> Option<&str> {
+        self.source_observation_owner.as_deref()
+    }
+
+    pub fn with_patch_readback_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.patch_readback_paths = Arc::new(paths);
+        self
+    }
+
+    pub fn patch_readback_paths(&self) -> &[PathBuf] {
+        &self.patch_readback_paths
+    }
+
+    pub fn with_mapped_source_reads(
+        mut self,
+        repo_root: PathBuf,
+        bindings: Vec<MappedSourceReadBinding>,
+    ) -> Self {
+        self.mapped_source_reads = Some(Arc::new((repo_root, bindings)));
+        self
+    }
+
+    pub fn mapped_source_reads(&self) -> Option<(&Path, &[MappedSourceReadBinding])> {
+        self.mapped_source_reads.as_deref()
+            .map(|(root, bindings)| (root.as_path(), bindings.as_slice()))
     }
 
     pub fn with_receipt_store(mut self, store: Option<Arc<ReceiptStore>>) -> Self {

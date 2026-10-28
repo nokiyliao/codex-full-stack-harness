@@ -385,9 +385,20 @@ pub struct RuntimeEvidenceState {
     pub tokens: [u64; 7],
     pub observation: Option<(Option<String>, Option<String>, Option<String>)>,
     pub observation_conflict: bool,
+    provider_observation_records: u64,
+    provider_response_seen: bool,
+    pre_model_marker_seen: bool,
+    pre_model_marker_valid: bool,
+    failed_attempts: Option<serde_json::Value>,
+    failed_attempts_conflict: bool,
 }
 
 impl RuntimeEvidenceState {
+    fn verified_pre_model_failure(&self) -> bool {
+        self.provider_observation_records == 1 && self.pre_model_marker_valid
+            && self.usage_records == 0 && !self.provider_response_seen
+    }
+
     pub fn add(&mut self, value: &serde_json::Value) {
         if value.get("type").and_then(serde_json::Value::as_str) == Some("runtime_usage") {
             let usage = &value["usage"];
@@ -395,6 +406,15 @@ impl RuntimeEvidenceState {
                 .all(|key| usage.get(*key).and_then(serde_json::Value::as_u64).is_some())
                 && ["cached_input_tokens", "cache_write_tokens", "reasoning_tokens", "latency_ms"].iter()
                     .all(|key| usage.get(*key).is_none_or(|field| field.as_u64().is_some()));
+            let valid = valid && match (
+                usage.get("input_tokens").and_then(serde_json::Value::as_u64),
+                usage.get("output_tokens").and_then(serde_json::Value::as_u64),
+                usage.get("total_tokens").and_then(serde_json::Value::as_u64),
+            ) {
+                (Some(input), Some(output), Some(total)) =>
+                    input.checked_add(output).is_some_and(|minimum| total >= minimum),
+                _ => false,
+            };
             self.usage_valid = self.usage_records == 0 && valid;
             self.usage_records = self.usage_records.saturating_add(1);
             for (total, key) in self.tokens.iter_mut().zip(EVIDENCE_USAGE_KEYS) {
@@ -402,6 +422,24 @@ impl RuntimeEvidenceState {
             }
         } else if value.get("type").and_then(serde_json::Value::as_str) == Some("runtime_provider_observation") {
             let observation = &value["provider_observation"];
+            if let Some(attempts) = observation.get("failed_attempts") {
+                if !attempts.is_array() || self.failed_attempts.as_ref().is_some_and(|old| old != attempts) {
+                    self.failed_attempts_conflict = true;
+                } else {
+                    self.failed_attempts = Some(attempts.clone());
+                }
+            }
+            self.provider_observation_records = self.provider_observation_records.saturating_add(1);
+            self.provider_response_seen |= !observation.is_null();
+            if let Some(marker) = value.get("provider_call_observation").filter(|marker| !marker.is_null()) {
+                self.pre_model_marker_seen = true;
+                self.pre_model_marker_valid |= observed_evidence_field(value, "runtime_id").is_some()
+                    && observed_evidence_field(value, "session_id").is_some()
+                    && value.get("status").and_then(serde_json::Value::as_str) == Some("Failed")
+                    && value.get("error_code").and_then(serde_json::Value::as_str) == Some("CALL_FAILED")
+                    && marker == &serde_json::json!({"schema_version":"provider_call_observation_v1",
+                        "scope":"runtime_provider_call", "stage":"authentication", "model_provider_invoked":false});
+            }
             let current = if observation.get("schema_version").and_then(serde_json::Value::as_str) == Some("provider_observation_v1")
                 && observation.get("source").and_then(serde_json::Value::as_str) == Some("provider_response") {
                 Some((observed_evidence_field(observation, "response_id"),
@@ -414,7 +452,10 @@ impl RuntimeEvidenceState {
                 }
             } else if current.is_some() {
                 self.observation = current;
-            } else if !observation.is_null() {
+            } else if !(observation.is_null()
+                || (observation["schema_version"] == "provider_observation_v1"
+                    && observation["source"] == "provider_failure"))
+            {
                 self.observation_conflict = true;
             }
         }
@@ -429,31 +470,111 @@ pub struct RuntimeEvidenceTotals {
     pub observation_count: u64,
     pub conflict_count: u64,
     pub unbound_or_malformed: bool,
+    verified_pre_model_failure_count: u64,
+    model_usage_conflict: bool,
+    failed_usage: FailedAttemptUsage,
+}
+
+#[derive(Debug, Default)]
+struct FailedAttemptUsage {
+    attempts: u64,
+    reported: u64,
+    unknown: u64,
+    invalid: u64,
+    conflicts: u64,
+    totals: std::collections::BTreeMap<String, u64>,
+}
+
+impl FailedAttemptUsage {
+    fn add(&mut self, bound: bool, state: &RuntimeEvidenceState) {
+        if state.failed_attempts_conflict || (!bound && state.failed_attempts.is_some()) {
+            self.conflicts += 1;
+            return;
+        }
+        let Some(attempts) = state.failed_attempts.as_ref().and_then(serde_json::Value::as_array) else { return; };
+        for attempt in attempts {
+            self.attempts += 1;
+            let usage = &attempt["usage"];
+            if usage.is_null() { self.unknown += 1; continue; }
+            let fields = ["input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"];
+            let valid = usage.is_object() && usage["invalid_fields"] == serde_json::json!([])
+                && fields.iter().all(|k| usage.get(*k).is_none_or(|v| v.is_null() || v.as_u64().is_some()));
+            let count = |k: &str| usage.get(k).and_then(serde_json::Value::as_u64);
+            let consistent = match (count("input_tokens"), count("output_tokens"), count("total_tokens")) {
+                (Some(i), Some(o), Some(t)) => i.checked_add(o) == Some(t),
+                _ => true,
+            };
+            let parts_valid = ![("cached_input_tokens", "input_tokens"), ("reasoning_tokens", "output_tokens")]
+                .iter().any(|(a,b)| matches!((count(a),count(b)), (Some(a),Some(b)) if a>b));
+            if !valid || !consistent || !parts_valid { self.invalid += 1; continue; }
+            let values: Vec<_> = fields.iter().filter_map(|k| count(k).map(|v| (*k,v))).collect();
+            if values.is_empty() { self.unknown += 1; continue; }
+            if values.iter().any(|(k,v)| self.totals.get(*k).unwrap_or(&0).checked_add(*v).is_none()) {
+                self.conflicts += 1;
+                continue;
+            }
+            self.reported += 1;
+            for (key,value) in values { *self.totals.entry(key.into()).or_default() += value; }
+        }
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        serde_json::json!({"coverage":"partial", "scope":"reported_failed_attempts_only",
+            "attempt_count":self.attempts, "reported_attempt_count":self.reported,
+            "unknown_attempt_count":self.unknown, "invalid_attempt_count":self.invalid,
+            "conflict_count":self.conflicts, "totals":self.totals,
+            "billing":"UNKNOWN", "included_in_reported_usage_totals":false})
+    }
 }
 
 impl RuntimeEvidenceTotals {
     pub fn add(&mut self, bound: bool, state: &RuntimeEvidenceState) {
+        self.failed_usage.add(bound, state);
         for (total, value) in self.tokens.iter_mut().zip(state.tokens) {
+            if total.checked_add(value).is_none() { self.unbound_or_malformed = true; }
             *total = total.saturating_add(value);
         }
         if !bound { self.unbound_or_malformed = true; return; }
         self.runtime_count += 1;
         self.valid_usage_count += u64::from(state.usage_records == 1 && state.usage_valid);
+        let verified_pre_model_failure = state.verified_pre_model_failure();
+        self.verified_pre_model_failure_count += u64::from(verified_pre_model_failure);
+        self.model_usage_conflict |= state.observation_conflict
+            || (state.pre_model_marker_seen && !verified_pre_model_failure);
         self.observation_count += u64::from(state.observation.is_some() && !state.observation_conflict);
         self.conflict_count += u64::from(state.observation_conflict);
     }
 
     pub fn usage(&self) -> serde_json::Value {
         let [input, cached, write, output, reasoning, total, latency] = self.tokens;
-        let total = if total == 0 { input.saturating_add(output).saturating_add(reasoning) } else { total };
-        serde_json::json!({"input_tokens":input, "cached_input_tokens":cached, "cache_write_tokens":write,
+        // Reasoning may already be included in output; never assume it is disjoint.
+        let total = if total == 0 { input.saturating_add(output) } else { total };
+        // This accounting classification never fabricates a usage record or changes
+        // the legacy recorded-runtime coverage denominator.
+        let expected_usage_runtime_count = self.runtime_count - self.verified_pre_model_failure_count;
+        let model_missing_usage_count = expected_usage_runtime_count - self.valid_usage_count;
+        let model_usage_status = if self.runtime_count == 0 { "unknown" }
+            else if self.unbound_or_malformed || self.model_usage_conflict { "incomplete" }
+            else if expected_usage_runtime_count == 0 { "not_invoked" }
+            else if model_missing_usage_count == 0 { "complete" } else { "incomplete" };
+        let mut usage = serde_json::json!({"input_tokens":input, "cached_input_tokens":cached, "cache_write_tokens":write,
             "output_tokens":output, "reasoning_output_tokens":reasoning, "reasoning_tokens":reasoning,
             "total_tokens":total, "latency_ms":latency, "coverage":{
                 "schema_version":"runtime_usage_coverage_v1",
                 "scope":"recorded_session_context_runtimes_not_provider_attempts_or_billing",
                 "known_runtime_count":self.runtime_count, "valid_usage_count":self.valid_usage_count,
                 "missing_usage_count":self.runtime_count - self.valid_usage_count,
-                "status":if self.runtime_count == 0 {"unknown"} else if self.runtime_count == self.valid_usage_count && !self.unbound_or_malformed {"complete"} else {"incomplete"}}})
+                "status":if self.runtime_count == 0 {"unknown"} else if self.runtime_count == self.valid_usage_count && !self.unbound_or_malformed {"complete"} else {"incomplete"}},
+            "model_usage_coverage":{
+                "schema_version":"runtime_model_usage_coverage_v1",
+                "scope":"recorded_runtime_invocations_not_all_provider_attempts_or_billing",
+                "verified_pre_model_failure_count":self.verified_pre_model_failure_count,
+                "expected_usage_runtime_count":expected_usage_runtime_count,
+                "missing_usage_count":model_missing_usage_count, "status":model_usage_status}});
+        if self.failed_usage.attempts > 0 || self.failed_usage.conflicts > 0 {
+            usage["reported_failed_attempt_usage"] = self.failed_usage.summary();
+        }
+        usage
     }
 
     pub fn provider_summary(&self, model: serde_json::Value, service_tier: serde_json::Value) -> serde_json::Value {
@@ -1259,6 +1380,247 @@ mod tests {
         SessionQuery,
     };
     use serde_json::json;
+
+    fn pre_model_failure_evidence() -> serde_json::Value {
+        json!({"type":"runtime_provider_observation", "runtime_id":"auth", "session_id":"session",
+            "status":"Failed", "error_code":"CALL_FAILED", "provider_observation":null,
+            "provider_call_observation":{"schema_version":"provider_call_observation_v1",
+                "scope":"runtime_provider_call", "stage":"authentication", "model_provider_invoked":false}})
+    }
+
+    fn usage_evidence() -> serde_json::Value {
+        json!({"type":"runtime_usage", "runtime_id":"model",
+            "usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}})
+    }
+
+    fn evidence_usage(records: &[serde_json::Value]) -> serde_json::Value {
+        let mut state = super::RuntimeEvidenceState::default();
+        for record in records { state.add(record); }
+        let mut totals = super::RuntimeEvidenceTotals::default();
+        totals.add(true, &state);
+        totals.usage()
+    }
+
+    #[test]
+    fn failure_usage_is_separate_deduplicated_and_never_complete_billing() {
+        let record = serde_json::json!({"type":"runtime_provider_observation","runtime_id":"a",
+            "provider_observation":{"schema_version":"provider_observation_v1","source":"provider_response",
+                "failed_attempts":[{"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12,
+                    "cached_input_tokens":0,"invalid_fields":[]}}, {"usage":null}]}});
+        let final_usage = serde_json::json!({"type":"runtime_usage","runtime_id":"a",
+            "usage":{"input_tokens":20,"output_tokens":4,"total_tokens":24}});
+        let result = evidence_usage(&[record.clone(), record.clone(), final_usage]);
+        assert_eq!(result["total_tokens"], 24);
+        let failed = &result["reported_failed_attempt_usage"];
+        assert_eq!(failed["attempt_count"], 2);
+        assert_eq!(failed["totals"]["total_tokens"], 12);
+        assert_eq!(failed["totals"]["cached_input_tokens"], 0);
+        assert!(failed["totals"].get("reasoning_tokens").is_none());
+        assert_eq!(failed["unknown_attempt_count"], 1);
+        assert_eq!(failed["coverage"], "partial");
+        assert_eq!(failed["billing"], "UNKNOWN");
+        assert_eq!(failed["included_in_reported_usage_totals"], false);
+        let mut conflicting = record.clone();
+        conflicting["provider_observation"]["failed_attempts"] = serde_json::json!([]);
+        let result = evidence_usage(&[record, conflicting]);
+        assert_eq!(result["reported_failed_attempt_usage"]["conflict_count"], 1);
+        assert_eq!(result["reported_failed_attempt_usage"]["totals"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn failure_usage_rejects_invalid_subsets_without_fabricated_zero_totals() {
+        for usage in [
+            serde_json::json!({"input_tokens":-1,"invalid_fields":[]}),
+            serde_json::json!({"input_tokens":true,"invalid_fields":[]}),
+            serde_json::json!({"input_tokens":10,"output_tokens":2,"total_tokens":11,"invalid_fields":[]}),
+            serde_json::json!({"input_tokens":10,"cached_input_tokens":11,"invalid_fields":[]}),
+        ] {
+            let result = evidence_usage(&[serde_json::json!({"type":"runtime_provider_observation",
+                "runtime_id":"a","provider_observation":{"schema_version":"provider_observation_v1",
+                    "source":"provider_failure","failed_attempts":[{"usage":usage}]}})]);
+            assert_eq!(result["reported_failed_attempt_usage"]["invalid_attempt_count"], 1);
+            assert_eq!(result["reported_failed_attempt_usage"]["totals"], serde_json::json!({}));
+        }
+    }
+
+    #[test]
+    fn model_usage_coverage_separates_verified_pre_model_failures_without_usage() {
+        let mut auth = super::RuntimeEvidenceState::default();
+        auth.add(&pre_model_failure_evidence());
+        assert_eq!(auth.usage_records, 0);
+        assert!(!auth.usage_valid);
+        let mut totals = super::RuntimeEvidenceTotals::default();
+        totals.add(true, &auth);
+        let auth_only = totals.usage();
+        assert_eq!(auth_only["coverage"], json!({"schema_version":"runtime_usage_coverage_v1",
+            "scope":"recorded_session_context_runtimes_not_provider_attempts_or_billing",
+            "known_runtime_count":1,"valid_usage_count":0,"missing_usage_count":1,"status":"incomplete"}));
+        assert_eq!(auth_only["model_usage_coverage"], json!({"schema_version":"runtime_model_usage_coverage_v1",
+            "scope":"recorded_runtime_invocations_not_all_provider_attempts_or_billing",
+            "verified_pre_model_failure_count":1,"expected_usage_runtime_count":0,"missing_usage_count":0,"status":"not_invoked"}));
+        let mut model = super::RuntimeEvidenceState::default();
+        model.add(&usage_evidence());
+        totals.add(true, &model);
+        let combined = totals.usage();
+        assert_eq!(combined["total_tokens"], 12);
+        assert_eq!(combined["coverage"]["status"], "incomplete");
+        assert_eq!(combined["coverage"]["known_runtime_count"], 2);
+        assert_eq!(combined["coverage"]["valid_usage_count"], 1);
+        assert_eq!(combined["model_usage_coverage"]["expected_usage_runtime_count"], 1);
+        assert_eq!(combined["model_usage_coverage"]["status"], "complete");
+    }
+
+    #[test]
+    fn model_usage_coverage_requires_exact_failed_authentication_marker() {
+        let marker = pre_model_failure_evidence();
+        let mut invalid = Vec::new();
+        for field in ["schema_version", "scope", "stage", "model_provider_invoked"] {
+            let mut value = marker.clone();
+            value["provider_call_observation"].as_object_mut().unwrap().remove(field);
+            invalid.push(value);
+        }
+        for (field, value) in [
+            ("schema_version", json!("provider_call_observation_v2")),
+            ("scope", json!("provider_attempt")), ("stage", json!("model")),
+            ("model_provider_invoked", json!(true)), ("model_provider_invoked", json!("false")),
+            ("model_provider_invoked", json!(0)), ("model_provider_invoked", json!(null)),
+            ("extra", json!(false)),
+        ] {
+            let mut record = marker.clone();
+            record["provider_call_observation"][field] = value;
+            invalid.push(record);
+        }
+        for (field, value) in [("status", json!("Succeeded")), ("status", json!(null)),
+            ("error_code", json!("CALL_FAILED_AFTER_COMMAND_EFFECT")), ("error_code", json!(null))] {
+            let mut record = marker.clone();
+            record[field] = value;
+            invalid.push(record);
+        }
+        for malformed in [json!(false), json!("false"), json!([])] {
+            let mut record = marker.clone();
+            record["provider_call_observation"] = malformed;
+            invalid.push(record);
+        }
+        for field in ["runtime_id", "session_id"] {
+            let mut missing = marker.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            invalid.push(missing);
+            for malformed in [json!(null), json!(false), json!(1), json!(""), json!(" \t "), json!("bad\nid")] {
+                let mut record = marker.clone();
+                record[field] = malformed;
+                invalid.push(record);
+            }
+        }
+        for record in invalid {
+            let result = evidence_usage(std::slice::from_ref(&record));
+            assert_eq!(result["model_usage_coverage"]["verified_pre_model_failure_count"], 0, "{record}");
+            assert_eq!(result["model_usage_coverage"]["status"], "incomplete", "{record}");
+            assert_eq!(result["coverage"]["missing_usage_count"], 1);
+            assert_eq!(evidence_usage(&[record, usage_evidence()])["model_usage_coverage"]["status"], "incomplete");
+        }
+    }
+
+    #[test]
+    fn model_usage_coverage_rejects_contradictions_and_duplicates_in_either_order() {
+        let marker = pre_model_failure_evidence();
+        let mut zero = usage_evidence();
+        zero["usage"] = json!({"input_tokens":0,"output_tokens":0,"total_tokens":0});
+        let response = json!({"type":"runtime_provider_observation", "runtime_id":"auth",
+            "provider_observation":{"schema_version":"provider_observation_v1", "source":"provider_response", "response_id":"response"}});
+        for mut other in [marker.clone(), usage_evidence(), zero, response] {
+            other["runtime_id"] = json!("auth");
+            for records in [vec![marker.clone(), other.clone()], vec![other.clone(), marker.clone()]] {
+                let result = evidence_usage(&records);
+                assert_eq!(result["model_usage_coverage"]["verified_pre_model_failure_count"], 0);
+                assert_eq!(result["model_usage_coverage"]["status"], "incomplete");
+            }
+        }
+        for response in [json!({}), json!(false), json!({"schema_version":"provider_observation_v1", "source":"provider_response"})] {
+            let mut record = marker.clone();
+            record["provider_observation"] = response;
+            assert_eq!(evidence_usage(&[record])["model_usage_coverage"]["status"], "incomplete");
+        }
+        assert_eq!(evidence_usage(&[usage_evidence(), json!({"type":"runtime_provider_observation",
+            "runtime_id":"model", "provider_observation":false})])["model_usage_coverage"]["status"], "incomplete");
+    }
+
+    #[test]
+    fn model_usage_coverage_does_not_infer_legacy_failures_or_unbound_calls() {
+        let empty = super::RuntimeEvidenceTotals::default().usage();
+        assert_eq!(empty["model_usage_coverage"]["status"], "unknown");
+        for observation in [serde_json::Value::Null,
+            json!({"schema_version":"provider_observation_v1", "source":"provider_response", "model":"gpt-6.1-sol"})] {
+            let record = json!({"type":"runtime_provider_observation", "runtime_id":"missing",
+                "status":"Failed", "error_code":"CALL_FAILED", "error":"OAuth authentication before model",
+                "provider_observation":observation});
+            let result = evidence_usage(&[record]);
+            assert_eq!(result["model_usage_coverage"]["expected_usage_runtime_count"], 1);
+            assert_eq!(result["model_usage_coverage"]["missing_usage_count"], 1);
+            assert_eq!(result["model_usage_coverage"]["status"], "incomplete");
+        }
+        let mut model = super::RuntimeEvidenceState::default();
+        model.add(&usage_evidence());
+        let mut auth = super::RuntimeEvidenceState::default();
+        auth.add(&pre_model_failure_evidence());
+        let mut totals = super::RuntimeEvidenceTotals::default();
+        totals.add(true, &model);
+        totals.add(false, &auth);
+        assert_eq!(totals.usage()["model_usage_coverage"]["verified_pre_model_failure_count"], 0);
+        assert_eq!(totals.usage()["model_usage_coverage"]["status"], "incomplete");
+        assert_eq!(evidence_usage(&[usage_evidence()])["model_usage_coverage"]["status"], "complete");
+    }
+
+    #[test]
+    fn runtime_usage_invalid_subsets_cannot_be_complete() {
+        for usage in [
+            json!({"input_tokens":10,"output_tokens":2,"total_tokens":11}),
+            json!({"input_tokens":u64::MAX,"output_tokens":1,"total_tokens":u64::MAX}),
+        ] {
+            let mut state = super::RuntimeEvidenceState::default();
+            state.add(&json!({"type":"runtime_usage","runtime_id":"a","usage":usage}));
+            let mut totals = super::RuntimeEvidenceTotals::default();
+            totals.add(true, &state);
+            assert!(!state.usage_valid);
+            assert_eq!(totals.usage()["coverage"]["status"], "incomplete");
+        }
+    }
+
+    #[test]
+    fn runtime_usage_missing_total_does_not_assume_disjoint_reasoning() {
+        let mut state = super::RuntimeEvidenceState::default();
+        state.add(&json!({"type":"runtime_usage","runtime_id":"a",
+            "usage":{"input_tokens":2,"output_tokens":3,"reasoning_tokens":2}}));
+        let mut totals = super::RuntimeEvidenceTotals::default();
+        totals.add(true, &state);
+        let usage = totals.usage();
+        assert_eq!(usage["total_tokens"], 5);
+        assert_eq!(usage["reasoning_tokens"], 2);
+        assert_eq!(usage["coverage"]["status"], "incomplete");
+    }
+
+    #[test]
+    fn runtime_usage_additive_cache_and_reasoning_remain_reported_not_guessed() {
+        let mut state = super::RuntimeEvidenceState::default();
+        state.add(&json!({"type":"runtime_usage","runtime_id":"a",
+            "usage":{"input_tokens":10,"output_tokens":2,"cached_input_tokens":11,
+                     "reasoning_tokens":3,"total_tokens":26}}));
+        assert!(state.usage_valid);
+        let mut totals = super::RuntimeEvidenceTotals::default();
+        totals.add(true, &state);
+        assert_eq!(totals.usage()["total_tokens"], 26);
+    }
+
+    #[test]
+    fn runtime_usage_aggregate_overflow_cannot_be_complete() {
+        let mut state = super::RuntimeEvidenceState::default();
+        state.add(&json!({"type":"runtime_usage","runtime_id":"a",
+            "usage":{"input_tokens":u64::MAX / 2 + 1,"output_tokens":0,"total_tokens":u64::MAX / 2 + 1}}));
+        assert!(state.usage_valid);
+        let mut totals = super::RuntimeEvidenceTotals::default();
+        totals.add(true, &state);
+        totals.add(true, &state);
+        assert_eq!(totals.usage()["coverage"]["status"], "incomplete");
+    }
 
     fn snapshot_fixture(session_id: &str) -> SessionSnapshot {
         let timestamp =

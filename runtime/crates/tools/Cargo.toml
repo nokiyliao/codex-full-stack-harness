@@ -34,6 +34,11 @@ name = "command_run_shell_process_hooks"
 path = "tests/os_testing/command_run_shell_process_hooks.rs"
 required-features = ["os-tests"]
 
+[[test]]
+name = "inspect_sandbox_shell"
+path = "tests/os_testing/inspect_sandbox_shell.rs"
+required-features = ["os-tests"]
+
 [features]
 business-tests = []
 live-tests = []

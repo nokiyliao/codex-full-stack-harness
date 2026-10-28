@@ -94,6 +94,16 @@ if scenario=='TRAJECTORY_SPOOL':
 if scenario=='FAIL_AFTER_EDIT':
     pathlib.Path(value('-C'),'answer.txt').write_text('effect before failure\n')
     sys.exit(2)
+if scenario=='EOF_AFTER_EDIT':
+    pathlib.Path(value('-C'),'answer.txt').write_text('effect before failure\n')
+    session=value('--session-id')
+    print(json.dumps({'type':'turn.completed','status':'failed','usage':None,
+        'model':value('-m'),'agent':value('-a'),'session_id':session,'cwd':value('-C'),
+        'reasoning_effort':value('--model-reasoning-effort'),'service_tier':value('--service-tier'),
+        'error':'manas processing failed: network error: provider transport failure: phase=responses-sse category=decode cause=unexpected-eof',
+        'execution_evidence':{'schema_version':'execution_evidence_v1','session_id':session,
+            'status':'persisted_prefix','from_sequence':0,'next_sequence':25,'terminal_boundary_verified':False}}))
+    sys.exit(2)
 if scenario=='STATUS_ONLY':
     print(json.dumps({'type':'item.completed','item':{'type':'command_execution','status':'completed',
         'aggregated_output':json.dumps({'task_status':{'task_group':'fixture'}})}}))
@@ -157,6 +167,81 @@ print(json.dumps({'type':'turn.completed','status':'completed','usage':{'total_t
             self.assertNotEqual(env[core.RECEIPT_ROOT_ENV], "/tmp/injected")
             if sys.platform == "darwin":
                 self.assertEqual(core.prepare(request)[0]["status"], "READY")
+
+    def test_unowned_native_scope_rejects_before_prepare_or_request_consumption(self):
+        request = self._request()
+        with patch.object(core, "inherited_root_parent",
+                          side_effect=core.ProcessScopeError("GRAPH_SUPERVISOR_SCOPE_NOT_EXCLUSIVE")), \
+                patch.object(core, "prepare") as prepare, \
+                patch.object(core.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "NATIVE_SCOPE_UNAVAILABLE"):
+                caller.execute(request)
+        prepare.assert_not_called()
+        spawn.assert_not_called()
+        self.assertFalse((request.artifact_root / request.request_id).exists())
+
+    def test_native_root_does_not_pretend_to_supply_an_external_verifier(self):
+        request = self._request()
+        with patch.object(core, "inherited_root_parent", return_value=17), \
+                patch.object(core, "prepare", return_value=(
+                    {"status": "READY"}, None, {}, {"verifier_commands": [{}]})), \
+                patch.object(core.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(caller.EmbeddedNokiyError, "VERIFIER_OUTER_SCOPE_REQUIRED"):
+                caller.execute(request)
+        spawn.assert_not_called()
+        self.assertFalse((request.artifact_root / request.request_id).exists())
+
+    def test_verifier_output_storage_is_bound_to_the_created_request(self):
+        request = self._request()
+        run = request.artifact_root / request.request_id
+        run.mkdir(mode=0o700)
+        from codex_collaboration_harness import verifier_parent
+        with patch.object(verifier_parent, "ParentVerifier", side_effect=RuntimeError("wiring observed")) as parent, \
+                patch.object(core, "_provider_prompt", return_value="prompt"), \
+                patch.object(caller, "_run_process") as unused:
+            with self.assertRaisesRegex(RuntimeError, "wiring observed"):
+                core._execute_created_run(request, run, None, {"context": {}},
+                    SimpleNamespace(artifacts={"tura_router": "router"}), {},
+                    {"verifier_commands": [{"timeout_seconds": 7}]})
+        self.assertEqual(parent.call_args.kwargs["diagnostic_root"], run)
+        self.assertEqual(parent.call_args.kwargs["request_id"], request.request_id)
+        self.assertEqual(parent.call_args.kwargs["request_sha256"], request.request_sha256)
+        unused.assert_not_called()
+
+    def test_public_preflight_checks_verifier_scope_without_consuming_request(self):
+        request = self._request()
+        ready = {"status": "READY", "model": request.model}
+        with patch.object(core, "prepare", return_value=(ready, None, {}, {"verifier_commands": [{}]})), \
+                patch.object(core, "current_process_is_sandboxed", return_value=True), \
+                patch.object(core, "inherited_root_parent") as claim, \
+                patch.object(core.subprocess, "Popen") as spawn:
+            result = caller.preflight(request)
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["first_typed_blocker"], "NOKIY_FULL_CORE_VERIFIER_OUTER_SCOPE_REQUIRED")
+        self.assertEqual(ready["status"], "READY")
+        claim.assert_not_called()
+        spawn.assert_not_called()
+        self.assertFalse((request.artifact_root / request.request_id).exists())
+
+    def test_verifier_readiness_preserves_external_and_nonverifier_routes(self):
+        with patch.object(core, "current_process_is_sandboxed", return_value=False):
+            self.assertIsNone(core.verifier_dispatch_blocker({"verifier_commands": [{}]}))
+        with patch.object(core, "current_process_is_sandboxed") as probe:
+            self.assertIsNone(core.verifier_dispatch_blocker({}))
+            self.assertIsNone(core.verifier_dispatch_blocker({"verifier_commands": []}))
+        probe.assert_not_called()
+        request = self._request()
+        ready = {"status": "BLOCKED", "first_typed_blocker": "EXISTING_FIRST_BLOCKER"}
+        with patch.object(core, "prepare", return_value=(ready, None, {}, {"verifier_commands": [{}]})), \
+                patch.object(core, "current_process_is_sandboxed") as probe:
+            self.assertEqual(caller.preflight(request), ready)
+        probe.assert_not_called()
+
+    def test_unknown_verifier_scope_is_not_ready(self):
+        for error in (OSError("unavailable"), core.ProcessScopeError("unknown")):
+            with patch.object(core, "current_process_is_sandboxed", side_effect=error):
+                self.assertEqual(core.verifier_dispatch_blocker({"verifier_commands": [{}]}),
+                                 "NOKIY_FULL_CORE_NATIVE_SCOPE_UNAVAILABLE")
 
     def test_nested_or_equal_artifact_root_blocks_before_process_or_request_consumption(self):
         nested = self.f.workspace / "worker"
@@ -652,8 +737,10 @@ assert capsule['evidence_refs'] == []
         try:
             env = core._environment(request, runtime, self.f.root / "state")
         finally:
-            if before is None: os.environ.pop("TURA_ROUTER_ADDR")
-            else: os.environ["TURA_ROUTER_ADDR"] = before
+            if before is None:
+                os.environ.pop("TURA_ROUTER_ADDR")
+            else:
+                os.environ["TURA_ROUTER_ADDR"] = before
         self.assertNotIn("TURA_ROUTER_ADDR", env)
         self.assertEqual(env["CODEX_HOME"], os.environ["CODEX_HOME"])
         self.assertEqual(env.get("HOME"), os.environ.get("HOME"))
@@ -1025,13 +1112,239 @@ channel.close()
                 self.assertEqual(answer.read_text(), "parent reconciled effect\n")
 
     @unittest.skipUnless(sys.platform == "darwin", "Darwin process fence")
-    def test_session_db_startup_failure_is_terminal_and_clean(self):
+    def test_failed_eof_preserves_bound_metadata_without_accepting_or_replaying_effects(self):
+        for profile in ("direct", "balanced"):
+            with self.subTest(profile=profile):
+                request = self._request(profile, prompt="EOF_AFTER_EDIT")
+                result = caller.execute(request)
+                self.assertEqual(result["status"], "BLOCKED", result)
+                self.assertEqual(result["first_typed_blocker"], "NOKIY_EMBEDDED_PROVIDER_EXECUTION_FAILED")
+                self.assertTrue(result["cleanup_pass"])
+                diagnostic = result["provider_failure_diagnostic"]
+                self.assertEqual(diagnostic["transport"], core._FAILED_TRANSPORT)
+                self.assertEqual(diagnostic["effect_outcome"], "UNKNOWN")
+                self.assertEqual(diagnostic["model_request_started"], "UNKNOWN")
+                self.assertFalse(diagnostic["execution_evidence"]["terminal_boundary_verified"])
+                self.assertEqual(diagnostic["trajectory_artifact"], result["trajectory_artifact"])
+                self.assertEqual(diagnostic["execution_evidence"]["session_id"], "full-" + request.request_sha256)
+                self.assertNotIn("error", diagnostic)
+                run = request.artifact_root / request.request_id
+                answer = self.f.workspace / "answer.txt"
+                self.assertEqual(answer.read_text(), "effect before failure\n")
+                before = {str(path.relative_to(run)): fixtures.file_sha256(path)
+                          for path in run.rglob("*") if path.is_file()}
+                with patch.dict(os.environ, {"CODEX_THREAD_ID": request.native_thread_id}):
+                    projected = inspector.project_terminal(result, request.artifact_root, request.request_id)
+                    with patch.object(inspector, "inspect", side_effect=AssertionError("inspected twice")):
+                        summary = inspector.summarize_terminal(projected, request.artifact_root, request.request_id)
+                self.assertEqual(summary["provider_failure_diagnostic"], diagnostic)
+                self.assertEqual(summary["status"], "BLOCKED")
+                self.assertEqual(caller.execute(request), result)
+                after = {str(path.relative_to(run)): fixtures.file_sha256(path)
+                         for path in run.rglob("*") if path.is_file()}
+                self.assertEqual(before, after)
+                self.assertEqual(answer.read_text(), "effect before failure\n")
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin process fence")
+    def test_failure_projection_requires_the_actual_indexed_event_without_an_extra_read(self):
+        request = self._request(prompt="EOF_AFTER_EDIT")
+        terminal = caller.execute(request)
+        run = request.artifact_root / request.request_id
+        diagnostic = terminal["provider_failure_diagnostic"]
+        prefix = diagnostic["execution_evidence"]
+        original = (run / "terminal.json").read_bytes()
+        legacy = {key: value for key, value in terminal.items() if key != "provider_failure_diagnostic"}
+        (run / "terminal.json").write_text(json.dumps(legacy))
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": request.native_thread_id}), patch.object(
+                core._Trajectory, "__iter__", autospec=True, side_effect=core._Trajectory.__iter__) as reads:
+            inspector.project_terminal(legacy, request.artifact_root, request.request_id)
+        baseline_reads = reads.call_count
+        self.assertGreater(baseline_reads, 0)
+        (run / "terminal.json").write_bytes(original)
+        for changed in ({**diagnostic, "event_index": diagnostic["event_index"] + 1},
+                        {**diagnostic, "execution_evidence": {**prefix, "next_sequence": 26}}):
+            with self.subTest(changed=changed), patch.dict(os.environ, {"CODEX_THREAD_ID": request.native_thread_id}):
+                altered = {**terminal, "provider_failure_diagnostic": changed}
+                self.assertIsNotNone(core.valid_provider_failure_diagnostic(changed, altered))
+                with patch.object(core._Trajectory, "__iter__", autospec=True,
+                                  side_effect=core._Trajectory.__iter__) as reads:
+                    projected = inspector.project_terminal(altered, request.artifact_root, request.request_id)
+                self.assertEqual(reads.call_count, baseline_reads)
+                self.assertNotIn("provider_failure_diagnostic", projected)
+                self.assertEqual(projected["status"], "BLOCKED")
+        # A legacy failed trajectory without a matching event cannot acquire this diagnostic.
+        empty = {key: value for key, value in terminal.items() if key != "provider_failure_diagnostic"}
+        (run / "core.jsonl").write_text("")
+        empty["trajectory_artifact"] = {"path": str(run / "core.jsonl"),
+                                        "sha256": hashlib.sha256(b"").hexdigest(), "bytes": 0}
+        (run / "terminal.json").write_text(json.dumps(empty))
+        fabricated = {**diagnostic, "trajectory_artifact": empty["trajectory_artifact"]}
+        altered = {**empty, "provider_failure_diagnostic": fabricated}
+        self.assertIsNotNone(core.valid_provider_failure_diagnostic(fabricated, altered))
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": request.native_thread_id}):
+            self.assertNotIn("provider_failure_diagnostic",
+                             inspector.project_terminal(altered, request.artifact_root, request.request_id))
+
+    def test_failed_turn_diagnostics_reject_unbound_malformed_or_secret_payloads(self):
+        request = self._request()
+        base = {"type": "turn.completed", "status": "failed", **core._terminal_identity(request),
+                "error": core._FAILED_TRANSPORT_ERROR,
+                "execution_evidence": {"schema_version": "execution_evidence_v1",
+                    "session_id": "full-" + request.request_sha256, "status": "persisted_prefix",
+                    "from_sequence": 0, "next_sequence": 25, "terminal_boundary_verified": False}}
+        reference = {"path": str(request.artifact_root / request.request_id / "core.jsonl"),
+                     "sha256": "a" * 64, "bytes": 100}
+
+        def project(events, complete=True):
+            observed = core._FailedTurnDiagnostic(request)
+            stream = observed.events(iter(events))
+            if complete:
+                list(stream)
+            else:
+                next(stream)
+            return observed.finish(reference)
+
+        self.assertIsNotNone(project([base]))
+        invalid = [{**base, "status": "completed"}, {**base, "model": "codex/foreign"},
+                   {**base, "session_id": "foreign"}, {**base, "error": core._FAILED_TRANSPORT_ERROR + " secret"},
+                   {**base, "error": {"message": core._FAILED_TRANSPORT_ERROR}},
+                   {**base, "error": "prefix " + core._FAILED_TRANSPORT_ERROR}]
+        for field, value in (("schema_version", "foreign"), ("session_id", "foreign"),
+                             ("status", "complete"), ("from_sequence", True), ("from_sequence", 1),
+                             ("next_sequence", True), ("next_sequence", -1), ("next_sequence", 2**63),
+                             ("terminal_boundary_verified", True)):
+            invalid.append({**base, "execution_evidence": {**base["execution_evidence"], field: value}})
+        invalid.append({**base, "execution_evidence": {**base["execution_evidence"], "secret": "not exposed"}})
+        for event in invalid:
+            with self.subTest(event=event):
+                self.assertIsNone(project([event]))
+        self.assertIsNone(project([base, base]))
+        self.assertIsNone(project([base], complete=False))
+        path = request.artifact_root / "malformed-core.jsonl"
+        path.write_text(json.dumps(base) + "\n{\n")
+        observed = core._FailedTurnDiagnostic(request)
+        with self.assertRaises(caller.EmbeddedNokiyError):
+            list(observed.events(core._Trajectory(path)))
+        self.assertIsNone(observed.finish(reference))
+
+    def test_failed_diagnostic_summary_is_bounded_bound_and_pure(self):
+        request = self._request()
+        reference = {"path": str(request.artifact_root / request.request_id / "core.jsonl"),
+                     "sha256": "a" * 64, "bytes": 100}
+        event = {"type": "turn.completed", "status": "failed", **core._terminal_identity(request),
+                 "error": core._FAILED_TRANSPORT_ERROR,
+                 "execution_evidence": {"schema_version": "execution_evidence_v1", "status": "persisted_prefix",
+                     "session_id": "full-" + request.request_sha256, "from_sequence": 0, "next_sequence": 25,
+                     "terminal_boundary_verified": False}}
+        observed = core._FailedTurnDiagnostic(request)
+        list(observed.events([event]))
+        diagnostic = observed.finish(reference)
+        terminal = {"status": "BLOCKED", "cleanup_pass": True,
+                    "first_typed_blocker": "NOKIY_EMBEDDED_PROVIDER_EXECUTION_FAILED",
+                    "request_id": request.request_id, "request_sha256": request.request_sha256,
+                    "native_thread_id": request.native_thread_id, "trajectory_artifact": reference,
+                    "provider_failure_diagnostic": diagnostic,
+                    "result_inspection": {"terminal_sha256": "b" * 64,
+                        "provider_failure_diagnostic_sha256": caller._canonical_sha256(diagnostic)}}
+        before = json.dumps(terminal, sort_keys=True)
+        with patch.object(inspector, "inspect", side_effect=AssertionError("inspected twice")):
+            summary = inspector.summarize_terminal(terminal, request.artifact_root, request.request_id)
+        self.assertEqual(summary["provider_failure_diagnostic"], diagnostic)
+        self.assertEqual(json.dumps(terminal, sort_keys=True), before)
+        for inspection in ({"terminal_sha256": "b" * 64},
+                           {**terminal["result_inspection"], "provider_failure_diagnostic_sha256": "c" * 64}):
+            self.assertNotIn("provider_failure_diagnostic", inspector.summarize_terminal(
+                {**terminal, "result_inspection": inspection}, request.artifact_root, request.request_id))
+        for changed in ({**diagnostic, "event_index": 1},
+                        {**diagnostic, "execution_evidence": {**diagnostic["execution_evidence"],
+                                                             "next_sequence": 26}}):
+            self.assertIsNotNone(core.valid_provider_failure_diagnostic(changed, terminal))
+            self.assertNotIn("provider_failure_diagnostic", inspector.summarize_terminal(
+                {**terminal, "provider_failure_diagnostic": changed}, request.artifact_root, request.request_id))
+        invalid = [None, {**diagnostic, "error": "secret"},
+                   {**diagnostic, "event_index": True},
+                   {**diagnostic, "effect_outcome": "known_success"},
+                   {**diagnostic, "model_request_started": False},
+                   {**diagnostic, "trajectory_artifact": {**reference, "sha256": "c" * 64}},
+                   {**diagnostic, "transport": {**diagnostic["transport"], "secret": "not exposed"}}]
+        for value in invalid:
+            with self.subTest(value=value):
+                projected = {**terminal, "provider_failure_diagnostic": value}
+                self.assertIsNone(core.valid_provider_failure_diagnostic(value, projected))
+                self.assertNotIn("provider_failure_diagnostic",
+                                 inspector.summarize_terminal(projected, request.artifact_root, request.request_id))
+        for field, value in (("status", "RESULT_AVAILABLE"), ("cleanup_pass", False),
+                             ("first_typed_blocker", None), ("request_sha256", "c" * 64)):
+            with self.subTest(field=field):
+                projected = {**terminal, field: value}
+                self.assertIsNone(core.valid_provider_failure_diagnostic(diagnostic, projected))
+        self.assertNotIn("provider_failure_diagnostic", inspector.summarize_terminal(
+            {key: value for key, value in terminal.items() if key != "provider_failure_diagnostic"},
+            request.artifact_root, request.request_id))
+
+    def test_long_evidence_root_starts_synthetic_services_without_provider_calls(self):
+        self.f.artifacts = self.f.artifacts.joinpath(*(["long-task-evidence-" + "x" * 80] * 5))
+        self.f.artifacts.mkdir(parents=True)
+        self.f.workspace = self.f.workspace.joinpath(*(["long-task-" + "y" * 80] * 5))
+        self.f.workspace.mkdir(parents=True)
+        self.f.context, self.f.jspace = self.f._write_context(write_scopes=["answer.txt"])
+        request = self._request()
+        run = request.artifact_root / request.request_id
+        run.mkdir()
+        self.assertGreater(len(os.fsencode(run / "execution-state")), 600)
+        for name, value in (("execution.json", {"request": request.to_wire(include_identity=False)}),
+                            ("capsule.json", json.loads(self.f.context.read_text())),
+                            ("jspace.json", json.loads(self.f.jspace.read_text()))):
+            (run / name).write_bytes(caller._canonical_bytes(value))
+        (run / "prompt.txt").write_text(request.prompt)
+        result = core._engine(run / "execution.json")
+        self.assertTrue(result["turn_completed"])
+        self.assertIsNone(result["provider_observation"]["model"]["value"])
+        self.assertTrue((run / "execution-state/cli-reached").is_file())
+
+    @unittest.skipIf(os.geteuid() == 0, "requires native permission refusal")
+    def test_engine_preserves_native_startup_stderr_on_long_evidence_path(self):
+        self.f.artifacts = self.f.artifacts.joinpath(*(["long-startup-" + "x" * 80] * 5))
+        self.f.artifacts.mkdir(parents=True)
+        self._permission_refusal_service()
+        request = self._request()
+        run = request.artifact_root / request.request_id
+        run.mkdir()
+        spec = run / "execution.json"
+        spec.write_bytes(caller._canonical_bytes({"request": request.to_wire(include_identity=False)}))
+        output = io.StringIO()
+        with patch.object(sys, "argv", [core.MODULE, "--engine", str(spec)]), redirect_stdout(output):
+            self.assertEqual(core.main(), 2)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["failure"], "NOKIY_FULL_CORE_SERVICE_NOT_READY")
+        diagnostic = result["startup_failure_diagnostic"]
+        self.assertEqual(diagnostic["service"], "tura_session_db")
+        self.assertEqual(diagnostic["exit_code"], 23)
+        self.assertIn("Permission denied", diagnostic["log_tail"])
+        self.assertEqual(diagnostic["log_artifact"], core._record_artifact(run / "tura_session_db.log"))
+        self.assertFalse((run / "core.jsonl").exists())
+        self.assertFalse((run / "execution-state/cli-reached").exists())
+        self.assertFalse((run / "execution-state/denied/must-not-exist").exists())
+
+    def _permission_refusal_service(self):
         self.f._write_executable(self.f.runtime / "tura_session_db", f"#!{sys.executable}\n" + r'''
 import os,pathlib,sys
-(pathlib.Path(os.environ['TURA_HOME'])/'session-db-started').write_text(str(os.getpid()))
-sys.exit(23)
+state=pathlib.Path(os.environ['TURA_HOME'])
+(state/'session-db-started').write_text(str(os.getpid()))
+denied=state/'denied';denied.mkdir(mode=0o500)
+try:
+    (denied/'must-not-exist').write_text('unauthorized')
+except PermissionError as error:
+    print(str(error),file=sys.stderr,flush=True)
+    sys.exit(23)
+finally:
+    denied.chmod(0o700)
 ''')
         self._image()
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.geteuid() != 0, "unprivileged Darwin process fence")
+    def test_session_db_startup_failure_is_terminal_and_clean(self):
+        self._permission_refusal_service()
         for profile in ("direct", "balanced"):
             with self.subTest(profile=profile):
                 request = self._request(profile)
@@ -1042,6 +1355,19 @@ sys.exit(23)
                 result = caller.execute(request)
                 self.assertEqual(result["status"], "BLOCKED", result)
                 self.assertEqual(result["first_typed_blocker"], "NOKIY_FULL_CORE_SERVICE_NOT_READY")
+                diagnostic = result["startup_failure_diagnostic"]
+                self.assertEqual(diagnostic["service"], "tura_session_db")
+                self.assertEqual(diagnostic["reason"], "process_exited")
+                self.assertEqual(diagnostic["exit_code"], 23)
+                self.assertIn("Permission denied", diagnostic["log_tail"])
+                log = request.artifact_root / request.request_id / "tura_session_db.log"
+                self.assertEqual(diagnostic["log_artifact"], core._record_artifact(log))
+                self.assertFalse((state / "denied/must-not-exist").exists())
+                self.assertIsNone(result["usage"])
+                self.assertIsNone(result["observed_model"])
+                inspection = inspector.inspect(request.artifact_root, request.request_id, request.native_thread_id)
+                self.assertEqual(inspection["first_blocker"], result["first_typed_blocker"])
+                self.assertEqual(inspection["startup_failure_diagnostic"], diagnostic)
                 self.assertIs(result["cleanup_pass"], True, result)
                 self.assertEqual(result["execution_profile"], profile)
                 self.assertTrue((state / "session-db-started").is_file())
@@ -1070,6 +1396,8 @@ sys.exit(23)
                 result = caller.execute(request)
                 self.assertEqual(result["status"], "BLOCKED", result)
                 self.assertEqual(result["first_typed_blocker"], "NOKIY_FULL_CORE_SERVICE_NOT_READY")
+                self.assertEqual(result["startup_failure_diagnostic"]["service"], "tura_router")
+                self.assertEqual(result["startup_failure_diagnostic"]["exit_code"], 23)
                 self.assertIs(result["cleanup_pass"], True, result)
                 self.assertEqual(result["execution_profile"], profile)
                 self.assertTrue((state / "router-started").is_file())
@@ -1121,9 +1449,8 @@ sys.exit(23)
                     jspace = json.loads(request.jspace_contract.path.read_text())
                     captured = []
 
-                    def capture_prompt(prompt, grant, terminal_delivery="assistant_reply"):
-                        captured.append(render_prompt(prompt, grant,
-                                                      terminal_delivery=terminal_delivery))
+                    def capture_prompt(prompt, grant, **options):
+                        captured.append(render_prompt(prompt, grant, **options))
                         raise StopAtPrompt
 
                     # Capture the real call site before any provider process starts.
@@ -1132,7 +1459,9 @@ sys.exit(23)
                         with self.assertRaises(StopAtPrompt):
                             core.execute_full_core(request)
                     provider_prompt.assert_called_once_with(
-                        request.prompt, jspace, terminal_delivery=request.terminal_delivery)
+                        request.prompt, jspace, terminal_delivery=request.terminal_delivery,
+                        admitted_digest_reference=False, observed_digest_reference=False,
+                        directory_source_read=False, capsule={}, capsule_digest_reference=False)
                     self.assertEqual(request.terminal_delivery, requested_mode or "assistant_reply")
                     self.assertEqual(captured, [render_prompt(
                         request.prompt, jspace, terminal_delivery=request.terminal_delivery)])
@@ -1255,6 +1584,32 @@ sys.exit(23)
         self.assertEqual(legacy["final_text"], observed["final_text"])
         for key in core._TerminalEvidence.FIELD_NAMES:
             self.assertNotIn(key, legacy)
+
+    def test_existing_terminal_handoff_artifact_remains_bound_and_directly_readable(self):
+        request, marker, completed = self._terminal_evidence_case()
+        runtime, provider = marker["runtime_id"], "call_report"
+        command_run = runtime + ".tool.command_run"
+        text = caller._canonical_bytes({"worker_report": "交付🙂", "parent_acceptance": "pending"}).decode()
+        event = {"type": "item.completed", "item": {
+            "type": "command_execution", "id": "item_report", "command_type": "task_status",
+            "status": "completed", "exit_code": None, "command": "task_status",
+            "runtime_id": runtime, "provider_tool_call_id": provider, "command_run_id": command_run,
+            "command_id": f"{command_run}:{provider}:0", "command_index": 0, "step": 1,
+            "aggregated_output": {"task_status": {
+                "status": "done", "final_reply": text, "final_reply_format": "json"}}}}
+        records = [event, marker, completed]
+        observed = self._terminal_evidence_records(request, records)
+        self.assertEqual(observed["result_artifact_source"]["status"], "MODEL_REPORTED")
+        self.assertEqual(Path(observed["result_artifact"]["path"]).read_text(), text)
+        handoff = core._EvidenceHandoff(request, self.f.root / request.request_id)
+        for index, record in enumerate(records):
+            handoff.observe(record, index)
+        projected = handoff.project(observed, marker, inline_limit=request.max_result_bytes)
+        self.assertEqual(projected["result_artifact_preview"]["text"], text)
+        self.assertTrue(projected["result_artifact_preview"]["complete"])
+        self.assertEqual(projected["result_artifact"], observed["result_artifact"])
+        self.assertNotIn("task_status_final_reply", projected)
+        self.assertFalse(marker["final_summary_turn_executed"])
 
     def test_terminal_marker_rejects_malformed_foreign_duplicate_and_late_events(self):
         for status in ("done", "blocked"):

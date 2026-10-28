@@ -771,6 +771,7 @@ mod tests {
         FakeEndpoint { task, requests }
     }
 
+    #[allow(clippy::await_holding_lock)] // the env lock serializes env-mutating tests across their runtimes
     #[tokio::test]
     async fn explicit_absolute_external_endpoint_directory_is_accepted() {
         let _lock = crate::services::ROUTER_TEST_ENV_LOCK

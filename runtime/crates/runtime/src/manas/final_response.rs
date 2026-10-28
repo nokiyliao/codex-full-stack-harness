@@ -1,5 +1,6 @@
 use crate::prompt_style::runtime_fallback;
 use lifecycle::SessionManagement;
+use runtime_contract::strip_tool_payload_suffix;
 
 use crate::gateway_events::summarize_single_tool_output;
 
@@ -32,7 +33,10 @@ pub(crate) fn user_visible_runtime_text(text: &str) -> Option<String> {
         break;
     }
 
-    let visible = strip_tool_payload_suffix(&strip_runtime_markup(visible.trim()));
+    let visible = strip_tool_payload_suffix(
+        &strip_runtime_markup(visible.trim()),
+        looks_like_tool_payload,
+    );
     if !visible.is_empty() {
         if is_code_fence_only(&visible) {
             return None;
@@ -69,17 +73,6 @@ pub(crate) fn user_visible_runtime_output_text(output: &serde_json::Value) -> Op
     let content = tura_llm_rust::normalize_response_content(output);
     let text = tura_llm_rust::extract_response_text(&content)?;
     user_visible_runtime_text(&text)
-}
-
-fn strip_tool_payload_suffix(text: &str) -> String {
-    let Some(index) = text.find("{\"commands\"") else {
-        return text.to_string();
-    };
-    let (prefix, suffix) = text.split_at(index);
-    if looks_like_tool_payload(suffix) {
-        return prefix.trim().to_string();
-    }
-    text.to_string()
 }
 
 pub(super) fn extract_reply_message_from_json(text: &str) -> Option<String> {
@@ -312,6 +305,130 @@ mod tests {
         }
         let text = format!("<think>hidden</think>Done.{payload}");
         assert_eq!(user_visible_runtime_text(&text).as_deref(), Some("Done."));
+    }
+
+    #[test]
+    fn user_visible_runtime_text_preserves_fenced_command_examples() {
+        for text in [
+            "regression:\n```rust\nlet args = json!({\"commands\":[]});\n```\nEND_ANSWER",
+            "```json\n{\"commands\":[]}\n```",
+            r#"regression:
+```rust
+#[test]
+fn code_answer() {
+    let call = ToolCall {
+        arguments: json!({"commands": []}),
+    };
+}
+```
+END_ANSWER"#,
+        ] {
+            assert_eq!(user_visible_runtime_text(text).as_deref(), Some(text));
+            let reply = json!({"input": {"reply_message": text}}).to_string();
+            assert_eq!(user_visible_runtime_text(&reply).as_deref(), Some(text));
+            assert_eq!(
+                user_visible_runtime_output_text(&json!({"text": text})).as_deref(),
+                Some(text)
+            );
+        }
+    }
+
+    #[test]
+    fn user_visible_runtime_text_tracks_fence_markers_and_widths() {
+        for (open, nested, close) in [
+            ("```json", "", "```"),
+            ("````rust", "```\n", "`````"),
+            ("~~~rust", "```\n", "~~~~"),
+            ("~~~~text", "~~~\n````\n~~~~not a closer\n", "~~~~"),
+            ("   `````rust", "   ````\n", "   `````"),
+        ] {
+            let text = format!(
+                "regression:\n{open}\n{nested}let args = json!({{\"commands\":[]}});\n{close}\nEND_ANSWER"
+            );
+            assert_eq!(
+                user_visible_runtime_text(&text).as_deref(),
+                Some(text.as_str())
+            );
+            for payload in [r#"{"commands":[]}"#, r#"{"commands":["#] {
+                let leaked = format!("{text}\n{payload}");
+                assert_eq!(
+                    user_visible_runtime_text(&leaked).as_deref(),
+                    Some(text.as_str()),
+                    "{leaked:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn user_visible_runtime_text_preserves_inline_command_examples() {
+        for text in [
+            r#"`{"commands":[]}`"#,
+            r#"Use `{"commands":[]}` inline. END_ANSWER"#,
+            r#"Use ``json!({"commands":[]})`` inline. END_ANSWER"#,
+            r#"Use ``a ` tick; {"commands":[]} `` inline. END_ANSWER"#,
+            r#"Use ```json!({"commands":[]})``` inline. END_ANSWER"#,
+            "Use ``json!(\n{\"commands\":[]}\n)`` inline. END_ANSWER",
+            "Unicode λ `{\"commands\":[]}` retained. END_ANSWER",
+        ] {
+            assert_eq!(user_visible_runtime_text(text).as_deref(), Some(text));
+            for payload in [r#"{"commands":[]}"#, r#"{"commands":["#] {
+                let leaked = format!("{text}\n{payload}");
+                assert_eq!(
+                    user_visible_runtime_text(&leaked).as_deref(),
+                    Some(text),
+                    "{leaked:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn user_visible_runtime_text_still_filters_unfenced_command_payloads() {
+        for payload in [
+            r#"{"commands":[]}"#,
+            r#"{"commands":["#,
+            r#"{"commands":[{"command_type":"source_read""#,
+            r#"{"commands":[]} trailing non-JSON text"#,
+        ] {
+            assert_eq!(user_visible_runtime_text(payload), None, "{payload:?}");
+            for prefix in [
+                "Done.",
+                "Unmatched ` delimiter.",
+                "Mismatched ` delimiters ``.",
+                r"Escaped \` delimiter.",
+                "Not a fence: ~~~ prose.",
+            ] {
+                let text = format!("{prefix}\n{payload}");
+                assert_eq!(
+                    user_visible_runtime_text(&text).as_deref(),
+                    Some(prefix),
+                    "{text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn user_visible_runtime_text_keeps_hidden_thought_guards_with_code() {
+        let answer = "regression:\n```rust\nlet args = json!({\"commands\":[]});\n```\nEND_ANSWER";
+        for text in [
+            format!("<think>{answer}</think>"),
+            format!("<think>{answer}"),
+        ] {
+            assert_eq!(user_visible_runtime_text(&text), None);
+            let reply = json!({"input": {"reply_message": text}}).to_string();
+            assert_eq!(user_visible_runtime_text(&reply), None);
+        }
+        let hidden_in_code = answer.replace("let args", "<think>hidden</think>let args");
+        assert_eq!(
+            user_visible_runtime_text(&hidden_in_code).as_deref(),
+            Some(answer)
+        );
+        let text = format!("<think>hidden</think><invoke>\n{answer}\n</invoke>");
+        assert_eq!(user_visible_runtime_text(&text).as_deref(), Some(answer));
+        let text = format!("{answer}<think>unfinished");
+        assert_eq!(user_visible_runtime_text(&text).as_deref(), Some(answer));
     }
 
     #[test]

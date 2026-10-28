@@ -22,6 +22,17 @@ pub fn coding_agent_provider() -> String {
     CodingAgent::provider().tura_llm_name
 }
 
+/// Where a session without an explicit directory lives: `sessions` under the working directory.
+/// Unit tests resolve it under the system temporary directory instead, so running them never
+/// initializes a repository inside the source tree.
+fn default_session_directory() -> PathBuf {
+    #[cfg(test)]
+    let base = std::env::temp_dir().join("tura-gateway-unit-tests");
+    #[cfg(not(test))]
+    let base = std::env::current_dir().unwrap_or_default();
+    base.join(DEFAULT_SESSION_DIRECTORY)
+}
+
 pub struct SessionManager;
 
 impl SessionManager {
@@ -34,12 +45,19 @@ impl SessionManager {
         let now = Utc::now();
 
         let dir_clone = directory.clone();
-        let session_directory = directory.map(PathBuf::from).unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .join(DEFAULT_SESSION_DIRECTORY)
-        });
-        if let Err(error) = tura_path::workspace_git::ensure_workspace_git_repo(&session_directory)
+        let session_directory = directory
+            .map(PathBuf::from)
+            .unwrap_or_else(default_session_directory);
+        // Gateway workspaces arrive as absolute paths. A relative one (a Windows path in a test
+        // on macOS, for example) would resolve against the server's working directory, so it gets
+        // no repository bootstrap there.
+        if !session_directory.is_absolute() {
+            tracing::warn!(
+                directory = %session_directory.display(),
+                "skipping workspace git bootstrap for a relative session directory"
+            );
+        } else if let Err(error) =
+            tura_path::workspace_git::ensure_workspace_git_repo(&session_directory)
         {
             tracing::warn!(
                 directory = %session_directory.display(),

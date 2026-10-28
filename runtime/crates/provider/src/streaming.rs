@@ -36,7 +36,7 @@ pub(crate) fn provider_transport_error(
     } else if error.is_body() {
         "body"
     } else if complete_chain && error.is_timeout() {
-        "timeout"
+        if error.is_connect() { "connect-timeout" } else { "timeout" }
     } else if complete_chain && error.is_connect() {
         "connect"
     } else if error.is_builder() {
@@ -249,6 +249,44 @@ mod tests {
             assert!(message.len() <= 128);
             assert!(!message.contains("SENTINEL"));
             assert!(!message.contains("provider.invalid"));
+        }
+    }
+
+    async fn local_request_timeout(tls: bool) -> reqwest::Error {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_connection, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_millis(30))
+            .timeout(Duration::from_millis(90))
+            .build().unwrap();
+        let scheme = if tls { "https" } else { "http" };
+        let error = client.get(format!("{scheme}://{address}/PRIVATE_SENTINEL"))
+            .bearer_auth("AUTH_SENTINEL")
+            .send().await.expect_err("local server never sends a TLS handshake or headers");
+        server.await.unwrap();
+        error
+    }
+
+    #[tokio::test]
+    async fn request_timeout_diagnostics_distinguish_connect_from_response_wait() {
+        for (tls, category) in [(true, "connect-timeout"), (false, "timeout")] {
+            let error = local_request_timeout(tls).await;
+            assert!(error.is_timeout());
+            assert_eq!(error.is_connect(), tls);
+            let TuraError::Network { message } =
+                provider_transport_error(ProviderTransportPhase::Request, &error)
+            else { panic!("expected network error") };
+            assert!(message.starts_with(&format!(
+                "provider transport failure: phase=request category={category} cause="
+            )));
+            assert!(message.len() <= 128);
+            assert!(!message.contains("SENTINEL"));
+            assert!(!message.contains(&error.url().unwrap().port().unwrap().to_string()));
         }
     }
 

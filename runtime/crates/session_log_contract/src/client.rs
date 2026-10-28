@@ -25,6 +25,8 @@ const PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
 const PROBE_OWNED_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
+// Stay comfortably inside the server's 60s idle read timeout.
+const REQUEST_CONNECTION_REUSE_WINDOW: Duration = Duration::from_secs(30);
 const SUBSCRIPTION_BLOCKING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EMPTY_RESPONSE_RETRIES: usize = 3;
 static NEXT_QUEUE_ID: AtomicU64 = AtomicU64::new(0);
@@ -108,6 +110,97 @@ pub fn call_service(command: &SessionLogCommand) -> Result<SessionLogResponse> {
     }
     Err(last_transient_response_error
         .unwrap_or_else(|| anyhow!("session_db service call did not run")))
+}
+
+/// An owned, serialized request/reply connection. Ordinary one-shot callers
+/// continue to use `call_service`.
+///
+/// Every call checks the current endpoint and build before sending anything.
+/// A transport or decode failure closes the connection without retrying the
+/// possibly consumed command; only a subsequent, new command may reconnect.
+/// A parsed `SessionLogResponse::Error` is a reply, not a poisoned transport.
+/// Reuse is bounded from the last request start, including response latency;
+/// an expired connection is retired before sending the next command.
+#[derive(Default)]
+pub struct SessionLogRequestClient {
+    connection: Option<(ServiceEndpoint, BufReader<TcpStream>, Instant)>,
+}
+
+impl SessionLogRequestClient {
+    pub fn call(&mut self, command: &SessionLogCommand) -> Result<SessionLogResponse> {
+        self.call_with_endpoint(command, read_endpoint())
+    }
+
+    fn call_with_endpoint(
+        &mut self,
+        command: &SessionLogCommand,
+        endpoint: Result<ServiceEndpoint>,
+    ) -> Result<SessionLogResponse> {
+        let result = (|| {
+            let endpoint = endpoint?;
+            ensure_version_compatible(&endpoint)?;
+            let addr = parse_addr(&endpoint)?;
+            let mut frame = serde_json::to_vec(command)?;
+            frame.push(b'\n');
+
+            let request_started_at = Instant::now();
+            if self
+                .connection
+                .as_ref()
+                .is_some_and(|(current, _, last_request_started_at)| {
+                    current != &endpoint
+                        || request_started_at.duration_since(*last_request_started_at)
+                            >= REQUEST_CONNECTION_REUSE_WINDOW
+                })
+            {
+                self.disconnect();
+            }
+            if self.connection.is_none() {
+                let stream =
+                    TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).with_context(|| {
+                        format!("failed to connect to session_db service at {addr}")
+                    })?;
+                stream.set_read_timeout(Some(READ_TIMEOUT))?;
+                stream.set_write_timeout(Some(READ_TIMEOUT))?;
+                self.connection = Some((endpoint, BufReader::new(stream), request_started_at));
+            }
+
+            let (_, reader, last_request_started_at) = self
+                .connection
+                .as_mut()
+                .expect("session_db request connection was opened");
+            // Serialize the delimiter with the payload before touching the
+            // socket. Any partial write, read or decode error poisons it.
+            // Never reset the age at response completion.
+            *last_request_started_at = request_started_at;
+            reader.get_mut().write_all(&frame)?;
+            reader.get_mut().flush()?;
+            let mut response = Vec::new();
+            let read = reader.read_until(b'\n', &mut response)?;
+            if read == 0 {
+                return Err(anyhow!(
+                    "session_db service at {addr} closed without a response"
+                ));
+            }
+            if response.last() != Some(&b'\n') {
+                return Err(anyhow!(
+                    "session_db service at {addr} closed with an incomplete response frame"
+                ));
+            }
+            serde_json::from_slice(&response)
+                .with_context(|| "failed to decode session_db service response")
+        })();
+        if result.is_err() {
+            self.disconnect();
+        }
+        result
+    }
+
+    fn disconnect(&mut self) {
+        if let Some((_, reader, _)) = self.connection.take() {
+            let _ = reader.get_ref().shutdown(Shutdown::Both);
+        }
+    }
 }
 
 pub struct SessionFeedSubscription {
@@ -585,6 +678,467 @@ fn format_owner_lock_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REQUEST_TEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn request_test_listener() -> (std::net::TcpListener, ServiceEndpoint) {
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind request listener");
+        let endpoint = ServiceEndpoint {
+            addr: listener.local_addr().expect("request address").to_string(),
+            version: tura_path::instance_version(),
+        };
+        listener
+            .set_nonblocking(true)
+            .expect("bound request accepts");
+        (listener, endpoint)
+    }
+
+    fn accept_test_request(listener: &std::net::TcpListener) -> BufReader<TcpStream> {
+        let started = Instant::now();
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    assert!(
+                        started.elapsed() < REQUEST_TEST_TIMEOUT,
+                        "request accept timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("request accept failed: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).expect("blocking mock socket");
+        stream
+            .set_read_timeout(Some(REQUEST_TEST_TIMEOUT))
+            .expect("bound mock reads");
+        stream
+            .set_write_timeout(Some(REQUEST_TEST_TIMEOUT))
+            .expect("bound mock writes");
+        BufReader::new(stream)
+    }
+
+    fn read_test_request(reader: &mut BufReader<TcpStream>) -> SessionLogCommand {
+        let mut frame = String::new();
+        assert!(reader.read_line(&mut frame).expect("read request") > 0);
+        assert!(
+            frame.ends_with('\n'),
+            "request must be a complete NDJSON frame"
+        );
+        serde_json::from_str(&frame).expect("decode request")
+    }
+
+    fn write_test_reply(reader: &mut BufReader<TcpStream>, reply: &SessionLogResponse) {
+        let mut frame = serde_json::to_vec(reply).expect("encode reply");
+        frame.push(b'\n');
+        reader.get_mut().write_all(&frame).expect("write reply");
+        reader.get_mut().flush().expect("flush reply");
+    }
+
+    fn assert_request_socket_closed(reader: &mut BufReader<TcpStream>) {
+        let mut extra = String::new();
+        assert_eq!(
+            reader
+                .read_line(&mut extra)
+                .expect("observe closed request socket"),
+            0,
+            "failed commands must not be retransmitted on the old socket"
+        );
+    }
+
+    fn assert_no_request_connection(listener: &std::net::TcpListener) {
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
+            "unexpected reconnect or command replay"
+        );
+    }
+
+    #[test]
+    fn request_client_reuses_one_socket_and_preserves_typed_error_framing() {
+        let (listener, endpoint) = request_test_listener();
+        let server = std::thread::spawn(move || {
+            let mut reader = accept_test_request(&listener);
+            for index in 0..3 {
+                let command = read_test_request(&mut reader);
+                if index == 1 {
+                    assert!(matches!(command, SessionLogCommand::ListWorkspaces));
+                    write_test_reply(
+                        &mut reader,
+                        &SessionLogResponse::Error {
+                            error: "typed rejection\nnot a transport failure 🦀".to_string(),
+                        },
+                    );
+                } else {
+                    assert!(matches!(command, SessionLogCommand::Health));
+                    write_test_reply(&mut reader, &SessionLogResponse::Ok);
+                }
+            }
+            assert_request_socket_closed(&mut reader);
+            assert_no_request_connection(&listener);
+        });
+        let mut client = SessionLogRequestClient::default();
+        assert!(matches!(
+            client.call_with_endpoint(&SessionLogCommand::Health, Ok(endpoint.clone())),
+            Ok(SessionLogResponse::Ok)
+        ));
+        client.connection.as_mut().expect("fresh connection").2 =
+            Instant::now() - Duration::from_secs(1);
+        let request_started_at = Instant::now();
+        assert!(matches!(
+            client.call_with_endpoint(&SessionLogCommand::ListWorkspaces, Ok(endpoint.clone())),
+            Ok(SessionLogResponse::Error { error })
+                if error == "typed rejection\nnot a transport failure 🦀"
+        ));
+        let (_, reader, last_request_started_at) = client
+            .connection
+            .as_ref()
+            .expect("typed errors keep the socket aligned");
+        assert!(
+            *last_request_started_at >= request_started_at,
+            "each request must refresh the send/start time"
+        );
+        assert_eq!(
+            reader.get_ref().read_timeout().expect("read timeout"),
+            Some(READ_TIMEOUT)
+        );
+        assert_eq!(
+            reader.get_ref().write_timeout().expect("write timeout"),
+            Some(READ_TIMEOUT)
+        );
+        assert!(matches!(
+            client.call_with_endpoint(&SessionLogCommand::Health, Ok(endpoint)),
+            Ok(SessionLogResponse::Ok)
+        ));
+        drop(client);
+        server.join().expect("request server");
+    }
+
+    #[test]
+    fn request_client_retires_expired_healthy_and_closed_sockets_before_sending() {
+        for (close_peer, idle_age) in [
+            (false, REQUEST_CONNECTION_REUSE_WINDOW),
+            (true, Duration::from_secs(62)),
+        ] {
+            let (listener, endpoint) = request_test_listener();
+            let (ready_sender, ready_receiver) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let mut reader = accept_test_request(&listener);
+                assert!(matches!(
+                    read_test_request(&mut reader),
+                    SessionLogCommand::Health
+                ));
+                let request_received_at = Instant::now();
+                write_test_reply(&mut reader, &SessionLogResponse::Ok);
+                if close_peer {
+                    reader
+                        .get_ref()
+                        .shutdown(Shutdown::Both)
+                        .expect("close expired peer");
+                }
+                ready_sender
+                    .send(request_received_at)
+                    .expect("idle socket ready");
+                assert_request_socket_closed(&mut reader);
+                let mut next_reader = accept_test_request(&listener);
+                assert!(matches!(
+                    read_test_request(&mut next_reader),
+                    SessionLogCommand::ListWorkspaces
+                ));
+                write_test_reply(&mut next_reader, &SessionLogResponse::Ok);
+                assert_request_socket_closed(&mut next_reader);
+                assert_no_request_connection(&listener);
+            });
+            let mut client = SessionLogRequestClient::default();
+            assert!(matches!(
+                client.call_with_endpoint(&SessionLogCommand::Health, Ok(endpoint.clone())),
+                Ok(SessionLogResponse::Ok)
+            ));
+            let request_received_at = ready_receiver
+                .recv_timeout(REQUEST_TEST_TIMEOUT)
+                .expect("peer ready before aging");
+            let (_, _, last_request_started_at) =
+                client.connection.as_mut().expect("idle request connection");
+            assert!(
+                *last_request_started_at <= request_received_at,
+                "reuse age must include response latency"
+            );
+            *last_request_started_at = Instant::now() - idle_age;
+            assert!(matches!(
+                client.call_with_endpoint(&SessionLogCommand::ListWorkspaces, Ok(endpoint)),
+                Ok(SessionLogResponse::Ok)
+            ));
+            drop(client);
+            server.join().expect("expired request server");
+        }
+    }
+
+    #[test]
+    fn request_client_waits_for_the_delimiter_and_reads_a_large_split_response() {
+        let (listener, endpoint) = request_test_listener();
+        let error = "large framed reply\n🦀".repeat(2048);
+        let expected_error = error.clone();
+        let (prefix_sender, prefix_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut reader = accept_test_request(&listener);
+            assert!(matches!(
+                read_test_request(&mut reader),
+                SessionLogCommand::Health
+            ));
+            let frame =
+                serde_json::to_vec(&SessionLogResponse::Error { error }).expect("large reply");
+            reader
+                .get_mut()
+                .write_all(&frame)
+                .expect("write reply without delimiter");
+            reader.get_mut().flush().expect("flush reply prefix");
+            prefix_sender.send(()).expect("report reply prefix");
+            release_receiver
+                .recv_timeout(REQUEST_TEST_TIMEOUT)
+                .expect("release delimiter");
+            reader
+                .get_mut()
+                .write_all(b"\r\n")
+                .expect("write reply delimiter");
+            assert!(matches!(
+                read_test_request(&mut reader),
+                SessionLogCommand::Health
+            ));
+            write_test_reply(&mut reader, &SessionLogResponse::Ok);
+            assert_request_socket_closed(&mut reader);
+            assert_no_request_connection(&listener);
+        });
+        let caller = std::thread::spawn(move || {
+            let mut client = SessionLogRequestClient::default();
+            result_sender
+                .send(client.call_with_endpoint(&SessionLogCommand::Health, Ok(endpoint.clone())))
+                .expect("report framed reply");
+            assert!(matches!(
+                client.call_with_endpoint(&SessionLogCommand::Health, Ok(endpoint)),
+                Ok(SessionLogResponse::Ok)
+            ));
+        });
+        prefix_receiver
+            .recv_timeout(REQUEST_TEST_TIMEOUT)
+            .expect("wait for complete JSON prefix");
+        assert!(
+            matches!(
+                result_receiver.recv_timeout(Duration::from_millis(20)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "JSON without its delimiter is not a reply"
+        );
+        release_sender.send(()).expect("release response delimiter");
+        assert!(matches!(
+            result_receiver
+                .recv_timeout(REQUEST_TEST_TIMEOUT)
+                .expect("framed response"),
+            Ok(SessionLogResponse::Error { error }) if error == expected_error
+        ));
+        caller.join().expect("framed response caller");
+        server.join().expect("framed response server");
+    }
+
+    #[test]
+    fn request_client_closes_the_old_socket_before_following_endpoint_drift() {
+        let (old_listener, old_endpoint) = request_test_listener();
+        let (new_listener, new_endpoint) = request_test_listener();
+        let old_server = std::thread::spawn(move || {
+            let mut reader = accept_test_request(&old_listener);
+            assert!(matches!(
+                read_test_request(&mut reader),
+                SessionLogCommand::Health
+            ));
+            write_test_reply(&mut reader, &SessionLogResponse::Ok);
+            assert_request_socket_closed(&mut reader);
+            assert_no_request_connection(&old_listener);
+        });
+        let new_server = std::thread::spawn(move || {
+            let mut reader = accept_test_request(&new_listener);
+            assert!(matches!(
+                read_test_request(&mut reader),
+                SessionLogCommand::ListWorkspaces
+            ));
+            write_test_reply(&mut reader, &SessionLogResponse::Ok);
+            assert_request_socket_closed(&mut reader);
+            assert_no_request_connection(&new_listener);
+        });
+        let mut client = SessionLogRequestClient::default();
+        assert!(matches!(
+            client.call_with_endpoint(&SessionLogCommand::Health, Ok(old_endpoint)),
+            Ok(SessionLogResponse::Ok)
+        ));
+        assert!(matches!(
+            client.call_with_endpoint(&SessionLogCommand::ListWorkspaces, Ok(new_endpoint)),
+            Ok(SessionLogResponse::Ok)
+        ));
+        drop(client);
+        old_server.join().expect("old endpoint server");
+        new_server.join().expect("new endpoint server");
+    }
+
+    #[test]
+    fn request_client_rechecks_version_address_and_discovery_before_each_command() {
+        for failure in 0..3 {
+            let (listener, endpoint) = request_test_listener();
+            let server = std::thread::spawn(move || {
+                let mut reader = accept_test_request(&listener);
+                assert!(matches!(
+                    read_test_request(&mut reader),
+                    SessionLogCommand::Health
+                ));
+                write_test_reply(&mut reader, &SessionLogResponse::Ok);
+                assert_request_socket_closed(&mut reader);
+                assert_no_request_connection(&listener);
+            });
+            let mut client = SessionLogRequestClient::default();
+            assert!(matches!(
+                client.call_with_endpoint(&SessionLogCommand::Health, Ok(endpoint.clone())),
+                Ok(SessionLogResponse::Ok)
+            ));
+            let changed_endpoint = match failure {
+                0 => Ok(ServiceEndpoint {
+                    version: "foreign-build".to_string(),
+                    ..endpoint
+                }),
+                1 => Ok(ServiceEndpoint {
+                    addr: "invalid address".to_string(),
+                    ..endpoint
+                }),
+                _ => Err(anyhow!("endpoint record is unavailable")),
+            };
+            assert!(
+                client
+                    .call_with_endpoint(&SessionLogCommand::ListWorkspaces, changed_endpoint)
+                    .is_err()
+            );
+            assert!(
+                client.connection.is_none(),
+                "endpoint failures must invalidate the old socket"
+            );
+            server.join().expect("endpoint validation server");
+        }
+    }
+
+    #[test]
+    fn request_client_poisons_eof_malformed_and_partial_replies_without_replay() {
+        for bad_reply in [
+            &b""[..],
+            &b"\n"[..],
+            &b"not-json\n{\"kind\":\"ok\"}\n"[..],
+            &b"\xff\n"[..],
+            &b"{\"kind\":\"ok\"}"[..],
+            &b"{\"kind\":"[..],
+        ] {
+            let (listener, endpoint) = request_test_listener();
+            let server = std::thread::spawn(move || {
+                let mut reader = accept_test_request(&listener);
+                assert!(matches!(
+                    read_test_request(&mut reader),
+                    SessionLogCommand::ListWorkspaces
+                ));
+                reader
+                    .get_mut()
+                    .write_all(bad_reply)
+                    .expect("write bad reply");
+                reader
+                    .get_ref()
+                    .shutdown(Shutdown::Write)
+                    .expect("end bad reply");
+                assert_request_socket_closed(&mut reader);
+                let mut next_reader = accept_test_request(&listener);
+                assert!(
+                    matches!(
+                        read_test_request(&mut next_reader),
+                        SessionLogCommand::Health
+                    ),
+                    "only a genuinely new command may reconnect"
+                );
+                write_test_reply(&mut next_reader, &SessionLogResponse::Ok);
+                assert_request_socket_closed(&mut next_reader);
+                assert_no_request_connection(&listener);
+            });
+            let mut client = SessionLogRequestClient::default();
+            assert!(
+                client
+                    .call_with_endpoint(&SessionLogCommand::ListWorkspaces, Ok(endpoint.clone()))
+                    .is_err()
+            );
+            assert!(
+                client.connection.is_none(),
+                "failed response must poison its socket"
+            );
+            assert!(matches!(
+                client.call_with_endpoint(&SessionLogCommand::Health, Ok(endpoint)),
+                Ok(SessionLogResponse::Ok)
+            ));
+            drop(client);
+            server.join().expect("poisoned response server");
+        }
+    }
+
+    #[test]
+    fn request_client_closes_a_partial_timed_out_response_before_a_new_command() {
+        let (listener, endpoint) = request_test_listener();
+        let server = std::thread::spawn(move || {
+            let mut reader = accept_test_request(&listener);
+            assert!(matches!(
+                read_test_request(&mut reader),
+                SessionLogCommand::Health
+            ));
+            write_test_reply(&mut reader, &SessionLogResponse::Ok);
+            assert!(matches!(
+                read_test_request(&mut reader),
+                SessionLogCommand::ListWorkspaces
+            ));
+            reader
+                .get_mut()
+                .write_all(b"{\"kind\":")
+                .expect("write partial reply");
+            reader.get_mut().flush().expect("flush partial reply");
+            assert_request_socket_closed(&mut reader);
+            let mut next_reader = accept_test_request(&listener);
+            assert!(matches!(
+                read_test_request(&mut next_reader),
+                SessionLogCommand::Health
+            ));
+            write_test_reply(&mut next_reader, &SessionLogResponse::Ok);
+            assert_request_socket_closed(&mut next_reader);
+            assert_no_request_connection(&listener);
+        });
+        let mut client = SessionLogRequestClient::default();
+        assert!(matches!(
+            client.call_with_endpoint(&SessionLogCommand::Health, Ok(endpoint.clone())),
+            Ok(SessionLogResponse::Ok)
+        ));
+        let (_, reader, _) = client.connection.as_ref().expect("initial connection");
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("short partial-frame timeout");
+        assert!(
+            client
+                .call_with_endpoint(&SessionLogCommand::ListWorkspaces, Ok(endpoint.clone()))
+                .is_err()
+        );
+        assert!(client.connection.is_none());
+        assert!(matches!(
+            client.call_with_endpoint(&SessionLogCommand::Health, Ok(endpoint)),
+            Ok(SessionLogResponse::Ok)
+        ));
+        let (_, reader, _) = client.connection.as_ref().expect("new command connection");
+        assert_eq!(
+            reader
+                .get_ref()
+                .read_timeout()
+                .expect("restored read timeout"),
+            Some(READ_TIMEOUT)
+        );
+        drop(client);
+        server.join().expect("partial timeout server");
+    }
 
     #[test]
     fn version_handshake_refuses_a_different_build() {

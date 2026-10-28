@@ -341,7 +341,7 @@ impl CliConfig {
                     .ok()
                     .and_then(|value| value.parse().ok())
             })
-            .unwrap_or_else(|| {
+            .unwrap_or({
                 if self.priority {
                     ModelServiceTier::Priority
                 } else {

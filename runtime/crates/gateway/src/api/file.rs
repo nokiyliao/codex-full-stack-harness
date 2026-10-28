@@ -618,9 +618,9 @@ fn open_with_system_file_manager(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         if path.is_file() {
-            return spawn_command("open", ["-R"], Some(path));
+            spawn_command("open", ["-R"], Some(path))
         } else {
-            return spawn_command("open", std::iter::empty::<&str>(), Some(path));
+            spawn_command("open", std::iter::empty::<&str>(), Some(path))
         }
     }
 

@@ -7,6 +7,7 @@ use session_lifecycle::{
     LifecycleConfig, SessionLifecycleStore, TerminalReceipt, TerminalReceiptIdentity,
     TerminalState, commander_store_path,
 };
+use session_log_contract::client::SessionLogRequestClient;
 use session_log_contract::{
     ActivateRuntimeLeaseRequest, AppendSessionFeedEventRequest, CommitRuntimeEventRequest,
     RegisterRuntimeRequest, RuntimeEventCommitOutcome, RuntimeLeaseOutcome,
@@ -139,8 +140,7 @@ impl RuntimeEventWriter {
         let client = SessionLogClient::discover()
             .map_err(|error| format!("failed to discover session service: {error}"))?;
         let (feed_sender, feed_receiver) = mpsc::channel();
-        let feed_client = client.clone();
-        let feed_worker = std::thread::spawn(move || run_feed_worker(feed_client, feed_receiver));
+        let feed_worker = std::thread::spawn(move || run_feed_worker(feed_receiver));
         Ok(Self {
             session_id,
             initial_runtime_id,
@@ -597,7 +597,17 @@ fn commit_runtime_event(
     }
 }
 
-fn run_feed_worker(client: SessionLogClient, receiver: mpsc::Receiver<FeedCommand>) {
+fn run_feed_worker(receiver: mpsc::Receiver<FeedCommand>) {
+    let mut client = SessionLogRequestClient::default();
+    run_feed_worker_with(receiver, |command| {
+        client.call(&command).map_err(|error| error.to_string())
+    });
+}
+
+fn run_feed_worker_with(
+    receiver: mpsc::Receiver<FeedCommand>,
+    mut call: impl FnMut(SessionLogCommand) -> Result<SessionLogResponse, String>,
+) {
     let mut errors = HashMap::<String, String>::new();
     while let Ok(command) = receiver.recv() {
         match command {
@@ -608,14 +618,16 @@ fn run_feed_worker(client: SessionLogClient, receiver: mpsc::Receiver<FeedComman
                 let runtime_id = request.runtime_id.clone();
                 let live_only =
                     matches!(&request.event, SessionFeedEvent::AssistantTextDelta { .. });
-                let result = client.call_typed(SessionLogCommand::AppendSessionFeedEvent(*request));
+                let result = call(SessionLogCommand::AppendSessionFeedEvent(*request));
                 let error = match result {
                     Ok(SessionLogResponse::SessionFeedEventAppended {
                         result:
                             SessionFeedAppendOutcome::Applied { .. }
-                            | SessionFeedAppendOutcome::Duplicate { .. }
-                            | SessionFeedAppendOutcome::PublishedLive,
+                            | SessionFeedAppendOutcome::Duplicate { .. },
                     }) => None,
+                    Ok(SessionLogResponse::SessionFeedEventAppended {
+                        result: SessionFeedAppendOutcome::PublishedLive,
+                    }) if live_only => None,
                     Ok(SessionLogResponse::SessionFeedEventAppended { result }) => Some(format!(
                         "session service rejected runtime {runtime_id} feed event: {result:?}"
                     )),
@@ -664,6 +676,244 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn mock_feed_publisher(
+        sender: &mpsc::Sender<FeedCommand>,
+        runtime_id: &str,
+    ) -> RuntimeFeedPublisher {
+        RuntimeFeedPublisher {
+            runtime_id: runtime_id.to_string(),
+            target_session_id: "mock-session".to_string(),
+            lease_id: "mock-lease".to_string(),
+            state: Arc::new(Mutex::new(RuntimeFeedState {
+                next_event_seq: 1,
+                assistant_text: String::new(),
+            })),
+            sender: sender.clone(),
+        }
+    }
+
+    fn mock_text_delta(delta: &str) -> SessionFeedEvent {
+        SessionFeedEvent::AssistantTextDelta {
+            message_id: "mock-message".to_string(),
+            part_id: "mock-part".to_string(),
+            delta: delta.to_string(),
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    fn mock_final_message(reply_message: &str) -> SessionFeedEvent {
+        SessionFeedEvent::AgentMessage {
+            message_id: "mock-message".to_string(),
+            part_id: "mock-part".to_string(),
+            reply_message: reply_message.to_string(),
+            new_learning: String::new(),
+            runtime_status: None,
+            context_tokens: None,
+            usage: None,
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    #[test]
+    fn feed_worker_orders_calls_and_waits_for_the_exact_final_text_ack_before_barrier() {
+        let timeout = std::time::Duration::from_secs(2);
+        let (sender, receiver) = mpsc::channel();
+        let (call_sender, call_receiver) = mpsc::channel();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run_feed_worker_with(receiver, |command| {
+                let SessionLogCommand::AppendSessionFeedEvent(request) = command else {
+                    panic!("unexpected feed command");
+                };
+                call_sender.send(request).expect("observe feed request");
+                reply_receiver
+                    .recv_timeout(timeout)
+                    .expect("mock feed reply")
+            });
+        });
+        let publisher = mock_feed_publisher(&sender, "mock-runtime");
+        publisher
+            .publish(mock_text_delta("first paragraph\n\n"))
+            .expect("first live delta");
+        publisher
+            .publish(mock_text_delta("🦀 second paragraph"))
+            .expect("second live delta");
+        publisher
+            .publish(mock_final_message("incorrect flattened text"))
+            .expect("final message");
+        let (barrier_sender, barrier_receiver) = mpsc::channel();
+        sender
+            .send(FeedCommand::Barrier {
+                runtime_id: "mock-runtime".to_string(),
+                response: barrier_sender,
+            })
+            .expect("queue terminal barrier");
+
+        let first = call_receiver.recv_timeout(timeout).expect("first feed call");
+        assert_eq!(first.event_id, "mock-runtime:feed:1");
+        assert!(matches!(
+            first.event,
+            SessionFeedEvent::AssistantTextDelta { delta, .. } if delta == "first paragraph\n\n"
+        ));
+        assert!(matches!(
+            call_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            barrier_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        reply_sender
+            .send(Ok(SessionLogResponse::Error {
+                error: "nonfatal live rejection".to_string(),
+            }))
+            .expect("reject first live delta");
+
+        let second = call_receiver
+            .recv_timeout(timeout)
+            .expect("second feed call");
+        assert_eq!(second.event_id, "mock-runtime:feed:2");
+        assert!(matches!(
+            second.event,
+            SessionFeedEvent::AssistantTextDelta { delta, .. } if delta == "🦀 second paragraph"
+        ));
+        reply_sender
+            .send(Ok(SessionLogResponse::SessionFeedEventAppended {
+                result: SessionFeedAppendOutcome::PublishedLive,
+            }))
+            .expect("acknowledge second live delta");
+
+        let final_request = call_receiver
+            .recv_timeout(timeout)
+            .expect("durable final feed call");
+        assert_eq!(final_request.runtime_id, "mock-runtime");
+        assert_eq!(final_request.target_session_id, "mock-session");
+        assert_eq!(final_request.lease_id, "mock-lease");
+        assert_eq!(final_request.event_id, "mock-runtime:feed:3");
+        assert!(matches!(
+            final_request.event,
+            SessionFeedEvent::AgentMessage { message_id, part_id, reply_message, .. }
+                if message_id == "mock-message" && part_id == "mock-part"
+                    && reply_message == "first paragraph\n\n🦀 second paragraph"
+        ));
+        assert!(
+            matches!(barrier_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "a live-only acknowledgement cannot complete the durable barrier"
+        );
+        reply_sender
+            .send(Ok(SessionLogResponse::SessionFeedEventAppended {
+                result: SessionFeedAppendOutcome::Applied { cursor: 42 },
+            }))
+            .expect("acknowledge durable final text");
+        assert_eq!(
+            barrier_receiver
+                .recv_timeout(timeout)
+                .expect("terminal barrier"),
+            Ok(())
+        );
+        drop(publisher);
+        drop(sender);
+        worker.join().expect("ordered feed worker");
+    }
+
+    #[test]
+    fn feed_worker_keeps_durable_failures_observable_after_a_dropped_live_delta() {
+        for durable_reply in [
+            Err("durable transport failure".to_string()),
+            Ok(SessionLogResponse::Error {
+                error: "durable typed rejection".to_string(),
+            }),
+            Ok(SessionLogResponse::SessionFeedEventAppended {
+                result: SessionFeedAppendOutcome::TargetSessionNotFound,
+            }),
+            Ok(SessionLogResponse::SessionFeedEventAppended {
+                result: SessionFeedAppendOutcome::PublishedLive,
+            }),
+        ] {
+            let timeout = std::time::Duration::from_secs(2);
+            let (sender, receiver) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut replies = [
+                    Err("live transport failure; do not replay".to_string()),
+                    durable_reply,
+                    Ok(SessionLogResponse::SessionFeedEventAppended {
+                        result: SessionFeedAppendOutcome::Duplicate { cursor: 43 },
+                    }),
+                ]
+                .into_iter();
+                let mut event_ids = Vec::new();
+                run_feed_worker_with(receiver, |command| {
+                    let SessionLogCommand::AppendSessionFeedEvent(request) = command else {
+                        panic!("unexpected feed command");
+                    };
+                    event_ids.push(request.event_id);
+                    replies
+                        .next()
+                        .expect("no feed replay or calls after durable failure")
+                });
+                assert!(
+                    replies.next().is_none(),
+                    "other runtimes must still progress"
+                );
+                event_ids
+            });
+            let failed = mock_feed_publisher(&sender, "failed-runtime");
+            failed
+                .publish(mock_text_delta("retained despite live failure"))
+                .expect("live delta");
+            failed
+                .publish(mock_final_message("fallback text"))
+                .expect("durable final event");
+            failed
+                .publish(mock_final_message("must not be sent after failure"))
+                .expect("skipped event");
+            let other = mock_feed_publisher(&sender, "other-runtime");
+            other
+                .publish(mock_final_message("independent durable event"))
+                .expect("other runtime event");
+            let (failed_sender, failed_receiver) = mpsc::channel();
+            sender
+                .send(FeedCommand::Barrier {
+                    runtime_id: "failed-runtime".to_string(),
+                    response: failed_sender,
+                })
+                .expect("failed runtime barrier");
+            let (other_sender, other_receiver) = mpsc::channel();
+            sender
+                .send(FeedCommand::Barrier {
+                    runtime_id: "other-runtime".to_string(),
+                    response: other_sender,
+                })
+                .expect("other runtime barrier");
+            assert!(
+                failed_receiver
+                    .recv_timeout(timeout)
+                    .expect("failed barrier reply")
+                    .is_err(),
+                "dropping a live delta must not conceal a subsequent durable failure"
+            );
+            assert_eq!(
+                other_receiver
+                    .recv_timeout(timeout)
+                    .expect("other barrier reply"),
+                Ok(())
+            );
+            drop(failed);
+            drop(other);
+            drop(sender);
+            assert_eq!(
+                worker.join().expect("failed feed worker"),
+                vec![
+                    "failed-runtime:feed:1",
+                    "failed-runtime:feed:2",
+                    "other-runtime:feed:1",
+                ]
+            );
+        }
+    }
 
     #[test]
     fn feed_publisher_keeps_completed_text_when_no_live_delta_was_sent() {

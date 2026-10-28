@@ -143,6 +143,12 @@ async fn execute_runtime_stream_command_batch_with_mock_router(
     execute_runtime_stream_command_batch(commands, session_directory).await
 }
 
+// The receipt store opens every session path component without following symlinks;
+// macOS temp dirs sit under the /var -> /private/var symlink, so tests use the physical root.
+fn physical_tempdir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)
+}
+
 fn shell_command(command: &str, step: u64) -> Value {
     shell_command_with_timeout(command, step, 5000)
 }
@@ -163,8 +169,8 @@ fn expected_shell_command_type() -> &'static str {
 }
 
 fn assert_shell_result(result: &Value, success: bool) {
-    assert_eq!(result["command_type"], expected_shell_command_type());
-    assert_eq!(result["success"], success);
+    assert_eq!(result["command_type"], expected_shell_command_type(), "{result}");
+    assert_eq!(result["success"], success, "{result}");
 }
 
 fn text_at(path: &std::path::Path) -> String {
@@ -190,7 +196,7 @@ fn workspace_entries(path: &Path) -> Vec<String> {
 
 #[tokio::test]
 async fn streamed_provider_command_ready_event_executes_once_in_session_workspace() {
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = physical_tempdir().expect("workspace");
     let command = shell_command("echo runtime-stream-event-ok > streamed-event.txt", 1);
     let event = tura_llm_rust::ProviderStreamEvent::CommandRunCommandReady {
         tool_call_id: "call_runtime_stream_event".to_string(),
@@ -216,7 +222,7 @@ async fn streamed_provider_command_ready_event_executes_once_in_session_workspac
 
 #[tokio::test]
 async fn streamed_provider_non_command_events_do_not_execute_workspace_commands() {
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = physical_tempdir().expect("workspace");
 
     let output = execute_runtime_stream_event_with_mock_router(
         tura_llm_rust::ProviderStreamEvent::TextDelta {
@@ -238,7 +244,7 @@ async fn streamed_provider_non_command_events_do_not_execute_workspace_commands(
 
 #[tokio::test]
 async fn streamed_command_batch_executes_multiple_ready_commands_in_ordered_result_shape() {
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = physical_tempdir().expect("workspace");
     let commands = vec![
         shell_command("echo runtime-stream-batch-one > streamed-batch-one.txt", 1),
         shell_command("echo runtime-stream-batch-two > streamed-batch-two.txt", 1),
@@ -274,7 +280,7 @@ async fn streamed_command_batch_executes_multiple_ready_commands_in_ordered_resu
 
 #[tokio::test]
 async fn streamed_command_batch_empty_input_returns_none_without_workspace_side_effects() {
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = physical_tempdir().expect("workspace");
 
     let output = execute_runtime_stream_command_batch_with_mock_router(
         Vec::new(),
@@ -294,7 +300,7 @@ async fn streamed_command_batch_empty_input_returns_none_without_workspace_side_
 
 #[tokio::test]
 async fn streamed_command_batch_reports_shell_failures_without_masking_result_shape() {
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = physical_tempdir().expect("workspace");
     let commands = vec![shell_command("exit 7", 1)];
 
     let output = execute_runtime_stream_command_batch_with_mock_router(
@@ -325,7 +331,7 @@ async fn streamed_command_batch_reports_shell_failures_without_masking_result_sh
 
 #[tokio::test]
 async fn streamed_command_batch_continues_after_failure_and_keeps_result_order() {
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = physical_tempdir().expect("workspace");
     let output = execute_runtime_stream_command_batch_with_mock_router(
         vec![
             shell_command("exit 9", 1),
@@ -353,7 +359,7 @@ async fn streamed_command_batch_continues_after_failure_and_keeps_result_order()
 
 #[tokio::test]
 async fn streamed_command_batch_reports_timeouts_without_success_side_effects() {
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = physical_tempdir().expect("workspace");
     let command = if cfg!(windows) {
         "Start-Sleep -Milliseconds 1500; Set-Content streamed-timeout-should-not-exist.txt done"
     } else {
@@ -397,7 +403,7 @@ async fn streamed_command_batch_reports_timeouts_without_success_side_effects() 
 
 #[tokio::test]
 async fn streamed_command_batch_runs_same_step_macro_commands_without_result_cross_talk() {
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = physical_tempdir().expect("workspace");
     let output = execute_runtime_stream_command_batch_with_mock_router(
         vec![
             shell_command("echo alpha-one > alpha.txt", 1),
@@ -431,7 +437,7 @@ async fn streamed_command_batches_repeated_workspaces_do_not_cross_talk() {
     let mut receipt_roots = std::collections::BTreeSet::new();
 
     for index in 0..batch_count {
-        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace = physical_tempdir().expect("workspace");
         let marker = format!("runtime-repeated-stream-{index}");
         let first_file = format!("batch-{index}-first.txt");
         let second_file = format!("batch-{index}-second.txt");
@@ -518,7 +524,7 @@ async fn streamed_command_batches_concurrent_workspaces_remain_isolated() {
 
 async fn streamed_command_batches_concurrent_workspaces_remain_isolated_inner() -> usize {
     let workspaces = (0..4)
-        .map(|_| tempfile::tempdir().expect("workspace"))
+        .map(|_| physical_tempdir().expect("workspace"))
         .collect::<Vec<_>>();
     let mut tasks = Vec::new();
 

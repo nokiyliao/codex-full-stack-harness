@@ -185,8 +185,8 @@ pub fn start_session_feed_tailer() -> Result<(SessionFeedTailer, tokio::sync::on
                         if !resident {
                             continue;
                         }
-                        if reducer.has_durable_gap(&entry) {
-                            if let Err(error) = replay_session_from_cursor(
+                        if reducer.has_durable_gap(&entry)
+                            && let Err(error) = replay_session_from_cursor(
                                 &client,
                                 &mut reducer,
                                 entry.session_id.clone(),
@@ -195,7 +195,6 @@ pub fn start_session_feed_tailer() -> Result<(SessionFeedTailer, tokio::sync::on
                                     "failed to reconcile durable Session feed cursor gap",
                                 ));
                             }
-                        }
                         if let Err(error) = reducer.apply(entry) {
                             break Err(error.context("failed to reduce durable Session feed"));
                         }

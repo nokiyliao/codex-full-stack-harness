@@ -123,7 +123,10 @@ fn compact_session_context_with_options(
     let retained_from_index = compact_retained_log_start(&session.session_log);
     let compact_entry_index = session.session_log.len();
     let workspace_snapshot = workspace_snapshot_for_session(session);
-    let environment_context = environment_context_message(&session.session_directory);
+    let environment_context = crate::manas::tool_catalog::jspace_environment_context(
+        environment_context_message(&session.session_directory),
+        session.jspace_contract.as_ref(),
+    );
     let compact_record = serde_json::json!({
             "type": "context_compaction",
             "category": "compact_context",

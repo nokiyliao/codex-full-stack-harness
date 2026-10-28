@@ -1,8 +1,0 @@
-{
-  "$schema": "https://unpkg.com/knip@6/schema.json",
-  "entry": ["src/app.tsx", "src/test/*-harness.tsx", "../tests/unit/**/*.ts"],
-  "project": ["src/**/*.{ts,tsx}", "../tests/unit/**/*.ts"],
-  "ignoreBinaries": ["eslint"],
-  "exclude": ["exports", "types"],
-  "ignoreExportsUsedInFile": true
-}

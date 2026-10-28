@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""Real full-stack preparation/preflight; synthetic image and DCF, no provider.
+"""Real full-stack preparation/preflight with a synthetic image, no provider.
 
+The legacy synthetic DCF uses the current local-context preparation route.
 Reuse existing fixture boundaries. A passing test is not live host admission.
 """
 import hashlib
@@ -21,6 +22,18 @@ class ModelTopologyPrepareTests(unittest.TestCase):
         self.fixture = fixtures.FullStackTests()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.action.write_text(json.dumps({
+            "mission": {
+                "mission_id": "model-topology-prepare",
+                "task_id": "test",
+                "mode": "DELIVERY",
+                "objective": "Validate prepared caller model selection and integrity.",
+                "current_predicate": "Prepared selections match requests and reject tampering.",
+            },
+            "context_summary": "Exercise preparation and model-selection validation with a synthetic image.",
+            "operations": ["read"],
+            "read_scopes": ["scripts/ops/dcf.py"],
+        }))
 
     def prepare(self, mode="nokiy-direct", family="sol", suffix=""):
         f = self.fixture
@@ -249,6 +262,9 @@ class ModelTopologyPrepareTests(unittest.TestCase):
         f = self.fixture
         output, _ = self.prepare()
         request_id = "tura_embedded_" + "a" * 64
+        # read-result reads a recorded terminal; without one it reports interrupted recovery.
+        (f.f.artifacts / request_id).mkdir()
+        (f.f.artifacts / request_id / "terminal.json").write_text("{}\n")
         for companion_present in (True, False):
             with self.subTest(companion_present=companion_present):
                 if not companion_present:
@@ -258,7 +274,9 @@ class ModelTopologyPrepareTests(unittest.TestCase):
                         patch.object(topology, "resolve") as resolve, patch("builtins.print"):
                     self.assertEqual(caller.main(["read-result", "--artifact-root", str(f.f.artifacts),
                                                   "--request-id", request_id]), 0)
-                read.assert_called_once_with(f.f.artifacts, request_id)
+                # Result inspection re-reads the same terminal; every read names the original ID.
+                self.assertTrue(read.call_args_list)
+                self.assertEqual({tuple(c.args) for c in read.call_args_list}, {(f.f.artifacts, request_id)})
                 execute.assert_not_called()
                 resolve.assert_not_called()
 

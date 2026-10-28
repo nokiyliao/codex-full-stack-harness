@@ -22,6 +22,12 @@ use tura_llm_rust::{
     TuraConfig,
 };
 
+// The receipt store opens every session path component without following symlinks;
+// macOS temp dirs sit under the /var -> /private/var symlink, so tests use the physical root.
+fn physical_tempdir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)
+}
+
 #[path = "../support/session_db_support.rs"]
 mod session_db_support;
 #[path = "../support/typed_session.rs"]
@@ -205,7 +211,7 @@ async fn runtime_google_business_flow_extracts_text_tool_metadata_usage_and_requ
 async fn runtime_openai_business_flow_replays_final_command_run_once_and_records_output() {
     let _guard = ASYNC_ENV_LOCK.lock().await;
     let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
-    let workspace = tempfile::tempdir().expect("runtime workspace");
+    let workspace = physical_tempdir().expect("runtime workspace");
     let marker = workspace.path().join("runtime-final-command.txt");
     let command_line = create_marker_command("runtime-final-command.txt", "final command replayed");
     let router_addr = mock_command_run_router_addr();
@@ -549,7 +555,7 @@ async fn runtime_http_auth_failure_is_not_retryable() {
 async fn runtime_prompt_cache_key_reuses_root_session_for_forked_sessions() {
     let _guard = ASYNC_ENV_LOCK.lock().await;
     let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
-    let workspace = tempfile::tempdir().expect("runtime cache workspace");
+    let workspace = physical_tempdir().expect("runtime cache workspace");
     let workspace_text = workspace.path().to_string_lossy().to_string();
     let root_session_id = "cache-root-session";
     let child_session_id = "cache-child-session";
@@ -643,7 +649,7 @@ async fn runtime_prompt_cache_key_reuses_root_session_for_forked_sessions() {
 #[tokio::test]
 async fn runtime_llm_call_reloads_dotenv_between_turns() {
     let _guard = ASYNC_ENV_LOCK.lock().await;
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = physical_tempdir().expect("workspace");
     let env_path = workspace.path().join(".env");
     std::fs::write(&env_path, "ENVRELOAD_API_KEY=runtime-env-first\n")
         .expect("write initial dotenv");

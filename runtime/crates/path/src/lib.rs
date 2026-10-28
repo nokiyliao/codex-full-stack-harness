@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub mod command_receipts;
 pub mod jspace;
+pub mod mapped_source_read;
 pub mod process_hardening;
 pub mod shell_fallback;
 pub mod workspace_git;

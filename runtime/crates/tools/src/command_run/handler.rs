@@ -10,6 +10,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use tura_path::command_receipts::ReceiptStore;
+use tura_path::mapped_source_read::MappedSourceReadBinding;
 
 #[path = "handler_parse.rs"]
 mod handler_parse;
@@ -234,6 +235,10 @@ pub async fn execute_async_value_with_allowed_lock_scope_sandbox_and_cancellatio
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "admission variants forward the shared execution arguments plus their own admission"
+)]
 pub async fn execute_async_value_with_source_read_admission(
     arguments: Value,
     session_dir: PathBuf,
@@ -244,6 +249,79 @@ pub async fn execute_async_value_with_source_read_admission(
     source_read_root: Option<Arc<File>>,
     receipt_store: Option<Arc<ReceiptStore>>,
 ) -> Value {
+    execute_async_value_with_mapped_source_read_admission(
+        arguments,
+        session_dir,
+        allowed_commands,
+        lock_scope,
+        sandbox,
+        cancellation,
+        source_read_root,
+        None,
+        receipt_store,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "admission variants forward the shared execution arguments plus their own admission"
+)]
+pub async fn execute_async_value_with_mapped_source_read_admission(
+    arguments: Value,
+    session_dir: PathBuf,
+    allowed_commands: Option<BTreeSet<String>>,
+    lock_scope: Option<String>,
+    sandbox: bool,
+    cancellation: CancellationToken,
+    source_read_root: Option<Arc<File>>,
+    mapped_source_reads: Option<(PathBuf, Vec<MappedSourceReadBinding>)>,
+    receipt_store: Option<Arc<ReceiptStore>>,
+) -> Value {
+    execute_async_value_with_patch_readback_admission(arguments, session_dir, allowed_commands,
+        lock_scope, sandbox, cancellation, source_read_root, mapped_source_reads,
+        receipt_store, Vec::new()).await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "admission variants forward the shared execution arguments plus their own admission"
+)]
+pub async fn execute_async_value_with_patch_readback_admission(
+    arguments: Value,
+    session_dir: PathBuf,
+    allowed_commands: Option<BTreeSet<String>>,
+    lock_scope: Option<String>,
+    sandbox: bool,
+    cancellation: CancellationToken,
+    source_read_root: Option<Arc<File>>,
+    mapped_source_reads: Option<(PathBuf, Vec<MappedSourceReadBinding>)>,
+    receipt_store: Option<Arc<ReceiptStore>>,
+    patch_readback_paths: Vec<PathBuf>,
+) -> Value {
+    execute_async_value_with_source_digest_admission(arguments, session_dir, allowed_commands,
+        lock_scope, sandbox, cancellation, source_read_root, mapped_source_reads,
+        receipt_store, patch_readback_paths, std::collections::BTreeMap::new(), None).await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "admission variants forward the shared execution arguments plus their own admission"
+)]
+pub async fn execute_async_value_with_source_digest_admission(
+    arguments: Value,
+    session_dir: PathBuf,
+    allowed_commands: Option<BTreeSet<String>>,
+    lock_scope: Option<String>,
+    sandbox: bool,
+    cancellation: CancellationToken,
+    source_read_root: Option<Arc<File>>,
+    mapped_source_reads: Option<(PathBuf, Vec<MappedSourceReadBinding>)>,
+    receipt_store: Option<Arc<ReceiptStore>>,
+    patch_readback_paths: Vec<PathBuf>,
+    source_read_digests: std::collections::BTreeMap<String, String>,
+    source_observation_owner: Option<String>,
+) -> Value {
     let mut args = match parse_args(&arguments) {
         Ok(args) => args,
         Err(message) => return error_payload(message),
@@ -253,7 +331,14 @@ pub async fn execute_async_value_with_source_read_admission(
     let ctx =
         ToolContext::new_with_lock_scope_and_cancellation(session_dir, lock_scope, cancellation)
             .with_source_read_root(source_read_root)
+            .with_source_read_digests(source_read_digests)
+            .with_source_observation_owner(source_observation_owner)
+            .with_patch_readback_paths(patch_readback_paths)
             .with_receipt_store(receipt_store);
+    let ctx = match mapped_source_reads {
+        Some((repo_root, bindings)) => ctx.with_mapped_source_reads(repo_root, bindings),
+        None => ctx,
+    };
     let ctx = match bind_receipt_store(ctx) {
         Ok(ctx) => ctx,
         Err(error) => return error_payload(error),
@@ -1373,7 +1458,7 @@ fn parse_args(arguments: &Value) -> Result<CommandRunArgs, String> {
     }
     validate_task_status_compact_context_position(&args.commands)?;
     let router = CommandRouter::new();
-    for command in &args.commands {
+    for command in &mut args.commands {
         let maximum = router
             .max_timeout_ms_for_command(&command.command)
             .unwrap_or(14_400_000);
@@ -1384,14 +1469,13 @@ fn parse_args(arguments: &Value) -> Result<CommandRunArgs, String> {
                 command.effective_timeout_ms()
             ));
         }
+        // A stall budget that cannot fire before the wall timeout adds no limit. Run the command
+        // under its wall timeout instead of refusing it (real tasks 2026-10-23..24).
         if command
             .stall_timeout_ms
             .is_some_and(|stall_timeout_ms| stall_timeout_ms >= command.effective_timeout_ms())
         {
-            return Err(format!(
-                "command_run stall_timeout_ms must be lower than timeout_ms for {}",
-                command.command
-            ));
+            command.stall_timeout_ms = None;
         }
     }
     Ok(args)

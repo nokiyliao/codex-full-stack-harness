@@ -237,12 +237,27 @@ fn resolve_binary(executable: &str) -> Option<PathBuf> {
         })?;
     let mut candidates = Vec::new();
     if let Ok(current_exe) = std::env::current_exe() {
-        candidates.push(current_exe.with_file_name(executable));
+        candidates.extend(sibling_binary_candidates(&current_exe, executable));
     }
     candidates.push(root.join("bin").join(executable));
     candidates.push(root.join("target").join("release").join(executable));
     candidates.push(root.join("target").join("debug").join(executable));
     candidates.into_iter().find(|path| path.exists())
+}
+
+/// Locations next to the running executable. Cargo test binaries live in
+/// `<profile>/deps/`, so the profile directory one level up is where the
+/// service binary is built; this keeps an external `CARGO_TARGET_DIR`
+/// resolvable. Installed binaries never sit in a `deps` directory.
+fn sibling_binary_candidates(current_exe: &Path, executable: &str) -> Vec<PathBuf> {
+    let mut candidates = vec![current_exe.with_file_name(executable)];
+    if let Some(parent) = current_exe.parent()
+        && parent.file_name().and_then(|name| name.to_str()) == Some("deps")
+        && let Some(profile_dir) = parent.parent()
+    {
+        candidates.push(profile_dir.join(executable));
+    }
+    candidates
 }
 
 fn find_repo_root(path: &Path) -> Option<PathBuf> {
@@ -259,7 +274,7 @@ fn find_repo_root(path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionDbService, find_repo_root, resolve_binary};
+    use super::{SessionDbService, find_repo_root, resolve_binary, sibling_binary_candidates};
     use session_log_contract::client::service_addr_path;
     use std::io::{BufRead, Write};
     use std::net::TcpListener;
@@ -423,6 +438,23 @@ mod tests {
         assert_eq!(
             resolve_binary("definitely-missing-tura-session-db-test-binary"),
             None
+        );
+    }
+
+    #[test]
+    fn sibling_candidates_include_cargo_profile_dir_for_test_binaries() {
+        let test_exe = PathBuf::from("/tmp/cargo-target/debug/deps/router-0123abcd");
+        assert_eq!(
+            sibling_binary_candidates(&test_exe, "tura_session_db"),
+            vec![
+                PathBuf::from("/tmp/cargo-target/debug/deps/tura_session_db"),
+                PathBuf::from("/tmp/cargo-target/debug/tura_session_db"),
+            ]
+        );
+        let installed = PathBuf::from("/opt/nokiy/bin/tura_router");
+        assert_eq!(
+            sibling_binary_candidates(&installed, "tura_session_db"),
+            vec![PathBuf::from("/opt/nokiy/bin/tura_session_db")]
         );
     }
 

@@ -1006,6 +1006,10 @@ fn terminal_commander_convergence_response(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the app-server protocol loop keeps the request, snapshots, ledger and stdio channels explicit"
+)]
 async fn run_protocol(
     request: &OfficialCodexTurnRequest,
     prior: Option<CodexThreadAssociation>,
@@ -1181,15 +1185,17 @@ async fn run_protocol(
         .as_ref()
         .map(|binding| binding.target_thread_id.as_str())
         .or(resume_thread_id)
-    {
-        if expected_thread_id != thread_id {
+        && expected_thread_id != thread_id {
             return Err(OfficialCodexAppServerError::InvalidResponse(format!(
                 "thread/resume returned {}, expected {}",
                 thread_id, expected_thread_id
             )));
         }
-    }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a turn start threads the protocol channels and the ledger snapshot explicitly"
+    )]
     async fn start_turn(
         request: &OfficialCodexTurnRequest,
         association: &mut CodexThreadAssociation,
@@ -1290,6 +1296,10 @@ async fn run_protocol(
         Ok((turn_id, turn_response.get("turn").cloned()))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "interrupted-turn recovery threads the protocol channels and the ledger snapshot explicitly"
+    )]
     async fn start_interrupted_recovery(
         request: &OfficialCodexTurnRequest,
         association: &mut CodexThreadAssociation,
@@ -1433,6 +1443,10 @@ async fn run_protocol(
         Ok(started)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "turn completion records the request, ledger, turn identity and usage explicitly"
+    )]
     fn finish_successful_turn(
         request: &OfficialCodexTurnRequest,
         mut association: CodexThreadAssociation,
@@ -2243,6 +2257,10 @@ async fn connect_commander_owner_transport(
     Ok((writer, lines, bridge_task))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each JSON-RPC exchange takes its channels, id counter and pending table explicitly"
+)]
 async fn rpc_request(
     method: &str,
     params: Value,
@@ -2527,8 +2545,8 @@ async fn handle_server_request(
         ToolEffectDisposition::Execute(effect_index) => effect_index,
         ToolEffectDisposition::Replay(_) => unreachable!(),
     };
-    if let (Some(effect_index), Some(context)) = (effect_index, turn_context.as_deref_mut()) {
-        if let Some(observation) = context.execution_ledger.effects[effect_index]
+    if let (Some(effect_index), Some(context)) = (effect_index, turn_context.as_deref_mut())
+        && let Some(observation) = context.execution_ledger.effects[effect_index]
             .read_only_observation
             .as_mut()
         {
@@ -2541,7 +2559,6 @@ async fn handle_server_request(
             observation.dispatch_phase = Some(CodexReadOnlyDispatchPhase::MayHaveDispatched);
             persist_execution_ledger(request_handler, context.execution_ledger, effect_index)?;
         }
-    }
     let handled = match request_handler.as_deref_mut() {
         Some(handler) => {
             handler
@@ -2565,10 +2582,10 @@ async fn handle_server_request(
             ));
         }
     };
-    return match handled {
+    match handled {
         Ok(result) => {
             let mut result = result;
-            if let (Some(effect_index), Some(context)) = (effect_index, turn_context.as_deref_mut())
+            if let (Some(effect_index), Some(context)) = (effect_index, turn_context)
             {
                 let command_run_observation = context
                     .execution_ledger
@@ -2627,7 +2644,7 @@ async fn handle_server_request(
             .await?;
             Err(OfficialCodexAppServerError::ServerRequestRejected { method, reason })
         }
-    };
+    }
 }
 
 enum ToolEffectDisposition {

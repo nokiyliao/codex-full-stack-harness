@@ -149,6 +149,8 @@ impl RouteConfig {
         self.validate()?;
 
         let mut failures = Vec::new();
+        let mut attempts = Vec::new();
+        let mut failures_before_model = true;
         for provider in &self.providers {
             let mut effective = options.clone();
             if effective.temperature.is_none() {
@@ -158,8 +160,24 @@ impl RouteConfig {
                 .call_with_stream_events(conf, messages.clone(), effective, stream_events.clone())
                 .await
             {
-                Ok(result) => return Ok(result),
+                Ok(mut result) => {
+                    attempts.append(&mut result.failed_attempts);
+                    result.failed_attempts = attempts;
+                    return Ok(result);
+                },
                 Err(err) => {
+                    if err.failed_attempts().is_empty() {
+                        attempts.push(crate::failure_usage::FailedProviderAttempt {
+                            provider: provider.provider.clone(),
+                            requested_model: provider.model.clone(),
+                            model_attempt_not_started: err.model_attempt_not_started(),
+                            stream_failure_snapshot: err.stream_failure_snapshot().cloned(),
+                            ..Default::default()
+                        });
+                    } else {
+                        attempts.extend_from_slice(err.failed_attempts());
+                    }
+                    let err = retain_authentication_failure_scope(err, &mut failures_before_model);
                     if command_effect_blocks_fallback(command_effect_started.as_ref()) {
                         warn!(
                             provider = %provider.provider,
@@ -167,11 +185,11 @@ impl RouteConfig {
                             error = %err,
                             "provider failure after command effect; route fallback disabled"
                         );
-                        return Err(err);
+                        return Err(err.with_failed_attempts(attempts));
                     }
                     if err.is_non_retryable_provider_failure() {
                         warn!(provider = %provider.provider, model = %provider.model, error = %err, "provider failure is not retryable; returning without route fallback");
-                        return Err(err);
+                        return Err(err.with_failed_attempts(attempts));
                     }
                     warn!(provider = %provider.provider, model = %provider.model, error = %err, "route fallback to next provider");
                     failures.push(format!(
@@ -182,10 +200,22 @@ impl RouteConfig {
             }
         }
 
-        Err(TuraError::AllProvidersFailed {
-            message: failures.join(" | "),
-        })
+        Err(failed_provider_route(&failures, failures_before_model).with_failed_attempts(attempts))
     }
+}
+
+fn failed_provider_route(failures: &[String], all_before_model: bool) -> TuraError {
+    let error = TuraError::AllProvidersFailed { message: failures.join(" | ") };
+    if all_before_model && !failures.is_empty() {
+        error.before_model_authentication()
+    } else {
+        error
+    }
+}
+
+fn retain_authentication_failure_scope(error: TuraError, all_before_model: &mut bool) -> TuraError {
+    *all_before_model &= error.model_attempt_not_started();
+    error.after_prior_model_attempt(!*all_before_model)
 }
 
 fn command_effect_blocks_fallback(effect_started: Option<&Arc<AtomicBool>>) -> bool {
@@ -783,6 +813,51 @@ mod tests {
         started.store(true, Ordering::SeqCst);
         assert!(command_effect_blocks_fallback(Some(&started)));
         assert!(!command_effect_blocks_fallback(None));
+    }
+
+    #[test]
+    fn authentication_scope_is_conservative_across_route_fallback_and_early_return() {
+        let auth = || TuraError::Network { message: "auth endpoint unavailable".into() }
+            .before_model_authentication();
+        let mut all_before = true;
+        assert!(super::retain_authentication_failure_scope(auth(), &mut all_before).model_attempt_not_started());
+        assert!(super::retain_authentication_failure_scope(auth(), &mut all_before).model_attempt_not_started());
+        assert!(all_before);
+        let model = TuraError::Network { message: "model transport unavailable".into() };
+        assert!(!super::retain_authentication_failure_scope(model, &mut all_before).model_attempt_not_started());
+        let last = TuraError::HttpStatus { status: 401, body: "auth denied".into() }
+            .before_model_authentication();
+        let last = super::retain_authentication_failure_scope(last, &mut all_before);
+        assert!(!last.model_attempt_not_started());
+        assert!(last.is_non_retryable_provider_failure());
+        assert!(!super::retain_authentication_failure_scope(auth(), &mut all_before).model_attempt_not_started());
+        assert!(!all_before);
+    }
+
+    #[test]
+    fn authentication_scope_aggregate_requires_all_auth_failures_and_preserves_unknown() {
+        let failure = vec!["fixture: model => network error: authentication failed".to_string()];
+        let auth = super::failed_provider_route(&failure, true);
+        let unknown = super::failed_provider_route(&failure, false);
+        assert!(auth.model_attempt_not_started());
+        assert!(!unknown.model_attempt_not_started());
+        assert_eq!(auth.to_string(), unknown.to_string());
+        assert_eq!(auth.is_non_retryable_provider_failure(), unknown.is_non_retryable_provider_failure());
+        assert!(!super::failed_provider_route(&[], true).model_attempt_not_started());
+    }
+
+    #[test]
+    fn failure_usage_wrapper_preserves_authentication_and_retry_boundaries() {
+        let observed = TuraError::HttpStatus { status: 401, body: "denied".into() }
+            .before_model_authentication()
+            .with_failed_attempts(vec![Default::default()]);
+        assert!(observed.model_attempt_not_started());
+        assert!(observed.is_non_retryable_provider_failure());
+        let observed = observed.after_prior_model_attempt(true);
+        assert!(!observed.model_attempt_not_started());
+        assert!(observed.is_non_retryable_provider_failure());
+        assert_eq!(observed.failed_attempts().len(), 1);
+        assert_eq!(observed.to_string(), "http status 401: denied");
     }
 
     fn settings_with_catalog_and_routes() -> Settings {

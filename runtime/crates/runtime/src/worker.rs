@@ -359,6 +359,16 @@ fn handle_call(payload: &Value) -> Value {
         });
     }
 
+    let capsule_source_read_binding = match task_context_capsule.as_ref() {
+        Some(capsule) => match capsule.readonly_source_read_binding(
+            jspace_contract.as_ref().expect("validated capsule requires J-Space"), &directory,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => return json!({"ok":false,"session_id":session_id,
+                "code":"CAPSULE_SOURCE_READ_BINDING_INVALID","error":error}),
+        },
+        None => None,
+    };
     let input = SessionInput {
         user_input: prompt,
         file_input: Vec::new(),
@@ -406,7 +416,7 @@ fn handle_call(payload: &Value) -> Value {
             std::env::remove_var("TURA_ROUTER_AGENT_SPEC")
         };
     }
-    match crate::mano::process_from_gateway_session_with_lease_and_lifecycle_and_jspace_in_directory(
+    match crate::mano::process_from_gateway_session_with_source_binding(
         session_id.clone(),
         runtime_id,
         fallback_from_id,
@@ -415,6 +425,7 @@ fn handle_call(payload: &Value) -> Value {
         directory,
         lifecycle,
         jspace_contract,
+        capsule_source_read_binding,
     ) {
         Ok(result) => response_from_mano_result(&session_id, result, return_log),
         Err(error) => json!({ "ok": false, "session_id": session_id, "error": error }),
@@ -881,7 +892,7 @@ fn response_from_mano_result(
     })
 }
 
-fn response_from_mano_result_with_evidence(
+pub(crate) fn response_from_mano_result_with_evidence(
     session_id: &str,
     result: ManoProcessResult,
     return_log: bool,
@@ -1015,33 +1026,9 @@ fn final_assistant_text(session_log: &[SessionLogEntry]) -> Option<String> {
             value
                 .get("content")
                 .and_then(Value::as_str)
-                .map(clean_agent_message)
+                .map(runtime_contract::clean_agent_message)
                 .filter(|text| !text.trim().is_empty())
         })
-}
-
-fn clean_agent_message(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || looks_like_tool_payload(trimmed) {
-        return String::new();
-    }
-    if let Some(index) = trimmed.find("{\"commands\"") {
-        let (prefix, suffix) = trimmed.split_at(index);
-        if looks_like_tool_payload(suffix) {
-            return prefix.trim().to_string();
-        }
-    }
-    trimmed.to_string()
-}
-
-fn looks_like_tool_payload(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with('{')
-        && (trimmed.contains("\"commands\"")
-            || trimmed.contains("\"task_group\"")
-            || trimmed.contains("\"step_summary\"")
-            || trimmed.contains("\"tool_calls\"")
-            || trimmed.contains("\"reply_message\""))
 }
 
 #[cfg(test)]
@@ -1226,6 +1213,40 @@ mod tests {
         ];
 
         assert_eq!(final_assistant_text(&log), Some("done".to_string()));
+    }
+
+    #[test]
+    fn final_assistant_text_preserves_markdown_tool_examples() {
+        for answer in [
+            "Example:\n```rust\njson!({\"commands\":[]});\n```\nEND_ANSWER",
+            "Example:\n~~~rust\njson!({\"commands\":[]});\n~~~\nEND_ANSWER",
+            "Example: `json!({\"commands\":[]});`\nEND_ANSWER",
+        ] {
+            for suffix in ["", "\n{\"commands\":[]}"] {
+                let log = vec![SessionLogEntry::new(
+                    json!({"role":"assistant","content":format!("{answer}{suffix}")}).to_string(),
+                )];
+                assert_eq!(
+                    final_assistant_text(&log),
+                    Some(answer.to_string()),
+                    "answer: {answer:?}, suffix: {suffix:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn final_assistant_text_suppresses_raw_tool_envelopes() {
+        for payload in [
+            r#"{"commands":[]}"#,
+            r#"{"task_group":"runtime answer delivery"}"#,
+            r#"{"reply_message":"not a visible answer"}"#,
+        ] {
+            let log = vec![SessionLogEntry::new(
+                json!({"role":"assistant","content":payload}).to_string(),
+            )];
+            assert_eq!(final_assistant_text(&log), None, "payload: {payload:?}");
+        }
     }
 
     #[test]

@@ -30,6 +30,13 @@ pub struct ToolExecutionResult {
 }
 
 pub async fn execute_tool(input: ExecuteToolInput) -> Result<ToolExecutionResult, String> {
+    execute_tool_with_source_binding(input, None).await
+}
+
+pub(crate) async fn execute_tool_with_source_binding(
+    input: ExecuteToolInput,
+    capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
+) -> Result<ToolExecutionResult, String> {
     let execution_tool_name = canonical_tool_file_name(&input.tool_name);
     let interface_path = input
         .tools_directory
@@ -51,13 +58,14 @@ pub async fn execute_tool(input: ExecuteToolInput) -> Result<ToolExecutionResult
 
     if execution_tool_name == "command_run" {
         let output_value =
-            crate::router_command_run::execute_command_run_value_or_error_with_jspace(
+            crate::router_command_run::execute_command_run_value_or_error_with_source_binding(
                 input.arguments.clone(),
                 input.session_directory.clone(),
                 Some(&input.session_id),
                 Some(&input.runtime_id),
                 input.allowed_command_run_commands.clone(),
                 input.jspace_contract.clone(),
+                capsule_source_read_binding,
             )
             .await;
         return Ok(ToolExecutionResult {

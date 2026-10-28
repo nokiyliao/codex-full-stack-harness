@@ -4,6 +4,7 @@ Rules:
 - Keep each `apply_patch` `command_line` focused on one file or one code block.
 - Put focused patches in one `command_run` batch. Different files may share a `step`; patches to the same file must use later ordered steps or one combined patch.
 - Use separate `apply_patch` commands for unrelated files even if the edits are small; batching keeps the turn efficient while keeping each patch easy to review and recover.
+- Optional `source_delta` with `coverage: all_text_changes` supplies exact applied hunks at this change's `postimage_sha256`. Combine only with already-read source matching its `preimage_sha256`; review covered text without a redundant read solely to repeat these bytes. Missing, omitted, unseen, mismatched or later-changed context requires granted source reads. This is post-edit context, not verifier success, current-state proof after later edits, semantic acceptance or permission to skip explicit task requirements.
 
 Example: update two files in one batch with multiple focused patches.
 

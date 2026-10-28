@@ -31,6 +31,34 @@ def ref(path):
     return full_core._record_artifact(path)
 
 
+class RootCleanupTests(unittest.TestCase):
+    def test_only_bound_current_root_with_empty_kernel_scope_can_settle_in_place(self):
+        scope = {"supervisor_pid": 42, "isolation_source": "native_command_root"}
+        for candidate, bound, root, accepted in (
+                (scope, True, 7, True), (scope, False, 7, False),
+                (scope, True, None, False), ({**scope, "supervisor_pid": 43}, True, 7, False),
+                ({"supervisor_pid": 42}, True, 7, False)):
+            with self.subTest(scope=candidate, bound=bound, root=root), \
+                    patch.object(inspector, "_process", return_value="present_unowned"), \
+                    patch.object(inspector.os, "getpid", return_value=42), \
+                    patch.object(full_core, "inherited_root_parent", return_value=root):
+                observed = inspector._supervisor_process(candidate, bound=bound)
+            self.assertEqual(observed, "current_root_settled" if accepted else "present_unowned")
+        with patch.object(inspector, "_process", return_value="present_unowned"), \
+                patch.object(inspector.os, "getpid", return_value=42), \
+                patch.object(full_core, "inherited_root_parent",
+                             side_effect=full_core.ProcessScopeError("GRAPH_SUPERVISOR_SCOPE_NOT_EXCLUSIVE")):
+            self.assertEqual(inspector._supervisor_process(scope, bound=True), "present_unowned")
+
+    def test_live_engine_and_unknown_supervisor_still_prevent_settlement(self):
+        settled = {"historical_pass": True, "engine_pid": "absent", "supervisor_pid": "current_root_settled"}
+        self.assertTrue(inspector._cleanup_settled(settled))
+        for key, value in (("historical_pass", False), ("engine_pid", "present_unowned"),
+                           ("supervisor_pid", "permission_unknown"), ("supervisor_pid", "present_unowned"),
+                           ("supervisor_pid", []), ("supervisor_pid", {})):
+            self.assertFalse(inspector._cleanup_settled({**settled, key: value}))
+
+
 class ParentReviewRecordTests(unittest.TestCase):
     def setUp(self):
         self.terminal_reference = {"path": "/task-artifacts/" + RID + "/terminal.json", "sha256": "b" * 64}
@@ -210,6 +238,328 @@ class ParentReviewRecordTests(unittest.TestCase):
         self.assertEqual((self.projected, self.terminal_reference, self.checks), before)
 
 
+class ParentReviewDeclarationTests(unittest.TestCase):
+    def setUp(self):
+        ParentReviewRecordTests.setUp(self)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.run = self.root / RID
+        self.run.mkdir()
+        self.terminal_path = self.run / "terminal.json"
+        store(self.terminal_path, {"schema_version": caller.TERMINAL_SCHEMA_VERSION,
+                                  "request_id": RID, "native_thread_id": THREAD})
+        terminal_artifact = ref(self.terminal_path)
+        self.terminal_reference = {key: terminal_artifact[key] for key in ("path", "sha256")}
+        self.projected.pop("result_text")
+        self.projected.pop("usage")
+        self.projected["result_inspection"].pop("commands")
+        self.projected["result_inspection"]["terminal_sha256"] = self.terminal_reference["sha256"]
+        summary_reference = inspector.publish_inspection_summary(self.projected, self.root, RID,
+                                                                  expected_thread_id=THREAD)
+        self.summary_path = Path(summary_reference["path"])
+        self.check_path = self.root / "checks.json"
+        self.postimage_path = self.root / "source.py"
+        store(self.check_path, {"check_status": "passed", "reviewed": True})
+        self.postimage_path.write_bytes(b"value = 1\n")
+        self.packet = {"schema_version": inspector.PARENT_REVIEW_INPUT_SCHEMA,
+                       "summary_reference": summary_reference, "request_id": RID, "thread_id": THREAD,
+                       "terminal_reference": self.terminal_reference,
+                       "required_check_paths": [str(self.check_path)],
+                       "task_checks": [{"path": str(self.check_path), "sha256": ref(self.check_path)["sha256"],
+                                        "check_status": "passed"}],
+                       "expected_postimages": {str(self.postimage_path): ref(self.postimage_path)["sha256"]},
+                       "review_complete": True, "semantic_decision": "accepted",
+                       "note": "Parent reviewed all task requirements, evidence and semantics."}
+        self.input_path = self.root / "parent-input.json"
+        store(self.input_path, self.packet)
+        self.output_path = self.root / "parent-review.json"
+
+    def cli(self, *, thread=THREAD, source=None, output=None):
+        stdout = io.StringIO()
+        environment = {} if thread is None else {"CODEX_THREAD_ID": thread}
+        with patch.dict(inspector.os.environ, environment, clear=True), redirect_stdout(stdout):
+            code = inspector.main(["parent-review", "--input", str(source or self.input_path),
+                                   "--output", str(output or self.output_path)])
+        return code, json.loads(stdout.getvalue())
+
+    def fails_without_creation(self, packet, output=None):
+        opened = inspector.os.open
+
+        def no_creation(path, flags, *args, **kwargs):
+            self.assertFalse(flags & inspector.os.O_CREAT, "validation must precede publication")
+            return opened(path, flags, *args, **kwargs)
+
+        with patch.object(inspector.os, "open", side_effect=no_creation), self.assertRaises((ValueError, OSError)):
+            inspector.declare_task_review(packet, str(output or self.output_path))
+        self.assertFalse(self.output_path.exists())
+
+    def test_api_and_cli_success_leave_all_inputs_unchanged_without_execution_or_reinspection(self):
+        paths = (self.input_path, self.summary_path, self.terminal_path, self.check_path, self.postimage_path)
+        before = {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths}
+        original = deepcopy(self.packet)
+        with ExitStack() as stack:
+            for target in ("subprocess.run", "subprocess.Popen", "os.system", "os.popen", "os.kill",
+                           "urllib.request.urlopen", "socket.create_connection", "socket.socket"):
+                stack.enter_context(patch(target, side_effect=AssertionError(target)))
+            for owner, method in ((inspector, "inspect"), (inspector, "project_terminal"),
+                                  (inspector, "publish_inspection_summary"), (caller, "execute"),
+                                  (caller, "read_terminal"), (full_core, "_Trajectory"),
+                                  (full_core, "_record_artifact")):
+                stack.enter_context(patch.object(owner, method, side_effect=AssertionError(method)))
+            loader = stack.enter_context(patch.object(inspector, "load_inspection_summary",
+                                                       wraps=inspector.load_inspection_summary))
+            record = inspector.declare_task_review(self.packet, str(self.output_path))
+            cli_path = self.root / "cli-review.json"
+            code, cli_record = self.cli(output=cli_path)
+        self.assertEqual(loader.call_count, 2)  # One retained-summary load per declaration, no inspect pass.
+        self.assertEqual((code, cli_record), (0, record))
+        self.assertEqual(record["decision"], "accepted")
+        self.assertEqual(record["native_thread_id"], THREAD)
+        self.assertEqual(record["terminal_reference"], self.terminal_reference)
+        self.assertEqual(record["task_evidence"], self.packet["task_checks"] + [
+            {"path": str(self.postimage_path), "sha256": self.packet["expected_postimages"][str(self.postimage_path)],
+             "check_status": "passed"}])
+        self.assertFalse(record["scope"]["deployment_or_lease_grant"])
+        for path in (self.output_path, cli_path):
+            self.assertEqual(path.read_bytes(), caller._canonical_bytes(record) + b"\n")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.packet, original)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths}, before)
+
+    def test_semantics_and_coverage_never_infer_acceptance_and_preserve_negative_decisions(self):
+        cases = ((None, True, True, "pending"), ("pending", True, True, "pending"),
+                 ("accepted", False, True, "pending"), ("accepted", True, False, "pending"),
+                 ("rejected", False, False, "rejected"))
+        for index, (semantic, complete, supplied, expected) in enumerate(cases):
+            packet = deepcopy(self.packet)
+            packet.update(semantic_decision=semantic, review_complete=complete)
+            if not supplied:
+                packet["task_checks"] = []
+            with self.subTest(semantic=semantic, complete=complete, supplied=supplied):
+                record = inspector.declare_task_review(packet, str(self.root / f"decision-{index}.json"))
+                self.assertEqual(record["decision"], expected)
+        packet = deepcopy(self.packet)
+        packet["required_check_paths"].append(str(self.root / "missing-check.json"))
+        record = inspector.declare_task_review(packet, str(self.output_path))
+        self.assertEqual(record["decision"], "pending")
+
+    def test_failed_unknown_checks_and_incomplete_inspection_cannot_accept(self):
+        for status in ("failed", "unknown"):
+            packet = deepcopy(self.packet)
+            packet["task_checks"][0]["check_status"] = status
+            self.fails_without_creation(packet)
+            for decision in ("pending", "rejected"):
+                packet["semantic_decision"] = decision
+                record = inspector.declare_task_review(packet, str(self.root / f"{status}-{decision}.json"))
+                self.assertEqual(record["decision"], decision)
+                self.assertEqual(record["task_evidence"][0]["check_status"], status)
+        summary = json.loads(self.summary_path.read_bytes())
+        summary.update(status="BLOCKED", first_typed_blocker="ORIGINAL_FAILURE")
+        summary["result_inspection"].update(status="INCOMPLETE_EVIDENCE", first_blocker="COMMAND_FAILURE",
+                                             projection_partial=True, projection_blocker="PROJECTION_PARTIAL")
+        store(self.summary_path, summary)
+        packet = {**self.packet, "summary_reference": ref(self.summary_path)}
+        self.fails_without_creation(packet)
+        for decision in ("pending", "rejected"):
+            record = inspector.declare_task_review({**packet, "semantic_decision": decision},
+                                                   str(self.root / f"incomplete-{decision}.json"))
+            self.assertEqual(record["decision"], decision)
+            self.assertEqual(record["blockers"]["inspection"], "COMMAND_FAILURE")
+
+    def test_mismatched_or_missing_task_content_never_creates_a_record(self):
+        for path in (self.check_path, self.postimage_path):
+            raw = path.read_bytes()
+            for content in (raw + b"changed", None):
+                if content is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(content)
+                for decision in ("accepted", "pending", "rejected"):
+                    with self.subTest(path=path.name, missing=content is None, decision=decision):
+                        self.fails_without_creation({**self.packet, "semantic_decision": decision})
+                path.write_bytes(raw)
+        packet = deepcopy(self.packet)
+        packet["expected_postimages"][str(self.postimage_path)] = "f" * 64
+        self.fails_without_creation(packet)
+
+    def test_large_postimage_hashing_is_streamed_and_midread_drift_prevents_publication(self):
+        self.postimage_path.write_bytes(b"x" * (inspector.MAX_JSON + 1))
+        packet = deepcopy(self.packet)
+        packet["expected_postimages"][str(self.postimage_path)] = ref(self.postimage_path)["sha256"]
+        record = inspector.declare_task_review(packet, str(self.root / "large-review.json"))
+        self.assertEqual(record["decision"], "accepted")
+        original_stat = inspector.os.stat
+
+        def change_before_final_stat(path, *args, **kwargs):
+            if path == self.postimage_path.name and kwargs.get("dir_fd") is not None:
+                self.postimage_path.write_bytes(b"drifted after reading")
+            return original_stat(path, *args, **kwargs)
+
+        with patch.object(inspector.os, "stat", side_effect=change_before_final_stat):
+            self.fails_without_creation(packet)
+
+    def test_invalid_packet_references_identity_schema_and_bounds_have_no_output(self):
+        cases = [None, [], {**self.packet, "extra": True},
+                 {key: value for key, value in self.packet.items() if key != "semantic_decision"}]
+        for key, value in (("schema_version", "foreign"), ("review_complete", 1), ("semantic_decision", "success"),
+                           ("semantic_decision", True), ("request_id", "foreign"), ("thread_id", True),
+                           ("thread_id", "87654321-1234-1234-1234-123456789abc"), ("note", " "),
+                           ("required_check_paths", {}), ("task_checks", {}), ("expected_postimages", [])):
+            cases.append({**self.packet, key: value})
+        for field, changes in (("summary_reference", {"sha256": "f" * 64}),
+                               ("summary_reference", {"bytes": True}),
+                               ("summary_reference", {"bytes": self.packet["summary_reference"]["bytes"] + 1}),
+                               ("terminal_reference", {"sha256": "f" * 64})):
+            cases.append({**self.packet, field: {**self.packet[field], **changes}})
+        for packet in cases:
+            with self.subTest(packet=packet):
+                self.fails_without_creation(packet)
+        for mutation in ("required-duplicate", "check-duplicate", "unbound-check", "overlap", "bad-sha", "excessive"):
+            packet = deepcopy(self.packet)
+            if mutation == "required-duplicate":
+                packet["required_check_paths"] *= 2
+            elif mutation == "check-duplicate":
+                packet["task_checks"] *= 2
+            elif mutation == "unbound-check":
+                packet["required_check_paths"] = []
+            elif mutation == "overlap":
+                packet["expected_postimages"][str(self.check_path)] = packet["task_checks"][0]["sha256"]
+            elif mutation == "bad-sha":
+                packet["expected_postimages"][str(self.postimage_path)] = "F" * 64
+            else:
+                packet["required_check_paths"] = [str(self.root / f"check-{index}.json") for index in range(9)]
+            with self.subTest(mutation=mutation):
+                self.fails_without_creation(packet)
+
+    def test_self_consistent_foreign_summary_and_unproven_cleanup_have_no_output(self):
+        original = json.loads(self.summary_path.read_bytes())
+        for target, key, value in (("summary", "schema_version", "foreign"),
+                                   ("summary", "native_thread_id", "87654321-1234-1234-1234-123456789abc"),
+                                   ("summary", "cleanup_pass", False), ("inspection", "artifact_integrity", "unproven"),
+                                   ("cleanup", "historical_pass", False), ("cleanup", "engine_pid", "unknown")):
+            summary = deepcopy(original)
+            destination = (summary if target == "summary" else summary["result_inspection"]
+                           if target == "inspection" else summary["result_inspection"]["cleanup"])
+            destination[key] = value
+            store(self.summary_path, summary)
+            for decision in ("accepted", "pending", "rejected"):
+                with self.subTest(target=target, key=key, decision=decision):
+                    self.fails_without_creation({**self.packet, "summary_reference": ref(self.summary_path),
+                                                  "semantic_decision": decision})
+
+    def test_cli_rejects_duplicate_malformed_and_oversized_json_without_output(self):
+        raw = self.input_path.read_bytes()
+        for bad in (raw.replace(b'"review_complete":true', b'"review_complete":true,"review_complete":false'),
+                    raw.replace(b'"check_status":"passed"', b'"check_status":"passed","check_status":"passed"'),
+                    b'{"n":NaN}', b'[]', b'\xff', b'{', b" " * (inspector.MAX_PROJECTED_BYTES + 1)):
+            self.input_path.write_bytes(bad)
+            with self.subTest(raw=bad[:50]):
+                code, error = self.cli()
+                self.assertEqual(code, 2)
+                self.assertEqual(error["schema_version"], "nokiy_parent_review_error_v1")
+                self.assertFalse(self.output_path.exists())
+
+    def test_cli_binds_only_the_calling_native_thread(self):
+        for thread in (None, "foreign", "87654321-1234-1234-1234-123456789abc"):
+            with self.subTest(thread=thread), patch.object(inspector, "load_inspection_summary",
+                                                          side_effect=AssertionError("identity first")):
+                code, error = self.cli(thread=thread)
+            self.assertEqual((code, error["error"]), (2, "PARENT_REVIEW_CALLING_THREAD_MISMATCH"))
+            self.assertFalse(self.output_path.exists())
+
+    def test_final_symlinks_directories_and_fifos_are_not_read_as_inputs(self):
+        for path in (self.input_path, self.summary_path, self.terminal_path, self.check_path, self.postimage_path):
+            raw = path.read_bytes()
+            target = self.root / "same-bytes.json"
+            target.write_bytes(raw)
+            for kind in ("symlink", "directory", "fifo"):
+                path.unlink()
+                if kind == "symlink":
+                    path.symlink_to(target)
+                elif kind == "directory":
+                    path.mkdir()
+                else:
+                    inspector.os.mkfifo(path)
+                with self.subTest(path=path.name, kind=kind):
+                    if path == self.input_path:
+                        self.assertEqual(self.cli()[0], 2)
+                        self.assertFalse(self.output_path.exists())
+                    else:
+                        self.fails_without_creation(self.packet)
+                if kind == "directory":
+                    path.rmdir()
+                else:
+                    path.unlink()
+                path.write_bytes(raw)
+            self.assertEqual(target.read_bytes(), raw)
+
+    def test_parent_symlinks_and_unnormalized_paths_cannot_publish(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        self.assertEqual(self.cli(source=alias / self.input_path.name)[0], 2)
+        packet = deepcopy(self.packet)
+        packet["task_checks"][0]["path"] = str(alias / self.check_path.name)
+        packet["required_check_paths"] = [packet["task_checks"][0]["path"]]
+        self.fails_without_creation(packet)
+        packet = deepcopy(self.packet)
+        packet["expected_postimages"] = {str(alias / self.postimage_path.name): ref(self.postimage_path)["sha256"]}
+        self.fails_without_creation(packet)
+        self.fails_without_creation(self.packet, alias / self.output_path.name)
+        for path in ("relative.json", str(self.root) + "/../review.json", str(self.root) + "/./review.json",
+                     str(self.root) + "//review.json", str(self.root) + "/.git/review.json", str(self.output_path) + "/"):
+            with self.subTest(path=path):
+                self.fails_without_creation(self.packet, path)
+
+    def test_existing_outputs_and_input_aliases_are_never_overwritten(self):
+        self.output_path.write_bytes(b"existing parent record")
+        before = self.output_path.read_bytes()
+        with self.assertRaises(FileExistsError):
+            inspector.declare_task_review(self.packet, str(self.output_path))
+        self.assertEqual(self.output_path.read_bytes(), before)
+        self.output_path.unlink()
+        self.output_path.symlink_to(self.input_path)
+        input_before = self.input_path.read_bytes()
+        self.assertEqual(self.cli()[0], 2)
+        self.assertEqual(self.input_path.read_bytes(), input_before)
+        self.output_path.unlink()
+        self.output_path.mkdir()
+        self.assertEqual(self.cli()[0], 2)
+        self.assertTrue(self.output_path.is_dir())
+        self.output_path.rmdir()
+        self.fails_without_creation(self.packet, self.check_path)
+        packet = {**self.packet, "required_check_paths": [str(self.output_path)], "task_checks": []}
+        self.fails_without_creation(packet)
+
+    def test_interrupted_write_removes_only_the_new_record(self):
+        before = self.input_path.read_bytes()
+        with patch.object(inspector.os, "fsync", side_effect=OSError("interrupted publication")):
+            code, error = self.cli()
+        self.assertEqual(code, 2)
+        self.assertIn("error", error)
+        self.assertFalse(self.output_path.exists())
+        self.assertEqual(self.input_path.read_bytes(), before)
+
+    def test_legacy_inspection_cli_arguments_status_and_help_are_compatible(self):
+        base = ["--artifact-root", str(self.root), "--request-id", RID, "--expected-thread-id", THREAD]
+        for status, expected in (("EVIDENCE_VERIFIED", 0), ("INCOMPLETE_EVIDENCE", 2)):
+            stdout = io.StringIO()
+            with patch.object(inspector, "inspect", return_value={"status": status}) as inspected, redirect_stdout(stdout):
+                code = inspector.main(base + ["--offset", "3", "--command-stream", "priority",
+                                               "--command-sha256", "c" * 64])
+            self.assertEqual((code, json.loads(stdout.getvalue())), (expected, {"status": status}))
+            inspected.assert_called_once_with(self.root, RID, THREAD, offset=3,
+                                               command_sha256=("c" * 64,), command_stream="priority")
+        for arguments, labels in ((["--help"], ("parent-review", "--artifact-root")),
+                                  (["parent-review", "--help"], ("--input", "--output"))):
+            stdout = io.StringIO()
+            with redirect_stdout(stdout), self.assertRaises(SystemExit) as exit_status:
+                inspector.main(arguments)
+            self.assertEqual(exit_status.exception.code, 0)
+            for label in labels:
+                self.assertIn(label, stdout.getvalue())
+
+
 class InspectionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -257,6 +607,158 @@ class InspectionTests(unittest.TestCase):
 
     def inspect(self, **kwargs):
         return inspector.inspect(self.root, RID, THREAD, **kwargs)
+
+    def pre_cli_fixture(self, blocker="NOKIY_FULL_CORE_SERVICE_NOT_READY"):
+        terminal, run, _ = self.capability_fixture("unused")
+        (run / "core.jsonl").unlink()
+        (run / "command-evidence.json").unlink()
+        (run / "core.stderr").unlink(missing_ok=True)
+        supervision = deepcopy(self.supervision)
+        supervision.update(failure=blocker, result={"failure": blocker})
+        terminal.update(status="BLOCKED", first_typed_blocker=blocker, usage=None,
+                        observed_model=None, observed_service_tier=None, result_text="",
+                        trajectory_artifact=None, command_evidence_artifact=None,
+                        command_evidence_summary=None)
+        self.publish_pre_cli(terminal, run, supervision)
+        return terminal, run, supervision
+
+    def publish_pre_cli(self, terminal, run, supervision):
+        store(run / "supervision.json", supervision)
+        terminal["supervision_artifact"] = ref(run / "supervision.json")
+        store(run / "terminal.json", terminal)
+
+    def test_pre_cli_shortcut_rejects_unknown_blockers_and_execution_evidence(self):
+        # F1: a missing terminal trajectory cannot hide retained CLI execution.
+        for case in ("other_blocker", "engine_trajectory", "completed_turn", "cli_stderr",
+                     "retained_trajectory", "terminal_reference"):
+            with self.subTest(case=case):
+                blocker = "NOKIY_CORE_ENGINE_FAILED" if case == "other_blocker" else "NOKIY_FULL_CORE_SERVICE_NOT_READY"
+                terminal, run, supervision = self.pre_cli_fixture(blocker)
+                expected = "PRE_CLI_EVIDENCE_CONFLICT"
+                if case == "other_blocker":
+                    expected = "ARTIFACT_REFERENCE_MISSING"
+                elif case == "engine_trajectory":
+                    supervision["result"]["trajectory_artifact"] = {
+                        "path": str(run / "core.jsonl"), "sha256": "a" * 64, "bytes": 0}
+                elif case == "completed_turn":
+                    supervision["result"]["turn_completed"] = True
+                elif case == "cli_stderr":
+                    (run / "core.stderr").write_text("retained CLI stderr\n")
+                    expected = "ARTIFACT_REFERENCE_MISSING"
+                elif case == "retained_trajectory":
+                    (run / "core.jsonl").write_bytes(b"{}\n")
+                    expected = "ARTIFACT_REFERENCE_MISSING"
+                else:
+                    terminal["command_evidence_artifact"] = {
+                        "path": str(run / "command-evidence.json"), "sha256": "a" * 64, "bytes": 0}
+                    expected = "ARTIFACT_REFERENCE_MISSING"
+                self.publish_pre_cli(terminal, run, supervision)
+                evidence = inspector.inspect(self.root, terminal["request_id"], THREAD)
+                self.assertEqual(evidence["first_blocker"], expected)
+                self.assertEqual(evidence["artifact_integrity"], "unproven")
+                self.assertEqual(evidence["command_success"], "unproven")
+
+    def test_pre_cli_shortcut_rejects_usage_and_provider_observations(self):
+        # F2: zero counters are still an execution claim, not unknown usage.
+        claims = (("terminal", "usage", {"input_tokens": 0, "output_tokens": 0}),
+                  ("terminal", "observed_model", "observed-model"),
+                  ("terminal", "observed_service_tier", "priority"),
+                  ("engine", "usage", {"input_tokens": 0}),
+                  ("engine", "provider_observation", {"model": "observed-model"}))
+        for owner, key, value in claims:
+            with self.subTest(owner=owner, key=key):
+                terminal, run, supervision = self.pre_cli_fixture()
+                target = terminal if owner == "terminal" else supervision["result"]
+                target[key] = value
+                self.publish_pre_cli(terminal, run, supervision)
+                evidence = inspector.inspect(self.root, terminal["request_id"], THREAD)
+                self.assertEqual(evidence["first_blocker"], "PRE_CLI_EVIDENCE_CONFLICT")
+                self.assertIsNone(evidence["usage"])
+                self.assertEqual(evidence["artifact_integrity"], "unproven")
+                self.assertEqual(evidence["command_success"], "unproven")
+
+    def test_startup_diagnostic_rejects_enum_lists_and_numeric_log_boolean(self):
+        # F3: matched malformed diagnostics return a typed failure, never TypeError.
+        for key, value in (("service", []), ("reason", []), ("log_truncated", 0)):
+            with self.subTest(key=key):
+                terminal, run, supervision = self.pre_cli_fixture()
+                (run / "tura_session_db.log").write_text("native startup refusal\n")
+                diagnostic = full_core._ServiceStartupError("tura_session_db", "process_exited",
+                                                           exit_code=23).diagnostic
+                diagnostic.update(full_core._startup_log(run, "tura_session_db"))
+                self.assertIs(diagnostic["log_truncated"], False)
+                diagnostic[key] = value
+                terminal["startup_failure_diagnostic"] = deepcopy(diagnostic)
+                supervision["result"]["startup_failure_diagnostic"] = deepcopy(diagnostic)
+                self.publish_pre_cli(terminal, run, supervision)
+                evidence = inspector.inspect(self.root, terminal["request_id"], THREAD)
+                self.assertEqual(evidence["first_blocker"], "STARTUP_DIAGNOSTIC_INVALID")
+                self.assertEqual(evidence["artifact_integrity"], "unproven")
+                self.assertEqual(evidence["command_success"], "unproven")
+                self.assertIsNone(evidence["usage"])
+
+    def test_successful_execution_receipt_requires_retained_trajectory(self):
+        evidence = self.inspect()
+        self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
+        self.assertIsNone(evidence["first_blocker"])
+        self.assertEqual(evidence["artifact_integrity"], "verified")
+        self.assertEqual(evidence["command_success"], "known_success")
+        trajectory = self.run / "core.jsonl"
+        raw = trajectory.read_bytes()
+        for case, blocker in (("missing", "FILE_UNAVAILABLE"), ("changed", "ARTIFACT_HASH_MISMATCH")):
+            with self.subTest(case=case):
+                if case == "missing":
+                    trajectory.unlink()
+                else:
+                    trajectory.write_bytes(raw + b"\n")
+                evidence = self.inspect()
+                self.assertEqual(evidence["first_blocker"], blocker)
+                self.assertEqual(evidence["artifact_integrity"], "unproven")
+                self.assertEqual(evidence["command_success"], "unproven")
+
+    def test_blocked_before_trajectory_preserves_startup_and_peer_cause(self):
+        for blocker in ("NOKIY_FULL_CORE_SERVICE_NOT_READY", "GRAPH_BATCH_PEER_FAILED"):
+            with self.subTest(blocker=blocker):
+                terminal, run, supervision = self.pre_cli_fixture(blocker)
+                projected = self.project_capability(terminal)
+                evidence = projected["result_inspection"]
+                self.assertEqual(evidence["first_blocker"], blocker)
+                self.assertEqual(evidence["status"], "INCOMPLETE_EVIDENCE")
+                self.assertEqual(evidence["trajectory_status"], "absent")
+                self.assertEqual(evidence["command_success"], "unproven")
+                self.assertEqual(evidence["artifact_integrity"], "verified")
+                self.assertIsNone(projected["usage"])
+                self.assertIsNone(projected["observed_model"])
+                self.assertIsNone(projected["observed_service_tier"])
+                self.assertEqual(evidence["counts"], {})
+                if blocker == "NOKIY_FULL_CORE_SERVICE_NOT_READY":
+                    log = run / "tura_session_db.log"
+                    log.write_text("native startup refusal\n")
+                    diagnostic = full_core._ServiceStartupError("tura_session_db", "process_exited",
+                                                               exit_code=23).diagnostic
+                    diagnostic.update(full_core._startup_log(run, "tura_session_db"))
+                    terminal["startup_failure_diagnostic"] = diagnostic
+                    supervision["result"]["startup_failure_diagnostic"] = diagnostic
+                    store(run / "supervision.json", supervision)
+                    terminal["supervision_artifact"] = ref(run / "supervision.json")
+                    store(run / "terminal.json", terminal)
+                    projected = self.project_capability(terminal)
+                    self.assertEqual(projected["result_inspection"]["startup_failure_diagnostic"], diagnostic)
+                    summary = inspector.summarize_terminal(projected, self.root, terminal["request_id"])
+                    self.assertEqual(summary["startup_failure_diagnostic"], diagnostic)
+                    log.write_text("changed log")
+                    changed = self.project_capability(terminal)
+                    self.assertEqual(changed["result_inspection"]["first_blocker"], "ARTIFACT_HASH_MISMATCH")
+                    self.assertNotIn("startup_failure_diagnostic", inspector.summarize_terminal(
+                        changed, self.root, terminal["request_id"]))
+                    log.unlink()
+                    missing = self.project_capability(terminal)
+                    self.assertEqual(missing["result_inspection"]["first_blocker"], "FILE_UNAVAILABLE")
+                    self.assertEqual(missing["result_inspection"]["artifact_integrity"], "unproven")
+                (run / "supervision.json").write_text("{}")
+                corrupted = self.project_capability(terminal)
+                self.assertNotEqual(corrupted["result_inspection"]["first_blocker"], blocker)
+                self.assertEqual(corrupted["first_typed_blocker"], blocker)
 
     def cli(self, command, *, thread=THREAD):
         output = io.StringIO()
@@ -355,9 +857,14 @@ class InspectionTests(unittest.TestCase):
     def delivery_request(self, index=1):
         root = self.root / f"delivery-artifacts-{index}"
         root.mkdir()
+        workspace = self.root / "workspace"
+        jspace = root / "jspace.json"
+        store(jspace, {"schema_version": "jspace_contract_v2", "repo_root": str(workspace),
+                       "write_scopes": [], "declared_targets": []})
         return SimpleNamespace(artifact_root=root, request_id="tura_embedded_" + f"{index:064x}",
                                native_thread_id=THREAD, schema_version=caller.REQUEST_SCHEMA_VERSION,
-                               execution_profile="direct", workspace=self.root / "workspace")
+                               execution_profile="direct", workspace=workspace,
+                               jspace_contract=caller.FileIdentity(jspace, hashlib.sha256(jspace.read_bytes()).hexdigest()))
 
     def delivery_execute(self, request):
         """Create realistic local receipts during execute, never before the new-run guard."""
@@ -391,14 +898,306 @@ class InspectionTests(unittest.TestCase):
         arguments.update(overrides)
         return inspector.load_inspection_summary(reference, **arguments)
 
+    def runtime_diagnostics(self):
+        return {
+            "phase_timings_ms": {"prepare": 0, "session_db_ready": 11, "router_ready": 12,
+                                 "cli_launch": 13, "cli_process": 2000, "trajectory_parse": 14,
+                                 "cleanup": 15, "total": 2065},
+            "phase_timing_observation": {
+                "schema_version": full_core.PHASE_TIMING_SCHEMA,
+                "request_id": RID, "request_sha256": RID[-64:],
+                "checkpoints_ms": {"engine_started": 0, "prepare": 0, "session_db_ready": 11,
+                                   "router_ready": 23, "cli_launch": 36, "cli_process": 2036,
+                                   "trajectory_parse": 2050, "cleanup_started": 2050, "cleanup": 2065}},
+            "tool_loop": {"completed_count": 24, "successful_count": 24},
+        }
+
+    def long_answer(self):
+        return json.dumps({"findings": [
+            {"id": i, "answer": "checked \u8b49\u64da " * 75} for i in range(12)
+        ]}, ensure_ascii=False)
+
+    def test_parent_answer_is_exact_verified_and_summary_needs_no_second_read(self):
+        text = self.long_answer()
+        terminal, run, _ = self.capability_fixture(text, file_change=True)
+        self.assertTrue(terminal["result_truncated"])
+        before = {name: (run / name).read_bytes() for name in
+                  ("terminal.json", "core.jsonl", "last-message.txt")}
+        with patch.object(Path, "read_text", side_effect=AssertionError("extra text read")), \
+                patch.object(Path, "read_bytes", side_effect=AssertionError("extra bulk read")):
+            projected = self.project_capability(terminal)
+        evidence = projected["result_inspection"]
+        self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED", evidence)
+        answer = evidence["parent_review_answer"]
+        self.assertEqual(answer["text"], text)
+        self.assertEqual(answer["artifact"], terminal["result_artifact"])
+        self.assertEqual(answer["terminal_content_sha256"], caller._canonical_sha256(terminal))
+        self.assertTrue(answer["parent_acceptance_required"])
+        self.assertEqual(json.loads(answer["text"])["findings"][11]["id"], 11)
+        with patch.object(inspector, "inspect", side_effect=AssertionError("second inspection")), \
+                patch.object(Path, "open", side_effect=AssertionError("second read")):
+            summary = inspector.summarize_terminal(projected, self.root, terminal["request_id"])
+        self.assertEqual(summary["result_inspection"]["parent_review_answer"], answer)
+        self.assertEqual(summary["result_text"], "")
+        self.assertEqual(summary["result_text_omission"], "VERIFIED_PARENT_REVIEW_ANSWER")
+        self.assertTrue(summary["result_truncated"])
+        with patch.object(inspector, "inspect", side_effect=AssertionError("second inspection")), \
+                patch.object(Path, "open", side_effect=AssertionError("second read")):
+            batched = batch.expand_summary(batch.summarize({
+                "status": projected["status"], "first_typed_blocker": None,
+                "members": [{"request_id": terminal["request_id"], "artifact_root": str(self.root),
+                             "status": projected["status"], "first_typed_blocker": None,
+                             "cleanup_pass": projected["cleanup_pass"], "terminal": projected}],
+            }))
+        self.assertEqual(batched["members"][0]["result_text"], text)
+        self.assertFalse(batched["members"][0]["result_truncated"])
+        for name, raw in before.items():
+            self.assertEqual((run / name).read_bytes(), raw)
+
+    def test_summary_deduplication_never_removes_unverified_or_needed_preview(self):
+        terminal, _, _ = self.capability_fixture(self.long_answer(), file_change=True)
+        projected = self.project_capability(terminal)
+        for section, key, value in (
+                ('terminal', 'status', 'BLOCKED'), ('terminal', 'cleanup_pass', False),
+                ('terminal', 'first_typed_blocker', 'FAILURE'), ('terminal', 'first_blocker', 'FAILURE'),
+                ('terminal', 'request_id', 'tura_embedded_' + 'f' * 64),
+                ('terminal', 'request_sha256', 'f' * 64), ('terminal', 'result_truncated', False),
+                ('terminal', 'native_thread_id', 'foreign'),
+                ('terminal', 'capability_gap', {'status': 'untrusted'}),
+                ('inspection', 'status', 'INCOMPLETE_EVIDENCE'),
+                ('inspection', 'first_blocker', 'FAILURE'), ('inspection', 'projection_partial', True),
+                ('inspection', 'artifact_integrity', 'unproven'),
+                ('inspection', 'request_id', 'tura_embedded_' + 'f' * 64),
+                ('inspection', 'expected_thread_id', '87654321-1234-1234-1234-123456789abc'),
+                ('inspection', 'parent_review_answer', None),
+                ('answer', 'schema_version', 'foreign'), ('answer', 'parent_acceptance_required', False),
+                ('answer', 'terminal_content_sha256', 'unknown'),
+                ('answer', 'artifact', {'path': '/foreign'}), ('answer', 'text', 'tampered'),
+                ('answer', 'text', '\ud800'), ('answer', 'text', ''),
+                ('artifact', 'bytes', True), ('artifact', 'bytes', -1),
+                ('artifact', 'sha256', 'f' * 64)):
+            changed = deepcopy(projected)
+            destination = (changed if section == 'terminal' else changed['result_inspection']
+                           if section == 'inspection' else changed['result_inspection']['parent_review_answer']
+                           if section == 'answer' else changed['result_artifact'])
+            destination[key] = value
+            before = deepcopy(changed)
+            with self.subTest(section=section, key=key), \
+                    patch.object(inspector, 'inspect', side_effect=AssertionError('reinspection')), \
+                    patch.object(Path, 'open', side_effect=AssertionError('file I/O')):
+                summary = inspector.summarize_terminal(changed, self.root, terminal['request_id'])
+            self.assertEqual(summary['result_text'], terminal['result_text'])
+            self.assertNotIn('result_text_omission', summary)
+            self.assertEqual(changed, before)
+
+    def test_legacy_retained_answer_snapshot_remains_readable_and_is_never_rewritten(self):
+        terminal, run, _ = self.capability_fixture(self.long_answer(), file_change=True)
+        projected = self.project_capability(terminal)
+        legacy = inspector.summarize_terminal(projected, self.root, terminal['request_id'])
+        legacy['result_text'] = terminal['result_text']
+        legacy.pop('result_text_omission')
+        path = run / inspector.INSPECTION_SUMMARY_FILE
+        store(path, legacy)
+        before = path.read_bytes()
+        reference = {'path': str(path), 'sha256': hashlib.sha256(before).hexdigest(), 'bytes': len(before)}
+        loaded = inspector.load_inspection_summary(reference, expected_request_id=terminal['request_id'],
+            expected_thread_id=THREAD, terminal_reference={'path': str(run / 'terminal.json'),
+                                                          'sha256': legacy['terminal_sha256']})
+        self.assertEqual(loaded, legacy)
+        retained = inspector.retain_inspection_summary(projected, self.root, terminal['request_id'],
+                                                       expected_thread_id=THREAD)
+        self.assertEqual(retained['inspection_summary_diagnostic'], 'INSPECTION_SUMMARY_COLLISION')
+        self.assertIsNone(retained['inspection_summary'])
+        self.assertEqual(path.read_bytes(), before)
+        for key in ('status', 'cleanup_pass', 'result_text', 'result_inspection'):
+            self.assertEqual(retained[key], projected[key])
+
+    def test_parent_answer_absent_for_short_or_oversized_utf8_or_escaped_body(self):
+        for text in ("short answer", "x" * inspector.MAX_PAGE_BYTES,
+                     "\u8b49" * (inspector.MAX_PAGE_BYTES // 6)):
+            with self.subTest(bytes=len(text.encode())):
+                terminal, _, _ = self.capability_fixture(text, file_change=True)
+                projected = self.project_capability(terminal)
+                evidence = projected["result_inspection"]
+                self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED", evidence)
+                self.assertNotIn("parent_review_answer", evidence)
+                self.assertEqual(projected["result_artifact"], terminal["result_artifact"])
+                self.assertLessEqual(len(caller._canonical_bytes(evidence)), inspector.MAX_PAGE_BYTES)
+
+    def test_parent_answer_never_survives_identity_integrity_or_cleanup_failure(self):
+        for case in ("thread", "result", "projection", "cleanup", "blocked"):
+            with self.subTest(case=case):
+                terminal, run, _ = self.capability_fixture(self.long_answer(), file_change=True)
+                if case == "thread":
+                    projected = self.project_capability(terminal, thread="87654321-1234-1234-1234-123456789abc")
+                elif case == "projection":
+                    projected = self.project_capability({**terminal, "result_text": "foreign result"})
+                else:
+                    if case == "result":
+                        (run / "last-message.txt").write_text("tampered", encoding="utf-8")
+                    elif case == "cleanup":
+                        terminal["cleanup"]["no_live_descendants"] = False
+                        store(run / "terminal.json", terminal)
+                    else:
+                        terminal.update(status="BLOCKED", first_typed_blocker="ORIGINAL_FAILURE")
+                        store(run / "terminal.json", terminal)
+                    projected = self.project_capability(terminal)
+                self.assertNotIn("parent_review_answer", projected["result_inspection"])
+                if case != "projection":
+                    self.assertEqual(projected["result_inspection"]["status"], "INCOMPLETE_EVIDENCE")
+
+    def test_parent_answer_budget_pressure_never_discards_verified_commands(self):
+        terminal, _, _ = self.capability_fixture(self.long_answer(), file_change=True)
+        original = self.project_capability(terminal)
+        evidence = deepcopy(original["result_inspection"])
+        evidence.pop("parent_review_answer")
+        baseline = {**original, "result_inspection": evidence}
+        full_page = inspector.inspect(self.root, terminal["request_id"], THREAD, command_stream="priority")
+        full_page.pop("parent_review_answer")
+        with patch.object(inspector, "MAX_PAGE_BYTES", len(caller._canonical_bytes(full_page)) + 128):
+            paged = self.project_capability(terminal)
+        self.assertNotIn("parent_review_answer", paged["result_inspection"])
+        self.assertEqual(paged["result_inspection"]["commands"], evidence["commands"])
+        with patch.object(inspector, "MAX_PROJECTED_BYTES", len(caller._canonical_bytes(baseline)) + 512):
+            projected = self.project_capability(terminal)
+        self.assertEqual(projected["result_inspection"], evidence)
+        self.assertEqual(projected["first_typed_blocker"], terminal["first_typed_blocker"])
+
+    def test_parent_answer_only_uses_last_completed_message(self):
+        terminal, run, _ = self.capability_fixture("final short answer", file_change=True)
+        events = [json.loads(line) for line in (run / "core.jsonl").read_text().splitlines()]
+        events.insert(2, {"type": "item.completed", "item": {
+            "type": "assistant_message", "text": self.long_answer()}})
+        (run / "core.jsonl").write_bytes(b"".join(caller._canonical_bytes(e) + b"\n" for e in events))
+        terminal["trajectory_artifact"] = ref(run / "core.jsonl")
+        store(run / "terminal.json", terminal)
+        projected = self.project_capability(terminal)
+        self.assertEqual(projected["result_inspection"]["status"], "EVIDENCE_VERIFIED",
+                         projected["result_inspection"])
+        self.assertNotIn("parent_review_answer", projected["result_inspection"])
+
+    def test_parent_answer_does_not_replace_capability_gap_or_evidence_only_delivery(self):
+        text = self.long_answer() + "\n" + self.capability_text(self.capability_handoff())
+        terminal, _, _ = self.capability_fixture(text, file_change=True)
+        projected = self.project_capability(terminal)
+        self.assertIn("capability_gap", projected)
+        self.assertNotIn("parent_review_answer", projected["result_inspection"])
+
+        def add_message(events, original, contract):
+            events.append({"type": "item.completed", "item": {
+                "type": "assistant_message", "text": self.long_answer()}})
+
+        terminal, _, _ = self.parent_context_fixture(add_message, mode="evidence_only")
+        projected = self.project_capability(terminal)
+        self.assertEqual(projected["result_inspection"]["status"], "EVIDENCE_VERIFIED",
+                         projected["result_inspection"])
+        self.assertEqual(projected["observed_terminal_delivery"], "evidence_only")
+        self.assertNotIn("parent_review_answer", projected["result_inspection"])
+
+    def test_parent_answer_never_hides_failed_command(self):
+        self.receipt.update(exit_code=1, terminal_state="failed")
+        self.item["exit_code"] = 1
+        self.item["aggregated_output"]["exit_code"] = 1
+        terminal, _, _ = self.capability_fixture(self.long_answer(), file_change=True)
+        projected = self.project_capability(terminal)
+        evidence = projected["result_inspection"]
+        self.assertEqual(evidence["status"], "INCOMPLETE_EVIDENCE", evidence)
+        self.assertEqual(evidence["first_blocker"], "COMMAND_FAILURE")
+        self.assertEqual(evidence["commands"][0]["execution_proof"], "known_failure")
+        self.assertNotIn("parent_review_answer", evidence)
+
+    def test_summary_runtime_diagnostics_are_exact_optional_and_pure(self):
+        projected = self.project_capability(self.terminal)
+        baseline = inspector.summarize_terminal(projected, self.root, RID)
+        diagnostics = self.runtime_diagnostics()
+        variants = ({}, diagnostics, {key: None for key in diagnostics},
+                    {key: {} for key in diagnostics},
+                    *({key: value} for key, value in diagnostics.items()))
+        with ExitStack() as stack:
+            for target, name in ((inspector, "inspect"), (inspector, "_file"),
+                                 (inspector.os, "open"), (inspector.os, "kill"), (Path, "open"),
+                                 (caller, "read_terminal"), (full_core, "_ArtifactReader"),
+                                 (caller, "_canonical_bytes"), (caller, "_canonical_sha256"),
+                                 (hashlib, "sha256"), (caller, "execute")):
+                stack.enter_context(patch.object(target, name,
+                    side_effect=AssertionError("summary must only select already projected fields")))
+            for optional in variants:
+                with self.subTest(diagnostics=optional):
+                    candidate = {**projected, **optional}
+                    before = deepcopy(candidate)
+                    summary = inspector.summarize_terminal(candidate, self.root, RID)
+                    # Phase timings stay in terminal.json; tool-loop counts remain optional in summaries.
+                    expected = {"tool_loop": optional["tool_loop"]} if "tool_loop" in optional else {}
+                    self.assertEqual(summary, {**baseline, **expected})
+                    self.assertEqual(candidate, before)
+                    for key in diagnostics:
+                        if key == "tool_loop" and key in optional:
+                            self.assertIs(summary[key], candidate[key])
+                        else:
+                            self.assertNotIn(key, summary)
+
+    def test_runtime_diagnostics_snapshot_capacity_and_identity_fail_closed(self):
+        diagnostics = self.runtime_diagnostics()
+        self.terminal.update(diagnostics)
+        self.terminal.update(status="BLOCKED", first_typed_blocker="ORIGINAL_EXECUTION_FAILURE",
+                             result_text="historical result é")
+        store(self.run / "terminal.json", self.terminal)
+        projected = self.project_capability(self.terminal, request_thread_id=THREAD, require_request_binding=True)
+        before = deepcopy(projected)
+        summary = inspector.summarize_terminal(projected, self.root, RID)
+        raw = caller._canonical_bytes(summary) + b"\n"
+        without = {key: value for key, value in projected.items() if key not in diagnostics}
+        self.assertLess(len(caller._canonical_bytes(inspector.summarize_terminal(without, self.root, RID))) + 1,
+                        len(raw) - 1)
+        with patch.object(inspector, "MAX_PROJECTED_BYTES", len(raw) - 1), \
+                patch.object(inspector, "_summary_directory", side_effect=AssertionError("oversize must not open")), \
+                patch.object(inspector, "_file", side_effect=AssertionError("oversize must not read")), \
+                patch.object(caller, "_write_create_only", side_effect=AssertionError("oversize must not write")):
+            with self.assertRaises(inspector.InspectionError) as failure:
+                inspector.publish_inspection_summary(projected, self.root, RID, expected_thread_id=THREAD)
+            self.assertEqual(failure.exception.code, "INSPECTION_SUMMARY_TOO_LARGE")
+            delivered = inspector.retain_inspection_summary(projected, self.root, RID, expected_thread_id=THREAD)
+        self.assertIsNone(delivered["inspection_summary"])
+        self.assertEqual(delivered["inspection_summary_diagnostic"], "INSPECTION_SUMMARY_TOO_LARGE")
+        self.assertEqual({key: delivered[key] for key in before}, before)
+        compact = inspector.summarize_terminal(delivered, self.root, RID)
+        self.assertEqual({key: compact[key] for key in summary}, summary)
+        self.assertFalse((self.run / inspector.INSPECTION_SUMMARY_FILE).exists())
+        with patch.object(inspector, "MAX_PROJECTED_BYTES", len(raw)):
+            reference = inspector.publish_inspection_summary(projected, self.root, RID, expected_thread_id=THREAD)
+            loaded = self.load_summary(reference)
+            self.assertEqual(reference["bytes"], len(raw))
+            self.assertEqual(Path(reference["path"]).read_bytes(), raw)
+            self.assertEqual(loaded, summary)
+            self.assertNotIn("inspection_summary", loaded)
+            other_thread = "87654321-1234-1234-1234-123456789abc"
+            with self.assertRaises(inspector.InspectionError) as failure:
+                self.load_summary(reference, expected_thread_id=other_thread)
+            self.assertEqual(failure.exception.code, "INSPECTION_SUMMARY_IDENTITY_MISMATCH")
+            with self.assertRaises(inspector.InspectionError) as failure:
+                inspector.publish_inspection_summary({**projected, "native_thread_id": other_thread},
+                                                     self.root, RID, expected_thread_id=THREAD)
+            self.assertEqual(failure.exception.code, "INSPECTION_SUMMARY_IDENTITY_MISMATCH")
+            self.assertEqual(Path(reference["path"]).read_bytes(), raw)
+        self.assertEqual(projected, before)
+        self.assertEqual(loaded["status"], "BLOCKED")
+        self.assertEqual(loaded["first_typed_blocker"], "ORIGINAL_EXECUTION_FAILURE")
+        self.assertEqual(loaded["result_inspection"], before["result_inspection"])
+        self.assertEqual(loaded["result_inspection"]["mission_acceptance"], "parent_owned")
+
     def test_retained_summary_roundtrip_inspects_once_and_reuses_only_identical_bytes(self):
+        diagnostics = self.runtime_diagnostics()
+        self.terminal.update(diagnostics)
+        store(self.run / "terminal.json", self.terminal)
         terminal_before = (self.run / "terminal.json").read_bytes()
         with patch.dict(caller.os.environ, {"CODEX_THREAD_ID": THREAD}), \
                 patch.object(inspector, "inspect", wraps=inspector.inspect) as inspected:
             projected = inspector.project_terminal(self.terminal, self.root, RID)
             original = deepcopy(projected)
             with patch.object(inspector.os, "kill", side_effect=AssertionError("no publication process pass")), \
-                    patch.object(full_core, "_ArtifactReader", side_effect=AssertionError("no second trajectory pass")):
+                    patch.object(full_core, "_ArtifactReader", side_effect=AssertionError("no second trajectory pass")), \
+                    patch.object(caller, "read_terminal", side_effect=AssertionError("no terminal reread")), \
+                    patch.object(inspector, "_file", wraps=inspector._file) as summary_reads:
                 delivered = inspector.retain_inspection_summary(projected, self.root, RID, expected_thread_id=THREAD)
                 reference = delivered["inspection_summary"]
                 path = self.run / inspector.INSPECTION_SUMMARY_FILE
@@ -406,6 +1205,16 @@ class InspectionTests(unittest.TestCase):
                 again = inspector.publish_inspection_summary(projected, self.root, RID, expected_thread_id=THREAD)
                 loaded = self.load_summary(reference)
         inspected.assert_called_once_with(self.root, RID, THREAD, command_stream="priority")
+        self.assertEqual(len(summary_reads.call_args_list), 3)  # Publication, byte reuse, snapshot load only.
+        for call in summary_reads.call_args_list:
+            self.assertEqual(call.args, (Path(inspector.INSPECTION_SUMMARY_FILE), inspector.MAX_PROJECTED_BYTES))
+        for key, value in diagnostics.items():
+            self.assertEqual(projected[key], value)
+            self.assertEqual(json.loads(terminal_before)[key], value)
+            if key == "tool_loop":
+                self.assertEqual(loaded[key], value)
+            else:
+                self.assertNotIn(key, loaded)
         self.assertEqual(projected, original)
         self.assertEqual(reference, again)
         self.assertEqual(reference, {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)})
@@ -697,8 +1506,10 @@ class InspectionTests(unittest.TestCase):
             members.append(batch.Member(path, hashlib.sha256(raw).hexdigest(), request.request_id, request.artifact_root))
             prepared[path] = (request, raw)
         members = tuple(members)
+        # Synthetic execution has no engine to attach to the verifier's native process root.
         with patch.dict(caller.os.environ, {"CODEX_THREAD_ID": THREAD}), \
                 patch.object(batch, "_load_plan", return_value=(members, 5)), \
+                patch("codex_collaboration_harness.graph_process.inherited_root_parent", return_value=None), \
                 patch.object(batch, "load_prepared_request", side_effect=lambda path: prepared[path]), \
                 patch.object(batch, "worker_capacity", return_value=5), \
                 patch.object(batch, "_scopes", return_value=(set(), set())), \
@@ -714,7 +1525,8 @@ class InspectionTests(unittest.TestCase):
                 patch.object(inspector.os, "kill", side_effect=AssertionError("no live clearance")), \
                 patch.object(full_core, "_ArtifactReader", side_effect=AssertionError("no trajectory pass")):
             compact = batch.summarize(result)
-            self.assertLessEqual(len(json.dumps(compact, ensure_ascii=True, sort_keys=True).encode("ascii")), 8000)
+            self.assertLessEqual(len(json.dumps(compact, ensure_ascii=True, sort_keys=True).encode("ascii")),
+                                 inspector.MAX_PROJECTED_BYTES)
             expanded = batch.expand_summary(compact)
             self.assertEqual(len(expanded["members"]), 5)
             for row, source in zip(expanded["members"], result["members"]):
@@ -733,6 +1545,7 @@ class InspectionTests(unittest.TestCase):
         member = batch.Member(self.root / "request.json", hashlib.sha256(raw).hexdigest(), request.request_id, request.artifact_root)
         with patch.dict(caller.os.environ, {"CODEX_THREAD_ID": THREAD}), \
                 patch.object(batch, "_load_plan", return_value=((member,), 1)), \
+                patch("codex_collaboration_harness.graph_process.inherited_root_parent", return_value=None), \
                 patch.object(batch, "load_plan", return_value=(member,)), \
                 patch.object(batch, "load_prepared_request", return_value=(request, raw)), \
                 patch.object(batch, "worker_capacity", return_value=5), \
@@ -1399,6 +2212,419 @@ class InspectionTests(unittest.TestCase):
                     self.assertEqual(source["part_index"], list(contents).index(row["path"]) if batched else 0)
                 self.assertEqual(before, {p: p.read_bytes() for p in before})
 
+    def interleaved_parent_context_fixture(self, mutate=None):
+        def interleave(events, original, contract):
+            first, command, read_a, read_b = events
+            second = deepcopy(first)
+            first["item"]["changes"] = first["item"]["changes"][:1]
+            second["item"].update(id="review-other-patch", changes=second["item"]["changes"][1:])
+            events[:] = [command, first, read_a, second, read_b]
+            if mutate is not None:
+                mutate(events, original, contract)
+        return self.parent_context_fixture(interleave, contents={
+            "src/file.py": "A café\nsecond\n", "src/other.py": "B final\n"})
+
+    def test_parent_context_per_file_fences_keep_unrelated_reads_without_extra_rereads(self):
+        terminal, run, _ = self.interleaved_parent_context_fixture()
+        events = [json.loads(line) for line in (run / "core.jsonl").read_text().splitlines()]
+        iterations = []
+        original_iter = full_core._Trajectory.__iter__
+        def counted(trajectory):
+            iterations.append(trajectory)
+            return original_iter(trajectory)
+        with patch.object(full_core._Trajectory, "__iter__", counted), \
+                patch.object(inspector, "_artifact", wraps=inspector._artifact) as artifacts, \
+                patch.object(file_change_evidence, "_postimage", side_effect=AssertionError("no source reread")), \
+                patch.object(caller, "execute", side_effect=AssertionError("no execution")):
+            evidence = self.project_capability(terminal)["result_inspection"]
+        self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
+        self.assertEqual(evidence["mission_acceptance"], "parent_owned")
+        self.assertEqual(len(iterations), 3)
+        self.assertEqual(sum(c.args[1] == "file-change-evidence.json" for c in artifacts.call_args_list), 1)
+        context = evidence["parent_review_context"]
+        self.assertEqual([(r["path"], r["text"], r["source_event"]["event_index"]) for r in context["ranges"]],
+                         [("src/file.py", "A café\nsecond\n", 2), ("src/other.py", "B final\n", 4)])
+        for row in context["ranges"]:
+            index = row["source_event"]["event_index"]
+            self.assertEqual(row["source_event"]["event_sha256"], caller._canonical_sha256(events[index]))
+            self.assertEqual(row["source_sha256"], events[index]["item"]["aggregated_output"]["source_sha256"])
+        for key in ("complete_file_coverage", "dependency_coverage", "live_source_freshness",
+                    "read_permission", "parent_acceptance"):
+            self.assertIs(context[key], False)
+
+    def test_parent_context_same_file_fences_invalidate_even_returned_final_sha(self):
+        for case in ("same_sha", "returned_sha", "fresh_read"):
+            def mutate(events, original, contract):
+                mutation = deepcopy(events[1])
+                mutation["item"]["id"] = "review-away-patch"
+                events.append(mutation)
+                if case != "same_sha":
+                    away = deepcopy(events[2])
+                    away["item"]["aggregated_output"].update(
+                        stdout="temporary\nsecond\n", source_sha256=hashlib.sha256(b"temporary\nsecond\n").hexdigest())
+                    away["item"]["aggregated_output"]["terminal_receipt"]["call_id"] = "context-read-away"
+                    events.append(away)
+                    restored = deepcopy(mutation)
+                    restored["item"]["id"] = "review-return-patch"
+                    events.append(restored)
+                if case == "fresh_read":
+                    fresh = deepcopy(events[2])
+                    fresh["item"]["aggregated_output"]["terminal_receipt"]["call_id"] = "context-read-final"
+                    events.append(fresh)
+            with self.subTest(case=case):
+                terminal, _, _ = self.interleaved_parent_context_fixture(mutate)
+                evidence = self.project_capability(terminal)["result_inspection"]
+                self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
+                ranges = evidence["parent_review_context"]["ranges"]
+                expected = [("src/other.py", 4)]
+                if case == "fresh_read":
+                    expected.append(("src/file.py", 8))
+                self.assertEqual([(r["path"], r["source_event"]["event_index"]) for r in ranges], expected)
+                self.assertNotIn("temporary", json.dumps(evidence))
+
+    def test_parent_context_per_file_fences_still_require_final_sha_match(self):
+        def mismatch(events, original, contract):
+            events[2]["item"]["aggregated_output"]["source_sha256"] = "0" * 64
+        terminal, _, _ = self.interleaved_parent_context_fixture(mismatch)
+        evidence = self.project_capability(terminal)["result_inspection"]
+        self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
+        self.assertEqual([r["path"] for r in evidence["parent_review_context"]["ranges"]], ["src/other.py"])
+
+    def test_parent_context_per_file_fences_require_verified_change_mappings(self):
+        for case in ("path", "event_index", "event_sha256", "records", "ambiguous_id", "missing", "counts"):
+            with self.subTest(case=case):
+                terminal, run, _ = self.interleaved_parent_context_fixture()
+                blocker = "FILE_CHANGE_EVENT_MISMATCH"
+                if case == "missing":
+                    terminal.pop("file_change_evidence_artifact")
+                    blocker = "FILE_CHANGE_PROOF_MISSING"
+                elif case == "counts":
+                    terminal["file_change_evidence_summary"]["target_count"] = 3
+                    blocker = "FILE_CHANGE_COUNTS_MISMATCH"
+                elif case == "ambiguous_id":
+                    events = [json.loads(line) for line in (run / "core.jsonl").read_text().splitlines()]
+                    events[3]["item"]["id"] = events[1]["item"]["id"]
+                    self.republish_terminal_evidence(terminal, run, events)
+                    blocker = "FILE_CHANGE_EVENT_INVALID"
+                else:
+                    path = run / "file-change-evidence.json"
+                    proof = json.loads(path.read_text())
+                    if case == "path":
+                        proof["records"][1]["changes"][0]["path"] = "src/file.py"
+                    elif case == "records":
+                        proof["records"].pop()
+                    else:
+                        proof["records"][1][case] = 2 if case == "event_index" else "0" * 64
+                    store(path, proof)
+                    terminal["file_change_evidence_artifact"] = ref(path)
+                store(run / "terminal.json", terminal)
+                with patch.object(file_change_evidence, "_postimage", side_effect=AssertionError("no source reread")):
+                    evidence = self.project_capability(terminal)["result_inspection"]
+                self.assertEqual(evidence["status"], "INCOMPLETE_EVIDENCE")
+                self.assertEqual(evidence["first_blocker"], blocker)
+                self.assertNotIn("parent_review_context", evidence)
+
+    def native_task_status_event(self, control, *, native=False, normalized_reply=False):
+        output = deepcopy(control)
+        if normalized_reply:
+            output.update(final_reply=json.dumps(output["final_reply"], sort_keys=True), final_reply_format="json")
+        event = {"type": "item.completed", "item": {
+            "type": "command_execution", "status": "completed", "exit_code": None,
+            "command": json.dumps(control),
+            "aggregated_output": json.dumps({"task_status": output})}}
+        if native:
+            runtime, call = "runtime-18e125d46247d3e8", "call_b588f006d40d409e9aa7486a8c0c4225"
+            run = runtime + ".tool.command_run"
+            event["item"].update(command_type="task_status", runtime_id=runtime, step=4,
+                command_index=5, command_id=f"{run}:{call}:5", command_run_id=run, provider_tool_call_id=call)
+        return event
+
+    def test_parent_context_native_identity_and_normalized_final_reply_preserve_reads(self):
+        controls = ({}, {"status": "doing", "task_group": "source context delivery", "task_type": ["refactoring"]},
+                    {"status": "done"}, {"status": "done", "final_reply": {
+                        "validation": {"status": "passed", "verifier_index": 0}, "parent_acceptance": "pending",
+                        "uncertainty": [], "changed_files": ["src/file.py"]}},
+                    {"status": "done", "final_reply": "Verified; parent acceptance pending."},
+                    {"status": "done", "final_reply": [{"verified": True}, "parent acceptance pending", 1]})
+        for control in controls:
+            with self.subTest(control=control):
+                def mutate(events, original, contract):
+                    events.append(self.native_task_status_event(control, native=True,
+                        normalized_reply=isinstance(control.get("final_reply"), (dict, list))))
+                terminal, _, _ = self.interleaved_parent_context_fixture(mutate)
+                evidence = self.project_capability(terminal)["result_inspection"]
+                self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
+                self.assertEqual(len(evidence["parent_review_context"]["ranges"]), 2)
+                self.assertEqual(evidence["mission_acceptance"], "parent_owned")
+
+    def test_parent_context_partial_duplicate_or_foreign_native_status_identity_remains_a_barrier(self):
+        fields = ("runtime_id", "step", "command_index", "command_id", "command_run_id", "provider_tool_call_id")
+        cases = [("missing_" + key, lambda item, key=key: item.pop(key)) for key in fields]
+        cases += [("foreign_" + key, lambda item, key=key: item.update({key: "foreign"}))
+                  for key in ("runtime_id", "command_id", "command_run_id", "provider_tool_call_id")]
+        cases += [("boolean_" + key, lambda item, key=key: item.update({key: True}))
+                  for key in ("step", "command_index")]
+        cases += [("duplicate", lambda item: None), ("indexed_duplicate", lambda item: None)]
+        for name, change in cases:
+            with self.subTest(case=name):
+                def mutate(events, original, contract):
+                    event = self.native_task_status_event({"status": "done"}, native=True)
+                    change(event["item"])
+                    events.append(event)
+                    if name == "duplicate":
+                        events.append(deepcopy(event))
+                    elif name == "indexed_duplicate":
+                        events[2]["item"]["command_id"] = event["item"]["command_id"]
+                terminal, _, _ = self.interleaved_parent_context_fixture(mutate)
+                evidence = self.project_capability(terminal)["result_inspection"]
+                self.assertNotIn("parent_review_context", evidence)
+
+    def test_parent_context_forged_normalized_reply_remains_a_barrier(self):
+        for case in ("type_confusion", "wrong_reply", "duplicate_reply_key", "invalid_reply", "nonobject_reply",
+                     "wrong_format", "missing_format", "not_done", "compact", "input_format", "mixed_output",
+                     "array_type_confusion", "array_command", "null_command", "text_with_marker", "empty_text",
+                     "blank_text", "empty_object", "empty_array", "null_reply", "numeric_reply", "boolean_reply",
+                     "text_not_done", "text_compact", "array_not_done", "array_compact", "unknown_field"):
+            with self.subTest(case=case):
+                def mutate(events, original, contract):
+                    control = {"status": "done", "final_reply": {"verified": True, "count": 1}}
+                    event = self.native_task_status_event(control, native=True, normalized_reply=True)
+                    item = event["item"]
+                    output = json.loads(item["aggregated_output"])
+                    reply = output["task_status"]
+                    if case == "type_confusion":
+                        reply["final_reply"] = '{"verified":1,"count":true}'
+                    elif case == "wrong_reply":
+                        reply["final_reply"] = '{"verified":false,"count":1}'
+                    elif case == "duplicate_reply_key":
+                        reply["final_reply"] = '{"verified":false,"verified":true,"count":1}'
+                    elif case == "invalid_reply":
+                        reply["final_reply"] = '{'
+                    elif case == "nonobject_reply":
+                        reply["final_reply"] = '[]'
+                    elif case == "wrong_format":
+                        reply["final_reply_format"] = "text"
+                    elif case == "missing_format":
+                        reply.pop("final_reply_format")
+                    elif case == "not_done":
+                        control["status"] = reply["status"] = "doing"
+                    elif case == "compact":
+                        control["compact_context"] = reply["compact_context"] = "compact"
+                    elif case == "input_format":
+                        control["final_reply_format"] = "json"
+                    elif case == "mixed_output":
+                        output["results"] = [{"command_type": "shell", "command_line": "unknown effect"}]
+                    elif case == "array_type_confusion":
+                        control["final_reply"] = [True, {"count": 1}]
+                        reply["final_reply"] = '[1,{"count":true}]'
+                    elif case == "array_command":
+                        control = []
+                    elif case == "null_command":
+                        control = None
+                    elif case == "text_with_marker":
+                        control["final_reply"] = reply["final_reply"]
+                    elif case in ("empty_text", "blank_text", "null_reply", "numeric_reply", "boolean_reply"):
+                        value = {"empty_text": "", "blank_text": " \n", "null_reply": None,
+                                 "numeric_reply": 1, "boolean_reply": True}[case]
+                        control["final_reply"] = reply["final_reply"] = value
+                        reply.pop("final_reply_format")
+                    elif case in ("empty_object", "empty_array"):
+                        control["final_reply"] = {} if case == "empty_object" else []
+                        reply["final_reply"] = json.dumps(control["final_reply"])
+                    elif case in ("text_not_done", "text_compact", "array_not_done", "array_compact"):
+                        if case.startswith("text"):
+                            control["final_reply"] = reply["final_reply"] = "Verified"
+                            reply.pop("final_reply_format")
+                        else:
+                            control["final_reply"] = ["Verified"]
+                            reply["final_reply"] = json.dumps(control["final_reply"])
+                        if case.endswith("not_done"):
+                            control["status"] = reply["status"] = "doing"
+                        else:
+                            control["compact_context"] = reply["compact_context"] = "compact"
+                    else:
+                        control["unknown"] = reply["unknown"] = True
+                    item.update(command=json.dumps(control), aggregated_output=json.dumps(output))
+                    events.append(event)
+                terminal, _, _ = self.interleaved_parent_context_fixture(mutate)
+                evidence = self.project_capability(terminal)["result_inspection"]
+                self.assertNotIn("parent_review_context", evidence)
+
+    def test_parent_context_native_status_controls_before_and_after_reads_keep_per_file_context(self):
+        for typed, placement in ((False, "doing"), (False, "done"), (False, "both"), (True, "both")):
+            def mutate(events, original, contract):
+                controls = []
+                if placement != "done":
+                    doing = self.native_task_status_event({
+                        "task_type": ["debug"], "task_group": "caller capability projection", "status": "doing"})
+                    events.insert(0, doing)
+                    controls.append(doing)
+                if placement != "doing":
+                    done = self.native_task_status_event({"status": "done"})
+                    events.append(done)
+                    controls.append(done)
+                for event in controls:
+                    self.assertNotIn("command_type", event["item"])
+                    if typed:
+                        event["item"]["command_type"] = "task_status"
+            with self.subTest(typed=typed, placement=placement):
+                terminal, run, _ = self.interleaved_parent_context_fixture(mutate)
+                with patch.object(file_change_evidence, "_postimage", side_effect=AssertionError("no source reread")), \
+                        patch.object(caller, "execute", side_effect=AssertionError("no execution")):
+                    evidence = self.project_capability(terminal)["result_inspection"]
+                self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
+                self.assertEqual(evidence["command_success"], "known_success")
+                self.assertEqual(evidence["mission_acceptance"], "parent_owned")
+                self.assertEqual(evidence["counts"]["commands"], 3)
+                offset = int(placement != "done")
+                ranges = evidence["parent_review_context"]["ranges"]
+                self.assertEqual([(r["path"], r["text"], r["source_event"]["event_index"]) for r in ranges], [
+                    ("src/file.py", "A café\nsecond\n", 2 + offset),
+                    ("src/other.py", "B final\n", 4 + offset)])
+                events = [json.loads(line) for line in (run / "core.jsonl").read_text().splitlines()]
+                for row in ranges:
+                    source = row["source_event"]
+                    self.assertEqual(source["event_sha256"], caller._canonical_sha256(events[source["event_index"]]))
+
+    def test_parent_context_malformed_and_mixed_status_claims_remain_unindexed_raw_barriers(self):
+        cases = ("started", "unsettled", "nonzero_exit", "claimed_type", "claimed_shell", "malformed_command",
+                 "malformed_output", "nonobject_control", "invalid_status", "mixed_command", "mixed_output",
+                 "mixed_control", "mixed_item", "bad_group", "bad_type", "bad_summary", "mismatched", "duplicate_command")
+        for case in cases:
+            def mutate(events, original, contract):
+                opaque = {"command_type": "shell", "command_line": "opaque effect", "step": 1}
+                control = {"status": "done"}
+                if case == "invalid_status":
+                    control["status"] = "invalid"
+                elif case == "mixed_control":
+                    control["commands"] = [opaque]
+                elif case == "bad_group":
+                    control["task_group"] = opaque
+                elif case == "bad_type":
+                    control["task_type"] = [opaque]
+                elif case == "bad_summary":
+                    control["compact_context"] = opaque
+                effect = self.native_task_status_event(control)
+                item = effect["item"]
+                if case == "started":
+                    effect["type"] = "item.started"
+                elif case == "unsettled":
+                    item["status"] = "in_progress"
+                elif case == "nonzero_exit":
+                    item["exit_code"] = 7
+                elif case == "claimed_type":
+                    effect["item"] = dict(deepcopy(self.item), command_type="task_status")
+                elif case == "claimed_shell":
+                    item["command_type"] = "shell"
+                elif case == "malformed_command":
+                    item["command"] = "{"
+                elif case == "malformed_output":
+                    # A type claim must not exempt a malformed acknowledgement.
+                    item.update(command_type="task_status", aggregated_output="{")
+                elif case == "nonobject_control":
+                    item["aggregated_output"] = json.dumps({"task_status": []})
+                elif case == "mixed_command":
+                    item["command"] = json.dumps({**control, "commands": [opaque]})
+                elif case == "mixed_output":
+                    item["aggregated_output"] = json.dumps({"task_status": control, "results": [opaque]})
+                elif case == "mixed_item":
+                    item["results"] = [opaque]
+                elif case == "mismatched":
+                    item["command"] = json.dumps({"status": "doing"})
+                elif case == "duplicate_command":
+                    item["command"] = '{"status":"done","status":"doing"}'
+                events.append(effect)
+                fresh = deepcopy(events[2])
+                fresh["item"]["aggregated_output"]["terminal_receipt"]["call_id"] = "context-read-after-control"
+                events.append(fresh)
+            with self.subTest(case=case):
+                terminal, _, _ = self.interleaved_parent_context_fixture(mutate)
+                evidence = self.project_capability(terminal)["result_inspection"]
+                self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
+                self.assertEqual(evidence["command_success"], "known_success")
+                self.assertNotIn("parent_review_context", evidence)
+
+    def test_parent_context_opaque_commands_and_ambiguous_batches_remain_global_raw_barriers(self):
+        cases = ("untyped", "shell", "unknown_type", "apply_patch", "batch_shell", "malformed_batch",
+                 "source_origin", "unindexed", "unindexed_fresh_read", "fresh_read", "task_status")
+        for case in cases:
+            def mutate(events, original, contract):
+                effect = deepcopy(self.item)
+                if case == "task_status":
+                    effect = self.native_task_status_event({"status": "done"})["item"]
+                    effect["command_type"] = "task_status"
+                elif case == "apply_patch":
+                    effect.update(command_type="apply_patch", command="*** Begin Patch\n*** End Patch\n")
+                elif case == "unknown_type":
+                    effect.update(command_type="unknown", command="opaque effect")
+                elif case == "source_origin":
+                    effect = deepcopy(events[2]["item"])
+                    effect["aggregated_output"]["terminal_receipt"]["termination_origin"] = "shell"
+                elif case == "malformed_batch":
+                    status = deepcopy(self.item)
+                    status.update(command_type="task_status", command="{}")
+                    effect = self.batch_item(events[2]["item"], status)
+                    effect["aggregated_output"]["results"][0]["command_type"] = "shell"
+                elif case not in ("untyped", "unindexed", "unindexed_fresh_read"):
+                    effect.update(command_type="shell", command="opaque effect")
+                    if case == "batch_shell":
+                        effect = self.batch_item(events[2]["item"], effect)
+                events.append({"type": "item.started" if case.startswith("unindexed") else "item.completed",
+                               "item": effect})
+                if case in ("fresh_read", "unindexed_fresh_read"):
+                    fresh = deepcopy(events[2])
+                    fresh["item"]["aggregated_output"]["terminal_receipt"]["call_id"] = "context-read-after-effect"
+                    events.append(fresh)
+            with self.subTest(case=case):
+                terminal, _, _ = self.interleaved_parent_context_fixture(mutate)
+                evidence = self.project_capability(terminal)["result_inspection"]
+                self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
+                self.assertEqual(evidence["command_success"], "known_success")
+                if case in ("fresh_read", "task_status"):
+                    ranges = evidence["parent_review_context"]["ranges"]
+                    expected = [("src/file.py", 6)] if case == "fresh_read" else [
+                        ("src/file.py", 2), ("src/other.py", 4)]
+                    self.assertEqual([(r["path"], r["source_event"]["event_index"]) for r in ranges], expected)
+                else:
+                    self.assertNotIn("parent_review_context", evidence)
+
+    def test_parent_context_per_file_raw_fences_do_not_relax_global_verifier_freshness(self):
+        def interleave(state):
+            events = state["events"]
+            first, command, verifier, read_a, read_b = events
+            second = deepcopy(first)
+            first["item"]["changes"] = first["item"]["changes"][:1]
+            second["item"].update(id="review-other-patch", changes=second["item"]["changes"][1:])
+            events[:] = [command, first, verifier, read_a, second, read_b]
+        terminal, _, _ = self.verifier_context_fixture(interleave, include_read=True, contents={
+            "src/file.py": "def changed():\n    return 'A'\n", "src/other.py": "def changed():\n    return 'B'\n"})
+        evidence = self.project_capability(terminal)["result_inspection"]
+        self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
+        context = evidence["parent_review_context"]
+        self.assertEqual([(r["path"], r["source_event"]["event_index"]) for r in context["ranges"]],
+                         [("src/file.py", 3), ("src/other.py", 5)])
+        self.assertNotIn("verifier_contexts", context)
+
+    def test_parent_context_per_file_conflicts_and_budgets_still_omit_context_atomically(self):
+        for case in ("conflict", "totals", "budget"):
+            def mutate(events, original, contract):
+                if case != "budget":
+                    other = deepcopy(events[2])
+                    output = other["item"]["aggregated_output"]
+                    if case == "conflict":
+                        output["stdout"] = "different\nsecond\n"
+                    else:
+                        output.update(total_lines=3, at_eof=False, next_line=3)
+                    events.append(other)
+            with self.subTest(case=case):
+                terminal, _, _ = self.interleaved_parent_context_fixture(mutate)
+                with patch.object(inspector, "MAX_REVIEW_CONTEXT_BYTES",
+                                  1 if case == "budget" else inspector.MAX_REVIEW_CONTEXT_BYTES):
+                    evidence = self.project_capability(terminal)["result_inspection"]
+                self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
+                self.assertEqual(evidence["command_success"], "known_success")
+                self.assertNotIn("parent_review_context", evidence)
+
     def test_parent_context_partial_overlaps_nested_repeats_and_novel_segments(self):
         lines = [f"line {number}\n" for number in range(1, 301)]
         cases = (
@@ -1423,9 +2649,6 @@ class InspectionTests(unittest.TestCase):
                         reads, contents={"src/file.py": "".join(lines)}, mode=mode)
                     evidence = self.project_capability(terminal)["result_inspection"]
                     self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
-                    if mode == "assistant_reply":
-                        self.assertNotIn("parent_review_context", evidence)
-                        continue
                     ranges = evidence["parent_review_context"]["ranges"]
                     self.assertEqual(
                         [(row["start_line"], row["end_line"], row["text"]) for row in ranges],
@@ -1459,9 +2682,6 @@ class InspectionTests(unittest.TestCase):
                     reads, contents={"src/file.py": "".join(lines)}, mode=mode)
                 full = inspector.inspect(self.root, terminal["request_id"], THREAD)
                 self.assertEqual(full["status"], "EVIDENCE_VERIFIED")
-                if mode == "assistant_reply":
-                    self.assertNotIn("parent_review_context", full)
-                    continue
                 context = full["parent_review_context"]
                 self.assertEqual([(row["start_line"], row["end_line"]) for row in context["ranges"]],
                                  [(100, 199), (200, 249)])
@@ -1557,12 +2777,13 @@ class InspectionTests(unittest.TestCase):
                     else:
                         other_output.update(total_lines=3, at_eof=False, next_line=3)
                     events.append(other)
-            with self.subTest(case=case):
-                terminal, _, _ = self.parent_context_fixture(mutate)
-                evidence = self.project_capability(terminal)["result_inspection"]
-                self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
-                self.assertEqual(evidence["command_success"], "known_success")
-                self.assertNotIn("parent_review_context", evidence)
+            for mode in ("evidence_only", "assistant_reply"):
+                with self.subTest(case=case, mode=mode):
+                    terminal, _, _ = self.parent_context_fixture(mutate, mode=mode)
+                    evidence = self.project_capability(terminal)["result_inspection"]
+                    self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
+                    self.assertEqual(evidence["command_success"], "known_success")
+                    self.assertNotIn("parent_review_context", evidence)
 
     def test_parent_context_batch_parts_must_have_matching_types_paths_sha_and_success_proof(self):
         for case in ("old_sha", "foreign", "type", "origin", "conflict", "missing_receipt", "failed"):
@@ -1620,55 +2841,108 @@ class InspectionTests(unittest.TestCase):
             output = events[2]["item"]["aggregated_output"]
             output.pop("terminal_receipt")
             output.pop("terminal_receipt_path")
-        for mutate, blocker in ((failed, "COMMAND_FAILURE"), (unknown, "EXECUTION_PROOF_UNAVAILABLE")):
-            terminal, _, _ = self.parent_context_fixture(mutate)
-            evidence = self.project_capability(terminal)["result_inspection"]
-            self.assertEqual(evidence["first_blocker"], blocker)
-            self.assertNotIn("parent_review_context", evidence)
-        with patch.object(full_core, "MAX_COMMAND_EVIDENCE", 1):
-            terminal, _, _ = self.parent_context_fixture()
-            evidence = self.project_capability(terminal)["result_inspection"]
-        self.assertEqual(evidence["first_blocker"], "EVIDENCE_INDEX_PARTIAL")
-        self.assertNotIn("parent_review_context", evidence)
-        for case in ("request", "file_proof", "file_artifact", "receipt"):
-            with self.subTest(case=case):
-                terminal, run, _ = self.parent_context_fixture()
-                if case == "request":
-                    path = run / "request-identity.json"
-                    original = json.loads(path.read_text())
-                    original["native_thread_id"] = "87654321-1234-1234-1234-123456789abc"
-                    store(path, original)
-                elif case == "receipt":
-                    events = [json.loads(line) for line in (run / "core.jsonl").read_text().splitlines()]
-                    path = Path(events[2]["item"]["aggregated_output"]["terminal_receipt_path"])
-                    store(path, dict(self.receipt, call_id="foreign-receipt"))
-                else:
-                    if case == "file_proof":
-                        path = run / "file-change-evidence.json"
-                        proof = json.loads(path.read_text())
-                        proof["request_id"] = RID
-                        store(path, proof)
-                        terminal["file_change_evidence_artifact"] = ref(path)
-                    else:
-                        terminal["file_change_evidence_artifact"]["sha256"] = "0" * 64
-                    store(run / "terminal.json", terminal)
-                evidence = self.project_capability(terminal)["result_inspection"]
-                self.assertEqual(evidence["status"], "INCOMPLETE_EVIDENCE")
+        for mode in ("evidence_only", "assistant_reply"):
+            for mutate, blocker in ((failed, "COMMAND_FAILURE"), (unknown, "EXECUTION_PROOF_UNAVAILABLE")):
+                with self.subTest(mode=mode, blocker=blocker):
+                    terminal, _, _ = self.parent_context_fixture(mutate, mode=mode)
+                    evidence = self.project_capability(terminal)["result_inspection"]
+                    self.assertEqual(evidence["first_blocker"], blocker)
+                    self.assertNotIn("parent_review_context", evidence)
+            with self.subTest(mode=mode, case="partial"):
+                with patch.object(full_core, "MAX_COMMAND_EVIDENCE", 1):
+                    terminal, _, _ = self.parent_context_fixture(mode=mode)
+                    evidence = self.project_capability(terminal)["result_inspection"]
+                self.assertEqual(evidence["first_blocker"], "EVIDENCE_INDEX_PARTIAL")
                 self.assertNotIn("parent_review_context", evidence)
+            for case in ("request", "missing_file_proof", "file_proof", "file_artifact", "receipt"):
+                with self.subTest(mode=mode, case=case):
+                    terminal, run, _ = self.parent_context_fixture(mode=mode)
+                    if case == "request":
+                        path = run / "request-identity.json"
+                        original = json.loads(path.read_text())
+                        original["native_thread_id"] = "87654321-1234-1234-1234-123456789abc"
+                        store(path, original)
+                    elif case == "missing_file_proof":
+                        terminal.pop("file_change_evidence_artifact")
+                        store(run / "terminal.json", terminal)
+                    elif case == "receipt":
+                        events = [json.loads(line) for line in (run / "core.jsonl").read_text().splitlines()]
+                        path = Path(events[2]["item"]["aggregated_output"]["terminal_receipt_path"])
+                        store(path, dict(self.receipt, call_id="foreign-receipt"))
+                    else:
+                        if case == "file_proof":
+                            path = run / "file-change-evidence.json"
+                            proof = json.loads(path.read_text())
+                            proof["request_id"] = RID
+                            store(path, proof)
+                            terminal["file_change_evidence_artifact"] = ref(path)
+                        else:
+                            terminal["file_change_evidence_artifact"]["sha256"] = "0" * 64
+                        store(run / "terminal.json", terminal)
+                    evidence = self.project_capability(terminal)["result_inspection"]
+                    self.assertEqual(evidence["status"], "INCOMPLETE_EVIDENCE")
+                    self.assertNotIn("parent_review_context", evidence)
 
-    def test_parent_context_default_assistant_reply_read_only_and_foreign_projection_have_no_source_body(self):
-        for mode, changed in ((None, True), ("assistant_reply", True), ("evidence_only", False)):
-            terminal, _, _ = self.parent_context_fixture(mode=mode, changed=changed)
-            with patch.object(inspector, "_ParentReviewContext", side_effect=AssertionError("no collector")):
-                projected = self.project_capability(terminal)
-            self.assertEqual(projected["result_inspection"]["status"], "EVIDENCE_VERIFIED")
-            self.assertNotIn("parent_review_context", projected["result_inspection"])
-            self.assertNotIn("new café", json.dumps(projected, ensure_ascii=False))
-        terminal, _, _ = self.parent_context_fixture()
-        foreign = {**terminal, "request_sha256": "0" * 64}
-        self.assertNotIn("parent_review_context", self.project_capability(foreign)["result_inspection"])
-        self.assertNotIn("parent_review_context", self.project_capability(
-            terminal, thread="87654321-1234-1234-1234-123456789abc")["result_inspection"])
+    def test_parent_context_delivery_modes_and_default_retain_identical_settled_reads(self):
+        contents = {f"src/file_{index}.py": "".join(f"file {index} line {line}\n" for line in range(count))
+                    for index, count in enumerate((10, 10, 10, 10, 8))}
+        contexts = []
+        for mode in ("evidence_only", "assistant_reply", None):
+            with self.subTest(mode=mode):
+                terminal, run, _ = self.parent_context_fixture(mode=mode, contents=contents)
+                original = json.loads((run / "request-identity.json").read_text())
+                if mode is None:
+                    self.assertNotIn("terminal_delivery", original)
+                else:
+                    self.assertEqual(original["terminal_delivery"], mode)
+                with patch.object(caller, "execute", side_effect=AssertionError("no execution")), \
+                        patch.object(file_change_evidence, "_postimage", side_effect=AssertionError("no source reread")):
+                    projected = self.project_capability(terminal)
+                evidence = projected["result_inspection"]
+                self.assertEqual(evidence["status"], "EVIDENCE_VERIFIED")
+                context = evidence["parent_review_context"]
+                self.assertEqual({row["path"]: row["text"] for row in context["ranges"]}, contents)
+                self.assertEqual(len(context["ranges"]), 5)
+                self.assertEqual(sum(row["end_line"] - row["start_line"] + 1
+                                     for row in context["ranges"]), 48)
+                self.assertEqual(context["terminal_content_sha256"], caller._canonical_sha256(terminal))
+                events = [json.loads(line) for line in (run / "core.jsonl").read_text().splitlines()]
+                for row in context["ranges"]:
+                    self.assertEqual(row["source_sha256"], hashlib.sha256(contents[row["path"]].encode()).hexdigest())
+                    source = row["source_event"]
+                    self.assertEqual(source["event_sha256"], caller._canonical_sha256(events[source["event_index"]]))
+                if mode == "evidence_only":
+                    self.assertEqual(projected["requested_terminal_delivery"], mode)
+                    self.assertEqual(projected["observed_terminal_delivery"], mode)
+                else:
+                    self.assertEqual(projected["result_text"], "changed source")
+                    for key in full_core._TerminalEvidence.FIELD_NAMES:
+                        self.assertNotIn(key, projected)
+                    self.assertFalse(any(event["type"] == "nokiy.terminal_evidence" for event in events))
+                # Distinct requests and receipt paths have distinct proof pins;
+                # compare retained context only after checking each real binding.
+                comparable = deepcopy(context)
+                comparable.pop("terminal_content_sha256")
+                for row in comparable["ranges"]:
+                    row["source_event"].pop("event_sha256")
+                contexts.append(comparable)
+        self.assertEqual(contexts[0], contexts[1])
+        self.assertEqual(contexts[0], contexts[2])
+
+    def test_parent_context_read_only_and_foreign_projection_have_no_source_body(self):
+        for mode in (None, "assistant_reply", "evidence_only"):
+            with self.subTest(mode=mode):
+                terminal, _, _ = self.parent_context_fixture(mode=mode, changed=False)
+                with patch.object(inspector, "_ParentReviewContext", side_effect=AssertionError("no collector")):
+                    projected = self.project_capability(terminal)
+                self.assertEqual(projected["result_inspection"]["status"], "EVIDENCE_VERIFIED")
+                self.assertNotIn("parent_review_context", projected["result_inspection"])
+                self.assertNotIn("new café", json.dumps(projected, ensure_ascii=False))
+                terminal, _, _ = self.parent_context_fixture(mode=mode)
+                foreign = {**terminal, "request_sha256": "0" * 64}
+                self.assertNotIn("parent_review_context", self.project_capability(foreign)["result_inspection"])
+                self.assertNotIn("parent_review_context", self.project_capability(
+                    terminal, thread="87654321-1234-1234-1234-123456789abc")["result_inspection"])
 
     def test_parent_context_utf8_budget_omits_whole_context_without_changing_success(self):
         terminal, _, _ = self.parent_context_fixture(contents={"src/file.py": "界" * 1000 + "\n"})
@@ -1938,11 +3212,14 @@ class InspectionTests(unittest.TestCase):
         store(run / "terminal.json", terminal)
         projected = self.project_capability(terminal)
         baseline = {key: value for key, value in projected.items() if key != "capability_gap"}
-        limit = (len(caller._canonical_bytes(baseline)) + 32 +
-                 len(caller._canonical_bytes(inspector._gap_diagnostic("CAPABILITY_GAP_PROJECTION_TOO_LARGE"))))
+        # Projection reserves room for the read-only delivery metadata appended afterward.
+        recovery_metadata = {"inspection_summary": None, "inspection_summary_omission": "READ_ONLY_RECOVERY"}
+        limit = len(caller._canonical_bytes({**baseline, **recovery_metadata,
+            "capability_gap": inspector._gap_diagnostic("CAPABILITY_GAP_PROJECTION_TOO_LARGE")}))
+        self.assertGreater(len(caller._canonical_bytes({**projected, **recovery_metadata})), limit)
         with patch.object(inspector, "MAX_PROJECTED_BYTES", limit):
             bounded = self.project_capability(terminal)
-        self.assertLessEqual(len(caller._canonical_bytes(bounded)), limit)
+        self.assertLessEqual(len(caller._canonical_bytes({**bounded, **recovery_metadata})), limit)
         self.assertEqual(bounded["capability_gap"]["first_blocker"], "CAPABILITY_GAP_PROJECTION_TOO_LARGE")
         self.assertEqual(bounded["status"], "BLOCKED")
         self.assertEqual(bounded["first_typed_blocker"], "ORIGINAL_SCOPE_DENIED")
@@ -2028,7 +3305,8 @@ class InspectionTests(unittest.TestCase):
         run = self.root / original["request_id"]
         run.mkdir(exist_ok=True)
         payloads = [event["item"]["aggregated_output"] for event in events
-                    if event["item"].get("type") == "command_execution"]
+                    if event["item"].get("type") in ("command_execution", "file_change")
+                    and isinstance(event["item"].get("aggregated_output"), dict)]
         payloads += [entry["output"] for payload in list(payloads) for entry in payload.get("results", [])]
         for i, payload in enumerate(payloads):
             if isinstance(payload.get("terminal_receipt"), dict):
@@ -2071,9 +3349,458 @@ class InspectionTests(unittest.TestCase):
     def inspect_resolution(self, fixture, **kwargs):
         return inspector.inspect(self.root, fixture["terminal"]["request_id"], THREAD, **kwargs)
 
+    def pending_verifier_settlement(self, mutate=None):
+        def pending(state):
+            state["events"][:] = [event for event in state["events"] if event["item"] is not state["passed"]]
+            if mutate is not None:
+                mutate(state)
+        fixture = self.resolution_fixture(pending)
+        fixture["terminal"].update(runtime_exit_code=0, fallback_used=False)
+        store(fixture["run"] / "terminal.json", fixture["terminal"])
+        return fixture, self.inspect_resolution(fixture)
+
+    def test_completed_workload_verifier_failure_has_v2_settlement_despite_question(self):
+        def question(state):
+            state["events"].append({"type": "item.completed", "item": {
+                "type": "command_execution", "command_type": "task_status", "status": "completed",
+                "exit_code": None, "command": json.dumps({"status": "question"}),
+                "aggregated_output": {"task_status": {"status": "question"}}}})
+        fixture, result = self.pending_verifier_settlement(question)
+        self.assertEqual(result["status"], "INCOMPLETE_EVIDENCE")
+        self.assertEqual(result["first_blocker"], "COMMAND_FAILURE")
+        self.assertEqual(result["command_success"], "known_failure")
+        self.assertEqual(result["counts"]["failed"], 1)
+        self.assertEqual(result["post_batch_verifier_settlement"], {
+            "schema_version": "nokiy_post_batch_verifier_settlement_v2",
+            "terminal_sha256": result["terminal_sha256"], "commands": 1, "failed": 1,
+            "policy_denials": 0, "unsettled_commands": 0})
+        events = [json.loads(line) for line in (fixture["run"] / "core.jsonl").read_text().splitlines()]
+        self.assertTrue(any(event.get("item", {}).get("aggregated_output") == {
+            "task_status": {"status": "question"}} for event in events))
+
+    def test_v2_settlement_excludes_nonverifier_unbound_and_unsettled_failures(self):
+        def ordinary(state):
+            state["failed"].update(command_type="zsh", command="false")
+            state["failed"]["aggregated_output"]["terminal_receipt"].update(termination_origin="workload")
+        def mixed(state):
+            item = state["verifier"](1, "shell")
+            item.update(command_type="zsh", command="false")
+            item["aggregated_output"]["terminal_receipt"].update(termination_origin="workload")
+            state["events"].append({"type": "item.completed", "item": item})
+        def duplicate(state):
+            state["events"].append({"type": "item.completed", "item": deepcopy(state["failed"])})
+        mutations = {
+            "ordinary": ordinary, "mixed": mixed, "reused_call": duplicate,
+            "foreign_executor": lambda s: s["failed"]["aggregated_output"].update(executor="foreign"),
+            "transport": lambda s: s["failed"]["aggregated_output"]["terminal_receipt"].update(failure_class="transport"),
+            "permission": lambda s: s["failed"]["aggregated_output"]["terminal_receipt"].update(failure_class="permission"),
+            "timeout": lambda s: s["failed"]["aggregated_output"].update(timed_out=True),
+            "cancelled": lambda s: s["failed"]["aggregated_output"].update(cancelled=True),
+            "unknown": lambda s: s["failed"]["aggregated_output"].update(outcome="unknown"),
+            "unreaped": lambda s: s["failed"]["aggregated_output"]["terminal_receipt"].update(process_reaped=False),
+            "live_group": lambda s: s["failed"]["aggregated_output"]["terminal_receipt"].update(process_group_empty=False),
+            "ungranted_index": lambda s: s["failed"].update(command=json.dumps({"verifier_index": 1})),
+            "boolean_index": lambda s: s["failed"].update(command=json.dumps({"verifier_index": True})),
+            "no_receipt": lambda s: s["failed"]["aggregated_output"].pop("terminal_receipt"),
+        }
+        for name, mutation in mutations.items():
+            with self.subTest(name=name):
+                _, result = self.pending_verifier_settlement(mutation)
+                self.assertEqual(result["status"], "INCOMPLETE_EVIDENCE")
+                self.assertNotEqual(result.get("post_batch_verifier_settlement", {}).get("schema_version"),
+                                    "nokiy_post_batch_verifier_settlement_v2")
+                if name == "ordinary":
+                    self.assertEqual(result["post_batch_verifier_settlement"]["schema_version"],
+                                     "nokiy_post_batch_verifier_settlement_v1")
+
+    def digest_mismatch_fixture(self, alter=None):
+        """I23 V424: a worker read a file with another file's digest before repairing its branch."""
+        def prepare(state):
+            state["contract"]["source_read"] = True
+            (state["workspace"] / "src/readonly.txt").write_bytes(b"old\n")
+            state["contract"]["read_scopes"].append("src/readonly.txt")
+            expected = "c" * 64
+            actual = file_change_evidence._postimage(state["workspace"], "src/readonly.txt")["sha256"]
+            evidence = {"schema_version": "nokiy_source_read_content_v1",
+                        "request": {"path": "src/readonly.txt", "start_line": 1, "end_line": 1,
+                                    "expected_sha256": expected, "line_numbers": True},
+                        "source_sha256": actual, "content_satisfied": False}
+            receipt = dict(self.receipt, exit_code=1, terminal_state="failed", pid=None,
+                           termination_origin="in_process_source_read", failure_class="workload_exit_nonzero",
+                           authority_effect="none", staging_authority="none",
+                           authoritative_publication="unproven", reconcile_required=True,
+                           retry_safe=False, auto_retry_allowed=False,
+                           call_id="worker.tool.command_run:call_read:0", source_read_evidence=evidence)
+            item = {"type": "command_execution", "command_type": "source_read", "status": "failed",
+                    "exit_code": None, "command": json.dumps(["src/readonly.txt", 1, 1, expected]),
+                    "aggregated_output": {"error_type": "SOURCE_READ_SHA256_MISMATCH", "exit_code": 1,
+                                          "source_read_evidence": evidence, "stdout": "",
+                                          "stderr": "SOURCE_READ_SHA256_MISMATCH", "terminal_receipt": receipt}}
+            if alter is not None:
+                alter(item)
+            state["events"].insert(0, {"type": "item.completed", "item": item})
+        return self.resolution_fixture(prepare)
+
+    def test_effect_free_digest_mismatch_read_explains_its_failure(self):
+        result = self.inspect_resolution(self.digest_mismatch_fixture())
+        self.assertIsNone(result["first_blocker"])
+        self.assertEqual(result["status"], "EVIDENCE_VERIFIED")
+        self.assertEqual(result["counts"]["failed"], 2)
+        self.assertEqual(result["commands"][0]["failure_resolution"],
+                         {"status": "resolved", "source_read": "digest_mismatch_no_content"})
+        self.assertEqual(result["source_read_digest_mismatch_reconciliation"], {
+            "schema_version": "nokiy_source_read_digest_mismatch_reconciliation_v1", "mismatch_count": 1,
+            "unresolved_count": 0, "effective_command_success": "known_success"})
+
+    def test_digest_mismatch_needs_the_exact_effect_free_proof(self):
+        output = lambda item: item["aggregated_output"]
+        cases = {
+            "content": lambda item: output(item)["source_read_evidence"].update(content_satisfied=True),
+            "effect": lambda item: output(item)["terminal_receipt"].update(authority_effect="workspace"),
+            "path": lambda item: item.update(command=json.dumps(["src/file.py", 1, 1, "c" * 64])),
+            "stdout": lambda item: output(item).update(stdout="1: old\n"),
+            "error": lambda item: output(item).update(error_type="SOURCE_READ_DENIED"),
+            # A writable path stays with the own-edit read rules.
+            "writable": lambda item: (output(item)["source_read_evidence"]["request"].update(path="src/unchanged.txt"),
+                                      item.update(command=json.dumps(["src/unchanged.txt", 1, 1, "c" * 64]))),
+        }
+        for name, alter in cases.items():
+            with self.subTest(case=name):
+                result = self.inspect_resolution(self.digest_mismatch_fixture(alter))
+                self.assertEqual(result["first_blocker"], "COMMAND_FAILURE")
+                self.assertNotIn("source_read_digest_mismatch_reconciliation", result)
+
+    def inspect_shell_failure_fixture(self, alter=None, contract_alter=None):
+        """Real tasks 2026-10-23..25: inspect actions whose only failures were closed shell exits."""
+        def prepare(state):
+            contract = state["contract"]
+            contract.pop("verifier_commands")
+            contract.update(schema_version="jspace_contract_v2", read_scopes=[], write_scopes=[],
+                            declared_targets=[], allowed_operations=["command", "read"],
+                            denied_operations=["create", "delete", "modify", "network"],
+                            inspect_shell={"schema_version": "nokiy_inspect_shell_v1", "profile_sha256": "a" * 64,
+                                           "network": "inherit",
+                                           "evidence_root": str(state["workspace"] / "evidence")})
+            if contract_alter is not None:
+                contract_alter(contract)
+            receipt = dict(self.receipt, exit_code=2, terminal_state="failed", pid=4242,
+                           termination_origin="workload", failure_class="workload_exit_nonzero",
+                           authority_effect="none", staging_authority="none",
+                           authoritative_publication="unproven", reconcile_required=True,
+                           retry_safe=False, auto_retry_allowed=False,
+                           call_id="worker.tool.command_run:call_probe:0")
+            failed = {"type": "command_execution", "command_type": "zsh", "status": "failed", "exit_code": None,
+                      "command": "python3 -B probe.py",
+                      "aggregated_output": {"exit_code": 2, "message": "Exit code: 2", "stdout": "",
+                                            "stderr": "Traceback (most recent call last)",
+                                            "terminal_receipt": receipt}}
+            passed = {"type": "command_execution", "command_type": "zsh", "status": "completed", "exit_code": 0,
+                      "command": "python3 -B probe.py --fixed",
+                      "aggregated_output": {"exit_code": 0, "stdout": "ok\n", "stderr": "",
+                                            "terminal_receipt": dict(
+                                                self.receipt, call_id="worker.tool.command_run:call_probe:1")}}
+            if alter is not None:
+                alter(failed)
+            state["events"][:] = [{"type": "item.completed", "item": failed},
+                                  {"type": "item.completed", "item": passed}]
+        return self.resolution_fixture(prepare, targets=(), changed=False)
+
+    def test_closed_inspect_shell_exit_explains_its_failure(self):
+        result = self.inspect_resolution(self.inspect_shell_failure_fixture())
+        self.assertIsNone(result["first_blocker"])
+        self.assertEqual(result["status"], "EVIDENCE_VERIFIED")
+        self.assertEqual(result["counts"]["failed"], 1)
+        self.assertEqual(result["commands"][0]["failure_resolution"],
+                         {"status": "resolved", "inspect_shell": "closed_exit_no_effect"})
+        self.assertEqual(result["inspect_shell_failure_reconciliation"], {
+            "schema_version": "nokiy_inspect_shell_failure_reconciliation_v1", "failure_count": 1,
+            "unresolved_count": 0, "effective_command_success": "known_success"})
+
+    def test_inspect_shell_exit_needs_the_admitted_contract_and_a_closed_receipt(self):
+        receipt = lambda item: item["aggregated_output"]["terminal_receipt"]
+        cases = {
+            "effect": (lambda item: receipt(item).update(authority_effect="workspace"), None),
+            "open": (lambda item: receipt(item).update(process_group_empty=False), None),
+            "timeout": (lambda item: receipt(item).update(timed_out=True), None),
+            "class": (lambda item: receipt(item).update(failure_class="wall_timeout"), None),
+            "changes": (lambda item: item["aggregated_output"].update(changes=["src/file.py"]), None),
+            "kind": (lambda item: item.update(command_type="apply_patch"), None),
+            "not_inspect": (None, lambda contract: contract.pop("inspect_shell")),
+            "writable": (None, lambda contract: contract.update(write_scopes=["src/file.py"])),
+        }
+        for name, (alter, contract_alter) in cases.items():
+            with self.subTest(case=name):
+                result = self.inspect_resolution(self.inspect_shell_failure_fixture(alter, contract_alter))
+                self.assertIsNotNone(result["first_blocker"])
+                self.assertNotIn("inspect_shell_failure_reconciliation", result)
+
+    def no_content_read_fixture(self, alter=None, path="src/readonly.txt"):
+        """Real tasks 2026-10-23..25: reads past the end, over-long lines and oversized JSON values."""
+        def prepare(state):
+            state["contract"]["source_read"] = True
+            (state["workspace"] / "src/readonly.txt").write_bytes(b"old\n")
+            state["contract"]["read_scopes"].append("src/readonly.txt")
+            receipt = dict(self.receipt, exit_code=1, terminal_state="failed", pid=None,
+                           termination_origin="in_process_source_read", failure_class="workload_exit_nonzero",
+                           authority_effect="none", staging_authority="none",
+                           authoritative_publication="unproven", reconcile_required=True,
+                           retry_safe=False, auto_retry_allowed=False,
+                           call_id="worker.tool.command_run:call_read:0")
+            item = {"type": "command_execution", "command_type": "source_read", "status": "failed",
+                    "exit_code": None, "command": json.dumps({"path": path, "start_line": 40, "end_line": 41}),
+                    "aggregated_output": {"error_type": "SOURCE_READ_RANGE_OUT_OF_BOUNDS", "exit_code": 1,
+                                          "json_recovery": {"hint": "diagnostic only"}, "stdout": "",
+                                          "stderr": "SOURCE_READ_RANGE_OUT_OF_BOUNDS", "terminal_receipt": receipt}}
+            if alter is not None:
+                alter(item)
+            state["events"].insert(0, {"type": "item.completed", "item": item})
+        return self.resolution_fixture(prepare)
+
+    def test_unwritable_read_without_content_explains_its_failure(self):
+        result = self.inspect_resolution(self.no_content_read_fixture())
+        self.assertIsNone(result["first_blocker"])
+        self.assertEqual(result["status"], "EVIDENCE_VERIFIED")
+        self.assertEqual(result["commands"][0]["failure_resolution"],
+                         {"status": "resolved", "source_read": "failed_without_content"})
+        self.assertEqual(result["source_read_no_content_reconciliation"], {
+            "schema_version": "nokiy_source_read_no_content_reconciliation_v1", "failure_count": 1,
+            "unresolved_count": 0, "effective_command_success": "known_success"})
+
+    def test_read_without_content_needs_an_unwritable_path_and_an_effect_free_receipt(self):
+        output = lambda item: item["aggregated_output"]
+        cases = {
+            "writable": (None, "src/unchanged.txt"),
+            "content": (lambda item: output(item).update(stdout="40: old\n"), "src/readonly.txt"),
+            "effect": (lambda item: output(item)["terminal_receipt"].update(authority_effect="workspace"),
+                       "src/readonly.txt"),
+            "changes": (lambda item: output(item).update(changes=["src/readonly.txt"]), "src/readonly.txt"),
+            "error": (lambda item: output(item).update(error_type="PERMISSION_DENIED"), "src/readonly.txt"),
+        }
+        for name, (alter, path) in cases.items():
+            with self.subTest(case=name):
+                result = self.inspect_resolution(self.no_content_read_fixture(alter, path))
+                self.assertIsNotNone(result["first_blocker"])
+                self.assertNotIn("source_read_no_content_reconciliation", result)
+
+    def jspace_refusal_fixture(self, witness=lambda value: None):
+        """Real tasks 2026-10-23..25: J-Space refused an inspect worker's apply_patch before dispatch."""
+        line = "*** Begin Patch\n*** Update File: tasklib.py\n@@\n-a\n+b\n*** End Patch\n"
+        error = "JSPACE_OPERATION_DENIED: operation=modify target=tasklib.py detail=denied"
+        call = "worker.tool.command_run:call_patch:0"
+
+        def prepare(state):
+            item = {"type": "command_execution", "command_type": "jspace", "status": "failed", "exit_code": None,
+                    "command": line, "aggregated_output": error, "command_id": call, "command_index": 0,
+                    "command_run_id": "worker.tool.command_run", "provider_tool_call_id": "call_patch",
+                    "runtime_id": "worker", "step": 1}
+            state["events"].insert(0, {"type": "item.completed", "item": item})
+        state = self.resolution_fixture(prepare)
+        session = "full-" + state["terminal"]["request_sha256"]
+        value = {"schema_version": "nokiy_jspace_policy_denial_v1", "owner": "router", "session_id": session,
+                 "runtime_id": "worker", "execution_id": call, "call_id": call,
+                 "authorization_semantic_sha256": state["contract"]["authorization_semantic_sha256"],
+                 "command_type": "apply_patch", "command_line_sha256": hashlib.sha256(line.encode()).hexdigest(),
+                 "step": 1, "jspace_error_code": "JSPACE_OPERATION_DENIED", "operation": "modify",
+                 "target": "tasklib.py", "error_message": error, "effect_state": "not_started",
+                 "process_started": False, "mutation_count": 0, "authority_effect": "none"}
+        if witness(value) is not False:
+            identity = json.dumps([session, "worker", call], separators=(",", ":")).encode()
+            name = "jspace-policy-denial-" + hashlib.sha256(identity).hexdigest() + ".json"
+            store(state["run"] / "execution-state/command_receipts" / name, value)
+        return state
+
+    def test_witnessed_jspace_refusal_is_a_non_attempt(self):
+        result = self.inspect_resolution(self.jspace_refusal_fixture())
+        self.assertIsNone(result["first_blocker"])
+        self.assertEqual(result["status"], "EVIDENCE_VERIFIED")
+        self.assertEqual(result["commands"][0]["execution_proof"], "not_attempted")
+        self.assertEqual(result["commands"][0]["pre_execution_rejection"]["jspace_error_code"],
+                         "JSPACE_OPERATION_DENIED")
+        self.assertEqual(result["jspace_refusal_reconciliation"], {
+            "schema_version": "nokiy_jspace_refusal_reconciliation_v1", "not_attempted_count": 1,
+            "unresolved_count": 0, "effective_command_success": "known_success"})
+
+    def test_jspace_refusal_needs_the_exact_router_witness(self):
+        cases = {
+            "missing": lambda value: False,
+            "line": lambda value: value.update(command_line_sha256="0" * 64),
+            "error": lambda value: value.update(error_message="JSPACE_OPERATION_DENIED: other"),
+            "session": lambda value: value.update(session_id="full-" + "0" * 64),
+            "started": lambda value: value.update(process_started=True),
+            "authorization": lambda value: value.update(authorization_semantic_sha256="0" * 64),
+        }
+        for name, witness in cases.items():
+            with self.subTest(case=name):
+                result = self.inspect_resolution(self.jspace_refusal_fixture(witness))
+                self.assertIsNotNone(result["first_blocker"])
+                self.assertNotIn("jspace_refusal_reconciliation", result)
+
+    def own_edit_read_fixture(self, mutate=None, *, batch=False, reverse=False, qualified=True):
+        def arrange(state):
+            state["contract"]["source_read"] = True
+            old = state["contract"]["dcf_generation"]["source_snapshot"]["src/file.py"]["sha256"]
+            current = file_change_evidence._postimage(state["workspace"], "src/file.py")["sha256"]
+
+            def identity(provider, index, step):
+                prefix = "worker.tool.command_run"
+                return dict(command_id=f"{prefix}:{provider}:{index}" if qualified else f"{provider}:{index}",
+                            provider_tool_call_id=provider, command_run_id=prefix if qualified else provider,
+                            command_index=index, step=step, runtime_id="worker")
+
+            def receipt(provider, index, origin, failed=False):
+                return dict(self.receipt, call_id=f"worker.tool.command_run:{provider}:{index}", pid=None,
+                            exit_code=int(failed), terminal_state="failed" if failed else "completed",
+                            termination_origin=origin, failure_class="workload_exit_nonzero" if failed else "none",
+                            reconcile_required=failed, retry_safe=False, auto_retry_allowed=False,
+                            authority_effect="none", staging_authority="none", authoritative_publication="unproven")
+
+            patch = deepcopy(state["events"][1]["item"])
+            patch.update(command_type="apply_patch", **identity("first", 0, 1))
+            facts = [{"kind": "update", "path": "src/file.py", "preimage_sha256": old, "postimage_sha256": current}]
+            patch_receipt = receipt("first", 0, "in_process_apply_patch")
+            patch_receipt["apply_patch_changes"] = deepcopy(facts)
+            patch["aggregated_output"] = {"exit_code": 0, "stdout": "updated", "stderr": "",
+                                          "changes": deepcopy(facts), "terminal_receipt": patch_receipt}
+
+            def read(failed):
+                provider, index, step, pin = ("first", 1, 2, old) if failed else ("second", 0, 1, current)
+                request = {"path": "src/file.py", "start_line": 1, "end_line": 1,
+                           "line_numbers": True, "expected_sha256": pin}
+                proof = {"schema_version": "nokiy_source_read_content_v1", "request": request,
+                         "source_sha256": current, "content_satisfied": not failed}
+                bound = receipt(provider, index, "in_process_source_read", failed)
+                bound["source_read_evidence"] = deepcopy(proof)
+                output = {"exit_code": int(failed), "stdout": "" if failed else "1: new\n",
+                          "stderr": "SOURCE_READ_SHA256_MISMATCH" if failed else "",
+                          "terminal_receipt": bound, "source_read_evidence": proof}
+                if failed:
+                    output["error_type"] = "SOURCE_READ_SHA256_MISMATCH"
+                else:
+                    output.update(path="src/file.py", source_sha256=current, truncated=False,
+                                  start_line=1, end_line=1, total_lines=1, line_numbers=True,
+                                  file_bytes=4, at_eof=True, next_line=None, truncation_reason=None, ends_with_newline=True)
+                return {"type": "command_execution", "command_type": "source_read", "command": json.dumps(request),
+                        "status": "failed" if failed else "completed", "success": not failed,
+                        "exit_code": int(failed), "aggregated_output": output, **identity(provider, index, step)}
+
+            failed, passed = read(True), read(False)
+            state.update(read_failed=failed, read_pass=passed, patch_item=patch)
+            events = [{"type": "item.completed", "item": item} for item in (patch, failed, passed, state["passed"])]
+            if batch:
+                patch_part = deepcopy(patch)
+                patch_part.update(type="command_execution", command="*** Begin Patch\n*** Update File: src/file.py\n@@\n-old\n+new\n*** End Patch\n")
+                items = [patch_part, failed]
+                if reverse:
+                    items.reverse()
+                wrapped = self.batch_item(*items)
+                wrapped.update(status="failed", success=False, exit_code=1)
+                wrapped["aggregated_output"].update(exit_code=1)
+                wrapped["aggregated_output"]["terminal_receipt"].update(exit_code=1, terminal_state="failed")
+                declared = json.loads(wrapped["command"])
+                for index, (part, command, entry) in enumerate(zip(items, declared["commands"], wrapped["aggregated_output"]["results"])):
+                    meta = identity("first", index, part["step"])
+                    command.update(meta)
+                    entry.update(meta)
+                    entry["output"]["terminal_receipt"]["call_id"] = f"worker.tool.command_run:first:{index}"
+                wrapped["command"] = json.dumps(declared)
+                state["batch_item"] = wrapped
+                events = [{"type": "item.completed", "item": wrapped}, *events[2:]]
+            state["events"][:] = events
+            if mutate is not None:
+                mutate(state)
+        return self.resolution_fixture(arrange)
+
+    def test_own_edit_stale_read_has_effective_resolution_without_rewriting_failure(self):
+        cases = [(batch, reverse, qualified) for batch, reverse in ((False, False), (True, False), (True, True))
+                 for qualified in (False, True)]
+        for batched, reverse, qualified in cases:
+            with self.subTest(batch=batched, reverse=reverse, qualified=qualified):
+                fixture = self.own_edit_read_fixture(batch=batched, reverse=reverse, qualified=qualified)
+                result = self.inspect_resolution(fixture)
+                self.assertEqual(result["status"], "EVIDENCE_VERIFIED", result)
+                self.assertEqual(result["command_success"], "known_failure")
+                self.assertEqual(result["counts"]["failed"], 1)
+                self.assertEqual(result["source_read_failure_resolution"], {
+                    "schema_version": "nokiy_source_read_failure_resolution_v1", "resolved_count": 1,
+                    "unresolved_count": 0, "effective_command_success": "known_success"})
+                failed = next(row for row in result["commands"] if row["execution_proof"] == "known_failure")
+                self.assertEqual(failed["failure_resolution"]["status"], "resolved")
+                self.assertEqual(fixture["read_failed"]["aggregated_output"]["terminal_receipt"]["terminal_state"], "failed")
+                self.assertIs(fixture["read_failed"]["aggregated_output"]["terminal_receipt"]["reconcile_required"], True)
+
+    def test_own_edit_read_requires_patch_identity_exact_selector_and_authenticated_content(self):
+        def witness(state, name, change):
+            item = state[name]
+            proof = item["aggregated_output"]["source_read_evidence"]
+            change(proof)
+            item["command"] = json.dumps(proof["request"])
+            item["aggregated_output"]["terminal_receipt"]["source_read_evidence"] = deepcopy(proof)
+
+        mutations = [lambda s: s["events"].pop(0),
+                     lambda s: s["events"].pop(2),  # A verifier pass and final prose are not a content repair.
+                     lambda s: s["patch_item"]["aggregated_output"]["terminal_receipt"].pop("apply_patch_changes"),
+                     lambda s: s["read_failed"]["aggregated_output"].pop("source_read_evidence"),
+                     lambda s: s["read_pass"]["aggregated_output"].pop("source_read_evidence"),
+                     lambda s: witness(s, "read_failed", lambda p: p["request"].update(expected_sha256="c" * 64)),
+                     lambda s: witness(s, "read_failed", lambda p: p.update(source_sha256="c" * 64)),
+                     lambda s: witness(s, "read_pass", lambda p: p["request"].update(end_line=2)),
+                     lambda s: witness(s, "read_pass", lambda p: p["request"].update(path="src/unchanged.txt")),
+                     lambda s: s["read_pass"].update(command=json.dumps({"path": "src/file.py", "start_line": 1, "end_line": 1})),
+                     lambda s: s["read_pass"]["aggregated_output"].update(truncated=True),
+                     lambda s: s["read_pass"]["aggregated_output"]["terminal_receipt"].update(process_group_empty=False),
+                     lambda s: s["read_failed"].update(outcome="unknown"),
+                     lambda s: s["read_pass"].update(process_group_empty=False),
+                     lambda s: s["read_pass"].update(command_id="second:0"),
+                     lambda s: s["read_pass"].update(command_run_id="second"),
+                     lambda s: s["read_pass"].update(command_run_id="foreign.tool.command_run"),
+                     lambda s: s["read_pass"].update(provider_tool_call_id="foreign-provider"),
+                     lambda s: s["read_pass"].update(runtime_id="foreign"),
+                     lambda s: s["read_pass"]["aggregated_output"]["terminal_receipt"].update(call_id="foreign.tool.command_run:second:0"),
+                     lambda s: s["contract"]["denied_operations"].append("read"),
+                     lambda s: s["events"].insert(3, deepcopy(s["events"][2]))]
+        def intervening(s):
+            item = s["verifier"](1, "failed-mutation")
+            item.update(command_type="apply_patch", command="failed patch")
+            s["events"].insert(2, {"type": "item.completed", "item": item})
+        def unresolved_verifier(s):
+            s["events"].append({"type": "item.completed", "item": s["verifier"](1, "late-failed-verifier")})
+        def concurrent_repair(s):
+            item = s["read_pass"]
+            item.update(command_id="worker.tool.command_run:first:2", provider_tool_call_id="first",
+                        command_run_id="worker.tool.command_run", command_index=2, step=2)
+            item["aggregated_output"]["terminal_receipt"]["call_id"] = "worker.tool.command_run:first:2"
+        mutations.extend((intervening, unresolved_verifier, concurrent_repair,
+                          lambda s: s["read_failed"].update(step=1)))
+        for number, mutation in enumerate(mutations):
+            with self.subTest(number=number):
+                result = self.inspect_resolution(self.own_edit_read_fixture(mutation))
+                self.assertNotEqual(result["status"], "EVIDENCE_VERIFIED", result)
+                self.assertIsNotNone(result["first_blocker"])
+
+    def test_own_edit_read_unrelated_settled_mutation_still_prevents_resolution(self):
+        def insert_mutation(state):
+            item = deepcopy(self.item)
+            item.update(command_type="apply_patch", command="settled unrelated patch")
+            state["events"].insert(2, {"type": "item.completed", "item": item})
+        result = self.inspect_resolution(self.own_edit_read_fixture(insert_mutation))
+        self.assertEqual(result["first_blocker"], "COMMAND_FAILURE", result)
+        self.assertEqual(result["source_read_failure_resolution"]["resolved_count"], 0)
+
+    def test_own_edit_read_selector_normalization_matches_runtime_forms(self):
+        digest = "a" * 64
+        named = {"path": "src/file.py", "start_line": 1, "end_line": 2, "expected_sha256": digest}
+        self.assertEqual(inspector._normalized_source_read(json.dumps(named)),
+                         inspector._normalized_source_read(json.dumps(["src/file.py", 1, 2, digest.upper(), True])))
+        search = inspector._normalized_source_read(json.dumps({"path": "src/file.py", "search_terms": ["new"], "expected_sha256": digest}))
+        self.assertEqual((search["start_line"], search["context_lines"], search["line_numbers"]), (1, 0, True))
+        for args in ({**named, "start_line": True}, {**named, "path": "src/../file.py"},
+                     {**named, "json_pointer": "/x"}, {"path": "src/file.py", "json_pointer": None, "expected_sha256": digest},
+                     {"path": "src/file.py", "search_terms": ["new"], "line_numbers": False, "expected_sha256": digest}):
+            self.assertIsNone(inspector._normalized_source_read(json.dumps(args)))
+
     def source_read_rejection_fixture(self, *, line=None, command=None, changed=True,
                                       include_read=True, include_pass=True, emit_marker=True,
-                                      contract_change=None):
+                                      contract_change=None, rejection_kind="json_syntax_or_shape"):
         line = line if line is not None else '{"path":"answer.txt","start_line":1,"end_line": ninety}'
         canonical = ({"command_type": "source_read", "command_line": line} if command is None else
                      {key: value for key, value in command.items() if key in
@@ -2105,7 +3832,7 @@ class InspectionTests(unittest.TestCase):
                                          {"type": "item.completed", "item": read})
         fixture = self.resolution_fixture(prepare, changed=changed)
         proof = {"schema_version": "nokiy_source_read_pre_execution_rejection_v1", "owner": "router",
-                 "rejection_kind": "json_syntax_or_shape", "session_id": "full-" + fixture["original"]["request_sha256"],
+                 "rejection_kind": rejection_kind, "session_id": "full-" + fixture["original"]["request_sha256"],
                  "runtime_id": "fixture-runtime", "execution_id": "fixture-runtime.tool.command_run:fixture-call:0",
                  "call_id": "fixture-runtime.tool.command_run:fixture-call:0",
                  "authorization_semantic_sha256": fixture["contract"]["authorization_semantic_sha256"],
@@ -2239,6 +3966,142 @@ class InspectionTests(unittest.TestCase):
                 result = self.inspect_resolution(self.source_read_rejection_fixture(line=json.dumps(args)))
                 self.assertEqual(result["first_blocker"], "COMMAND_FAILURE")
                 self.assertNotIn("source_read_rejection_reconciliation", result)
+
+    def test_positional_shape_rejections_require_physical_witness_and_preserve_history(self):
+        for args in ([], [None, 1, 2], ["file", True, 2], ["file", 1, "two"],
+                     ["file", 1, 2, 17], ["file", 1, 2, None, "true"],
+                     ["file", 1, 2, None, None, [7]],
+                     ["file", 1, 2, None, None, None, -1],
+                     ["file", 1, 2, None, None, None, None, None],
+                     ["file", None, None, None, None, None, None, "", "extra"]):
+            with self.subTest(args=args):
+                fixture = self.source_read_rejection_fixture(line=json.dumps(args))
+                before = fixture["run"].joinpath("core.jsonl").read_bytes()
+                result = self.inspect_resolution(fixture)
+                self.assertEqual(result["status"], "EVIDENCE_VERIFIED")
+                self.assertEqual(result["counts"]["failed"], 1)
+                self.assertEqual(result["commands"][0]["execution_proof"], "not_attempted")
+                self.assertEqual(fixture["run"].joinpath("core.jsonl").read_bytes(), before)
+                fixture["rejection_witness"].unlink()
+                self.assertEqual(self.inspect_resolution(fixture)["first_blocker"], "COMMAND_FAILURE")
+
+    def test_positional_semantic_failures_are_not_shape_rejections(self):
+        for args in (["file"], ["file", 1], ["file", 0, 2], ["file", 2, 1],
+                     ["../secret", 1, 2], ["file", 1, 2, "a" * 64],
+                     ["file", 1, 2, "bad"],
+                     ["file", None, None, None, None, []],
+                     ["file", None, None, None, None, None, None, ""],
+                     ["file", None, None, None, None, None, None, "invalid-pointer"]):
+            with self.subTest(args=args):
+                fixture = self.source_read_rejection_fixture(line=json.dumps(args))
+                result = self.inspect_resolution(fixture)
+                self.assertEqual(result["first_blocker"], "COMMAND_FAILURE")
+                self.assertNotIn("source_read_rejection_reconciliation", result)
+
+    def test_positional_digest_rejections_preserve_exact_raw_command_identity(self):
+        line = '[ "file", 1, 2, "bad" ]'
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped):
+                command = {"command_type": "source_read", "command_line": line, "id": "read-1"}
+                fixture = self.source_read_rejection_fixture(
+                    line=line, command=command if wrapped else None,
+                    rejection_kind="invalid_expected_sha256")
+                result = self.inspect_resolution(fixture)
+                self.assertEqual(result["status"], "EVIDENCE_VERIFIED")
+                self.assertEqual(result["commands"][0]["execution_proof"], "not_attempted")
+                # Equivalent JSON is not the command authenticated by the witness.
+                changed_line = json.dumps(json.loads(line))
+                fixture["rejected"]["command"] = (json.dumps({"commands": [
+                    {**command, "command_line": changed_line}]}) if wrapped else changed_line)
+                self.republish_source_read_rejection(fixture)
+                self.assertEqual(self.inspect_resolution(fixture)["first_blocker"], "COMMAND_FAILURE")
+
+    def test_positional_digest_rejections_do_not_excuse_semantic_or_authority_failures(self):
+        for args in (["file", 1, 2, "0" * 64], ["file", 1, 2, 17],
+                     ["../secret", 1, 2, "bad"], ["file", 0, 2, "bad"],
+                     ["file", 1, 0, "bad"], ["file", 1, 2, "bad", None, []]):
+            with self.subTest(args=args):
+                fixture = self.source_read_rejection_fixture(
+                    line=json.dumps(args), rejection_kind="invalid_expected_sha256")
+                self.assertEqual(self.inspect_resolution(fixture)["first_blocker"], "COMMAND_FAILURE")
+        fixture = self.source_read_rejection_fixture(
+            line='["file",1,2,"bad"]', changed=False, include_read=False,
+            include_pass=False, rejection_kind="invalid_expected_sha256")
+        self.assertNotEqual(self.inspect_resolution(fixture)["status"], "EVIDENCE_VERIFIED")
+
+    def test_unknown_source_read_fields_reconcile_only_as_authenticated_non_attempts(self):
+        for extra in ({"expected_sha2565": "a" * 64}, {"arbitrary_extension": True}):
+            with self.subTest(extra=extra):
+                line = json.dumps({"path": "src/file.py", "start_line": 1, "end_line": 1, **extra})
+                fixture = self.source_read_rejection_fixture(
+                    line=line, changed=False, include_pass=False, emit_marker=False)
+                before = fixture["run"].joinpath("core.jsonl").read_bytes()
+                result = self.inspect_resolution(fixture)
+                self.assertEqual(result["status"], "EVIDENCE_VERIFIED")
+                self.assertEqual(result["counts"]["failed"], 1)
+                self.assertEqual(result["commands"][0]["execution_proof"], "not_attempted")
+                self.assertEqual(result["source_read_rejection_reconciliation"]["unresolved_count"], 0)
+                self.assertEqual(before, fixture["run"].joinpath("core.jsonl").read_bytes())
+                fixture["rejection_witness"].unlink()
+                self.assertEqual(self.inspect_resolution(fixture)["first_blocker"], "COMMAND_FAILURE")
+
+    def test_json_pointer_shape_matches_router_deserialization(self):
+        for pointer in (None, True, 1, [], {}):
+            with self.subTest(pointer=pointer):
+                line = json.dumps({"path": "src/file.py", "json_pointer": pointer})
+                fixture = self.source_read_rejection_fixture(line=line)
+                self.assertEqual(self.inspect_resolution(fixture)["status"], "EVIDENCE_VERIFIED")
+        for pointer in ("", "/field", "invalid-pointer"):
+            with self.subTest(string_pointer=pointer):
+                line = json.dumps({"path": "src/file.py", "json_pointer": pointer})
+                fixture = self.source_read_rejection_fixture(line=line)
+                self.assertEqual(self.inspect_resolution(fixture)["first_blocker"], "COMMAND_FAILURE")
+
+    def test_digest_format_rejection_reconciles_only_with_its_typed_witness(self):
+        bad_digest = "5c7d6faa308bb6125375d6b1b06a0106d5e09fd22b182d51a6bf1c6af1c6af1c6af5321124"
+        for digest in (bad_digest, "", "a" * 63, "a" * 65, "g" * 64, "\u00e9" * 64):
+            with self.subTest(digest=digest):
+                line = json.dumps({"path": "src/file.py", "start_line": 1,
+                                   "end_line": 1, "expected_sha256": digest})
+                fixture = self.source_read_rejection_fixture(line=line, changed=False,
+                    include_pass=False, emit_marker=False, rejection_kind="invalid_expected_sha256")
+                before = fixture["run"].joinpath("core.jsonl").read_bytes()
+                result = self.inspect_resolution(fixture)
+                self.assertEqual(result["status"], "EVIDENCE_VERIFIED")
+                self.assertEqual(result["source_read_rejection_reconciliation"]["not_attempted_count"], 1)
+                self.assertEqual(result["commands"][0]["status"], "failed")
+                self.assertEqual(result["commands"][0]["pre_execution_rejection"]["rejection_kind"],
+                                 "invalid_expected_sha256")
+                self.assertEqual(fixture["run"].joinpath("core.jsonl").read_bytes(), before)
+                fixture["rejection_witness"].unlink()
+                self.assertEqual(self.inspect_resolution(fixture)["first_blocker"], "COMMAND_FAILURE")
+
+    def test_digest_format_rejection_never_excuses_valid_hash_or_other_invalid_selectors(self):
+        base = {"path": "src/file.py", "start_line": 1, "end_line": 1, "expected_sha256": "bad"}
+        for update in ({"expected_sha256": "0" * 64}, {"expected_sha256": "A" * 64},
+                       {"expected_sha256": None}, {"expected_sha256": 17}, {"path": "../private"},
+                       {"path": "x" * 513}, {"start_line": 0}, {"start_line": "one"},
+                       {"end_line": 0}, {"search_terms": []}, {"json_pointer": "/value"},
+                       {"workdir": "/private"}):
+            with self.subTest(update=update):
+                fixture = self.source_read_rejection_fixture(line=json.dumps({**base, **update}),
+                    rejection_kind="invalid_expected_sha256")
+                self.assertEqual(self.inspect_resolution(fixture)["first_blocker"], "COMMAND_FAILURE")
+        for kind in ("json_syntax_or_shape", "permission_denied"):
+            fixture = self.source_read_rejection_fixture(line=json.dumps(base), rejection_kind=kind)
+            self.assertEqual(self.inspect_resolution(fixture)["first_blocker"], "COMMAND_FAILURE")
+
+    def test_digest_format_rejection_does_not_turn_a_generic_error_into_evidence(self):
+        line = json.dumps({"path": "src/file.py", "start_line": 1, "end_line": 1,
+                           "expected_sha256": "bad"})
+        fixture = self.source_read_rejection_fixture(line=line, rejection_kind="invalid_expected_sha256")
+        fixture["rejected"].update(command_type="jspace", aggregated_output=
+            "JSPACE_SOURCE_READ_INVALID: operation=read target=source_read detail=SOURCE_READ_SHA256_INVALID")
+        self.republish_terminal_evidence(fixture["terminal"], fixture["run"], fixture["events"])
+        self.assertEqual(self.inspect_resolution(fixture)["first_blocker"], "COMMAND_FAILURE")
+        fixture = self.source_read_rejection_fixture(line=line, changed=False, include_read=False,
+            include_pass=False, rejection_kind="invalid_expected_sha256")
+        self.assertNotEqual(self.inspect_resolution(fixture)["status"], "EVIDENCE_VERIFIED")
 
     def test_pre_execution_rejection_invalid_fields_never_excuse_failure_even_with_matching_witness(self):
         invalid = {"schema_version": "other", "owner": "worker", "rejection_kind": "permission_denied",
@@ -2450,6 +4313,54 @@ class InspectionTests(unittest.TestCase):
         result = self.inspect_resolution(self.resolution_fixture(legacy))
         self.assertEqual(result["first_blocker"], "COMMAND_FAILURE")
         self.assertEqual(result["verifier_failure_resolution"]["resolved_count"], 0)
+
+    def test_verifier_pass_binds_an_admitted_target_that_remains_absent(self):
+        def admit(state):
+            contract = state["contract"]
+            for key in ("read_scopes", "write_scopes", "declared_targets"):
+                contract[key].append("src/optional.py")
+            contract["allowed_operations"].append("create")
+            contract["dcf_generation"]["source_snapshot"]["src/optional.py"] = None
+            state["passed"]["aggregated_output"]["verification_evidence"]["source_postimages"]["src/optional.py"] = None
+        fixture = self.resolution_fixture(admit)
+        result = self.inspect_resolution(fixture)
+        self.assertEqual(result["status"], "EVIDENCE_VERIFIED")
+        self.assertEqual(result["counts"]["failed"], 1)
+        self.assertEqual(result["verifier_failure_resolution"]["resolved_count"], 1)
+        self.assertFalse((fixture["workspace"] / "src/optional.py").exists())
+
+    def test_absent_verifier_postimages_cannot_replace_existing_missing_or_ungranted_sources(self):
+        def arrange(state, case):
+            contract = state["contract"]
+            name = "src/optional.py"
+            for key in ("read_scopes", "write_scopes", "declared_targets"):
+                contract[key].append(name)
+            contract["allowed_operations"].append("create")
+            snapshot = contract["dcf_generation"]["source_snapshot"]
+            snapshot[name] = None
+            postimages = state["passed"]["aggregated_output"]["verification_evidence"]["source_postimages"]
+            postimages[name] = None
+            if case == "missing_snapshot":
+                snapshot.pop(name)
+            elif case == "existing_snapshot":
+                snapshot[name] = dict(snapshot["src/unchanged.txt"])
+            elif case == "create_not_allowed":
+                contract["allowed_operations"].remove("create")
+            elif case == "create_denied":
+                contract["denied_operations"].append("create")
+            elif case == "missing_postimage":
+                postimages.pop(name)
+            elif case == "false_not_null":
+                postimages[name] = False
+            else:
+                postimages["src/unchanged.txt"] = None
+        for case in ("missing_snapshot", "existing_snapshot", "create_not_allowed", "create_denied",
+                     "missing_postimage", "false_not_null", "existing_source"):
+            with self.subTest(case=case):
+                fixture = self.resolution_fixture(lambda s: arrange(s, case))
+                result = self.inspect_resolution(fixture)
+                self.assertEqual(result["first_blocker"], "COMMAND_FAILURE")
+                self.assertEqual(result["verifier_failure_resolution"]["resolved_count"], 0)
 
     def test_verifier_evidence_rejects_partial_malformed_foreign_and_type_confused_values(self):
         changes = [("schema_version", "foreign"), ("authorization_semantic_sha256", "b" * 64),
@@ -2882,7 +4793,14 @@ class InspectionTests(unittest.TestCase):
             result = self.inspect(command_stream=stream)
             self.assertEqual(result["first_blocker"], "COMMAND_FAILURE")
             self.assertEqual(result["command_success"], "known_failure")
-            self.assertNotIn(45, [row["event_index"] for row in result["commands"]])
+        self.assertNotIn(45, [row["event_index"] for row in self.inspect()["commands"]])
+        # The priority stream leads with the failure, then keeps event order for the rest.
+        first = self.inspect(command_stream="priority")
+        self.assertEqual([row["event_index"] for row in first["commands"]], [45, *range(25, 40)])
+        self.assertEqual(first["commands"][0]["exit_code"], 9)
+        self.assertEqual(first["pagination"]["next_offset"], 16)
+        self.assertEqual([row["event_index"] for row in self.inspect(command_stream="priority", offset=16)["commands"]],
+                         list(range(40, 45)))
         selected = hashlib.sha256(self.verifier_item()["command"].encode()).hexdigest()
         self.assertEqual(self.inspect(command_stream="priority", command_sha256=(selected,))["first_blocker"],
                          "COMMAND_FAILURE")
@@ -2896,9 +4814,20 @@ class InspectionTests(unittest.TestCase):
         self.assertIn(evidence["projection_blocker"], ("PROJECTION_PARTIAL", "PROJECTION_TOO_LARGE"))
         self.assertEqual(evidence["pagination"]["stream"], "priority")
         self.assertLessEqual(len(caller._canonical_bytes(projected)), 3000)
-        late = self.inspect(command_stream="priority", offset=20)
-        self.assertEqual(late["commands"][0]["event_index"], 45)
-        self.assertEqual(late["commands"][0]["exit_code"], 9)
+        if evidence["commands"]:
+            self.assertEqual(evidence["commands"][0]["event_index"], 45)
+
+    def test_priority_lists_verifier_results_before_other_successes(self):
+        self.events = ([{"type": "item.completed", "item": deepcopy(self.item)} for _ in range(20)]
+                       + [{"type": "item.completed", "item": self.verifier_item()}])
+        self.publish()
+        first = self.inspect(command_stream="priority")
+        self.assertIsNone(first["first_blocker"])
+        self.assertEqual([row["event_index"] for row in first["commands"]], [20, *range(15)])
+        self.assertIn("verifier_output_excerpt", first["commands"][0])
+        self.assertEqual([row["event_index"] for row in self.inspect(command_stream="priority", offset=16)["commands"]],
+                         list(range(15, 20)))
+        self.assertEqual([row["event_index"] for row in self.inspect()["commands"]], list(range(16)))
 
     def test_priority_partial_index_does_not_count_unindexed_reads_or_claim_success(self):
         self.events = ([{"type": "item.completed", "item": self.source_read_item()} for _ in range(4)]
@@ -3408,6 +5337,9 @@ class InspectionTests(unittest.TestCase):
                 result = self.inspect()
                 self.assertEqual(result["first_blocker"], "RECEIPT_PROOF_INVALID")
                 self.assertEqual(result["command_success"], "unproven")
+                detail = result["first_blocker_detail"]
+                self.assertEqual(detail["failed_field"], "terminal_state")
+                self.assertEqual(detail["expected"], "completed" if code == 0 else "failed")
 
     def test_known_failed_receipt_requires_outcome_and_all_cleanup_proof(self):
         valid = {**self.receipt, "exit_code": 1, "terminal_state": "failed"}
@@ -3425,7 +5357,13 @@ class InspectionTests(unittest.TestCase):
                     self.receipt[key] = value
                 store(self.receipt_path, self.receipt)
                 self.publish()
-                self.assertEqual(self.inspect()["first_blocker"], "RECEIPT_PROOF_INVALID")
+                result = self.inspect()
+                self.assertEqual(result["first_blocker"], "RECEIPT_PROOF_INVALID")
+                detail = result["first_blocker_detail"]
+                self.assertEqual(detail["failed_field"], key)
+                self.assertEqual(detail["failed_predicate"], "equals" if key == "outcome" else "is_true")
+                self.assertEqual(detail["observed"]["type"], "missing" if value is None else
+                                 "bool" if type(value) is bool else "int" if type(value) is int else "str")
 
     def test_bool_receipt_exit_codes_rejected_in_either_copy(self):
         for actual_code, event_code in ((False, False), (True, True), (0, False),
@@ -3440,6 +5378,56 @@ class InspectionTests(unittest.TestCase):
                 result = self.inspect()
                 self.assertEqual(result["first_blocker"], "RECEIPT_PROOF_INVALID")
                 self.assertEqual(result["command_success"], "unproven")
+                detail = result["first_blocker_detail"]
+                self.assertEqual((detail["failed_field"], detail["failed_predicate"], detail["observed"]["type"]),
+                                 ("exit_code", "type_is_int", "bool"))
+                self.assertEqual(detail["receipt_copy"], "file" if type(actual_code) is bool else "embedded")
+
+    def test_receipt_diagnostics_are_bounded_and_do_not_echo_untrusted_contents(self):
+        secret = "RECEIPT_CREDENTIAL_SENTINEL"
+        self.receipt.update(schema_version=secret * 2000, credentials={"token": secret},
+                            arbitrary_untrusted_string=secret)
+        self.item.update(runtime_id="runtime-one", command_id=secret * 100,
+                         provider_tool_call_id="opaque/\n" + secret, command_index=0)
+        store(self.receipt_path, self.receipt)
+        self.publish()
+        before = {p: p.read_bytes() for p in self.run.rglob("*") if p.is_file()}
+        result = self.inspect()
+        detail = result["first_blocker_detail"]
+        self.assertEqual(result["first_blocker"], "RECEIPT_PROOF_INVALID")
+        self.assertEqual(detail["observed"], {"type": "str", "redacted": True})
+        self.assertEqual(detail["expected"], "tura_command_terminal_receipt_v1")
+        self.assertEqual(detail["request_locator"], {"request_id": RID, "artifact_root": str(self.root)})
+        self.assertEqual(detail["receipt_path"], str(self.receipt_path))
+        self.assertEqual(detail["identity"]["runtime_id"], "runtime-one")
+        self.assertEqual(detail["identity"]["command_id"]["sha256"], hashlib.sha256((secret * 100).encode()).hexdigest())
+        self.assertNotIn(secret, json.dumps(detail))
+        self.assertLess(len(caller._canonical_bytes(detail)), 4096)
+        with patch.dict(caller.os.environ, CODEX_THREAD_ID=THREAD), \
+                patch.object(caller, "execute", side_effect=AssertionError("replay")):
+            projected = inspector.project_terminal(self.terminal, self.root, RID)
+            summary = inspector.summarize_terminal(projected, self.root, RID)
+        self.assertEqual(summary["result_inspection"]["first_blocker_detail"], detail)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.run.rglob("*") if p.is_file()})
+
+    def test_nested_receipt_diagnostic_uses_inspected_command_identity_and_aggregate_stays_closed(self):
+        receipt = {**self.receipt, "termination_proven": False}
+        path = self.receipt_path.with_name("child.json")
+        store(path, receipt)
+        identity = {"command_id": "runtime-one.tool.command_run:opaque:4",
+                    "command_run_id": "runtime-one.tool.command_run", "provider_tool_call_id": "opaque", "command_index": 4}
+        self.item["runtime_id"] = "runtime-one"
+        self.item["aggregated_output"]["results"] = [{**identity, "success": True, "output": {
+            "exit_code": 0, "terminal_receipt": receipt, "terminal_receipt_path": str(path)}}]
+        self.publish()
+        result = self.inspect()
+        self.assertEqual(result["first_blocker"], "RECEIPT_PROOF_INVALID")
+        self.assertEqual(result["commands"], [])
+        detail = result["first_blocker_detail"]
+        self.assertEqual(detail["identity"], {**identity, "runtime_id": "runtime-one"})
+        self.assertEqual((detail["event_index"], detail["result_index"]), (0, 0))
+        self.assertEqual(detail["receipt_path"], str(path))
+        self.assertEqual(detail["failed_field"], "termination_proven")
 
     def test_failed_receipt_mismatch_and_conflicting_exit_codes_rejected(self):
         self.receipt.update(exit_code=1, terminal_state="failed")
@@ -3557,7 +5545,16 @@ class InspectionTests(unittest.TestCase):
         self.assertEqual(self.inspect(offset=26)["first_blocker"], "OFFSET_OUT_OF_RANGE")
         self.item["command"] = "x" * (inspector.MAX_COMMAND_BYTES + 1)
         self.publish()
-        self.assertEqual(self.inspect()["first_blocker"], "COMMAND_IDENTITY_OMITTED")
+        bounded = self.inspect()
+        self.assertLessEqual(len(caller._canonical_bytes(bounded)), inspector.MAX_PAGE_BYTES)
+        self.assertEqual(bounded["status"], "EVIDENCE_VERIFIED")
+        self.assertIsNone(bounded["first_blocker"])
+        row = bounded["commands"][0]
+        self.assertIsNone(row["command"])
+        self.assertEqual(row["command_head"], self.item["command"][:inspector.MAX_COMMAND_HEAD_CHARS])
+        self.assertEqual(row["command_sha256"], hashlib.sha256(self.item["command"].encode()).hexdigest())
+        self.assertEqual(row["command_bytes"], len(self.item["command"].encode()))
+        self.assertEqual(row["execution_proof"], "known_success")
 
     def test_pagination_bounded(self):
         self.events = [self.events[0].copy() for _ in range(25)]
@@ -3570,12 +5567,14 @@ class InspectionTests(unittest.TestCase):
 
 
     def terminal_evidence_fixture(self, *, requested=True, emit_marker=True, planning="Earlier planning, not final",
-                                  terminal_status="done"):
+                                  terminal_status="done", max_result_bytes=None):
         terminal, old_run, _ = self.capability_fixture(planning)
         original = json.loads((old_run / "request-identity.json").read_text())
         original = {key: value for key, value in original.items() if key not in {"request_id", "request_sha256"}}
         if requested:
             original["terminal_delivery"] = "evidence_only"
+        if max_result_bytes is not None:
+            original["max_result_bytes"] = max_result_bytes
         digest = caller._canonical_sha256(original)
         original.update(request_id="tura_embedded_" + digest, request_sha256=digest)
         run = self.root / original["request_id"]
@@ -3618,6 +5617,140 @@ class InspectionTests(unittest.TestCase):
                         command_evidence_artifact=ref(run / "command-evidence.json"),
                         command_evidence_summary={key: evidence[key] for key in ("total_count", "failed_count", "complete")})
         store(run / "terminal.json", terminal)
+
+    def native_terminal_reply_fixture(self, reply, *, max_result_bytes=None):
+        terminal, run, events = self.terminal_evidence_fixture(max_result_bytes=max_result_bytes)
+        event = self.native_task_status_event({"status": "done", "final_reply": reply}, native=True,
+                                            normalized_reply=isinstance(reply, (dict, list)))
+        runtime, call = "runtime-18e14ebab6e0afb0", "call_65eb4463ad734b3b98be40c1407840c8"
+        command_run = runtime + ".tool.command_run"
+        event["item"].update(id="item_17", runtime_id=runtime, provider_tool_call_id=call,
+            command_run_id=command_run, command_id=f"{command_run}:{call}:0", command_index=0, step=1)
+        events[1] = event
+        events[2]["runtime_id"] = runtime
+        terminal.update(full_core._EvidenceHandoff.unavailable("HANDOFF_IDENTITY_INVALID"))
+        self.republish_terminal_evidence(terminal, run, events)
+        return terminal, run, events
+
+    def test_native_terminal_final_reply_readback_preserves_original_unavailable_handoff(self):
+        # The supplied reproduction's native JSON command + normalized JSON-string
+        # acknowledgement, with the original native identities and unavailable result.
+        report = {"terminal_delivery": "evidence_only", "decision": "no_justified_change", "changed_files": [],
+                  "verification": {"tests_executed": False, "final_acceptance": "parent required",
+                                   "npm_test": {"owner": "existing parent nokiy_native executor", "status": "pending"}}}
+        terminal, run, events = self.native_terminal_reply_fixture(report)
+        paths = [path for path in run.rglob("*") if path.is_file()]
+        before = {path: path.read_bytes() for path in paths}
+        with patch.object(caller, "execute", side_effect=AssertionError("no replay")):
+            projected = self.project_capability(terminal)
+        reply = projected["task_status_final_reply"]
+        text = json.loads(events[1]["item"]["aggregated_output"])["task_status"]["final_reply"]
+        self.assertEqual(reply["text"], text)
+        self.assertEqual(json.loads(reply["text"]), report)
+        self.assertEqual((reply["status"], reply["complete"], reply["truncated"]), ("MODEL_REPORTED", True, False))
+        self.assertTrue(reply["parent_acceptance_required"])
+        self.assertEqual(reply["source_artifact"], terminal["trajectory_artifact"])
+        self.assertEqual(reply["output_json_pointer"], "/task_status/final_reply")
+        self.assertEqual(reply["binding"]["event_index"], 1)
+        self.assertEqual(reply["binding"]["event_sha256"], caller._canonical_sha256(events[1]))
+        for key in ("request_id", "request_sha256", "native_thread_id"):
+            self.assertEqual(reply["binding"][key], terminal[key])
+        self.assertEqual(reply["binding"]["runtime_id"], events[2]["runtime_id"])
+        self.assertEqual(reply["content_sha256"], hashlib.sha256(text.encode()).hexdigest())
+        self.assertEqual(reply["content_bytes"], len(text.encode()))
+        self.assertEqual(projected["result_artifact_source"], terminal["result_artifact_source"])
+        self.assertIsNone(projected["result_artifact"])
+        self.assertEqual(projected["result_text"], terminal["result_text"])
+        self.assertFalse(projected["terminal_evidence"]["final_summary_turn_executed"])
+        self.assertEqual(projected["result_inspection"]["mission_acceptance"], "parent_owned")
+        with patch.object(inspector, "inspect", side_effect=AssertionError("no second inspection")), \
+                patch.object(full_core, "_Trajectory", side_effect=AssertionError("no trajectory dump")):
+            summary = inspector.summarize_terminal(projected, self.root, terminal["request_id"])
+        self.assertEqual(summary["task_status_final_reply"], reply)
+        self.assertEqual(before, {path: path.read_bytes() for path in run.rglob("*") if path.is_file()})
+        self.assertFalse((run / "worker-handoff.txt").exists())
+        with patch.object(caller, "execute", side_effect=AssertionError("no replay")):
+            self.assertEqual(self.project_capability(terminal)["task_status_final_reply"], reply)
+
+    def test_native_terminal_final_reply_rejects_unbound_ambiguous_and_late_content(self):
+        for case in ("command", "runtime", "request", "session", "duplicate", "duplicate_id", "late", "marker"):
+            terminal, run, events = self.native_terminal_reply_fixture({"worker_claim": "done"})
+            item = events[1]["item"]
+            if case == "command":
+                item["command"] = json.dumps({"status": "done", "final_reply": {"worker_claim": "different"}})
+            elif case == "runtime":
+                events[2]["runtime_id"] = "runtime-foreign"
+            elif case == "request":
+                item["request_id"] = "tura_embedded_" + "f" * 64
+            elif case == "session":
+                item["session_id"] = "full-foreign"
+            elif case == "duplicate":
+                events.insert(2, deepcopy(events[1]))
+            elif case == "duplicate_id":
+                events[0]["item"]["command_id"] = item["command_id"]
+            elif case == "late":
+                events.insert(3, deepcopy(events[1]))
+            else:
+                events.insert(3, deepcopy(events[2]))
+            self.republish_terminal_evidence(terminal, run, events)
+            with self.subTest(case=case):
+                projected = self.project_capability(terminal)
+                self.assertNotIn("task_status_final_reply", projected)
+                self.assertIsNone(projected["result_artifact"])
+                self.assertNotEqual(projected["result_artifact_source"]["status"], "MODEL_REPORTED")
+
+    def test_native_terminal_final_reply_unicode_bounds_and_projection_omission_keep_reference(self):
+        text = "交付🙂é" * 400
+        terminal, run, _ = self.native_terminal_reply_fixture(text, max_result_bytes=256)
+        projected = self.project_capability(terminal)
+        reply = projected["task_status_final_reply"]
+        expected, truncated = full_core._text_preview(text, 256)
+        self.assertTrue(truncated)
+        self.assertEqual(reply["text"], expected)
+        self.assertLessEqual(len(reply["text"].encode()), 256)
+        self.assertEqual((reply["complete"], reply["truncated"], reply["truncation_reason"]),
+                         (False, True, "MAX_RESULT_BYTES"))
+        self.assertEqual(reply["content_bytes"], len(text.encode()))
+        self.assertEqual(reply["source_artifact"], ref(run / "core.jsonl"))
+        terminal, _, _ = self.native_terminal_reply_fixture("é" * 12000)
+        complete = self.project_capability(terminal)
+        baseline = deepcopy(complete)
+        baseline["task_status_final_reply"].pop("text")
+        with patch.object(inspector, "MAX_PROJECTED_BYTES", len(caller._canonical_bytes(baseline)) + 512):
+            bounded = self.project_capability(terminal)
+        omitted = bounded["task_status_final_reply"]
+        self.assertNotIn("text", omitted)
+        self.assertFalse(omitted["complete"])
+        self.assertTrue(omitted["truncated"])
+        self.assertEqual(omitted["truncation_reason"], "PROJECTION_BUDGET")
+        self.assertEqual(omitted["source_artifact"], complete["task_status_final_reply"]["source_artifact"])
+        self.assertEqual(bounded["result_inspection"], complete["result_inspection"])
+
+    def test_native_terminal_final_reply_does_not_suppress_failed_checks(self):
+        def mutate(events, original, contract):
+            command = events[1]["item"]
+            command.update(status="failed", exit_code=1)
+            command["aggregated_output"].update(exit_code=1, stderr="original failure")
+            command["aggregated_output"]["terminal_receipt"].update(exit_code=1, terminal_state="failed")
+            event = self.native_task_status_event({"status": "done", "final_reply": {
+                "worker_claim": "all checks passed"}}, native=True, normalized_reply=True)
+            event["item"]["id"] = "item_report"
+            events.append(event)
+        terminal, run, _ = self.parent_context_fixture(mutate, terminal_status="blocked")
+        events = [json.loads(line) for line in (run / "core.jsonl").read_text().splitlines()]
+        marker = next(event for event in events if event.get("type") == "nokiy.terminal_evidence")
+        marker["runtime_id"] = events[-3]["item"]["runtime_id"]
+        terminal["terminal_evidence"] = marker
+        terminal.update(full_core._EvidenceHandoff.unavailable("HANDOFF_IDENTITY_INVALID"))
+        self.republish_terminal_evidence(terminal, run, events)
+        projected = self.project_capability(terminal)
+        evidence = projected["result_inspection"]
+        self.assertEqual(projected["task_status_final_reply"]["status"], "MODEL_REPORTED")
+        self.assertEqual(evidence["first_blocker"], "COMMAND_FAILURE")
+        self.assertEqual(evidence["command_success"], "known_failure")
+        self.assertEqual(evidence["counts"]["failed"], 1)
+        self.assertEqual(evidence["verifier_failure_resolution"]["unresolved_count"], 1)
+        self.assertEqual(evidence["mission_acceptance"], "parent_owned")
 
     def test_terminal_evidence_exact_recovery_and_summary_do_not_replay_or_reinspect(self):
         planning = self.capability_text(self.capability_handoff())
@@ -3704,6 +5837,8 @@ class InspectionTests(unittest.TestCase):
                 for key in full_core._TerminalEvidence.FIELD_NAMES:
                     self.assertNotIn(key, projected)
                     self.assertNotIn(key, summary)
+            self.assertNotIn("task_status_final_reply", projected)
+            self.assertNotIn("task_status_final_reply", summary)
 
     def test_terminal_evidence_recovery_rejects_invalid_unrequested_duplicate_and_late_markers(self):
         cases = ("foreign", "empty_runtime", "malformed", "bool_one", "bool_zero", "unknown_status",

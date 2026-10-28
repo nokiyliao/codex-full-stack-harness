@@ -98,6 +98,11 @@ pub(super) fn parse_command_item(value: &Value) -> Result<CommandItem, String> {
     })
     .unwrap_or_default();
     let inline_arguments = inline_command_arguments(object);
+    let command = if shell_typed_source_read(&command, &command_line) {
+        "source_read".to_string()
+    } else {
+        command
+    };
     Ok(CommandItem {
         index: 0,
         command,
@@ -109,6 +114,37 @@ pub(super) fn parse_command_item(value: &Value) -> Result<CommandItem, String> {
         stall_timeout_ms: u64_field(object, &["stall_timeout_ms", "stallTimeoutMs"]),
         binding_id: string_field(object, &["id", "command_id", "commandId", "result_id"]),
     })
+}
+
+/// Fields only an exact source_read request carries; a shell JSON invocation names `command`.
+const SOURCE_READ_ONLY_FIELDS: &[&str] = &[
+    "search_terms",
+    "start_line",
+    "end_line",
+    "json_pointer",
+    "children_offset",
+    "context_lines",
+    "line_numbers",
+    "expected_sha256",
+    "expected_sha256_ref",
+];
+
+/// Models sometimes label an exact source_read request as the shell, for example
+/// `{"command_type":"zsh","command_line":"{\"path\":...,\"search_terms\":[...]}"}`. The shell
+/// policy then refuses the JSON as unsafe syntax and the model pays another round. A shell-typed
+/// JSON object with a string `path`, a source_read-only field and no `command`/`cmd` key can
+/// only mean source_read, so it is retyped and meets source_read's own J-Space admission.
+fn shell_typed_source_read(command: &str, command_line: &str) -> bool {
+    if crate::commands::canonical_command(command) != crate::commands::active_shell_command_name() {
+        return false;
+    }
+    let Ok(Value::Object(request)) = serde_json::from_str::<Value>(command_line.trim()) else {
+        return false;
+    };
+    request.get("path").is_some_and(Value::is_string)
+        && !request.contains_key("command")
+        && !request.contains_key("cmd")
+        && SOURCE_READ_ONLY_FIELDS.iter().any(|field| request.contains_key(*field))
 }
 
 pub(super) fn string_field(

@@ -43,11 +43,47 @@ struct Reply {
     result: VerifierObservation,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShellReply {
+    version: u8,
+    binding: String,
+    call_id: String,
+    shell: bool,
+    result: VerifierObservation,
+}
+
+const VERIFIER_REQUEST_LIMIT: usize = 4096;
+const VERIFIER_REPLY_LIMIT: usize = 262_143;
+const SHELL_REQUEST_LIMIT: usize = 262_144;
+const SHELL_REPLY_LIMIT: usize = 8 * 1024 * 1024;
+
 pub(crate) async fn request(
     matcher: &JSpaceMatcher, call_id: &str, index: usize,
     cancellation: &code_tools::runtime::tool::CancellationToken,
 ) -> Result<VerifierObservation, String> {
     let duration = matcher.check_verifier_command(index).map_err(|e| e.to_string())?.timeout_seconds;
+    let mut channel = acquire(cancellation).await?;
+    exchange(&mut channel, matcher.authorization_semantic_sha256(), call_id, index, duration, cancellation).await
+}
+
+/// One parent-executed read-only shell line for a contract that admits `parent_shell`. The parent
+/// applies the profile the contract binds by digest; the channel carries only the line and outcome.
+pub(crate) async fn request_shell(
+    matcher: &JSpaceMatcher, call_id: &str, line: &str, workdir: Option<&str>, timeout_seconds: u64,
+    cancellation: &code_tools::runtime::tool::CancellationToken,
+) -> Result<VerifierObservation, String> {
+    if !matcher.parent_shell_admitted() {
+        return Err("PARENT_SHELL_NOT_ADMITTED".into());
+    }
+    let mut channel = acquire(cancellation).await?;
+    exchange_shell(&mut channel, matcher.authorization_semantic_sha256(), call_id, line, workdir,
+        timeout_seconds, cancellation).await
+}
+
+async fn acquire(
+    cancellation: &code_tools::runtime::tool::CancellationToken,
+) -> Result<tokio::sync::MutexGuard<'static, Option<tokio::net::UnixStream>>, String> {
     let channel = CHANNEL.get_or_init(|| Mutex::new(None));
     let mut channel = tokio::select! {
         locked = channel.lock() => locked,
@@ -59,7 +95,7 @@ pub(crate) async fn request(
             .ok_or("VERIFIER_CHANNEL_UNSETTLED")?;
         *channel = Some(tokio::net::UnixStream::from_std(raw).map_err(|e| e.to_string())?);
     }
-    exchange(&mut channel, &matcher.authorization_semantic_sha256(), call_id, index, duration, cancellation).await
+    Ok(channel)
 }
 
 async fn exchange(
@@ -67,26 +103,63 @@ async fn exchange(
     index: usize, duration: u64,
     cancellation: &code_tools::runtime::tool::CancellationToken,
 ) -> Result<VerifierObservation, String> {
-    // Removing it poisons reuse on cancellation, panic, partial send or bad reply.
-    let mut stream = channel.take().ok_or("VERIFIER_CHANNEL_UNSETTLED")?;
-    let mut bytes = serde_json::to_vec(&json!({"version":1,"binding":binding,
-        "call_id":call_id,"verifier_index":index})).map_err(|e| e.to_string())?;
-    bytes.push(b'\n');
-    if bytes.len() > 4096 { return Err("VERIFIER_REQUEST_TOO_LARGE".into()) }
-    let transaction = async {
-        stream.write_all(&bytes).await.map_err(|e| e.to_string())?;
-        let mut response = Vec::new();
-        loop {
-            let byte = stream.read_u8().await.map_err(|e| e.to_string())?;
-            if byte == b'\n' { break; }
-            if response.len() >= 262143 { return Err("VERIFIER_REPLY_TOO_LARGE".into()) }
-            response.push(byte);
-        }
-        let reply: Reply = serde_json::from_slice(&response).map_err(|e| e.to_string())?;
+    let request = json!({"version":1,"binding":binding,"call_id":call_id,"verifier_index":index});
+    transact(channel, &request, VERIFIER_REQUEST_LIMIT, VERIFIER_REPLY_LIMIT, duration, cancellation, |bytes| {
+        let reply: Reply = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         if reply.version != 1 || reply.binding != binding || reply.call_id != call_id || reply.verifier_index != index {
             return Err("VERIFIER_REPLY_IDENTITY_MISMATCH".into());
         }
         Ok(reply.result)
+    }).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn exchange_shell(
+    channel: &mut Option<tokio::net::UnixStream>, binding: &str, call_id: &str, line: &str,
+    workdir: Option<&str>, timeout_seconds: u64,
+    cancellation: &code_tools::runtime::tool::CancellationToken,
+) -> Result<VerifierObservation, String> {
+    let request = json!({"version":1,"binding":binding,"call_id":call_id,
+        "shell":{"line":line,"workdir":workdir,"timeout_seconds":timeout_seconds}});
+    transact(channel, &request, SHELL_REQUEST_LIMIT, SHELL_REPLY_LIMIT, timeout_seconds, cancellation, |bytes| {
+        let reply: ShellReply = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        if reply.version != 1 || reply.binding != binding || reply.call_id != call_id || !reply.shell {
+            return Err("PARENT_SHELL_REPLY_IDENTITY_MISMATCH".into());
+        }
+        Ok(reply.result)
+    }).await
+}
+
+async fn transact<F>(
+    channel: &mut Option<tokio::net::UnixStream>, request: &Value, request_limit: usize,
+    reply_limit: usize, duration: u64,
+    cancellation: &code_tools::runtime::tool::CancellationToken, parse: F,
+) -> Result<VerifierObservation, String>
+where F: FnOnce(&[u8]) -> Result<VerifierObservation, String> {
+    let mut bytes = serde_json::to_vec(request).map_err(|e| e.to_string())?;
+    bytes.push(b'\n');
+    // Refused before the stream is taken, so an oversized request leaves the channel usable.
+    if bytes.len() > request_limit { return Err("VERIFIER_REQUEST_TOO_LARGE".into()) }
+    // Removing it poisons reuse on cancellation, panic, partial send or bad reply.
+    let mut stream = channel.take().ok_or("VERIFIER_CHANNEL_UNSETTLED")?;
+    let transaction = async {
+        stream.write_all(&bytes).await.map_err(|e| e.to_string())?;
+        let mut response = Vec::new();
+        let mut chunk = vec![0u8; 65536];
+        loop {
+            let read = stream.read(&mut chunk).await.map_err(|e| e.to_string())?;
+            if read == 0 { return Err("VERIFIER_CHANNEL_CLOSED".into()) }
+            let end = chunk[..read].iter().position(|byte| *byte == b'\n');
+            let take = end.unwrap_or(read);
+            if response.len() + take > reply_limit { return Err("VERIFIER_REPLY_TOO_LARGE".into()) }
+            response.extend_from_slice(&chunk[..take]);
+            if let Some(end) = end {
+                // One request, one reply line: trailing bytes would desynchronize the next call.
+                if end + 1 != read { return Err("VERIFIER_REPLY_TRAILING_BYTES".into()) }
+                break;
+            }
+        }
+        parse(&response)
     };
     let result = tokio::select! {
         result = tokio::time::timeout(Duration::from_secs(duration + 20), transaction) =>
@@ -130,6 +203,45 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), peer).await.unwrap().unwrap();
     }
 
+    #[tokio::test]
+    async fn shell_exchange_binds_identity_and_keeps_only_a_settled_channel() {
+        let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        let peer = tokio::spawn(async move {
+            for (call, shell) in [("one", true), ("two", false)] {
+                let mut request = Vec::new();
+                loop {
+                    let byte = server.read_u8().await.unwrap();
+                    if byte == b'\n' { break; }
+                    request.push(byte);
+                }
+                let request: Value = serde_json::from_slice(&request).unwrap();
+                assert_eq!(request["shell"]["line"], "git diff --check");
+                assert_eq!(request["call_id"], call);
+                let mut reply = serde_json::to_vec(&json!({"version":1,"binding":"binding","call_id":call,
+                    "shell":shell,"result":{"success":true,"exit_code":0,"stdout":"x".repeat(100_000),
+                    "stderr":"","outcome":"known","process_reaped":true,"process_group_empty":true}})).unwrap();
+                reply.push(b'\n');
+                server.write_all(&reply).await.unwrap();
+            }
+        });
+        let mut channel = Some(client);
+        let cancel = CancellationToken::new();
+        let first = exchange_shell(&mut channel, "binding", "one", "git diff --check", None, 5, &cancel)
+            .await.unwrap();
+        assert_eq!(first.stdout.len(), 100_000);
+        assert!(channel.is_some(), "a settled reply keeps the channel");
+        let second = exchange_shell(&mut channel, "binding", "two", "git diff --check", Some("/tmp"), 5, &cancel).await;
+        assert_eq!(second.unwrap_err(), "PARENT_SHELL_REPLY_IDENTITY_MISMATCH");
+        assert!(channel.is_none(), "a mismatched reply poisons the channel");
+        tokio::time::timeout(Duration::from_secs(1), peer).await.unwrap().unwrap();
+        let (client, _server) = tokio::net::UnixStream::pair().unwrap();
+        let mut channel = Some(client);
+        let long = "x".repeat(SHELL_REQUEST_LIMIT);
+        let refused = exchange_shell(&mut channel, "binding", "three", &long, None, 5, &cancel).await;
+        assert_eq!(refused.unwrap_err(), "VERIFIER_REQUEST_TOO_LARGE");
+        assert!(channel.is_some(), "an oversized request never takes the stream");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn plan_preserves_legacy_shape_and_echoes_only_bound_import_roots() {
@@ -171,7 +283,16 @@ mod tests {
             binding: contract["authorization_semantic_sha256"].as_str().unwrap().into(),
             contract, verifier_index: 0,
         };
-        let legacy = plan_value(&request).unwrap();
+        // The profile denies the TCP ports listening when it is built; other tests in this process
+        // open and close listeners concurrently, so compare plans without that one volatile line.
+        let stable = |mut plan: Value| {
+            let profile = plan["profile"].as_str().unwrap_or_default().lines()
+                .filter(|line| !line.starts_with("(deny network-outbound"))
+                .collect::<Vec<_>>().join("\n");
+            plan["profile"] = json!(profile);
+            plan
+        };
+        let legacy = stable(plan_value(&request).unwrap());
         assert_eq!(legacy, json!({
             "binding":request.binding,"verifier_index":0,"profile":legacy["profile"],
             "argv":[executable,pinned],"scratch_root":scratch,"timeout_seconds":10
@@ -186,7 +307,17 @@ mod tests {
         let mut expected = legacy.clone();
         expected["binding"] = json!(request.binding);
         expected["python_import_roots"] = roots;
-        assert_eq!(plan_value(&request).unwrap(), expected);
+        assert_eq!(stable(plan_value(&request).unwrap()), expected);
+        // V318: a granted cwd joins the plan; the OS profile is unchanged by it.
+        request.contract["verifier_commands"][0]["cwd"] = json!(workspace.join("src"));
+        request.contract["authorization_semantic_sha256"] =
+            json!(authorization_semantic_sha256(&request.contract).unwrap());
+        request.contract.as_object_mut().unwrap().remove("content_sha256");
+        request.contract["content_sha256"] = json!(semantic_sha256(&request.contract));
+        request.binding = request.contract["authorization_semantic_sha256"].as_str().unwrap().into();
+        let planned = stable(plan_value(&request).unwrap());
+        assert_eq!(planned["cwd"], json!(workspace.join("src")));
+        assert_eq!(planned["profile"], legacy["profile"]);
         // The profile stays byte-for-byte unchanged: roots add no OS permissions.
         request.binding = legacy["binding"].as_str().unwrap().into();
         assert_eq!(plan_value(&request).unwrap_err().to_string(), "VERIFIER_BINDING_MISMATCH");
@@ -225,6 +356,9 @@ fn plan_value(request: &OnceRequest) -> anyhow::Result<Value> {
         "timeout_seconds":grant.timeout_seconds});
     if let Some(roots) = &grant.python_import_roots {
         value["python_import_roots"] = json!(roots);
+    }
+    if let Some(cwd) = &grant.cwd {
+        value["cwd"] = json!(cwd);
     }
     Ok(value)
 }

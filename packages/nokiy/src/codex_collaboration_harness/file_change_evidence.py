@@ -97,6 +97,20 @@ def _postimage(workspace: Path, relative: str) -> dict[str, Any]:
         os.close(descriptor)
 
 
+def _failed_patch(event: dict[str, Any], item: dict[str, Any], output: object) -> bool:
+    """A completed in-process apply_patch that failed, proven terminated with a known outcome."""
+    receipt = output.get("terminal_receipt") if isinstance(output, dict) else None
+    return (event.get("type") == "item.completed" and item.get("status") == "failed"
+            and isinstance(output, dict) and isinstance(output.get("error_type"), str)
+            and bool(output["error_type"]) and isinstance(output.get("failed_changes"), list)
+            and bool(output["failed_changes"]) and isinstance(receipt, dict)
+            and type(receipt.get("exit_code")) is int and receipt["exit_code"] != 0
+            and receipt.get("terminal_state") == "failed" and receipt.get("outcome") == "known"
+            and receipt.get("termination_origin") == "in_process_apply_patch"
+            and all(receipt.get(key) is True for key in
+                    ("process_reaped", "process_group_empty", "termination_proven")))
+
+
 def _events(events: Iterable[dict[str, Any]], workspace: Path, contract: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Path]]:
     records: list[dict[str, Any]] = []
     targets: dict[str, Path] = {}
@@ -113,17 +127,38 @@ def _events(events: Iterable[dict[str, Any]], workspace: Path, contract: dict[st
                                     parse_constant=caller._invalid_constant)
             except ValueError as exc:
                 raise EffectError("FILE_CHANGE_EVENT_INVALID") from exc
-        if (event.get("type") != "item.completed" or item.get("status") != "completed"
-                or item.get("success", True) is not True
-                or item.get("isError") is True or not isinstance(item.get("id"), str)
-                or not item["id"] or item["id"] in ids
-                or ("exit_code" in item and (type(item["exit_code"]) is not int or item["exit_code"] != 0))
-                or (output is not None and (not isinstance(output, dict)
-                    or output.get("success", True) is not True or output.get("isError") is True
-                    or ("exit_code" in output and (type(output["exit_code"]) is not int
-                        or output["exit_code"] != 0))))
-                or not isinstance(changes, list) or not changes):
-            raise EffectError("FILE_CHANGE_EVENT_INVALID")
+        failed_patch = (_failed_patch(event, item, output) and isinstance(changes, list) and bool(changes)
+                        and isinstance(item.get("id"), str) and bool(item["id"]) and item["id"] not in ids)
+        if failed_patch:
+            # A failed apply_patch lists exactly the files it still changed, and the gateway shows
+            # the workspace itself when it changed none. A retried patch used to block a finished
+            # run (live 2026-10-17/18, six runs): skip a proven no-op, index real partial changes.
+            changes = [change for change in changes
+                       if change != {"kind": "update", "path": str(workspace)}]
+            if not changes:
+                ids.add(item["id"])
+                continue
+        else:
+            if isinstance(output, dict) and "terminal_receipt" in output:
+                receipt = output["terminal_receipt"]
+                if (not isinstance(receipt, dict) or type(receipt.get("exit_code")) is not int
+                        or receipt["exit_code"] != 0 or receipt.get("terminal_state") != "completed"
+                        or receipt.get("outcome") != "known" or receipt.get("reconcile_required") is not False
+                        or any(receipt.get(key) is not True for key in
+                               ("process_reaped", "process_group_empty", "termination_proven"))
+                        or output.get("failed_change") is not None or output.get("error") not in (None, "")):
+                    raise EffectError("FILE_CHANGE_EVENT_INVALID")
+            if (event.get("type") != "item.completed" or item.get("status") != "completed"
+                    or item.get("success", True) is not True
+                    or item.get("isError") is True or not isinstance(item.get("id"), str)
+                    or not item["id"] or item["id"] in ids
+                    or ("exit_code" in item and (type(item["exit_code"]) is not int or item["exit_code"] != 0))
+                    or (output is not None and (not isinstance(output, dict)
+                        or output.get("success", True) is not True or output.get("isError") is True
+                        or ("exit_code" in output and (type(output["exit_code"]) is not int
+                            or output["exit_code"] != 0))))
+                    or not isinstance(changes, list) or not changes):
+                raise EffectError("FILE_CHANGE_EVENT_INVALID")
         ids.add(item["id"])
         if len(records) >= MAX_EVENTS or len(changes) > MAX_TARGETS:
             raise EffectError("FILE_CHANGE_INDEX_PARTIAL")

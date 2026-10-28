@@ -8,12 +8,15 @@ pub(crate) fn extract_openapi_metrics(data: &Value, context_window: Option<u64>)
         pointer_u64(&usage, "/prompt_tokens").or_else(|| pointer_u64(&usage, "/input_tokens"));
     let output_tokens =
         pointer_u64(&usage, "/completion_tokens").or_else(|| pointer_u64(&usage, "/output_tokens"));
-    let cached_input_tokens = pointer_u64(&usage, "/prompt_tokens_details/cached_tokens")
-        .or_else(|| pointer_u64(&usage, "/input_tokens_details/cached_tokens"))
+    let detailed_cached_tokens = pointer_u64(&usage, "/prompt_tokens_details/cached_tokens")
+        .or_else(|| pointer_u64(&usage, "/input_tokens_details/cached_tokens"));
+    let cached_input_tokens = detailed_cached_tokens
         .or_else(|| pointer_u64(&usage, "/cache_read_input_tokens"))
         .or_else(|| pointer_u64(&usage, "/cache_read_tokens"));
-    let cache_write_tokens = pointer_u64(&usage, "/prompt_tokens_details/cache_creation_tokens")
-        .or_else(|| pointer_u64(&usage, "/input_tokens_details/cache_write_tokens"))
+    let detailed_write_tokens = pointer_u64(&usage, "/prompt_tokens_details/cache_write_tokens")
+        .or_else(|| pointer_u64(&usage, "/prompt_tokens_details/cache_creation_tokens"))
+        .or_else(|| pointer_u64(&usage, "/input_tokens_details/cache_write_tokens"));
+    let cache_write_tokens = detailed_write_tokens
         .or_else(|| pointer_u64(&usage, "/cache_creation_input_tokens"))
         .or_else(|| pointer_u64(&usage, "/cache_write_tokens"));
     let reasoning_tokens = pointer_u64(&usage, "/completion_tokens_details/reasoning_tokens")
@@ -24,11 +27,14 @@ pub(crate) fn extract_openapi_metrics(data: &Value, context_window: Option<u64>)
             input_tokens,
             output_tokens,
             total_tokens: pointer_u64(&usage, "/total_tokens").or_else(|| {
-                input_tokens.zip(output_tokens).map(|(input, output)| {
-                    input
-                        + output
-                        + cached_input_tokens.unwrap_or(0)
-                        + cache_write_tokens.unwrap_or(0)
+                // Each detail is an input subset; aliases retain their prior
+                // additive semantics even when the other cache field is detailed.
+                input_tokens.zip(output_tokens).and_then(|(input, output)| {
+                    input.checked_add(output)
+                        .and_then(|total| total.checked_add(
+                            if detailed_cached_tokens.is_some() { 0 } else { cached_input_tokens.unwrap_or(0) }))
+                        .and_then(|total| total.checked_add(
+                            if detailed_write_tokens.is_some() { 0 } else { cache_write_tokens.unwrap_or(0) }))
                 })
             }),
             cached_input_tokens,
@@ -53,6 +59,8 @@ pub(crate) fn extract_openapi_metrics(data: &Value, context_window: Option<u64>)
             .map(str::to_string),
         provider_request_id: None,
         raw_usage: if usage.is_null() { None } else { Some(usage) },
+        transport_timing: None,
+        request_profile: None,
     };
     record_context_utilization(&mut metrics);
     metrics
@@ -98,6 +106,8 @@ pub(crate) fn extract_google_metrics(
             .map(str::to_string),
         provider_request_id,
         raw_usage: data.get("usageMetadata").cloned(),
+        transport_timing: None,
+        request_profile: None,
     };
     record_context_utilization(&mut metrics);
     metrics
@@ -138,6 +148,66 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn openapi_detailed_cache_is_not_added_to_input_again() {
+        for usage in [
+            json!({"input_tokens":10,"output_tokens":3,
+                "input_tokens_details":{"cached_tokens":4,"cache_write_tokens":2},
+                "output_tokens_details":{"reasoning_tokens":1}}),
+            json!({"prompt_tokens":10,"completion_tokens":3,
+                "prompt_tokens_details":{"cached_tokens":4,"cache_write_tokens":2}}),
+        ] {
+            let metrics = extract_openapi_metrics(&json!({"usage":usage}), None);
+            assert_eq!(metrics.usage.total_tokens, Some(13));
+            assert_eq!(metrics.usage.cached_input_tokens, Some(4));
+            assert_eq!(metrics.usage.cache_write_tokens, Some(2));
+        }
+    }
+
+    #[test]
+    fn openapi_additive_cache_aliases_and_explicit_total_are_preserved() {
+        let usage = json!({"input_tokens":10,"output_tokens":3,
+            "cache_read_input_tokens":14,"cache_creation_input_tokens":2});
+        let metrics = extract_openapi_metrics(&json!({"usage":usage}), None);
+        assert_eq!(metrics.usage.total_tokens, Some(29));
+        let metrics = extract_openapi_metrics(&json!({"usage":{
+            "input_tokens":10,"output_tokens":3,"total_tokens":99,
+            "input_tokens_details":{"cached_tokens":4}}}), None);
+        assert_eq!(metrics.usage.total_tokens, Some(99));
+    }
+
+    #[test]
+    fn openapi_mixed_cache_origins_are_accounted_independently() {
+        for (usage, total) in [
+            (json!({"input_tokens":10,"output_tokens":3,
+                "input_tokens_details":{"cached_tokens":4},
+                "cache_creation_input_tokens":2}), 15),
+            (json!({"input_tokens":10,"output_tokens":3,
+                "input_tokens_details":{"cache_write_tokens":2},
+                "cache_read_input_tokens":4}), 17),
+        ] {
+            let metrics = extract_openapi_metrics(&json!({"usage":usage}), None);
+            assert_eq!(metrics.usage.total_tokens, Some(total));
+            assert_eq!(metrics.usage.cached_input_tokens, Some(4));
+            assert_eq!(metrics.usage.cache_write_tokens, Some(2));
+            let mut reported = usage;
+            reported["total_tokens"] = json!(99);
+            let metrics = extract_openapi_metrics(&json!({"usage":reported}), None);
+            assert_eq!(metrics.usage.total_tokens, Some(99));
+        }
+    }
+
+    #[test]
+    fn openapi_total_overflow_is_unknown_not_wrapped_or_saturated() {
+        for usage in [
+            json!({"input_tokens":u64::MAX,"output_tokens":1}),
+            json!({"input_tokens":u64::MAX - 2,"output_tokens":1,"cache_read_input_tokens":5}),
+        ] {
+            let metrics = extract_openapi_metrics(&json!({"usage":usage}), None);
+            assert_eq!(metrics.usage.total_tokens, None);
+        }
+    }
+
+    #[test]
     fn openapi_metrics_read_all_known_usage_variants() {
         let metrics = extract_openapi_metrics(
             &json!({
@@ -169,7 +239,7 @@ mod tests {
         assert_eq!(metrics.usage.reasoning_tokens, Some(5));
         assert_eq!(metrics.usage.audio_input_tokens, Some(3));
         assert_eq!(metrics.usage.audio_output_tokens, Some(2));
-        assert_eq!(metrics.usage.total_tokens, Some(167));
+        assert_eq!(metrics.usage.total_tokens, Some(120));
         assert_eq!(metrics.tool_call_count, 2);
         assert_eq!(metrics.finish_reason.as_deref(), Some("tool_calls"));
         assert!(metrics.cache_hit);

@@ -1,0 +1,96 @@
+{
+  "schema_version": "nokiy_workflow_profiles_v1",
+  "profiles": [
+    {
+      "slug": "nokiy",
+      "display_name": "Nokiy",
+      "workflow": "nokiy",
+      "coordinator": {
+        "model": "gpt-6-astra",
+        "reasoning_effort": "xhigh"
+      },
+      "worker": {
+        "model": "gpt-6.1-terra",
+        "reasoning_effort": "xhigh",
+        "service_tier": "default"
+      },
+      "worker_selector": {
+        "default_effort": "medium",
+        "models": {
+          "low": "gpt-6-luna",
+          "medium": "gpt-6.1-terra",
+          "high": "gpt-6.1-sol",
+          "xhigh": "gpt-6-astra"
+        },
+        "reasoning_efforts": {
+          "low": "max",
+          "medium": "xhigh",
+          "high": "max",
+          "xhigh": "xhigh"
+        }
+      },
+      "tool_output_token_limit": 64000
+    },
+    {
+      "slug": "nokiy-direct",
+      "display_name": "Nokiy Ultra",
+      "workflow": "nokiy-direct",
+      "coordinator": {
+        "model": "gpt-6-astra",
+        "reasoning_effort": "xhigh"
+      },
+      "worker": {
+        "model": "gpt-6.1-terra",
+        "reasoning_effort": "xhigh",
+        "service_tier": "default"
+      },
+      "worker_selector": {
+        "default_effort": "medium",
+        "models": {
+          "low": "gpt-6-luna",
+          "medium": "gpt-6.1-terra",
+          "high": "gpt-6.1-sol",
+          "xhigh": "gpt-6-astra"
+        },
+        "reasoning_efforts": {
+          "low": "max",
+          "medium": "xhigh",
+          "high": "xhigh",
+          "xhigh": "xhigh"
+        }
+      },
+      "auto_compact_token_limit": 272000,
+      "tool_output_token_limit": 64000
+    },
+    {
+      "slug": "nokiy-efficient",
+      "display_name": "Nokiy Efficient",
+      "workflow": "nokiy-direct",
+      "coordinator": {
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "max"
+      },
+      "worker": {
+        "model": "gpt-6.1-terra",
+        "reasoning_effort": "xhigh",
+        "service_tier": "default"
+      },
+      "worker_selector": {
+        "default_effort": "medium",
+        "models": {
+          "low": "gpt-6-luna",
+          "medium": "gpt-6.1-terra",
+          "high": "gpt-6.1-sol",
+          "xhigh": "gpt-6-astra"
+        },
+        "reasoning_efforts": {
+          "low": "max",
+          "medium": "xhigh",
+          "high": "xhigh",
+          "xhigh": "xhigh"
+        }
+      },
+      "tool_output_token_limit": 64000
+    }
+  ]
+}

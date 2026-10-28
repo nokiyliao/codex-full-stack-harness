@@ -30,11 +30,12 @@ pub(crate) struct OfficialCodexRuntimeInput {
     pub(crate) service_tier: Option<runtime_contract::ModelServiceTier>,
 }
 
-pub(crate) async fn call_runtime_official_codex(
+pub(crate) async fn call_runtime_official_codex_with_source_binding(
     runtime: &mut RuntimeAggregate,
     provider: &tura_llm_rust::ProviderConfig,
     input: OfficialCodexRuntimeInput,
     mut runtime_event_writer: Option<&mut RuntimeEventWriter>,
+    capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
 ) -> Result<(), String> {
     let executable = resolve_codex_executable()?;
     let commander_owner_socket_path = input
@@ -50,6 +51,7 @@ pub(crate) async fn call_runtime_official_codex(
         allowed_command_run_commands: input.allowed_command_run_commands,
         disable_permission_restrictions: input.disable_permission_restrictions,
         jspace_contract: input.jspace_contract,
+        capsule_source_read_binding,
     };
     let request = OfficialCodexTurnRequest {
         tura_session_id: runtime.session_id.clone(),
@@ -122,6 +124,7 @@ struct RuntimeOfficialCodexHandler {
     allowed_command_run_commands: Option<BTreeSet<String>>,
     disable_permission_restrictions: bool,
     jspace_contract: Option<Value>,
+    capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
 }
 
 impl RuntimeOfficialCodexHandler {
@@ -500,13 +503,14 @@ impl OfficialCodexServerRequestHandler for RuntimeOfficialCodexHandler {
                 .ok_or_else(|| "command_run tool call ID is unavailable".to_string())?;
             let execution_id = format!("{}:{tool_call_id}", self.runtime_id);
             let arguments = governed_dynamic_tool_arguments(&request.params, &execution_id)?;
-            let output = crate::router_command_run::execute_command_run_value_with_jspace(
+            let output = crate::router_command_run::execute_command_run_value_with_source_binding(
                 arguments,
                 self.session_directory.clone(),
                 Some(&self.session_id),
                 Some(&self.runtime_id),
                 self.allowed_command_run_commands.clone(),
                 self.jspace_contract.clone(),
+                self.capsule_source_read_binding.clone(),
             )
             .await?;
             Ok(json!({
@@ -729,7 +733,7 @@ mod tests {
         governed_dynamic_tool_arguments, qualifies_for_synthetic_read_only_recovery,
         resolve_commander_owner_socket_path, safe_call_id,
     };
-    use std::{collections::BTreeSet, path::Path, sync::Mutex};
+    use std::{collections::BTreeSet, path::Path};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tura_llm_rust::official_codex_app_server::{
         CODEX_EXECUTION_LEDGER_SCHEMA_VERSION, CodexExecutionLedger, CodexObservedCommandAccess,
@@ -738,7 +742,7 @@ mod tests {
         OfficialCodexServerRequestHandler,
     };
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::ROUTER_TEST_ENV as ENV_LOCK;
 
     #[test]
     fn commander_owner_socket_is_version_independent_and_absolute() {
@@ -807,6 +811,7 @@ mod tests {
                 allowed_command_run_commands: None,
                 disable_permission_restrictions: false,
                 jspace_contract: None,
+                capsule_source_read_binding: None,
             };
             let mut unrestricted = RuntimeOfficialCodexHandler {
                 session_directory: std::env::temp_dir(),
@@ -815,6 +820,7 @@ mod tests {
                 allowed_command_run_commands: None,
                 disable_permission_restrictions: true,
                 jspace_contract: None,
+                capsule_source_read_binding: None,
             };
 
             assert_eq!(
@@ -839,6 +845,7 @@ mod tests {
             allowed_command_run_commands: None,
             disable_permission_restrictions: false,
             jspace_contract: None,
+            capsule_source_read_binding: None,
         };
         let ledger = CodexExecutionLedger {
             schema_version: CODEX_EXECUTION_LEDGER_SCHEMA_VERSION,
@@ -881,6 +888,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)] // the env lock serializes env-mutating tests across their runtimes
     #[tokio::test]
     async fn command_run_request_uses_router_and_preserves_terminal_receipt() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
@@ -940,6 +948,7 @@ mod tests {
             allowed_command_run_commands: None,
             disable_permission_restrictions: false,
             jspace_contract: None,
+            capsule_source_read_binding: None,
         };
         let response = handler
             .handle(OfficialCodexServerRequest {
@@ -1094,6 +1103,7 @@ mod tests {
             allowed_command_run_commands: None,
             disable_permission_restrictions: false,
             jspace_contract: None,
+            capsule_source_read_binding: None,
         };
         let observation = CodexReadOnlyEffectObservation {
             original_runtime_id: "runtime-original".to_string(),
@@ -1141,6 +1151,7 @@ mod tests {
             allowed_command_run_commands: None,
             disable_permission_restrictions: false,
             jspace_contract: None,
+            capsule_source_read_binding: None,
         };
         let mut observation = CodexReadOnlyEffectObservation {
             original_runtime_id: "runtime-original".to_string(),
@@ -1191,6 +1202,7 @@ mod tests {
             allowed_command_run_commands: None,
             disable_permission_restrictions: false,
             jspace_contract: None,
+            capsule_source_read_binding: None,
         };
         let observation = handler
             .observe_read_only_effect(&OfficialCodexServerRequest {
@@ -1271,6 +1283,7 @@ mod tests {
             allowed_command_run_commands: None,
             disable_permission_restrictions: false,
             jspace_contract: None,
+            capsule_source_read_binding: None,
         };
         let observation = handler
             .observe_command_run_effect(
@@ -1344,6 +1357,7 @@ mod tests {
             allowed_command_run_commands: None,
             disable_permission_restrictions: false,
             jspace_contract: None,
+            capsule_source_read_binding: None,
         };
         let error = handler
             .observe_command_run_effect(

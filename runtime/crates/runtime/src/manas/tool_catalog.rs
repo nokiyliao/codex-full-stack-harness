@@ -66,6 +66,8 @@ pub(crate) fn filter_tools_for_turn(
     _is_final_turn: bool,
     _force_no_tools: bool,
 ) -> Result<Vec<serde_json::Value>, String> {
+    // Terminal turns retain the ordinary provider prefix. Invocation is disabled
+    // by tool_choice=none and the runtime's empty executable-tool allowlist.
     Ok(keep_command_run_only(tools))
 }
 
@@ -311,6 +313,12 @@ pub(crate) fn provider_command_run_commands_for_jspace(
     let has_read_commands = contract
         .get("read_commands")
         .is_some_and(serde_json::Value::is_object);
+    let has_inspect_shell = contract
+        .get("inspect_shell")
+        .is_some_and(serde_json::Value::is_object);
+    let has_parent_shell = contract
+        .get("parent_shell")
+        .is_some_and(serde_json::Value::is_object);
     let has_write_scopes = contract
         .get("write_scopes")
         .and_then(serde_json::Value::as_array)
@@ -319,7 +327,7 @@ pub(crate) fn provider_command_run_commands_for_jspace(
     let mut visible = execution_commands.clone();
     let shell_is_admitted = allowed.contains("command")
         && !denied.contains("command")
-        && (has_command_templates || has_read_commands);
+        && (has_command_templates || has_read_commands || has_inspect_shell || has_parent_shell);
     if !shell_is_admitted {
         visible.remove(active_shell_command_name());
     }
@@ -336,7 +344,13 @@ pub(crate) fn provider_command_run_commands_for_jspace(
         visible.remove("web_discover");
     }
 
-    if contract
+    // This filter only retains commands already admitted by the matcher above.
+    // Do not hide its directory-backed reader merely because no exact grant exists.
+    let directory_reader = has_read_commands
+        && contract.get("schema_version").and_then(serde_json::Value::as_str) == Some("jspace_contract_v2")
+        && allowed.contains("read") && allowed.contains("command")
+        && !denied.contains("read") && !denied.contains("command");
+    if !directory_reader && contract
         .get("source_read")
         .and_then(serde_json::Value::as_bool)
         != Some(true)
@@ -428,6 +442,15 @@ fn tool_interface_to_provider_schema_with_commands_and_jspace(
         };
     let strict = env_flag("TURA_COMMAND_RUN_STRICT_JSON");
     if strict {
+        // Strict mode keeps the legacy string payload; arbitrary reply JSON
+        // must not become a required argument on ordinary commands.
+        if name == COMMAND_RUN_TOOL
+            && let Some(properties) = parameters
+                .pointer_mut("/properties/commands/items/properties")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            properties.remove("arguments");
+        }
         parameters = strict_provider_schema(parameters);
     }
     parameters = strip_tura_schema_extensions(parameters);
@@ -558,24 +581,25 @@ fn command_run_description_for_active_shell(
         .replace("Available commands: apply_patch, bash, shell_command.", "")
         .trim_end()
         .to_string();
-    let jspace_shell_guidance = jspace_provider_shell_guidance(jspace_contract);
+    // The run-specific boundary (argv, roots, evidence paths) lives in the developer
+    // environment context; the tool description stays static so its prefix caches.
+    let jspace_shell_boundary = jspace_provider_shell_guidance(jspace_contract).is_some();
     let command_lines = command_list_for_description(allowed_commands, active)
         .into_iter()
         .filter_map(|command| {
-            if command == active
-                && let Some(guidance) = jspace_shell_guidance.as_deref()
-            {
+            if command == active && jspace_shell_boundary {
                 return Some(format!(
-                    "- {active}: Follow the J-Space shell boundary exactly. {guidance} Submit the admitted command as `command_line`; do not probe substitute utilities."
+                    "- {active}: Follow the J-Space shell boundary in the environment context exactly. Submit the admitted command as `command_line`; do not probe substitute utilities."
                 ));
             }
             command_run_command_format_line(&command, require_startup_task_state)
         })
         .collect::<Vec<_>>();
-    let jspace_guidance = jspace_shell_guidance
-        .as_deref()
-        .map(|guidance| format!("\nJ-Space shell boundary:\n{guidance}"))
-        .unwrap_or_default();
+    let jspace_guidance = if jspace_shell_boundary {
+        "\nJ-Space shell boundary: the environment context lists the exact admitted argv, read utilities, read roots and shell sandbox for this run."
+    } else {
+        ""
+    };
     format!(
         "{prefix} Available commands: {}.{jspace_guidance}\nCommand run patterns:\n{}\nCommand line formats:\n{}",
         command_list_for_description(allowed_commands, active).join(", "),
@@ -584,7 +608,20 @@ fn command_run_description_for_active_shell(
     )
 }
 
-fn jspace_provider_shell_guidance(contract: Option<&serde_json::Value>) -> Option<String> {
+/// Append the run-specific J-Space shell boundary to the developer environment context.
+pub(crate) fn jspace_environment_context(
+    environment: String,
+    contract: Option<&serde_json::Value>,
+) -> String {
+    match jspace_provider_shell_guidance(contract) {
+        Some(guidance) => {
+            format!("{environment}\n<jspace_shell_boundary>\n{guidance}\n</jspace_shell_boundary>")
+        }
+        None => environment,
+    }
+}
+
+pub(crate) fn jspace_provider_shell_guidance(contract: Option<&serde_json::Value>) -> Option<String> {
     let contract = contract?;
     let mut sections = Vec::new();
 
@@ -645,6 +682,34 @@ fn jspace_provider_shell_guidance(contract: Option<&serde_json::Value>) -> Optio
             sections.push(format!("Admitted read roots: {}.", roots.join(", ")));
         }
     }
+    if let Some(policy) = contract.get("inspect_shell").and_then(serde_json::Value::as_object) {
+        let evidence = policy.get("evidence_root")?.as_str()?;
+        let network = match policy.get("network")?.as_str()? {
+            "loopback" => "loopback (127.0.0.1/localhost) only",
+            "inherit" => "that of the worker runtime",
+            _ => "none",
+        };
+        sections.push(format!(
+            "Inspect shell: any shell line (pipelines, heredocs, python3 -c, git, rg, curl) runs under an OS sandbox. \
+             The repository is read-only; writes succeed only under {evidence} and $TMPDIR; network: {network}. \
+             Repository writes and apply_patch fail. Open SQLite read-only as file:<path>?mode=ro&immutable=1. \
+             Batch related checks into one shell line where possible, write evidence files under {evidence} \
+             and cite their paths in the result."
+        ));
+    }
+    if let Some(policy) = contract.get("parent_shell").and_then(serde_json::Value::as_object) {
+        let evidence = policy.get("evidence_root")?.as_str()?;
+        let network = match policy.get("network")?.as_str()? {
+            "inherit" => "that of the parent process",
+            _ => "none",
+        };
+        sections.push(format!(
+            "Parent shell: any shell line (pipelines, heredocs, rg, git, python3, test runners) runs in the parent \
+             process under an OS sandbox. It reads everywhere except credentials and writes only under {evidence} \
+             and $TMPDIR; network: {network}. Repository files are read-only to shell lines: edit them with \
+             apply_patch. Send shell lines in their own command_run call, separate from apply_patch and source_read."
+        ));
+    }
 
     (!sections.is_empty()).then(|| sections.join(" "))
 }
@@ -673,11 +738,11 @@ pub(crate) fn command_run_command_format_line(
             compact_schema(&command_schema(&command_id)),
         )),
         "source_read" => Some(format!(
-            "- source_read: Read only an exact J-Space-granted workspace file. Use DCF locators first; for an unknown exact branch, search the relevant file using JSON `path`, `search_terms` (1..16 nonempty literal OR terms, <=2048 bytes total), optional `context_lines` (0..5), and optional `start_line` (default 1). For ranges provide `path`, `start_line`, `end_line` and optional `line_numbers`: true. For JSON projection instead provide named `path`, `json_pointer` (RFC 6901 string; empty selects the whole JSON), and no line/search options. Returns compact selected JSON with projection metadata and the source file SHA, not line coverage; invalid JSON, malformed/missing pointers and oversized selections fail without partial output. All modes accept `expected_sha256`; range/search resume using `next_line` as `start_line` with that hash. {} Read only needed ranges or JSON fields, batch independent file requests in the existing command_run, don't reread file starts; cite printed physical line labels only for line reads, stripping labels from verbatim quotes. No shell or workdir override.",
+            "- source_read: Read only an exact J-Space-granted workspace file. Use DCF locators first; for an unknown exact branch, search the relevant file using JSON `path`, `search_terms` (1..16 nonempty literal OR terms, <=2048 bytes total), optional `context_lines` (0..5), and optional `start_line` (default 1) and `end_line` (scan bound). For ranges provide `path`, `start_line`, `end_line` and optional `line_numbers`: true. For JSON projection instead provide named `path`, `json_pointer` (RFC 6901 string; empty selects the whole JSON), and no search options. Returns compact selected JSON with projection metadata and the source file SHA, not line coverage; invalid JSON, malformed/missing pointers and oversized selections fail without partial output, returning `json_recovery` child pointers. A selected JSON string also takes `start_line` and `end_line` to read its decoded lines like a file (oversized strings return `json_recovery.string_page`); positions are `string_*` fields, resume with `string_next_line`. A selected JSON object or array also takes `children_offset` (0 for the first page) to list its children (object keys sorted, arrays by index), one JSON line each: small children complete as `key` or `index` with `value`, larger ones summarized with their own `json_pointer`, `type`, `bytes` and counts; resume with `children_next_offset` (failures name `json_recovery.children_page`). For caller-listed `admitted_source_digest_paths`, use `expected_sha256_ref`: `admitted` instead of `expected_sha256`; the router resolves the existing read-only pin and still verifies the read buffer. Do not use this reference for other paths. All modes accept `expected_sha256`; range/search resume using `next_line` as `start_line` with that hash. A pre-edit SHA cannot pin a read after mutation; use the successful edit's `postimage_sha256` for later granted reads. Do not put a literal pre-edit SHA on a later read in the same mutating batch; obtain edit feedback first. Explicit `expected_sha256` values are never automatically overridden. {} Read only needed ranges or JSON fields, batch independent file requests in the existing command_run, don't reread file starts; cite printed physical line labels only for line reads, stripping labels from verbatim quotes. No shell or workdir override.",
             code_tools::commands::source_read::output_limits_description(),
         )),
         "focused_verifier" => Some(
-            "- focused_verifier: Run a preauthorized public test in a verifier-only step group. command_line must contain only JSON {\"verifier_index\":0}, selecting a zero-based grant. No argv, cwd/workdir or timeout overrides. Task-specific whole-array restrictions prevail. Only when the task permits a mixed response, fully-known J-Space-admitted apply_patch commands may run at earlier positive steps in the same command_run response, with focused_verifier in its own verifier-only strictly later positive step group after all patches it verifies. No same-step dependent verification, speculative edits, relaxed admission or automatic done. Reverify after relevant mutations or verifier failures, interpret required fresh evidence before completion, and avoid unconditional duplicate retests.".to_string(),
+            "- focused_verifier: Run a preauthorized public test in a verifier-only step group. command_line must contain only JSON {\"verifier_index\":0}, selecting a zero-based grant. No argv, cwd/workdir or timeout overrides. Task-specific whole-array restrictions prevail. Only when the task permits a mixed response, fully-known J-Space-admitted apply_patch commands may run at earlier positive steps in the same command_run response, with focused_verifier in its own verifier-only strictly later positive step group after all patches it verifies. No same-step dependent verification, speculative edits, relaxed admission or automatic done. Reverify after relevant mutations or verifier failures, interpret required fresh evidence before completion, and avoid unconditional duplicate retests. A failure your edits cannot fix, such as a module, fixture or permission outside your write scope, is the verifier's environment: rerun only after a change that could affect it, and report the exact error with your result.".to_string(),
         ),
         "task_status" => {
             let task_status_schema = task_status::task_status_schema(require_startup_task_state);
@@ -803,7 +868,8 @@ fn command_run_usage_patterns_for(
         patterns.push("- Context compaction: after a meaningful phase completes, or when context is near the active context limit and feels crowded, put the handoff summary in `task_status.compact_context` after the work it summarizes.");
     }
     if allowed_commands.contains("task_status")
-        && (allowed_commands.contains("focused_verifier") || allowed_commands.contains("source_read"))
+        && (allowed_commands.contains("focused_verifier")
+            || allowed_commands.contains("source_read"))
     {
         if allowed_commands.contains("focused_verifier") {
             patterns.push(if allowed_commands.contains("apply_patch") {
@@ -1137,15 +1203,18 @@ mod tests {
 
     #[test]
     fn terminal_batching_economy_respects_allowed_commands_in_both_binding_modes() {
-        let command_names = ["apply_patch", "focused_verifier", "source_read", "task_status"];
+        let command_names = [
+            "apply_patch",
+            "focused_verifier",
+            "source_read",
+            "task_status",
+        ];
         for output_bindings_enabled in [false, true] {
             for mask in 0..(1 << command_names.len()) {
                 let commands = command_names
                     .iter()
                     .enumerate()
-                    .filter_map(|(bit, command)| {
-                        (mask & (1 << bit) != 0).then(|| (*command).to_string())
-                    })
+                    .filter(|&(bit, _command)| mask & (1 << bit) != 0 ).map(|(_bit, command)| (*command).to_string())
                     .collect::<BTreeSet<_>>();
                 let description =
                     command_run_usage_patterns_for(&commands, output_bindings_enabled);
@@ -1240,27 +1309,40 @@ mod tests {
         let description = schema["function"]["description"]
             .as_str()
             .expect("command guidance");
-        assert!(description.contains(&code_tools::commands::source_read::output_limits_description()));
+        assert!(
+            description.contains(&code_tools::commands::source_read::output_limits_description())
+        );
         for expected in [
-            "Line modes: At most 200 complete lines in both modes.",
+            "Line modes: At most 512 complete lines for ranges and 200 for searches.",
             "Range reads: 12288 text bytes, 16384 receipt-inclusive serialized result bytes.",
             "Search reads: 6144 text bytes, 8192 receipt-inclusive serialized result bytes.",
-            "JSON projection reads: 12288 text bytes, 16384 receipt-inclusive serialized result bytes.",
+            "JSON pointer reads: 10000 text bytes, 16384 receipt-inclusive serialized result bytes, for projections and string or children pages.",
             "Oversized JSON projections fail without partial output.",
             "Read only an exact J-Space-granted workspace file.",
             "Use DCF locators first",
             "`search_terms` (1..16 nonempty literal OR terms, <=2048 bytes total)",
             "optional `context_lines` (0..5), and optional `start_line` (default 1)",
             "For ranges provide `path`, `start_line`, `end_line` and optional `line_numbers`: true.",
-            "For JSON projection instead provide named `path`, `json_pointer` (RFC 6901 string; empty selects the whole JSON), and no line/search options.",
+            "For JSON projection instead provide named `path`, `json_pointer` (RFC 6901 string; empty selects the whole JSON), and no search options.",
+            "A selected JSON string also takes `start_line` and `end_line` to read its decoded lines like a file",
+            "A selected JSON object or array also takes `children_offset` (0 for the first page) to list its children",
+            "resume with `children_next_offset` (failures name `json_recovery.children_page`).",
             "Returns compact selected JSON with projection metadata and the source file SHA, not line coverage",
-            "invalid JSON, malformed/missing pointers and oversized selections fail without partial output.",
+            "invalid JSON, malformed/missing pointers and oversized selections fail without partial output, returning `json_recovery` child pointers.",
             "All modes accept `expected_sha256`; range/search resume using `next_line` as `start_line` with that hash.",
+            "A pre-edit SHA cannot pin a read after mutation; use the successful edit's `postimage_sha256` for later granted reads.",
+            "Do not put a literal pre-edit SHA on a later read in the same mutating batch; obtain edit feedback first.",
+            "Explicit `expected_sha256` values are never automatically overridden.",
+            "For caller-listed `admitted_source_digest_paths`, use `expected_sha256_ref`: `admitted` instead of `expected_sha256`",
+            "Do not use this reference for other paths.",
             "Read only needed ranges or JSON fields, batch independent file requests in the existing command_run, don't reread file starts",
             "cite printed physical line labels only for line reads, stripping labels from verbatim quotes",
             "No shell or workdir override.",
         ] {
-            assert!(description.contains(expected), "missing source_read guidance: {expected}");
+            assert!(
+                description.contains(expected),
+                "missing source_read guidance: {expected}"
+            );
         }
     }
 
@@ -1362,6 +1444,7 @@ mod tests {
         )
         .expect("filter should succeed");
 
+        assert_eq!(filtered, vec![tool(COMMAND_RUN_TOOL)]);
         assert_eq!(names(filtered), vec![COMMAND_RUN_TOOL]);
     }
 
@@ -1378,19 +1461,28 @@ mod tests {
     }
 
     #[test]
-    fn final_turn_keeps_command_run_schema_for_prompt_cache() {
-        let filtered = filter_tools_for_turn(
-            vec![
-                tool(COMMAND_RUN_TOOL),
-                tool(PLANNING_TOOL),
-                tool("web_search"),
-            ],
-            true,
-            true,
-        )
-        .expect("filter should succeed");
+    fn disabled_turns_retain_ordinary_provider_tools() {
+        let tools = vec![
+            tool(COMMAND_RUN_TOOL),
+            tool(PLANNING_TOOL),
+            tool("web_search"),
+        ];
+        let normal = filter_tools_for_turn(tools.clone(), false, false)
+            .expect("normal filter should succeed");
+        for (is_final_turn, force_no_tools) in [(true, false), (false, true), (true, true)] {
+            let filtered = filter_tools_for_turn(tools.clone(), is_final_turn, force_no_tools)
+                .expect("filter should succeed");
 
-        assert_eq!(names(filtered), vec![COMMAND_RUN_TOOL]);
+            assert_eq!(
+                filtered, normal,
+                "is_final_turn={is_final_turn}, force_no_tools={force_no_tools}"
+            );
+            assert_eq!(filtered, vec![tool(COMMAND_RUN_TOOL)]);
+            assert_eq!(
+                serde_json::to_vec(&filtered).expect("terminal tools should serialize"),
+                serde_json::to_vec(&normal).expect("normal tools should serialize")
+            );
+        }
     }
 
     #[test]
@@ -1746,6 +1838,50 @@ max_timeout_ms = 2000
     }
 
     #[test]
+    fn dcf_discovery_reader_survives_provider_projection_without_granting_other_tools() {
+        use sha2::{Digest, Sha256};
+        use tura_path::jspace::{JSpaceMatcher, authorization_semantic_sha256, semantic_sha256};
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/file"), "readable").unwrap();
+        let pin = |name: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, name).unwrap();
+            serde_json::json!({"path":path, "sha256":format!("{:x}", Sha256::digest(name.as_bytes()))})
+        };
+        let mut contract = serde_json::json!({
+            "schema_version":"jspace_contract_v2", "repo_root":root,
+            "dcf_generation":{"repo_root":root,"generation_id":"dcf-discovery"},
+            "provenance":{}, "matched_surface_ids":["source"],
+            "allowed_operations":["read","command"],
+            "denied_operations":["network","create","modify","delete"],
+            "read_scopes":["src/**"], "write_scopes":[], "declared_targets":[],
+            "command_templates":[], "focused_verifiers":[],
+            "read_commands":{"roots":["src"],"cat":pin("cat"),"rg":pin("rg")},
+            "expansion":{"mode":"exact_target_only","error_code":"JSPACE_EXPANSION_REQUIRED","mutation_on_expansion":false}
+        });
+        contract["authorization_semantic_sha256"] = serde_json::json!(authorization_semantic_sha256(&contract).unwrap());
+        contract["content_sha256"] = serde_json::json!(semantic_sha256(&contract));
+        let matcher = JSpaceMatcher::from_value(&root, &contract).unwrap();
+        matcher.check_source_read(&root.join("src/file")).unwrap();
+        let mut commands = BTreeSet::from(["planning".to_string(), "task_status".to_string(),
+                                           "apply_patch".to_string(), "web_discover".to_string()]);
+        if matcher.source_read_enabled() { commands.insert("source_read".to_string()); }
+        let visible = provider_command_run_commands_for_jspace(&commands, Some(&contract));
+        let schema = tool_interface_to_provider_schema_with_commands(command_run_interface(), Some(&visible), false);
+        assert_command_type_enum(&schema, &["source_read", "task_status", "planning"]);
+        commands.remove("source_read");
+        assert!(!provider_command_run_commands_for_jspace(&commands, Some(&contract)).contains("source_read"));
+        commands.insert("source_read".to_string());
+        for denied in ["read", "command"] {
+            let mut blocked = contract.clone();
+            blocked["denied_operations"] = serde_json::json!([denied]);
+            assert!(!provider_command_run_commands_for_jspace(&commands, Some(&blocked)).contains("source_read"));
+        }
+    }
+
+    #[test]
     fn focused_verifier_format_describes_ordered_step_groups_and_task_limits() {
         let guide = command_run_command_format_line("focused_verifier", false)
             .expect("focused_verifier guide");
@@ -1762,6 +1898,8 @@ max_timeout_ms = 2000
             "Reverify after relevant mutations or verifier failures",
             "interpret required fresh evidence before completion",
             "avoid unconditional duplicate retests",
+            "A failure your edits cannot fix",
+            "rerun only after a change that could affect it, and report the exact error with your result",
         ] {
             assert!(
                 guide.contains(expected),
@@ -1845,12 +1983,16 @@ max_timeout_ms = 2000
         let json_content = serde_json::json!({
             "answer": {"ok": true},
             "padding": "x".repeat(13 * 1024)
-        }).to_string();
+        })
+        .to_string();
         assert!(json_content.len() > 12 * 1024);
         assert_eq!(json_content.lines().count(), 1);
         std::fs::write(&json_source, &json_content).expect("single-line JSON fixture");
-        std::fs::write(workspace_root.join("src/denied.json"), r#"{"answer":{"ok":true}}"#)
-            .expect("ungranted JSON fixture");
+        std::fs::write(
+            workspace_root.join("src/denied.json"),
+            r#"{"answer":{"ok":true}}"#,
+        )
+        .expect("ungranted JSON fixture");
         let mut contract = serde_json::json!({
             "schema_version": "jspace_contract_v2",
             "repo_root": workspace_root,
@@ -1905,14 +2047,18 @@ max_timeout_ms = 2000
         );
         assert_command_type_enum(&schema, &["source_read", "task_status", "planning"]);
         matcher.check_source_read(&source).expect("exact read");
-        matcher.check_source_read(&json_source).expect("exact JSON read");
+        matcher
+            .check_source_read(&json_source)
+            .expect("exact JSON read");
         let denied_request = code_tools::commands::source_read::parse_command_line(
             r#"{"path":"src/denied.json","json_pointer":"/answer"}"#,
-        ).expect("valid denied JSON projection request");
-        let denied_target = code_tools::commands::source_read::target_path(
-            &workspace_root, &denied_request,
-        ).expect("existing denied JSON target");
-        matcher.check_source_read(&denied_target)
+        )
+        .expect("valid denied JSON projection request");
+        let denied_target =
+            code_tools::commands::source_read::target_path(&workspace_root, &denied_request)
+                .expect("existing denied JSON target");
+        matcher
+            .check_source_read(&denied_target)
             .expect_err("JSON projection must not expand exact read scopes");
         matcher
             .check_command("task_status", "done")
@@ -1969,7 +2115,8 @@ max_timeout_ms = 2000
             results.iter().all(|result| result["success"] == true),
             "{command_run_result}"
         );
-        assert_eq!(results[0]["output"]["stdout"], "alpha\nbeta\n");
+        assert_eq!(results[0]["output"]["stdout"], "1: alpha\n2: beta\n");
+        assert_eq!(results[0]["output"]["line_numbers"], true);
         assert_eq!(
             results[1]["output"]["steps"].as_array().map(Vec::len),
             Some(2)
@@ -1980,40 +2127,47 @@ max_timeout_ms = 2000
             "alpha\nbeta\n"
         );
 
-        let json_dispatch_result = code_tools::command_run::execute_async_value_with_source_read_admission(
-            serde_json::json!({
-                "execution_id": "schema-dispatch-json-projection",
-                "commands": [
-                    {
-                        "command_type": "source_read",
-                        "command_line": serde_json::json!({
-                            "path": "src/capsule.json", "json_pointer": "/answer"
-                        }).to_string(),
-                        "step": 1
-                    },
-                    {
-                        "command_type": "source_read",
-                        "command_line": serde_json::json!({
-                            "path": "src/capsule.json",
-                            "search_terms": ["not-present-in-fixture"]
-                        }).to_string(),
-                        "step": 1
-                    }
-                ]
-            }),
-            workspace_root.clone(),
-            Some(visible),
-            None,
-            false,
-            code_tools::runtime::tool::CancellationToken::new(),
-            Some(std::sync::Arc::new(
-                std::fs::File::open(&workspace_root).expect("workspace directory descriptor")
-            )),
-            None,
-        ).await;
-        let json_results = json_dispatch_result["results"].as_array().expect("JSON dispatch results");
+        let json_dispatch_result =
+            code_tools::command_run::execute_async_value_with_source_read_admission(
+                serde_json::json!({
+                    "execution_id": "schema-dispatch-json-projection",
+                    "commands": [
+                        {
+                            "command_type": "source_read",
+                            "command_line": serde_json::json!({
+                                "path": "src/capsule.json", "json_pointer": "/answer"
+                            }).to_string(),
+                            "step": 1
+                        },
+                        {
+                            "command_type": "source_read",
+                            "command_line": serde_json::json!({
+                                "path": "src/capsule.json",
+                                "search_terms": ["not-present-in-fixture"]
+                            }).to_string(),
+                            "step": 1
+                        }
+                    ]
+                }),
+                workspace_root.clone(),
+                Some(visible),
+                None,
+                false,
+                code_tools::runtime::tool::CancellationToken::new(),
+                Some(std::sync::Arc::new(
+                    std::fs::File::open(&workspace_root).expect("workspace directory descriptor"),
+                )),
+                None,
+            )
+            .await;
+        let json_results = json_dispatch_result["results"]
+            .as_array()
+            .expect("JSON dispatch results");
         assert_eq!(json_results.len(), 2, "{json_dispatch_result}");
-        assert!(json_results.iter().all(|result| result["success"] == true), "{json_dispatch_result}");
+        assert!(
+            json_results.iter().all(|result| result["success"] == true),
+            "{json_dispatch_result}"
+        );
         let projection = &json_results[0]["output"];
         let search = &json_results[1]["output"];
         assert_eq!(projection["stdout"], r#"{"ok":true}"#);
@@ -2030,19 +2184,38 @@ max_timeout_ms = 2000
         assert!(source_sha.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(projection["source_sha256"], source_sha);
         for key in [
-            "start_line", "end_line", "requested_end_line", "next_line", "total_lines",
-            "line_numbers", "at_eof", "ends_with_newline", "search_matches", "context_lines",
+            "start_line",
+            "end_line",
+            "requested_end_line",
+            "next_line",
+            "total_lines",
+            "line_numbers",
+            "at_eof",
+            "ends_with_newline",
+            "search_matches",
+            "context_lines",
         ] {
-            assert!(projection.get(key).is_none(), "no fabricated line metadata: {key}");
+            assert!(
+                projection.get(key).is_none(),
+                "no fabricated line metadata: {key}"
+            );
         }
-        assert_eq!(projection["terminal_receipt"]["terminal_state"], "completed");
+        assert_eq!(
+            projection["terminal_receipt"]["terminal_state"],
+            "completed"
+        );
         assert_eq!(projection["terminal_receipt"]["exit_code"], 0);
-        let receipt_path = projection["terminal_receipt_path"].as_str().expect("JSON receipt path");
-        let durable: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(receipt_path).expect("durable JSON receipt"),
-        ).expect("JSON terminal receipt");
+        let receipt_path = projection["terminal_receipt_path"]
+            .as_str()
+            .expect("JSON receipt path");
+        let durable: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(receipt_path).expect("durable JSON receipt"))
+                .expect("JSON terminal receipt");
         assert_eq!(durable, projection["terminal_receipt"]);
-        assert_eq!(std::fs::read_to_string(json_source).expect("JSON source unchanged"), json_content);
+        assert_eq!(
+            std::fs::read_to_string(json_source).expect("JSON source unchanged"),
+            json_content
+        );
     }
 
     #[test]
@@ -2081,22 +2254,97 @@ max_timeout_ms = 2000
             Some(&contract),
         );
         let description = schema["function"]["description"].as_str().unwrap();
-        let jspace_pos = description
+        let guidance = jspace_provider_shell_guidance(Some(&contract)).unwrap();
+        let jspace_pos = guidance
             .find(r#"["cat","scripts/ops/dcf/jspace.py"]"#)
             .unwrap();
-        let task_context_pos = description
+        let task_context_pos = guidance
             .find(r#"["cat","scripts/ops/dcf/task_context.py"]"#)
             .unwrap();
 
-        assert!(description.contains("J-Space shell boundary:"));
-        assert!(
-            description
-                .contains("Use these exact argv; do not substitute unlisted shell utilities.")
-        );
+        assert!(description.contains("J-Space shell boundary"));
+        assert!(!description.contains("scripts/ops/dcf/jspace.py"));
+        assert!(guidance.contains("Use these exact argv; do not substitute unlisted shell utilities."));
         assert!(jspace_pos < task_context_pos);
         assert!(!description.contains("Use for tests, builds, scripts, package tools"));
         assert!(!description.contains("sed -n"));
         assert!(!description.contains("tail -n"));
+    }
+
+    #[test]
+    fn jspace_tool_description_is_identical_across_runs_with_different_paths() {
+        let shell = active_shell_command_name().to_string();
+        let allowed_commands = BTreeSet::from([shell]);
+        let contract = |root: &str| serde_json::json!({
+            "allowed_operations": ["read", "command"],
+            "command_templates": [{"argv": ["cat", format!("{root}/verifier.json")]}],
+            "read_commands": {"roots": [root], "rg": {"path": "/usr/bin/rg", "sha256": "a"}},
+            "inspect_shell": {"schema_version": "nokiy_inspect_shell_v1", "profile_sha256": "a",
+                "evidence_root": format!("{root}/evidence"), "network": "loopback"}
+        });
+        let describe = |value: serde_json::Value| tool_interface_to_provider_schema_with_commands_and_jspace(
+            command_run_interface(), Some(&allowed_commands), false, Some(&value),
+        )["function"]["description"].as_str().unwrap().to_string();
+        let first = describe(contract("/runs/a"));
+        assert_eq!(first, describe(contract("/runs/b")));
+        assert!(!first.contains("/runs/a"));
+        let environment = jspace_environment_context("<env/>".to_string(), Some(&contract("/runs/a")));
+        assert!(environment.starts_with("<env/>\n<jspace_shell_boundary>\n"));
+        assert!(environment.contains("/runs/a/evidence") && environment.contains("/runs/a/verifier.json"));
+        assert_eq!(jspace_environment_context("<env/>".to_string(), None), "<env/>");
+    }
+
+    #[test]
+    fn jspace_provider_description_exposes_the_inspect_shell_sandbox() {
+        let shell = active_shell_command_name().to_string();
+        let allowed_commands = BTreeSet::from([shell]);
+        let contract = serde_json::json!({
+            "allowed_operations": ["read", "command"],
+            "command_templates": [],
+            "inspect_shell": {"schema_version": "nokiy_inspect_shell_v1", "profile_sha256": "a",
+                "evidence_root": "/tmp/nokiy/inspect/evidence", "network": "loopback"}
+        });
+        let schema = tool_interface_to_provider_schema_with_commands_and_jspace(
+            command_run_interface(),
+            Some(&allowed_commands),
+            false,
+            Some(&contract),
+        );
+        let description = schema["function"]["description"].as_str().unwrap();
+        let guidance = jspace_provider_shell_guidance(Some(&contract)).unwrap();
+        assert!(description.contains("J-Space shell boundary"), "{description}");
+        assert!(!description.contains("/tmp/nokiy/inspect/evidence"));
+        assert!(guidance.contains("Inspect shell:"), "{guidance}");
+        assert!(guidance.contains("/tmp/nokiy/inspect/evidence"));
+        assert!(guidance.contains("loopback (127.0.0.1/localhost) only"));
+        assert!(guidance.contains("mode=ro&immutable=1"));
+        assert!(!guidance.contains("Use these exact argv"));
+    }
+
+    #[test]
+    fn jspace_provider_description_exposes_the_parent_shell_to_writing_actions() {
+        let shell = active_shell_command_name().to_string();
+        let allowed_commands = BTreeSet::from([shell.clone(), "apply_patch".to_string()]);
+        let contract = serde_json::json!({
+            "allowed_operations": ["read", "create", "modify", "command"],
+            "write_scopes": ["src/**"],
+            "command_templates": [],
+            "parent_shell": {"schema_version": "nokiy_parent_shell_v1", "profile_sha256": "b",
+                "evidence_root": "/tmp/nokiy/parent/evidence", "network": "inherit"}
+        });
+        let schema = tool_interface_to_provider_schema_with_commands_and_jspace(
+            command_run_interface(),
+            Some(&allowed_commands),
+            false,
+            Some(&contract),
+        );
+        let description = schema["function"]["description"].as_str().unwrap();
+        let guidance = jspace_provider_shell_guidance(Some(&contract)).unwrap();
+        assert!(guidance.contains("Parent shell:"), "{guidance}");
+        assert!(guidance.contains("/tmp/nokiy/parent/evidence"));
+        assert!(guidance.contains("edit them with apply_patch"));
+        assert!(!description.contains("/tmp/nokiy/parent/evidence"));
+        assert!(description.contains(&shell), "the shell command stays visible: {description}");
     }
 
     #[test]
@@ -2120,9 +2368,11 @@ max_timeout_ms = 2000
             Some(&contract),
         );
         let description = schema["function"]["description"].as_str().unwrap();
+        let guidance = jspace_provider_shell_guidance(Some(&contract)).unwrap();
 
-        assert!(description.contains("Admitted read utilities: cat, rg."));
-        assert!(description.contains("Admitted read roots: src, tests."));
+        assert!(guidance.contains("Admitted read utilities: cat, rg."));
+        assert!(guidance.contains("Admitted read roots: src, tests."));
+        assert!(!description.contains("Admitted read roots"));
     }
 
     #[test]
@@ -2225,6 +2475,45 @@ max_timeout_ms = 2000
     }
 
     #[test]
+    fn real_command_run_provider_schema_preserves_optional_structured_delivery() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let previous = std::env::var_os("TURA_COMMAND_RUN_STRICT_JSON");
+        // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+        #[allow(
+            unsafe_code,
+            reason = "Rust 2024 process-environment mutation audited at the caller"
+        )]
+        unsafe {
+            std::env::set_var("TURA_COMMAND_RUN_STRICT_JSON", "0")
+        };
+        let interface = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tools/src/command_run/schema.json"
+        ))
+        .expect("command_run schema should parse");
+        let schema = tool_interface_to_provider_schema(interface);
+        // SAFETY: protected by the same process-environment lock above.
+        #[allow(
+            unsafe_code,
+            reason = "Rust 2024 process-environment mutation audited at the caller"
+        )]
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("TURA_COMMAND_RUN_STRICT_JSON", previous);
+            } else {
+                std::env::remove_var("TURA_COMMAND_RUN_STRICT_JSON");
+            }
+        };
+        let item = &schema["function"]["parameters"]["properties"]["commands"]["items"];
+        assert_eq!(schema["function"]["strict"], false);
+        assert_eq!(item["required"], serde_json::json!(["command_type", "command_line"]));
+        let arguments = &item["properties"]["arguments"];
+        assert_eq!(arguments["required"], serde_json::json!(["status", "final_reply"]));
+        assert_eq!(arguments["properties"]["status"]["enum"], serde_json::json!(["done"]));
+        assert_eq!(arguments["properties"]["final_reply"]["anyOf"].as_array().expect("reply alternatives").len(), 3);
+        assert!(arguments.get("x-tura-optional").is_none());
+    }
+
+    #[test]
     fn real_command_run_provider_schema_is_openai_strict_compatible() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
@@ -2264,6 +2553,7 @@ max_timeout_ms = 2000
         );
         assert!(parameters["properties"].get("sandbox").is_none());
         assert!(parameters["properties"].get("task_status").is_none());
+        assert!(parameters["properties"]["commands"]["items"]["properties"].get("arguments").is_none());
         assert!(command_required.contains(&serde_json::json!("command_type")));
         assert!(command_required.contains(&serde_json::json!("step")));
         assert!(command_required.contains(&serde_json::json!("id")));

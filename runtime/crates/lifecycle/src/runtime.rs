@@ -435,6 +435,8 @@ pub struct ProviderObservation {
     pub response_id: Option<String>,
     pub model: Option<String>,
     pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_attempts: Vec<serde_json::Value>,
 }
 
 /// Canonical state for one provider invocation.
@@ -1208,6 +1210,7 @@ mod tests {
             response_id: Some("resp-final".into()),
             model: Some("gpt-6".into()),
             service_tier: Some("default".into()),
+            failed_attempts: vec![serde_json::json!({"usage":{"input_tokens":12,"output_tokens":null}})],
         };
         runtime
             .set_output_with_provider_observation(
@@ -1217,6 +1220,10 @@ mod tests {
             .expect("output");
         assert_eq!(runtime.output, Some(serde_json::json!({"text":"hi"})));
         let wire = serde_json::to_value(&runtime).expect("snapshot");
+        let mut old_observation = serde_json::to_value(&observation).expect("observation");
+        old_observation.as_object_mut().expect("object").remove("failed_attempts");
+        assert!(serde_json::from_value::<super::ProviderObservation>(old_observation)
+            .expect("legacy observation").failed_attempts.is_empty());
         assert_eq!(
             serde_json::from_value::<RuntimeAggregate>(wire.clone()).expect("restore"),
             runtime

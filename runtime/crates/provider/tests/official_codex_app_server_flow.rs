@@ -417,7 +417,7 @@ async fn run_commander_target_convergence() {
     );
     let captured = captured_messages(&stale_capture);
     let methods = methods(&captured);
-    assert!(!methods.iter().any(|method| *method == "turn/start"));
+    assert!(!methods.contains(&"turn/start"));
 
     let mismatch_directory = root.path().join("mismatch-session");
     fs::create_dir_all(&mismatch_directory).expect("mismatch session directory");

@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use code_tools::runtime::tool::CancellationToken;
 use code_tools::commands::source_read::{SourceReadPreExecutionRejection, SourceReadRejectionKind};
 use parking_lot::Mutex;
+use runtime_contract::{CapsuleSourceReadBinding, CapsuleSourceReadContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -17,6 +18,12 @@ use std::sync::{
 };
 use tura_path::command_receipts::ReceiptStore;
 use tura_path::jspace::{JSpaceAdmissionCache, JSpaceError, JSpaceMatcher};
+
+fn observation_owner(store: &ReceiptStore, runtime_id: Option<&str>) -> Option<String> {
+    // A caller-bound receipt scope survives model continuations; a runtime ID does not.
+    // Legacy unbound stores retain the narrower runtime-local behavior.
+    store.observation_scope().or(runtime_id).map(str::to_owned)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandRunRequest {
@@ -34,6 +41,8 @@ pub struct CommandRunRequest {
     pub sandbox: bool,
     #[serde(default)]
     pub jspace_contract: Option<Value>,
+    #[serde(default)]
+    pub capsule_source_read_context: Option<CapsuleSourceReadContext>,
 }
 
 #[cfg(test)]
@@ -144,6 +153,17 @@ impl CommandRunService {
             )
             .map_err(|error| anyhow!(error.to_string()))?;
         let source_read_requested = contains_source_read(&request.arguments);
+        let capsule_binding = match capsule_source_binding(&request, jspace_matcher.as_deref()) {
+            Ok(binding) => binding,
+            Err(error) => {
+                return Ok(json!({
+                    "status": "finished", "owner": "router", "session_id": session_id,
+                    "runtime_id": request.runtime_id,
+                    "execution_id": request_id.unwrap_or("command-run-legacy"),
+                    "result": jspace_error_result(error),
+                }));
+            }
+        };
         if jspace_matcher.is_none() && source_read_requested {
             return Ok(json!({
                 "status": "finished",
@@ -180,11 +200,11 @@ impl CommandRunService {
             None
         };
         if let Some(matcher) = jspace_matcher.as_deref()
-            && let Err(error) = validate_jspace_arguments(matcher, &request.arguments)
+            && let Err(error) = validate_jspace_arguments_with_capsule(matcher, &request.arguments, capsule_binding)
         {
             let (error, rejection_kind) = match error {
                 JSpacePreflightError::Policy(error) => (error, None),
-                JSpacePreflightError::SourceReadJson(error, kind) => (error, Some(kind)),
+                JSpacePreflightError::SourceReadArguments(error, kind) => (error, Some(kind)),
             };
             let proof = match rejection_kind {
                 Some(kind) => record_source_read_rejection(&request, request_id, kind, error.to_string())?,
@@ -192,7 +212,11 @@ impl CommandRunService {
             };
             let result = match proof {
                 Some(proof) => json!({"results": [proof.failed_result()]}),
-                None => jspace_error_result(error),
+                None => {
+                    // Best effort: a missing witness only keeps the denial uncertain downstream.
+                    let _ = record_policy_denial(&request, request_id, &error);
+                    jspace_error_result(error)
+                }
             };
             return Ok(json!({
                 "status": "finished",
@@ -202,6 +226,20 @@ impl CommandRunService {
                 "execution_id": request_id.unwrap_or("command-run-legacy"),
                 "result": result,
             }));
+        }
+        let mut source_read_digests = BTreeMap::new();
+        if let Some(matcher) = jspace_matcher.as_deref() {
+            for command in code_tools::command_run::command_run_preflight_commands(&request.arguments)
+                .map_err(|error| anyhow!(error))?
+            {
+                if code_tools::commands::canonical_command(&command.command) != "source_read" { continue; }
+                let parsed = code_tools::commands::source_read::parse_command_line(&command.command_line)
+                    .map_err(|error| anyhow!(error))?;
+                if parsed.uses_admitted_digest() {
+                    source_read_digests.insert(parsed.path().to_owned(),
+                        admitted_source_digest(matcher, capsule_binding, Path::new(parsed.path()))?);
+                }
+            }
         }
         let execution_id = request_id
             .map(str::trim)
@@ -240,6 +278,22 @@ impl CommandRunService {
                 }));
             }
         };
+        let parent_shells = match super::parent_shell::prepare_batch(
+            &arguments,
+            jspace_matcher.as_deref(),
+            &batch_call_ids,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(json!({
+                    "status":"finished", "owner":"router", "session_id":session_id,
+                    "runtime_id":request.runtime_id, "execution_id":execution_id,
+                    "result":jspace_error_result(JSpaceError::new(
+                        "JSPACE_PARENT_SHELL_DENIED", "command", "parent_shell", error,
+                    )),
+                }));
+            }
+        };
         let session_directory = request.session_directory;
         let receipt_store = Arc::new(
             ReceiptStore::open(&session_directory)
@@ -251,6 +305,7 @@ impl CommandRunService {
         #[cfg(test)]
         let worker_call_ids = batch_call_ids.clone();
         let runtime_id = request.runtime_id;
+        let source_observation_owner = observation_owner(&receipt_store, runtime_id.as_deref());
         code_tools::shell_executor::begin_command_run_batch(
             &receipt_store,
             &batch_execution_id,
@@ -273,6 +328,11 @@ impl CommandRunService {
             let worker_cancellation = cancellation.clone();
             let worker = tokio::spawn(async move {
                 let execution = async move {
+                    if let Some(matcher) = jspace_matcher.as_deref()
+                        && let Err(error) = matcher.revalidate_mapped_source_reads()
+                    {
+                        return jspace_error_result(error);
+                    }
                     if let Some(commands) = focused_verifiers {
                         return super::focused_verifier::execute_batch(
                             commands,
@@ -286,9 +346,30 @@ impl CommandRunService {
                         )
                         .await;
                     }
+                    if let Some(commands) = parent_shells {
+                        return super::parent_shell::execute_batch(
+                            commands,
+                            jspace_matcher
+                                .as_deref()
+                                .expect("preflight admitted parent shell"),
+                            &session_directory,
+                            &worker_batch_execution_id,
+                            worker_cancellation,
+                            worker_receipt_store,
+                        )
+                        .await;
+                    }
+                    let mapped_source_reads = jspace_matcher.as_deref().and_then(|matcher| {
+                        (!matcher.mapped_source_reads().is_empty()).then(|| {
+                            (matcher.repo_root().to_path_buf(), matcher.mapped_source_reads().to_vec())
+                        })
+                    });
+                    let patch_readback_paths = jspace_matcher.as_deref().map(|matcher| {
+                        admitted_patch_readback_paths(&arguments, matcher)
+                    }).unwrap_or_default();
                     code_tools::registry::with_command_environment(
                         command_env,
-                        code_tools::command_run::execute_async_value_with_source_read_admission(
+                        code_tools::command_run::execute_async_value_with_source_digest_admission(
                             arguments,
                             session_directory,
                             request.allowed_commands,
@@ -296,7 +377,11 @@ impl CommandRunService {
                             request.sandbox,
                             worker_cancellation,
                             source_read_root,
+                            mapped_source_reads,
                             Some(worker_receipt_store),
+                            patch_readback_paths,
+                            source_read_digests,
+                            source_observation_owner,
                         ),
                     )
                     .await
@@ -496,7 +581,7 @@ impl CommandRunService {
 #[derive(Debug)]
 enum JSpacePreflightError {
     Policy(JSpaceError),
-    SourceReadJson(JSpaceError, SourceReadRejectionKind),
+    SourceReadArguments(JSpaceError, SourceReadRejectionKind),
 }
 
 impl From<JSpaceError> for JSpacePreflightError {
@@ -535,14 +620,112 @@ fn record_source_read_rejection(
     Ok(Some(proof))
 }
 
+/// Publish the router's witness that J-Space refused this one-command request before dispatch.
+/// Native streaming sends each command alone, so the denial covers exactly one call.
+fn record_policy_denial(request: &CommandRunRequest, request_id: Option<&str>, error: &JSpaceError) -> Result<()> {
+    let Some(authorization) = request.jspace_contract.as_ref()
+        .and_then(|contract| contract["authorization_semantic_sha256"].as_str()) else { return Ok(()); };
+    let Some(commands) = request.arguments["commands"].as_array().filter(|commands| commands.len() == 1)
+        else { return Ok(()); };
+    let (Some(session_id), Some(runtime_id)) = (request.session_id.as_deref(), request.runtime_id.as_deref())
+        else { return Ok(()); };
+    let Some(execution_id) = request_id.map(str::trim).filter(|id| !id.is_empty())
+        .or_else(|| request.arguments["execution_id"].as_str().filter(|id| !id.trim().is_empty()))
+        else { return Ok(()); };
+    let mut arguments = request.arguments.clone();
+    arguments.as_object_mut().expect("commands object")
+        .entry("execution_id").or_insert_with(|| json!(execution_id));
+    let Ok((execution_id, call_ids)) = code_tools::command_run::command_run_batch_identity(&arguments)
+        else { return Ok(()); };
+    let [call_id] = call_ids.as_slice() else { return Ok(()); };
+    let Some(denial) = code_tools::command_run::JSpacePolicyDenial::new(session_id, runtime_id, &execution_id,
+        call_id, authorization, &commands[0], error.code(), error.operation(), error.target(), &error.to_string())
+        else { return Ok(()); };
+    let store = ReceiptStore::open(&request.session_directory)
+        .map_err(|error| anyhow!("COMMAND_RUN_RECEIPT_STORE_INVALID:{error}"))?;
+    denial.publish(&store).map_err(|error| anyhow!("JSPACE_POLICY_DENIAL_RECEIPT_INVALID:{error}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn validate_jspace_arguments(
     matcher: &JSpaceMatcher,
     arguments: &Value,
 ) -> Result<(), JSpacePreflightError> {
+    validate_jspace_arguments_with_capsule(matcher, arguments, None)
+}
+
+fn capsule_source_binding<'a>(
+    request: &'a CommandRunRequest,
+    matcher: Option<&JSpaceMatcher>,
+) -> Result<Option<&'a CapsuleSourceReadBinding>, JSpaceError> {
+    let Some(context) = request.capsule_source_read_context.as_ref() else { return Ok(None); };
+    let invalid = || JSpaceError::new(
+        "JSPACE_CAPSULE_SOURCE_BINDING_INVALID", "read", "source_read",
+        "capsule source expectation does not match this runtime and admitted contract",
+    );
+    if context.session_id.trim().is_empty() || context.runtime_id.trim().is_empty()
+        || request.session_id.as_deref() != Some(context.session_id.as_str())
+        || request.runtime_id.as_deref() != Some(context.runtime_id.as_str())
+    {
+        return Err(invalid());
+    }
+    let matcher = matcher.ok_or_else(invalid)?;
+    let contract = request.jspace_contract.as_ref().ok_or_else(invalid)?;
+    context.binding.validate_against(contract, matcher.repo_root()).map_err(|_| invalid())?;
+    Ok(Some(&context.binding))
+}
+
+fn admitted_source_digest(
+    matcher: &JSpaceMatcher,
+    capsule: Option<&CapsuleSourceReadBinding>,
+    relative: &Path,
+) -> Result<String, JSpaceError> {
+    match matcher.admitted_source_read_digest(relative) {
+        Ok(digest) => Ok(digest),
+        Err(error) => {
+            let Some(binding) = capsule else { return Err(error); };
+            let Some(name) = relative.to_str() else { return Err(error); };
+            if !matcher.source_read_enabled() || relative.is_absolute() || name.contains('\\')
+                || relative.components().any(|part| !matches!(part, std::path::Component::Normal(_)))
+                || !matcher.scope_projection().read_scopes.iter().any(|scope| scope == name)
+                || !matcher.scope_projection().write_scopes.is_empty()
+                || matcher.mapped_source_read_binding(relative).is_some()
+            {
+                return Err(error);
+            }
+            let Some(digest) = binding.digest(name) else { return Err(error); };
+            matcher.check_source_read(&matcher.repo_root().join(relative))?;
+            Ok(digest.to_owned())
+        }
+    }
+}
+
+fn validate_jspace_arguments_with_capsule(
+    matcher: &JSpaceMatcher,
+    arguments: &Value,
+    capsule: Option<&CapsuleSourceReadBinding>,
+) -> Result<(), JSpacePreflightError> {
+    matcher.revalidate_mapped_source_reads()?;
     let commands =
         code_tools::command_run::command_run_preflight_commands(arguments).map_err(|error| {
             JSpaceError::new("JSPACE_COMMAND_PAYLOAD_INVALID", "command", "", error)
         })?;
+    if matcher.parent_shell_admitted() {
+        let routed = commands
+            .iter()
+            .filter(|command| matcher.parent_shell_routes(&command.command, &command.command_line))
+            .count();
+        if routed != 0 && routed != commands.len() {
+            return Err(JSpaceError::new(
+                "JSPACE_PARENT_SHELL_BATCH_MIXED",
+                "command",
+                "parent_shell",
+                "shell lines run in the parent process: send them in their own command_run call, \
+                 separate from apply_patch, source_read and template commands",
+            ).into());
+        }
+    }
     for command in commands {
         let command_type = command.command.as_str();
         let command_line = command.command_line.as_str();
@@ -573,10 +756,17 @@ fn validate_jspace_arguments(
                 .map_err(|error| {
                     let policy = JSpaceError::new("JSPACE_SOURCE_READ_INVALID", "read", "source_read", error.to_string());
                     match error.rejection_kind() {
-                        Some(kind) => JSpacePreflightError::SourceReadJson(policy, kind),
+                        Some(kind) => JSpacePreflightError::SourceReadArguments(policy, kind),
                         None => JSpacePreflightError::Policy(policy),
                     }
                 })?;
+            if request.uses_admitted_digest() {
+                admitted_source_digest(matcher, capsule, Path::new(request.path()))?;
+            }
+            if matcher.mapped_source_read_binding(Path::new(request.path())).is_some() {
+                matcher.check_source_read(Path::new(request.path()))?;
+                continue;
+            }
             let target =
                 code_tools::commands::source_read::target_path(matcher.repo_root(), &request)
                     .map_err(|error| {
@@ -591,7 +781,8 @@ fn validate_jspace_arguments(
             continue;
         }
         matcher.check_command(command_type, command_line)?;
-        if canonical_command == "apply_patch" {
+        // An apply_patch entry without text changes nothing and needs no admission.
+        if canonical_command == "apply_patch" && !command_line.trim().is_empty() {
             let changes = code_tools::commands::apply_patch::jspace_changes(command_line)
                 .map_err(|error| JSpaceError::new("JSPACE_PATCH_MALFORMED", "modify", "", error))?;
             for (kind, path, move_path) in changes {
@@ -626,6 +817,35 @@ fn contains_source_read(arguments: &Value) -> bool {
             code_tools::commands::canonical_command(&command.command) == "source_read"
         })
     })
+}
+
+fn admitted_patch_readback_paths(arguments: &Value, matcher: &JSpaceMatcher) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Ok(commands) = code_tools::command_run::command_run_preflight_commands(arguments) else {
+        return paths;
+    };
+    for command in commands {
+        if code_tools::commands::canonical_command(&command.command) != "apply_patch" {
+            continue;
+        }
+        let Ok(changes) = code_tools::commands::apply_patch::jspace_changes(&command.command_line) else {
+            continue;
+        };
+        for (kind, path, moved) in changes {
+            if kind != "update" || moved.is_some() { continue; }
+            let line = json!({"path":path,"start_line":1,"end_line":1}).to_string();
+            let Ok(request) = code_tools::commands::source_read::parse_command_line(&line) else {
+                continue;
+            };
+            let Ok(target) = code_tools::commands::source_read::target_path(matcher.repo_root(), &request) else {
+                continue;
+            };
+            if matcher.check_source_read(&target).is_ok() && !paths.contains(&target) {
+                paths.push(target);
+            }
+        }
+    }
+    paths
 }
 
 fn jspace_error_result(error: JSpaceError) -> Value {
@@ -746,7 +966,7 @@ mod tests {
     use super::{CommandRunRequest, CommandRunService, validate_jspace_arguments};
     use serde_json::{Value, json};
     use std::collections::BTreeSet;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
     use tura_path::jspace::{authorization_semantic_sha256, semantic_sha256};
 
@@ -813,6 +1033,596 @@ mod tests {
         contract
     }
 
+    #[cfg(unix)]
+    fn capsule_digest_fixture() -> (tempfile::TempDir, Value, Value, String) {
+        use runtime_contract::{TaskContextCapsule, CapsuleSourceReadContext,
+            READONLY_SOURCE_OUTLINE_MARKER, READONLY_SOURCE_OUTLINE_NOTICE,
+            task_context_semantic_sha256_v1};
+        use sha2::{Digest, Sha256};
+        let tree = canonical_tempdir();
+        std::fs::create_dir(tree.path().join("src")).unwrap();
+        std::fs::write(tree.path().join("src/one.py"), "value = 1\n").unwrap();
+        std::fs::write(tree.path().join("src/outside.py"), "outside = 2\n").unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"value = 1\n"));
+        let mut contract = jspace_contract(tree.path());
+        contract["source_read"] = json!(true);
+        contract["read_scopes"] = json!(["src/one.py"]);
+        contract["write_scopes"] = json!([]);
+        contract["declared_targets"] = json!([]);
+        contract["allowed_operations"] = json!(["read", "command"]);
+        contract["command_templates"] = json!([]);
+        let contract = reseal_jspace(contract);
+        let outline = json!({"kind":"readonly_source_outline", "notice":READONLY_SOURCE_OUTLINE_NOTICE,
+            "files":[{"path":"src/one.py", "source_sha256":digest, "definitions":[]}]});
+        let mut capsule = json!({"schema_version":"task_context_capsule_v1",
+            "mission":{"mission_id":"capsule-source", "mode":"RESEARCH", "objective":"read",
+                "current_predicate":"source preimage"},
+            "context_summary":format!("Bounded source{READONLY_SOURCE_OUTLINE_MARKER}{outline}"),
+            "dcf_generation":contract["dcf_generation"], "surface":{"repo_root":tree.path()},
+            "authority":{}, "evidence_refs":[], "focused_verifiers":[],
+            "jspace_semantic_sha256":contract["authorization_semantic_sha256"]});
+        capsule["semantic_sha256"] = json!(task_context_semantic_sha256_v1(&capsule).unwrap());
+        let capsule = TaskContextCapsule::from_value(capsule).unwrap();
+        let binding = capsule.readonly_source_read_binding(&contract, tree.path()).unwrap().unwrap();
+        let context = serde_json::to_value(CapsuleSourceReadContext {
+            session_id:"capsule-session".into(), runtime_id:"capsule-runtime".into(), binding,
+        }).unwrap();
+        (tree, contract, context, digest)
+    }
+
+    #[cfg(unix)]
+    fn capsule_digest_input(root: &Path, contract: &Value, context: &Value, selector: Value, id: &str) -> Value {
+        json!({"session_id":"capsule-session", "runtime_id":"capsule-runtime",
+            "session_directory":root, "jspace_contract":contract, "capsule_source_read_context":context,
+            "allowed_commands":["source_read"], "arguments":{"execution_id":id, "commands":[{
+                "command_type":"source_read", "command_line":selector.to_string()}]}})
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn capsule_source_digest_first_read_matches_literal_and_rejects_stale_buffer() {
+        let (tree, contract, context, digest) = capsule_digest_fixture();
+        let service = CommandRunService::new();
+        let reference = json!({"path":"src/one.py", "start_line":1, "end_line":1,
+            "expected_sha256_ref":"admitted"});
+        let first = service.execute(capsule_digest_input(tree.path(), &contract, &context,
+            reference.clone(), "capsule-first")).await.unwrap();
+        let literal = service.execute(capsule_digest_input(tree.path(), &contract, &context,
+            json!({"path":"src/one.py", "start_line":1,"end_line":1,"expected_sha256":digest}),
+            "capsule-literal")).await.unwrap();
+        assert_eq!(first["result"]["results"][0]["success"], true, "{first}");
+        assert_eq!(first["result"]["results"][0]["output"]["stdout"], "1: value = 1\n");
+        assert_eq!(first["result"]["results"][0]["output"]["source_sha256"], digest);
+        assert_eq!(first["result"]["results"][0]["output"]["stdout"], literal["result"]["results"][0]["output"]["stdout"]);
+        std::fs::write(tree.path().join("src/one.py"), "changed = 3\n").unwrap();
+        let stale = service.execute(capsule_digest_input(tree.path(), &contract, &context,
+            reference, "capsule-stale")).await.unwrap();
+        assert_eq!(stale["result"]["results"][0]["success"], false, "{stale}");
+        assert!(stale.to_string().contains("SOURCE_READ_SHA256_MISMATCH"), "{stale}");
+        assert_eq!(stale["result"]["results"][0]["output"]["stdout"], "");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn capsule_source_digest_never_repins_wrong_literal_or_accepts_model_context() {
+        let (tree, contract, context, _) = capsule_digest_fixture();
+        let service = CommandRunService::new();
+        for length in [64, 67] {
+            let response = service.execute(capsule_digest_input(tree.path(), &contract, &context,
+                json!({"path":"src/one.py", "start_line":1,"end_line":1,"expected_sha256":"a".repeat(length)}),
+                &format!("capsule-wrong-{length}"))).await.unwrap();
+            assert_ne!(response["result"]["results"][0]["success"], true, "{response}");
+            assert!(!response.to_string().contains("1: value = 1"), "{response}");
+        }
+        let mut model_context = capsule_digest_input(tree.path(), &contract, &Value::Null,
+            json!({"path":"src/one.py", "start_line":1,"end_line":1,"expected_sha256_ref":"admitted"}),
+            "capsule-model-spoof");
+        model_context["arguments"]["capsule_source_read_context"] = context;
+        let denied = service.execute(model_context).await.unwrap();
+        assert!(denied.to_string().contains("JSPACE_SOURCE_DIGEST_REFERENCE_UNAVAILABLE"), "{denied}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn capsule_source_digest_rejects_foreign_changed_writable_mapped_and_outside_contexts() {
+        let (tree, contract, context, _) = capsule_digest_fixture();
+        let selector = json!({"path":"src/one.py", "start_line":1,"end_line":1,"expected_sha256_ref":"admitted"});
+        for case in 0..7 {
+            let mut changed = contract.clone();
+            let mut foreign = context.clone();
+            let mut selector = selector.clone();
+            match case {
+                0 => foreign["session_id"] = json!("foreign-session"),
+                1 => foreign["runtime_id"] = json!("foreign-runtime"),
+                2 => foreign["binding"]["repo_root"] = json!("/foreign"),
+                3 => changed["write_scopes"] = json!(["src/one.py"]),
+                4 => changed["read_scopes"] = json!(["src/outside.py"]),
+                5 => changed["mapped_source_reads"] = json!([{}]),
+                _ => selector["path"] = json!("src/outside.py"),
+            }
+            if changed != contract && case != 5 { changed = reseal_jspace(changed); }
+            let response = CommandRunService::new().execute(capsule_digest_input(tree.path(), &changed,
+                &foreign, selector, &format!("capsule-denied-{case}"))).await;
+            match response {
+                Ok(response) => {
+                    assert_ne!(response["result"]["results"][0]["success"], true, "case {case}: {response}");
+                    assert!(!response.to_string().contains("1: value = 1"), "case {case}: {response}");
+                }
+                Err(error) => assert!(error.to_string().contains("JSPACE_"), "case {case}: {error}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn admitted_digest_fixture() -> (tempfile::TempDir, tempfile::TempDir, Value) {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        let tree = canonical_tempdir();
+        let artifacts = canonical_tempdir();
+        let root = tree.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "before\n").unwrap();
+        std::fs::write(root.join("src/edit.rs"), "before\n").unwrap();
+        let binary = root.join("runner");
+        std::fs::write(&binary, [0xfe, 0xed, 0xfa, 0xcf, 1, 2, 3, 4]).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut contract = jspace_contract(root);
+        contract["read_scopes"] = json!(["src/main.rs"]);
+        contract["write_scopes"] = json!(["src/edit.rs"]);
+        contract["declared_targets"] = json!(["src/edit.rs"]);
+        contract["command_templates"] = json!([]);
+        contract["source_read"] = json!(true);
+        contract["verifier_artifact_root"] = json!(artifacts.path());
+        contract["verifier_commands"] = json!([{
+            "argv":[binary,root.join("src/main.rs")],
+            "executable_sha256":format!("{:x}",Sha256::digest(std::fs::read(&binary).unwrap())),
+            "pinned_files":[{"path":root.join("src/main.rs"),
+                "sha256":format!("{:x}",Sha256::digest(b"before\n"))}],
+            "timeout_seconds":30,"scratch_root":artifacts.path().join("scratch"),"network":false
+        }]);
+        (tree, artifacts, reseal_jspace(contract))
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn observed_digest_survives_model_runtime_rollover_only_in_same_bound_store() {
+        use code_tools::runtime::tool::{ToolContext, ToolCall, ToolPayload, ToolHandler};
+        use code_tools::commands::source_read::{SourceReadHandler, open_admitted_root};
+        use tura_path::command_receipts::{ReceiptBinding, ReceiptStore};
+        use std::sync::Arc;
+        let workspace = canonical_tempdir();
+        let state = canonical_tempdir();
+        let foreign_state = canonical_tempdir();
+        std::fs::write(workspace.path().join("file"), "unchanged\n").unwrap();
+        let binding = ReceiptBinding::new(state.path(), workspace.path());
+        let first = ReceiptStore::open_bound(workspace.path(), Some(&binding)).unwrap();
+        let reopened = ReceiptStore::open_existing_bound(workspace.path(), Some(&binding)).unwrap();
+        let foreign_binding = ReceiptBinding::new(foreign_state.path(), workspace.path());
+        let foreign = ReceiptStore::open_bound(workspace.path(), Some(&foreign_binding)).unwrap();
+        let owner_a = super::observation_owner(&first, Some("runtime-round-one")).unwrap();
+        let owner_b = super::observation_owner(&reopened, Some("runtime-round-two")).unwrap();
+        assert_eq!(owner_a, owner_b);
+        assert_ne!(owner_a, super::observation_owner(&foreign, Some("runtime-round-one")).unwrap());
+        let context = |store: ReceiptStore, runtime: &str| {
+            let owner = super::observation_owner(&store, Some(runtime));
+            ToolContext::new(workspace.path().to_path_buf())
+                .with_receipt_store(Some(Arc::new(store)))
+                .with_source_read_root(Some(Arc::new(open_admitted_root(workspace.path()).unwrap())))
+                .with_source_observation_owner(owner)
+        };
+        let call = |reference: bool| {
+            let mut arguments = json!({"path":"file", "start_line":1, "end_line":1});
+            if reference { arguments["expected_sha256_ref"] = json!("observed"); }
+            ToolCall {tool_name:"source_read".to_owned(), call_id:"read".to_owned(),
+                payload:ToolPayload::Function {arguments}}
+        };
+        assert_eq!(SourceReadHandler.handle(call(false), context(first, "runtime-round-one")).await.unwrap().success, Some(true));
+        assert_eq!(SourceReadHandler.handle(call(true), context(reopened, "runtime-round-two")).await.unwrap().success, Some(true));
+        assert!(SourceReadHandler.handle(call(true), context(foreign, "runtime-round-two")).await.is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[ignore = "requires TURA_SCOPED_TEST_RG naming the rg executable to pin"]
+    async fn discovery_multi_pattern_rg_executes_literal_or_and_denies_outside_paths() {
+        use sha2::{Digest, Sha256};
+        let tree = canonical_tempdir();
+        let root = tree.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/file"), "compile_local_context\nverify_local_context\nsource_sections\na.b\naxb\nx|y\nx\ny\n--hidden\n").unwrap();
+        std::fs::write(root.join("outside"), "OUTSIDE_SECRET\n").unwrap();
+        let rg = PathBuf::from(std::env::var_os("TURA_SCOPED_TEST_RG").expect("pinned rg path"))
+            .canonicalize().unwrap();
+        let cat = PathBuf::from("/bin/cat").canonicalize().unwrap();
+        let pin = |path: &Path| json!({"path":path,
+            "sha256":format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))});
+        let mut contract = jspace_contract(root);
+        contract["read_commands"] = json!({"roots":["src"], "cat":pin(&cat), "rg":pin(&rg)});
+        contract["read_scopes"] = json!(["src/**", "outside"]);
+        contract["write_scopes"] = json!([]);
+        contract["declared_targets"] = json!([]);
+        contract["allowed_operations"] = json!(["read", "command"]);
+        contract["command_templates"] = json!([]);
+        let contract = reseal_jspace(contract);
+        let prefix = format!("'{}' --no-config --max-filesize=1M -n -F", rg.to_string_lossy().replace('\'', "'\\''"));
+        let service = CommandRunService::new();
+        for (id, suffix, expected) in [
+            ("three-patterns", "-e 'compile_local_context' -e 'verify_local_context' -e 'source_sections' -- src/file", "1:compile_local_context\n2:verify_local_context\n3:source_sections\n"),
+            ("literal-patterns", "-e 'a.b' --regexp 'x|y' -e '--hidden' -- src/file", "4:a.b\n6:x|y\n9:--hidden\n"),
+        ] {
+            let response = service.execute(json!({"session_id":"rg-patterns", "runtime_id":"rg-worker",
+                "session_directory":root, "jspace_contract":contract, "allowed_commands":["bash"],
+                "arguments":{"execution_id":id, "commands":[{
+                    "command_type":"bash", "command_line":format!("{prefix} {suffix}")}]}})).await.unwrap();
+            let result = &response["result"]["results"][0];
+            assert_eq!(result["success"], true, "{response}");
+            assert_eq!(result["output"]["stdout"], expected, "{response}");
+            assert_eq!(result["output"]["terminal_receipt"]["exit_code"], 0, "{response}");
+        }
+        let denied = service.execute(json!({"session_id":"rg-patterns", "runtime_id":"rg-worker",
+            "session_directory":root, "jspace_contract":contract, "allowed_commands":["bash"],
+            "arguments":{"execution_id":"outside-patterns", "commands":[{
+                "command_type":"bash", "command_line":format!("{prefix} -e OUTSIDE_SECRET -- outside src")}]}})).await.unwrap();
+        let result = &denied["result"]["results"][0];
+        assert_eq!(result["success"], false, "{denied}");
+        assert_eq!(result["jspace_error_code"], "JSPACE_READ_COMMAND_DENIED", "{denied}");
+        assert_eq!(result["effect_state"], "not_started", "{denied}");
+        assert!(result.get("output").is_none(), "{denied}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn dcf_discovery_range_read_executes_pages_and_rejects_stale_or_outside_content() {
+        use sha2::{Digest, Sha256};
+        let tree = canonical_tempdir();
+        let root = tree.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/file"), "first\nsecond\nthird\n").unwrap();
+        std::fs::write(root.join("outside"), "outside\n").unwrap();
+        let pin = |name: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, name).unwrap();
+            json!({"path":path, "sha256":format!("{:x}", Sha256::digest(name.as_bytes()))})
+        };
+        let mut contract = jspace_contract(root);
+        contract["read_commands"] = json!({"roots":["src"], "cat":pin("cat"), "rg":pin("rg")});
+        contract["read_scopes"] = json!(["src/**", "outside"]);
+        contract["write_scopes"] = json!([]);
+        contract["declared_targets"] = json!([]);
+        contract["allowed_operations"] = json!(["read", "command"]);
+        contract["command_templates"] = json!([]);
+        let contract = reseal_jspace(contract);
+        assert!(contract.get("source_read").is_none());
+        let service = CommandRunService::new();
+        let mut input = json!({"session_id":"dcf-discovery-range", "runtime_id":"range-worker",
+            "session_directory":root, "jspace_contract":contract,
+            "allowed_commands":["source_read"], "arguments":{"execution_id":"range-first", "commands":[{
+                "command_type":"source_read", "command_line":json!(["src/file",1,1]).to_string()}]}});
+        let first = service.execute(input.clone()).await.unwrap();
+        assert_eq!(first["result"]["results"][0]["success"], true, "{first}");
+        let output = &first["result"]["results"][0]["output"];
+        assert_eq!(output["stdout"], "1: first\n");
+        let digest = output["source_sha256"].as_str().unwrap();
+        input["arguments"]["execution_id"] = json!("range-second");
+        input["arguments"]["commands"][0]["command_line"] = json!(json!(["src/file",2,3,digest]).to_string());
+        let second = service.execute(input.clone()).await.unwrap();
+        assert_eq!(second["result"]["results"][0]["success"], true, "{second}");
+        assert_eq!(second["result"]["results"][0]["output"]["stdout"], "2: second\n3: third\n");
+        std::fs::write(root.join("src/file"), "changed\n").unwrap();
+        input["arguments"]["execution_id"] = json!("range-stale");
+        let stale = service.execute(input.clone()).await.unwrap();
+        assert_ne!(stale["result"]["results"][0]["success"], true, "{stale}");
+        assert!(!stale.to_string().contains("1: changed"));
+        input["arguments"]["execution_id"] = json!("range-outside");
+        input["arguments"]["commands"][0]["command_line"] = json!(json!(["outside",1,1]).to_string());
+        let outside = service.execute(input).await.unwrap();
+        assert_ne!(outside["result"]["results"][0]["success"], true, "{outside}");
+        assert!(outside.to_string().contains("JSPACE_"), "{outside}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn observed_digest_router_works_without_verifiers_and_keeps_read_scope() {
+        let (tree, _artifacts, mut contract) = admitted_digest_fixture();
+        contract["write_scopes"] = json!([]);
+        contract["declared_targets"] = json!([]);
+        contract.as_object_mut().unwrap().remove("verifier_commands");
+        contract.as_object_mut().unwrap().remove("verifier_artifact_root");
+        contract = reseal_jspace(contract);
+        let service = CommandRunService::new();
+        let selector = json!({"path":"src/main.rs", "start_line":1, "end_line":1});
+        let mut input = json!({"session_id":"shared-session-label", "runtime_id":"observed-worker-a",
+            "session_directory":tree.path(), "jspace_contract":contract,
+            "allowed_commands":["source_read"], "arguments":{"execution_id":"observe-first", "commands":[{
+                "command_type":"source_read", "command_line":selector.to_string()}]}});
+        let first = service.execute(input.clone()).await.unwrap();
+        assert_eq!(first["result"]["results"][0]["success"], true, "{first}");
+        let mut reference = selector;
+        reference["expected_sha256_ref"] = json!("observed");
+        input["arguments"]["commands"][0]["command_line"] = json!(reference.to_string());
+        input["arguments"]["execution_id"] = json!("observe-reference");
+        let second = service.execute(input.clone()).await.unwrap();
+        assert_eq!(second["result"]["results"][0]["success"], true, "{second}");
+        assert_eq!(second["result"]["results"][0]["output"]["stdout"], "1: before\n");
+        assert_eq!(second["result"]["results"][0]["output"]["observed_digest_reference"]["request"], reference);
+        input["runtime_id"] = json!("observed-worker-b");
+        input["arguments"]["execution_id"] = json!("observe-foreign");
+        let foreign = service.execute(input.clone()).await.unwrap();
+        assert!(foreign.to_string().contains("SOURCE_READ_DIGEST_REFERENCE_UNAVAILABLE"), "{foreign}");
+        input["runtime_id"] = json!("observed-worker-a");
+        reference["path"] = json!("src/edit.rs");
+        input["arguments"]["execution_id"] = json!("observe-outside-scope");
+        input["arguments"]["commands"][0]["command_line"] = json!(reference.to_string());
+        let denied = service.execute(input).await.unwrap();
+        assert_eq!(denied["result"]["results"][0]["success"], false, "{denied}");
+        assert!(denied.to_string().contains("JSPACE_"), "{denied}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn admitted_digest_router_preserves_identity_and_rejects_stale_content() {
+        let (tree, _artifacts, contract) = admitted_digest_fixture();
+        let service = CommandRunService::new();
+        let selector = json!({"path":"src/main.rs","start_line":1,"end_line":1,
+            "expected_sha256_ref":"admitted"});
+        let command = json!({"command_type":"source_read","command_line":selector.to_string()});
+        let mut input = json!({"session_id":"admitted-digest-router","session_directory":tree.path(),
+            "jspace_contract":contract,"allowed_commands":["source_read"],
+            "arguments":{"commands":[command]}});
+        let response = service.execute(input.clone()).await.unwrap();
+        let result = &response["result"]["results"][0];
+        assert_eq!(result["success"], true, "{response}");
+        assert_eq!(result["output"]["stdout"], "1: before\n");
+        assert_eq!(result["output"]["admitted_digest_reference"]["request"], selector);
+        assert!(result["output"].get("source_read_evidence").is_none());
+        assert_eq!(result["output"]["terminal_receipt"]["terminal_state"], "completed");
+        let receipt_path = result["output"]["terminal_receipt_path"].as_str().unwrap();
+        let durable: Value = serde_json::from_slice(&std::fs::read(receipt_path).unwrap()).unwrap();
+        assert_eq!(durable, result["output"]["terminal_receipt"]);
+        // Cached admission must not bypass comparison with the actual read buffer.
+        std::fs::write(tree.path().join("src/main.rs"), "changed\n").unwrap();
+        input["arguments"]["execution_id"] = json!("admitted-digest-stale-read");
+        let stale = service.execute(input).await.unwrap();
+        assert_eq!(stale["result"]["results"][0]["success"], false, "{stale}");
+        assert!(stale.to_string().contains("SOURCE_READ_SHA256_MISMATCH"), "{stale}");
+        assert_eq!(stale["result"]["results"][0]["output"]["stdout"], "");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[ignore = "requires the hash-bound recorded benchmark source; no provider calls"]
+    async fn admitted_digest_recorded_selector_matches_literal_read() {
+        use sha2::{Digest, Sha256};
+        let source = std::env::var_os("NOKIY_DIGEST_REPLAY_SOURCE").expect("recorded source path");
+        let content = std::fs::read(source).unwrap();
+        let expected = "c9c59f4e8ff0b06a8bc38756fc0ba3c4021b75308d9e030f7bf501c1de35504d";
+        assert_eq!(format!("{:x}", Sha256::digest(&content)), expected);
+        let (tree, _artifacts, mut contract) = admitted_digest_fixture();
+        let path = "scripts/r19/compare_full1127_guarded_selector.py";
+        std::fs::create_dir_all(tree.path().join("scripts/r19")).unwrap();
+        let target = tree.path().join(path);
+        std::fs::write(&target, &content).unwrap();
+        contract["read_scopes"] = json!([path]);
+        contract["verifier_commands"][0]["argv"][1] = json!(target);
+        contract["verifier_commands"][0]["pinned_files"][0] =
+            json!({"path":target,"sha256":expected});
+        let contract = reseal_jspace(contract);
+        let mut selector = json!({"path":path,"start_line":265,"end_line":295,
+            "expected_sha256":"c9c59f4e8ff0b06a8bc38756fc0ba3c4021b75308d9e030f7d9b36baacff"});
+        let service = CommandRunService::new();
+        let mut outputs = Vec::new();
+        for mode in ["recorded-invalid", "literal", "admitted"] {
+            if mode == "literal" { selector["expected_sha256"] = json!(expected); }
+            if mode == "admitted" {
+                selector.as_object_mut().unwrap().remove("expected_sha256");
+                selector["expected_sha256_ref"] = json!("admitted");
+            }
+            let response = service.execute(json!({
+                "session_id":"recorded-digest-replay","session_directory":tree.path(),
+                "jspace_contract":contract,"allowed_commands":["source_read"],
+                "arguments":{"execution_id":mode,"commands":[{
+                    "command_type":"source_read","command_line":selector.to_string()
+                }]}
+            })).await.unwrap();
+            let result = &response["result"]["results"][0];
+            if mode == "recorded-invalid" {
+                assert_eq!(result["success"], false, "{response}");
+                assert!(response.to_string().contains("SOURCE_READ_SHA256_INVALID"));
+                continue;
+            }
+            assert_eq!(result["success"], true, "{response}");
+            assert_eq!(result["output"]["source_sha256"], expected);
+            assert_eq!(result["output"]["start_line"], 265);
+            assert_eq!(result["output"]["end_line"], 295);
+            assert_eq!(result["output"]["truncated"], false);
+            outputs.push(result["output"]["stdout"].clone());
+        }
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[0].as_str().unwrap().lines().count(), 31);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn admitted_digest_router_preflight_rejects_before_any_batch_mutation() {
+        let (tree, _artifacts, contract) = admitted_digest_fixture();
+        let patch = json!({"command_type":"apply_patch","command_line":
+            "*** Begin Patch\n*** Update File: src/edit.rs\n@@\n-before\n+changed\n*** End Patch"});
+        for selector in [
+            json!({"path":"src/edit.rs","start_line":1,"end_line":1,"expected_sha256_ref":"admitted"}),
+            json!({"path":"src/missing.rs","start_line":1,"end_line":1,"expected_sha256_ref":"admitted"}),
+            json!({"path":"src/main.rs","start_line":1,"end_line":1,"expected_sha256":"short"}),
+            json!({"path":"src/main.rs","start_line":1,"end_line":1,"expected_sha256_ref":"latest"}),
+        ] {
+            let response = CommandRunService::new().execute(json!({
+                "session_id":"admitted-digest-denied","session_directory":tree.path(),
+                "jspace_contract":contract,"allowed_commands":["apply_patch","source_read"],
+                "arguments":{"commands":[patch,{"command_type":"source_read","command_line":selector.to_string()}]}
+            })).await.unwrap();
+            assert_eq!(response["result"]["results"][0]["success"], false, "{response}");
+            assert_eq!(std::fs::read_to_string(tree.path().join("src/edit.rs")).unwrap(), "before\n");
+        }
+    }
+
+    #[tokio::test]
+    async fn applied_source_delta_obeys_jspace_read_grant_and_receipt() {
+        for mode in ["exact", "no_source_read", "no_read", "other_path", "wildcard", "no_command"] {
+            let workspace = canonical_tempdir();
+            let source = workspace.path().join("src/main.rs");
+            std::fs::create_dir(workspace.path().join("src")).unwrap();
+            std::fs::write(&source, "old\n").unwrap();
+            let mut contract = jspace_contract(workspace.path());
+            if mode != "no_source_read" {
+                contract["source_read"] = json!(true);
+            }
+            if mode != "no_source_read" {
+                contract["command_templates"] = json!([]);
+            }
+            contract["read_scopes"] = match mode {
+                "other_path" => json!(["src/other.rs"]),
+                "wildcard" => json!(["src/**", "src/other.rs"]),
+                _ => json!(["src/main.rs"]),
+            };
+            if mode == "no_read" { contract["allowed_operations"] = json!(["modify","command"]); }
+            if mode == "no_command" { contract["allowed_operations"] = json!(["read", "modify"]); }
+            let service = CommandRunService::new();
+            let response = service.execute(json!({
+                "session_id":format!("patch-delta-{mode}"), "runtime_id":"delta-test",
+                "session_directory":workspace.path(), "jspace_contract":reseal_jspace(contract),
+                "arguments":{"commands":[{"command":"apply_patch", "command_line":
+                    "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch"}]}
+            })).await;
+            if matches!(mode, "no_read" | "no_command") {
+                let error = response.unwrap_err().to_string();
+                assert!(error.contains("JSPACE_SOURCE_READ_DENIED"), "{mode}: {error}");
+                assert_eq!(std::fs::read_to_string(&source).unwrap(), "old\n");
+                continue;
+            }
+            let response = response.unwrap();
+            let result = &response["result"]["results"][0];
+            assert_eq!(result["success"], true, "{mode}: {response}");
+            let output = &result["output"];
+            assert!(output["terminal_receipt"].is_object(), "{response}");
+            assert_eq!(output["changes"][0].get("source_delta").is_some(), mode == "exact", "{mode}: {response}");
+            assert_eq!(std::fs::read_to_string(source).unwrap(), "new\n");
+        }
+    }
+
+    #[cfg(unix)]
+    fn mapped_jspace_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Value) {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::symlink;
+        use tura_path::mapped_source_read::MappedSourceReadBinding;
+        let tree = canonical_tempdir();
+        let repo = tree.path().join("repo");
+        let physical = tree.path().join("external/dcf/v2");
+        std::fs::create_dir_all(repo.join("config/contracts")).expect("contract directory");
+        std::fs::create_dir_all(repo.join("output")).expect("logical parent");
+        std::fs::create_dir_all(repo.join("src")).expect("source directory");
+        std::fs::create_dir_all(&physical).expect("physical root");
+        std::fs::write(repo.join("src/main.rs"), "before\n").expect("patch target");
+        std::fs::write(physical.join("current.json"), "{\"generation\":1}\n").expect("pointer");
+        std::fs::write(physical.join("other.json"), "not admitted\n").expect("other pointer");
+        symlink(physical.parent().unwrap(), repo.join("output/dcf_runtime")).expect("alias");
+        let logical = "output/dcf_runtime/v2/current.json";
+        let bytes = serde_json::to_vec(&json!({
+            "schema_version":"dcf_v2_contract_v1", "status":"active",
+            "authority_effect":"none", "no_apply":true,
+            "runtime":{"namespace":"output/dcf_runtime/v2", "current_pointer":logical},
+            "two_tier_storage_cutover":{
+                "logical_runtime_namespace":"output/dcf_runtime/v2",
+                "target_physical_runtime_root":physical,
+            }
+        })).expect("DCF contract");
+        std::fs::write(repo.join("config/contracts/dcf_v2_contract.json"), &bytes).expect("contract");
+        let binding = MappedSourceReadBinding::derive(
+            &repo, &bytes, &format!("{:x}", Sha256::digest(&bytes)), logical,
+        ).expect("binding");
+        let mut contract = jspace_contract(&repo);
+        contract["read_scopes"] = json!([logical]);
+        contract["write_scopes"] = json!(["src/main.rs", logical]);
+        contract["declared_targets"] = json!(["src/main.rs", logical]);
+        contract["command_templates"] = json!([]);
+        contract["source_read"] = json!(true);
+        contract["mapped_source_reads"] = json!([binding]);
+        (tree, repo, physical, reseal_jspace(contract))
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn mapped_source_read_router_bridge_preserves_logical_output_and_terminal_receipt() {
+        let (_tree, repo, physical, contract) = mapped_jspace_fixture();
+        let logical = "output/dcf_runtime/v2/current.json";
+        let response = CommandRunService::new().execute(json!({
+            "session_id":"mapped-router", "runtime_id":"mapped-test",
+            "session_directory":repo, "jspace_contract":contract,
+            "allowed_commands":["source_read"],
+            "arguments":{"commands":[{
+                "command_type":"source_read",
+                "command_line":json!({"path":logical,"start_line":1,"end_line":1}).to_string()
+            }]}
+        })).await.expect("mapped router response");
+        let result = &response["result"]["results"][0];
+        assert_eq!(result["success"], true, "{response}");
+        assert_eq!(result["output"]["stdout"], "1: {\"generation\":1}\n");
+        assert_eq!(result["output"]["path"], logical);
+        assert_eq!(result["output"]["terminal_receipt"]["terminal_state"], "completed");
+        assert_eq!(result["output"]["terminal_receipt"]["authority_effect"], "none");
+        let receipt = result["output"]["terminal_receipt_path"].as_str().expect("receipt path");
+        let durable: Value = serde_json::from_slice(&std::fs::read(receipt).expect("receipt bytes")).expect("receipt JSON");
+        assert_eq!(durable, result["output"]["terminal_receipt"]);
+        assert_eq!(std::fs::read_to_string(physical.join("current.json")).unwrap(), "{\"generation\":1}\n");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn mapped_source_read_router_keeps_full_batch_preflight_and_workdir_denials() {
+        let (_tree, repo, physical, contract) = mapped_jspace_fixture();
+        let logical = "output/dcf_runtime/v2/current.json";
+        let patch = json!({"command_type":"apply_patch", "command_line":
+            "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-before\n+changed\n*** End Patch"});
+        let physical_target = physical.join("current.json").to_string_lossy().into_owned();
+        for (scenario, command) in [
+            ("workdir", json!({"command_type":"source_read", "workdir":"src", "command_line":
+                json!({"path":logical,"start_line":1,"end_line":1}).to_string()})),
+            ("sibling", json!({"command_type":"source_read", "command_line":
+                json!({"path":"output/dcf_runtime/v2/other.json","start_line":1,"end_line":1}).to_string()})),
+            ("physical", json!({"command_type":"source_read", "command_line":
+                json!({"path":physical_target,"start_line":1,"end_line":1}).to_string()})),
+            ("alias", json!({"command_type":"source_read", "command_line":
+                json!({"path":"output/./dcf_runtime/v2/current.json","start_line":1,"end_line":1}).to_string()})),
+            ("cat", json!({"command_type":"bash", "command_line":"cat output/dcf_runtime/v2/current.json"})),
+            ("write", json!({"command_type":"apply_patch", "command_line":
+                "*** Begin Patch\n*** Update File: output/dcf_runtime/v2/current.json\n@@\n-{\"generation\":1}\n+changed\n*** End Patch"})),
+        ] {
+            let response = CommandRunService::new().execute(json!({
+                "session_id":format!("mapped-deny-{scenario}"), "session_directory":repo,
+                "jspace_contract":contract, "allowed_commands":["apply_patch","source_read","bash"],
+                "arguments":{"commands":[patch,command]}
+            })).await.expect("router denial");
+            assert_eq!(response["result"]["results"][0]["success"], false, "{scenario}: {response}");
+            assert_eq!(std::fs::read_to_string(repo.join("src/main.rs")).unwrap(), "before\n", "{scenario}");
+            assert_eq!(std::fs::read_to_string(physical.join("current.json")).unwrap(), "{\"generation\":1}\n", "{scenario}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mapped_source_read_router_does_not_use_unadmitted_arguments_or_stale_bindings() {
+        let (_tree, repo, _physical, contract) = mapped_jspace_fixture();
+        let arguments = json!({"commands":[{"command_type":"source_read", "command_line":
+            json!({"path":"output/dcf_runtime/v2/current.json","start_line":1,"end_line":1}).to_string()}],
+            "mapped_source_reads":contract["mapped_source_reads"]});
+        let matcher = tura_path::jspace::JSpaceMatcher::from_value(&repo, &contract).expect("admission");
+        validate_jspace_arguments(&matcher, &arguments).expect("mapped preflight");
+        let mut ordinary = contract.clone();
+        ordinary.as_object_mut().unwrap().remove("mapped_source_reads");
+        let ordinary = tura_path::jspace::JSpaceMatcher::from_value(&repo, &reseal_jspace(ordinary)).expect("ordinary admission");
+        assert!(validate_jspace_arguments(&ordinary, &arguments).is_err());
+        std::fs::write(repo.join("config/contracts/dcf_v2_contract.json"), "{}\n").expect("contract change");
+        assert!(validate_jspace_arguments(&matcher, &arguments).is_err());
+    }
+
     #[test]
     fn prepared_source_read_contract_passes_router_preflight_without_execution() {
         let Some(workspace) = std::env::var_os("TURA_SCOPED_TEST_WORKSPACE") else {
@@ -853,6 +1663,7 @@ mod tests {
         for (index, line) in [
             r#"{"path":"src/main.rs","start_line":1,"end_line":ninety}"#,
             r#"{"path":"src/main.rs","start_line":1,"end_line":"ninety"}"#,
+            r#"{"path":"src/main.rs","start_line":1,"end_line":1,"expected_sha256":"5c7d6faa308bb6125375d6b1b06a0106d5e09fd22b182d51a6bf1c6af1c6af1c6af5321124"}"#,
         ].into_iter().enumerate() {
             let command = json!({"command_type":"source_read", "command":"source_read", "command_line":line, "step":1});
             let response = service.execute_with_request_id(json!({
@@ -865,6 +1676,8 @@ mod tests {
             assert_eq!(result["command_type"], "source_read");
             assert_eq!(result["jspace_error_code"], "JSPACE_SOURCE_READ_INVALID");
             let evidence = &result["output"]["pre_execution_rejection"];
+            assert_eq!(evidence["rejection_kind"],
+                if index == 2 { "invalid_expected_sha256" } else { "json_syntax_or_shape" });
             assert_eq!(evidence["effect_state"], "not_started");
             assert_eq!(evidence["process_started"], false);
             assert_eq!(evidence["source_content_read"], false);
@@ -890,14 +1703,66 @@ mod tests {
         }), Some("corrected-read")).await.expect("corrected read");
         let corrected = &corrected["result"]["results"][0];
         assert_eq!(corrected["success"], true);
-        assert_eq!(corrected["output"]["stdout"], "answer\n");
+        assert_eq!(corrected["output"]["stdout"], "1: answer\n");
         assert!(corrected["output"].get("pre_execution_rejection").is_none());
     }
 
     #[tokio::test]
     #[cfg(unix)]
     async fn policy_path_stale_and_mixed_failures_never_get_recovery_evidence() {
-        for scenario in 0..10 {
+        // (existing scenarios below)
+        policy_path_scenarios().await;
+    }
+
+    // Real tasks 2026-10-23..25: inspect workers' apply_patch, rg and payload refusals ended
+    // "blocked" because nothing durable showed the refused command never ran.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn jspace_policy_denial_leaves_a_durable_non_execution_witness() {
+        use code_tools::command_run::JSpacePolicyDenial;
+        let workspace = canonical_tempdir();
+        std::fs::create_dir(workspace.path().join("src")).expect("source directory");
+        std::fs::write(workspace.path().join("src/main.rs"), "answer\n").expect("source");
+        let contract = reseal_jspace(jspace_contract(workspace.path()));
+        let authorization = contract["authorization_semantic_sha256"].as_str().unwrap().to_owned();
+        let command = json!({"command_type": "apply_patch", "step": 1,
+            "command_line": "*** Begin Patch\n*** Delete File: src/main.rs\n*** End Patch\n"});
+        let response = CommandRunService::new().execute_with_request_id(json!({
+            "session_id": "denied-session", "runtime_id": "denied-runtime",
+            "session_directory": workspace.path(), "jspace_contract": contract,
+            "arguments": {"commands": [command.clone()]},
+        }), Some("denied-call")).await.expect("denial response");
+        let mut result = response["result"]["results"][0].clone();
+        assert_eq!(result["command_type"], "jspace", "{result}");
+        assert_eq!(result["delivery_state"], "deterministic_policy_denial");
+        assert!(result["jspace_error_code"].as_str().unwrap().starts_with("JSPACE_"), "{result}");
+        assert_eq!(std::fs::read_to_string(workspace.path().join("src/main.rs")).unwrap(), "answer\n");
+        result["step"] = json!(1); // the runtime reports the command's step with its result
+        let (_, calls) = code_tools::command_run::command_run_batch_identity(
+            &json!({"execution_id": "denied-call", "commands": [command.clone()]})).expect("call identity");
+        let store = super::ReceiptStore::open_existing(workspace.path()).expect("durable store");
+        assert_eq!(store.list_names().expect("audit entries").len(), 1, "a witness only, no admission or claim");
+        assert!(JSpacePolicyDenial::authenticate(&store, "denied-session", "denied-runtime", &calls[0],
+            Some(&authorization), &command, &result));
+        let mut other_line = command.clone();
+        other_line["command_line"] = json!("*** Begin Patch\n*** Delete File: src/other.rs\n*** End Patch\n");
+        let mut other_error = result.clone();
+        other_error["error"] = json!("JSPACE_OPERATION_DENIED: something else");
+        for (call, command, result, authorization) in [
+            ("other-call", &command, &result, authorization.as_str()),
+            (calls[0].as_str(), &other_line, &result, authorization.as_str()),
+            (calls[0].as_str(), &command, &other_error, authorization.as_str()),
+            (calls[0].as_str(), &command, &result, "0000000000000000000000000000000000000000000000000000000000000000"),
+        ] {
+            assert!(!JSpacePolicyDenial::authenticate(&store, "denied-session", "denied-runtime", call,
+                Some(authorization), command, result));
+        }
+        assert!(!JSpacePolicyDenial::authenticate(&store, "other-session", "denied-runtime", &calls[0],
+            Some(&authorization), &command, &result));
+    }
+
+    async fn policy_path_scenarios() {
+        for scenario in 0..12 {
             let workspace = canonical_tempdir();
             std::fs::create_dir(workspace.path().join("src")).expect("source directory");
             std::fs::write(workspace.path().join("src/main.rs"), "answer\n").expect("source");
@@ -920,6 +1785,11 @@ mod tests {
                 9 => {
                     std::os::unix::fs::symlink("main.rs", workspace.path().join("src/link.rs")).expect("symlink");
                     command["command_line"] = json!(r#"{"path":"src/link.rs","start_line":1,"end_line":1}"#);
+                }
+                10 => command["command_line"] = json!(r#"{"path":"../secret","start_line":1,"end_line":1,"expected_sha256":"bad"}"#),
+                11 => {
+                    contract.as_object_mut().expect("contract").remove("source_read");
+                    command["command_line"] = json!(r#"{"path":"src/main.rs","start_line":1,"end_line":1,"expected_sha256":"bad"}"#);
                 }
                 _ => {}
             }
@@ -968,7 +1838,7 @@ mod tests {
             .expect("accepted read");
         let result = &accepted["result"]["results"][0];
         assert_eq!(result["success"], true, "{accepted}");
-        assert_eq!(result["output"]["stdout"], "alpha\nbeta\n");
+        assert_eq!(result["output"]["stdout"], "1: alpha\n2: beta\n");
         assert_eq!(
             result["output"]["terminal_receipt"]["authority_effect"],
             "none"
@@ -1898,6 +2768,41 @@ mod tests {
             "JSPACE_EXPANSION_REQUIRED"
         );
         assert!(!marker.exists());
+    }
+
+    // 2026-10-22 i8: a Luna worker sent id-only apply_patch entries as labels next to the real
+    // patches; each label was rejected before execution as a malformed patch.
+    #[tokio::test]
+    async fn jspace_admits_an_empty_apply_patch_label_beside_a_real_patch() {
+        let workspace = canonical_tempdir();
+        std::fs::create_dir(workspace.path().join("src")).expect("create source directory");
+        let service = CommandRunService::new();
+        let contract = jspace_contract(workspace.path());
+        let response = service
+            .execute(json!({
+                "session_id": "jspace-label-session",
+                "runtime_id": "jspace-label-runtime",
+                "session_directory": workspace.path().display().to_string(),
+                "jspace_contract": contract,
+                "arguments": {
+                    "commands": [
+                        {"command": "apply_patch", "id": "label", "step": 1},
+                        {"command": "apply_patch", "step": 1,
+                         "command_line": "*** Begin Patch\n*** Add File: src/main.rs\n+fn main() {}\n*** End Patch"}
+                    ]
+                }
+            }))
+            .await
+            .expect("command result");
+
+        let results = &response["result"]["results"];
+        assert_eq!(results[0]["success"], true, "{response}");
+        assert!(results[0].to_string().contains("no_effect"), "{response}");
+        assert_eq!(results[1]["success"], true, "{response}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("src/main.rs")).expect("patched file"),
+            "fn main() {}\n"
+        );
     }
 
     #[tokio::test]

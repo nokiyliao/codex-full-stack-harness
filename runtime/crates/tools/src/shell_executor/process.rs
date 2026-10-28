@@ -56,7 +56,7 @@ pub(super) fn panic_cleanup_process_scope_empty(
     let _ = owner_scope;
     #[cfg(unix)]
     unsafe {
-        return Ok(kill(-(pid as i32), 0) != 0);
+        Ok(kill(-(pid as i32), 0) != 0)
     }
     #[cfg(windows)]
     {

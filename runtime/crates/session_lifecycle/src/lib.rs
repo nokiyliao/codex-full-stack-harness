@@ -309,6 +309,10 @@ pub struct ChildReadySetIdentity {
 }
 
 impl ChildReadySetIdentity {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the identity constructor mirrors its hashed identity fields"
+    )]
     pub fn new(
         mission_id: impl Into<String>,
         task_id: impl Into<String>,
@@ -3610,8 +3614,8 @@ mod tests {
             "lease-0",
             "transaction-1",
             "runtime-0.message",
-            &canonical_value_sha256(&Value::String("delegated prompt".to_string())),
-            &canonical_value_sha256(&serde_json::json!({"prompt": "delegated prompt"})),
+            canonical_value_sha256(&Value::String("delegated prompt".to_string())),
+            canonical_value_sha256(&serde_json::json!({"prompt": "delegated prompt"})),
             "/tmp/child-1",
             "delegated child",
             1_786_845_600_000,
@@ -5140,7 +5144,7 @@ mod tests {
 
     #[test]
     fn watchdog_is_demoted_and_never_used_as_elapsed_failure_evidence() {
-        assert!(DEFAULT_WATCHDOG_INTERVAL_SECS > 300);
+        const _: () = assert!(DEFAULT_WATCHDOG_INTERVAL_SECS > 300);
         assert_eq!(
             LifecycleConfig {
                 watchdog_interval_secs: 300,

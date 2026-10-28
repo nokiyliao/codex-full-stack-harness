@@ -21,53 +21,36 @@ It is intentionally an in-memory reference, not an agent runtime, workflow
 service, sandbox, durable queue, or authorization system. Integrators provide
 the actual worker, persistence, effect, and callback adapters.
 
-The `$tura-kernel` Skill and its implicit Native-versus-graph selection path are
-retired. They did not reproduce the external runtime's model-loop,
-context, or provider gains because those surfaces remained owned by Native
-Codex. The parent may still create a first-class Native Codex task from a
-verified capsule, but its prompt no longer invokes or installs a Skill. See
-[`docs/nokiy-kernel-retirement.md`](docs/nokiy-kernel-retirement.md).
+The preferred Codex deployment profile packages Tura as the explicitly invoked
+[`$tura-kernel` Skill](src/codex_collaboration_harness/skills/tura-kernel/SKILL.md).
+The parent creates a first-class Native Codex task; Native Codex remains the sole
+owner of task persistence, tools, provider turns, and restart recovery, while
+the Skill contributes bounded execution policy and returns one official
+`send_message_to_thread` callback. The older
+[`agents/tura.toml`](src/codex_collaboration_harness/agents/tura.toml) remains a
+compatibility resource rather than the operational dispatch baseline. See
+[`docs/native-tura-role.md`](docs/native-tura-role.md) for the topology and
+drift-safe installation procedure.
 
-Ordinary Native task dispatch can inherit the current Native Codex model and
+Ordinary Native Tura dispatch can inherit the current Native Codex model and
 reasoning setting, or request a `preferred` pair for its first turn without
 binding later turns to it. Explicit benchmark or reproduction profiles may pin
-both values; `thinking="max"` is their default and highest admitted Nokiy effort.
-The capsule renderer does not advertise `ultra` as a Nokiy tier.
+both values; `thinking="max"` is their default and highest admitted Tura effort.
+The Skill does not advertise `ultra` as a Tura tier.
 
 The package also retains an optional, transport-neutral
-[`NokiyAdapter`](src/codex_collaboration_harness/adapters/nokiy.py). It turns the
-generic task/lease contract into a bounded Nokiy request and maps a third-party
-Nokiy terminal envelope back into the core result/failure model. No private
-endpoint, credential, UTM shape, or Nokiy runtime source is required by the
+[`TuraAdapter`](src/codex_collaboration_harness/adapters/tura.py). It turns the
+generic task/lease contract into a bounded Tura request and maps a third-party
+Tura terminal envelope back into the core result/failure model. No private
+endpoint, credential, UTM shape, or Tura runtime source is required by the
 Python package.
-
-For an explicitly selected `direct` or `balanced` turn, `nokiy-embedded-run`
-verifies an exact frozen runtime image, starts execution-local Router and
-Session DB processes, and returns a terminal result. The default single-task
-path uses the existing native worker and command graph without those services.
-Neither path reads or writes the private Codex session database. See
-[`docs/embedded-nokiy-runtime.md`](docs/embedded-nokiy-runtime.md).
 
 For review of the historical external-runtime profile, the repository binds the
 [public AGPL runtime fork](https://github.com/nokiyliao/tura)
-through [`components/nokiy-runtime.json`](components/nokiy-runtime.json). The
+through [`components/tura-runtime.json`](components/tura-runtime.json). The
 manifest deliberately separates the public source ref, the benchmarked
 candidate, and any installed/running claim. See
 [`docs/full-stack-profile.md`](docs/full-stack-profile.md).
-
-### nokiy Naming
-
-Owned CLI entry points are `nokiy-taskpacket`, `nokiy-graph-tool`, and
-`nokiy-embedded-run`; Python modules are `native_nokiy`, `embedded_nokiy`, and
-`adapters.nokiy`. Importers must adopt these names when installing this candidate.
-The command-graph MCP tools are `nokiy_graph_prepare` and `nokiy_graph_execute`.
-This source rename does not switch any installed caller or running runtime.
-
-Durable request IDs, callback markers, wire schemas, existing recovery paths,
-and external binary/environment contracts retain their exact values. They are
-not branding. Historical records and golden identity vectors are not rewritten.
-Upstream source and license provenance remain in [provenance](docs/provenance.md)
-and the component manifest; the name does not claim an independent engine rewrite.
 
 ## Why It Exists
 
@@ -133,46 +116,33 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 There is no runtime daemon or lifecycle service in the reference package. The
-`nokiy-taskpacket` CLI validates and renders an immutable Native task capsule.
-Its `--format dispatch` view is a compact
+only CLI, `tura-taskpacket`, installs or verifies the packaged Skill and renders
+an immutable Native Tura task capsule. Its `--format dispatch` view is a compact
 ready-to-send Native task with task-local evidence already projected; it does
 not create sessions, dispatch workers, or write callbacks. A target-bound
 capsule can be compiled into exact official `create_thread` arguments with:
 
 ```bash
-nokiy-taskpacket prepare-dispatch --task-name /root/example_task
+tura-taskpacket prepare-dispatch --task-name /root/example_task
 ```
 
-The resulting dispatch-plan v5 JSON binds the selection policy, target, prompt
-digest, callback identity, and parent thread without a Skill contract. A
+The resulting dispatch-plan v4 JSON always binds the selection policy, target,
+Skill contract, prompt digest, callback identity, and parent thread. A
 `preferred` profile supplies initial model and reasoning arguments while
 allowing later official Native turns to override them. A pinned profile binds
 the exact pair for reproducibility; an inherited profile omits both from
 `create_thread` so Native Codex selects them. It also
 reports exact UTF-8 byte counts for the dispatch, projected task context, and
 J-Space policy plus the inline evidence-reference count. The Commander still
-performs the official task creation. `install-skill` is no longer exposed.
+performs the official task creation. A reviewed Skill update can be adopted
+atomically with `tura-taskpacket install-skill --replace`; without `--replace`,
+any target drift continues to fail closed.
 
 Audit an existing packet root without migrating or dispatching anything with:
 
 ```bash
-nokiy-taskpacket inspect-packets
+tura-taskpacket inspect-packets
 ```
-
-Preflight or execute one explicit full Nokiy runtime call with:
-
-```bash
-nokiy-embedded-run preflight --request /absolute/path/request.json
-nokiy-embedded-run run --request /absolute/path/request.json
-```
-
-`read-result` retrieves an existing terminal independently of expired execution
-context. Detailed traces stay in the request's local artifact root; only the
-bounded result and exact artifact identities belong in the Native conversation.
-Version 3 requests bind the result to the current Native `CODEX_THREAD_ID` and
-declare Codex as the sole durable session owner. They can also require
-authoritative tool-loop evidence, so a model's textual claim cannot turn a
-tool-free response into a successful execution.
 
 The inventory separates current target-bound packets from readable historical
 packets and exact rejected members. Historical digest-only v1 filenames remain
@@ -183,8 +153,8 @@ digest are needed; this avoids carrying the per-packet rows into a callback turn
 Capsules whose scopes are all explicitly prefixed with `read:` receive the
 `NATIVE_TURA_READ_ONLY_FAST_PATH_V1` and
 `NATIVE_TURA_FAST_PATH_EXECUTION_V3` markers. The inline fast-path contract is
-self-contained, so those tasks do not spend a Native tool continuation loading
-an external policy file. They obtain
+self-contained, so those tasks do not spend a Native tool continuation reading
+the Skill file. They obtain
 `CODEX_THREAD_ID` in the same first batch as every task read, proceed directly
 to the single terminal callback, and emit only a fixed delivery acknowledgement
 after tool success. The compiler embeds the exact two-line canonical terminal
@@ -224,7 +194,7 @@ installation, CLI smoke test, and checksums, run:
 make release-check
 ```
 
-Networked verification of the public Nokiy component ref, exact Git trees,
+Networked verification of the public Tura component ref, exact Git trees,
 ancestry, license, and modification notice is deliberately separate:
 
 ```bash
@@ -260,12 +230,12 @@ reference to production effects.
 | Reviewer question | Public evidence |
 |---|---|
 | What is the collaboration graph? | [`docs/architecture.md`](docs/architecture.md) |
-| How is Nokiy installed as a thin Native Codex role? | [`docs/native-nokiy-role.md`](docs/native-nokiy-role.md) |
+| How is Tura installed as a thin Native Codex role? | [`docs/native-tura-role.md`](docs/native-tura-role.md) |
 | What constitutes the reviewable full stack? | [`docs/full-stack-profile.md`](docs/full-stack-profile.md) |
 | Which boundaries are enforced here? | [`docs/trust-boundaries.md`](docs/trust-boundaries.md) |
 | What can I reproduce? | [`docs/verification.md`](docs/verification.md) |
 | What is not claimed? | [`docs/limitations.md`](docs/limitations.md) |
-| How can I connect a Nokiy runtime? | [`docs/nokiy-integration.md`](docs/nokiy-integration.md) |
+| How can I connect a Tura runtime? | [`docs/tura-integration.md`](docs/tura-integration.md) |
 | Where did the implementation come from? | [`docs/provenance.md`](docs/provenance.md) |
 | What do the internal measurements mean? | [`docs/internal-benchmark.md`](docs/internal-benchmark.md) |
 | What should an OpenAI reviewer inspect? | [`docs/openai-review-packet.md`](docs/openai-review-packet.md) |

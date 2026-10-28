@@ -28,6 +28,7 @@ pub struct OrchestrationConfig {
     pub redis_url: String,
     pub session_directory: Option<PathBuf>,
     pub jspace_contract: Option<Value>,
+    pub capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
 }
 
 impl Default for OrchestrationConfig {
@@ -36,6 +37,7 @@ impl Default for OrchestrationConfig {
             redis_url: "redis://localhost:6379".to_string(),
             session_directory: None,
             jspace_contract: None,
+            capsule_source_read_binding: None,
         }
     }
 }
@@ -122,6 +124,10 @@ pub fn orchestrate_for_session_with_lease_and_lifecycle_in_directory(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "orchestration forwards session, lease, lifecycle and J-Space bindings explicitly"
+)]
 pub fn orchestrate_for_session_with_lease_and_lifecycle_and_jspace_in_directory(
     input: SessionInput,
     session_id: String,
@@ -132,11 +138,30 @@ pub fn orchestrate_for_session_with_lease_and_lifecycle_and_jspace_in_directory(
     jspace_contract: Option<Value>,
     fallback_from_id: Option<RuntimeId>,
 ) -> Result<ManoProcessResult, String> {
+    orchestrate_for_session_with_source_binding(
+        input, session_id, runtime_id, lease_id, session_directory, lifecycle,
+        jspace_contract, fallback_from_id, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn orchestrate_for_session_with_source_binding(
+    input: SessionInput,
+    session_id: String,
+    runtime_id: RuntimeId,
+    lease_id: String,
+    session_directory: PathBuf,
+    lifecycle: Option<LifecycleExecutionContext>,
+    jspace_contract: Option<Value>,
+    fallback_from_id: Option<RuntimeId>,
+    capsule_source_read_binding: Option<runtime_contract::CapsuleSourceReadBinding>,
+) -> Result<ManoProcessResult, String> {
     orchestrate_with_config_and_session(
         input,
         OrchestrationConfig {
             session_directory: Some(session_directory),
             jspace_contract,
+            capsule_source_read_binding,
             ..OrchestrationConfig::default()
         },
         Some(session_id.clone()),
@@ -213,6 +238,11 @@ fn orchestrate_with_config_and_session(
         )?),
         None => None,
     };
+    let capsule_source_read_binding = crate::provider_flow::call::reconcile_source_binding(
+        config.capsule_source_read_binding,
+        initial_retry_provider_input.as_ref().and_then(|input| input.capsule_source_read_binding.clone()),
+        session.jspace_contract.as_ref(), &session.session_directory,
+    )?;
     let initial_messages = initial_messages_with_task_state(
         &mut session,
         initial_task_state.as_ref(),
@@ -237,6 +267,7 @@ fn orchestrate_with_config_and_session(
         initial_retry_provider_input,
         runtime_event_writer,
         session_delta_writer,
+        capsule_source_read_binding,
     };
 
     let manas_result =
@@ -305,6 +336,7 @@ where
             format!("RUNTIME_RETRY_SOURCE_INVALID:{session_id}:{runtime_id}:runtime_missing")
         })?;
         let aggregate = replay.aggregate;
+        let capsule_source_read_binding = crate::provider_flow::call::captured_source_binding(&aggregate)?;
         if aggregate.runtime_id != runtime_id || aggregate.session_id != session_id {
             return Err(format!(
                 "RUNTIME_RETRY_SOURCE_INVALID:{session_id}:{runtime_id}:identity_mismatch"
@@ -352,7 +384,7 @@ where
 
         match aggregate.fallback_from_id {
             Some(parent_runtime_id) => runtime_id = parent_runtime_id,
-            None => return Ok(RetryProviderInput { messages, tools }),
+            None => return Ok(RetryProviderInput { messages, tools, capsule_source_read_binding }),
         }
     }
 
@@ -615,6 +647,26 @@ mod tests {
 
         assert_eq!(resolved.messages, root_messages);
         assert_eq!(resolved.tools, root_tools);
+    }
+
+    #[test]
+    fn capsule_source_retry_replay_preserves_original_expectation() {
+        let root = std::path::Path::new("/workspace");
+        let (contract, binding) = crate::provider_flow::call::tests::capsule_source_fixture(root);
+        let mut replay = retry_replay("runtime-root", None,
+            vec![serde_json::json!({"role":"user","content":"same mission"})], Vec::new());
+        replay.aggregate.input.as_mut().unwrap()["capsule_source_read_context"] = serde_json::to_value(
+            runtime_contract::CapsuleSourceReadContext {
+                session_id:"retry-session".into(),runtime_id:"runtime-root".into(),binding:binding.clone(),
+            }).unwrap();
+        let resolved = resolve_retry_provider_input("retry-session", "runtime-root", "same mission",
+            |_| Ok(Some(replay.clone()))).unwrap();
+        assert_eq!(resolved.capsule_source_read_binding, Some(binding.clone()));
+        assert_eq!(crate::provider_flow::call::reconcile_source_binding(None,
+            resolved.capsule_source_read_binding, Some(&contract), root).unwrap(), Some(binding));
+        replay.aggregate.input.as_mut().unwrap()["capsule_source_read_context"]["session_id"] = serde_json::json!("foreign");
+        assert!(resolve_retry_provider_input("retry-session", "runtime-root", "same mission",
+            |_| Ok(Some(replay.clone()))).is_err());
     }
 
     #[test]

@@ -24,14 +24,13 @@ pub fn strip_json_fence(input: &str) -> String {
     let s = input.trim();
     if let Some((opening, rest)) = s.split_once('\n') {
         let opening = opening.strip_suffix('\r').unwrap_or(opening);
-        if opening == "```json" || opening == "```" {
-            if let Some((body, "```")) = rest.rsplit_once('\n') {
+        if (opening == "```json" || opening == "```")
+            && let Some((body, "```")) = rest.rsplit_once('\n') {
                 let json = body.trim();
                 if serde_json::from_str::<Value>(json).is_ok() {
                     return json.to_string();
                 }
             }
-        }
     }
     s.to_string()
 }

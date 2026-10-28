@@ -235,6 +235,162 @@ class BatchFixture(unittest.TestCase):
             batch.run_batch(self.plan, self.digest)
         exe.assert_not_called()
 
+    def inspect_contract(self):
+        return {"schema_version": "jspace_contract_v2", "repo_root": str(self.workspace),
+                "read_scopes": [], "write_scopes": [], "declared_targets": [], "command_templates": [],
+                "matched_surface_ids": [], "allowed_operations": ["command", "read"],
+                "denied_operations": ["create", "delete", "modify", "network"],
+                "command_effect_policy": "trusted_argv_effects_v1",
+                "expansion": {"mode": "exact_target_only", "error_code": "JSPACE_EXPANSION_REQUIRED",
+                              "mutation_on_expansion": False},
+                "inspect_shell": {"schema_version": "nokiy_inspect_shell_v1", "evidence_root": "/unused",
+                                  "network": "inherit", "profile_sha256": "0" * 64}}
+
+    def test_inspect_members_batch_together_but_not_beside_a_workspace_writer(self):
+        pre, exe = self.mocks()
+        for index in range(2):
+            self.bind_contract(index, self.inspect_contract())
+        result = batch.run_batch(self.plan, self.digest)
+        self.assertEqual(exe.call_count, 2)
+        self.assertEqual(pre.call_count, 2)
+        self.assertEqual(result["status"], "RESULT_AVAILABLE")
+        exe.reset_mock()
+        self.write_scopes(self.requests[1].jspace_contract.path, ["input-1.txt"], ["output-1.txt"])
+        self.requests[1].jspace_contract.sha256 = hashlib.sha256(
+            self.requests[1].jspace_contract.path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(EmbeddedNokiyError, "overlap"):
+            batch.run_batch(self.plan, self.digest)
+        widened = {**self.inspect_contract(), "write_scopes": ["output-1.txt"]}
+        self.bind_contract(1, widened)
+        with self.assertRaisesRegex(EmbeddedNokiyError, "unsupported inspect shape"):
+            batch.run_batch(self.plan, self.digest)
+        exe.assert_not_called()
+
+    def use_workspace(self, index, workspace, reads, writes):
+        workspace.mkdir(parents=True, exist_ok=True)
+        self.requests[index].workspace = workspace
+        contract = json.loads(self.requests[index].jspace_contract.path.read_text())
+        contract.update(repo_root=str(workspace), read_scopes=reads, write_scopes=writes,
+                        declared_targets=writes)
+        self.bind_contract(index, contract)
+
+    def test_members_may_use_disjoint_workspaces(self):
+        pre, exe = self.mocks()
+        self.use_workspace(1, self.workspace.parent / "workspace-b", ["input-1.txt"], ["output-1.txt"])
+        result = batch.run_batch(self.plan, self.digest)
+        self.assertEqual(pre.call_count, 2)
+        self.assertEqual(exe.call_count, 2)
+        self.assertEqual(result["status"], "RESULT_AVAILABLE")
+
+    def test_nested_workspaces_keep_absolute_overlap_checks(self):
+        _, exe = self.mocks()
+        # Member 1 works inside member 0's workspace and writes what member 0 reads.
+        self.use_workspace(1, self.workspace / "sub", ["input-1.txt"], ["output-1.txt"])
+        self.use_workspace(0, self.workspace, ["sub/output-1.txt"], ["output-0.txt"])
+        with self.assertRaisesRegex(EmbeddedNokiyError, "cross-member read/write"):
+            batch.run_batch(self.plan, self.digest)
+        # An inspect member reads its whole workspace, so a nested writer conflicts too.
+        self.bind_contract(0, self.inspect_contract())
+        with self.assertRaisesRegex(EmbeddedNokiyError, "overlap"):
+            batch.run_batch(self.plan, self.digest)
+        exe.assert_not_called()
+
+    def test_artifact_root_inside_another_member_workspace_rejected(self):
+        _, exe = self.mocks()
+        other = self.workspace.parent / "workspace-b"
+        self.use_workspace(1, other, ["input-1.txt"], ["output-1.txt"])
+        nested_root = other / "artifacts-0"
+        nested_root.mkdir()
+        self.members[0]["artifact_root"] = str(nested_root)
+        self.requests[0].artifact_root = nested_root
+        self.save_plan()
+        with self.assertRaisesRegex(EmbeddedNokiyError, "artifact root and workspace overlap"):
+            batch.run_batch(self.plan, self.digest)
+        exe.assert_not_called()
+
+    def discovery_contract(self, index, root="discovery"):
+        from codex_collaboration_harness.local_context import _read_commands
+        (self.workspace / root).mkdir(parents=True, exist_ok=True)
+        contract = json.loads(self.requests[index].jspace_contract.path.read_text())
+        contract.update(read_scopes=[root + "/**", f"input-{index}.txt"],
+                        write_scopes=[], declared_targets=[],
+                        allowed_operations=["read", "command"],
+                        read_commands=_read_commands([root]))
+        contract.pop("source_read", None)
+        self.bind_contract(index, contract)
+        return contract
+
+    def test_discovery_and_exact_file_member_execute_without_tree_expansion(self):
+        self.discovery_contract(0)
+        pre, exe = self.mocks()
+        with patch.object(batch.os, "scandir", side_effect=AssertionError("unneeded tree scan")):
+            batch.run_batch(self.plan, self.digest)
+        self.assertEqual(pre.call_count, 2)
+        self.assertEqual(exe.call_count, 2)
+
+    def test_two_readers_can_share_discovery_root(self):
+        self.discovery_contract(0)
+        self.discovery_contract(1)
+        _, exe = self.mocks()
+        batch.run_batch(self.plan, self.digest)
+        self.assertEqual(exe.call_count, 2)
+
+    def test_discovery_blocks_descendant_writer_in_either_member_order(self):
+        _, exe = self.mocks()
+        for reader, writer in ((0, 1), (1, 0)):
+            self.discovery_contract(reader)
+            contract = json.loads(self.requests[writer].jspace_contract.path.read_text())
+            contract.pop("read_commands", None)
+            contract.update(read_scopes=[], write_scopes=["discovery/new.py"],
+                            declared_targets=["discovery/new.py"], source_read=True,
+                            allowed_operations=["read", "modify", "command"])
+            self.bind_contract(writer, contract)
+            with self.assertRaisesRegex(EmbeddedNokiyError, "cross-member.*overlap"):
+                batch.run_batch(self.plan, self.digest)
+        exe.assert_not_called()
+
+    def test_discovery_blocks_hardlinked_writer_outside_root(self):
+        self.discovery_contract(0)
+        original = self.workspace / "discovery/source.py"
+        original.write_text("original")
+        os.link(original, self.workspace / "output-1.txt")
+        _, exe = self.mocks()
+        with self.assertRaisesRegex(EmbeddedNokiyError, "hardlinked write"):
+            batch.run_batch(self.plan, self.digest)
+        exe.assert_not_called()
+
+    def test_discovery_rejects_unbound_or_changed_contracts(self):
+        original = self.discovery_contract(0)
+        _, exe = self.mocks()
+        mutations = [
+            lambda c: c.update(read_scopes=["input-0.txt"]),
+            lambda c: c["read_scopes"].append("unbound/**"),
+            lambda c: c["read_commands"]["cat"].update(sha256="0" * 64),
+            lambda c: c["read_commands"].update(roots=["."]),
+            lambda c: c["read_commands"].update(roots=["../escape"]),
+            lambda c: c["read_commands"].update(roots=["discovery", "discovery"]),
+            lambda c: c.update(allowed_operations=["read"]),
+            lambda c: c.update(command_templates=["sh -c arbitrary"]),
+        ]
+        for mutation in mutations:
+            contract = deepcopy(original)
+            mutation(contract)
+            self.bind_contract(0, contract)
+            with self.subTest(contract=contract), self.assertRaises(EmbeddedNokiyError):
+                batch.run_batch(self.plan, self.digest)
+        exe.assert_not_called()
+
+    def test_discovery_rejects_symlink_root(self):
+        contract = self.discovery_contract(0)
+        (self.workspace / "alias").symlink_to(self.workspace / "discovery", target_is_directory=True)
+        contract["read_commands"]["roots"] = ["alias"]
+        contract["read_scopes"] = ["alias/**"]
+        self.bind_contract(0, contract)
+        _, exe = self.mocks()
+        with self.assertRaises(EmbeddedNokiyError):
+            batch.run_batch(self.plan, self.digest)
+        exe.assert_not_called()
+
     def test_cross_member_hardlink_aliases_fail_before_execution(self):
         pre, exe = self.mocks()
         original = self.workspace / "output-0.txt"
@@ -407,6 +563,55 @@ class BatchFixture(unittest.TestCase):
                 batch.run_batch(self.plan, self.digest)
         self.assertEqual(pre.call_count, 4)
         exe.assert_not_called()
+
+    def test_verifier_only_pin_is_a_conflict_dependency_without_new_source_grants(self):
+        contracts = self.focused_verifiers()
+        external = self.plan.parent / "acceptance.py"
+        external.write_text("# offline external verifier fixture\n")
+        command = contracts[0]["verifier_commands"][0]
+        command["argv"][1] = str(external)
+        command["pinned_files"] = [{"path": str(external), "scope": "verifier_only",
+                                    "sha256": hashlib.sha256(external.read_bytes()).hexdigest()}]
+        self.bind_contract(0, contracts[0])
+        before = deepcopy(contracts[0])
+        reads, writes = batch._scopes(self.requests[0])
+        self.assertIn(external, reads)
+        self.assertNotIn(external, writes)
+        self.assertNotIn(str(external), before["read_scopes"])
+        pre, exe = self.mocks()
+        with patch.object(batch, "worker_capacity", return_value=2):
+            result = batch.run_batch(self.plan, self.digest)
+        self.assertEqual(result["status"], "RESULT_AVAILABLE")
+        self.assertEqual(pre.call_count, 2)
+        self.assertEqual(exe.call_count, 2)
+        self.assertEqual(json.loads(self.requests[0].jspace_contract.path.read_text()), before)
+
+    def test_verifier_only_pins_conflict_with_foreign_source_alias_and_scratch(self):
+        contracts = self.focused_verifiers()
+        pre, exe = self.mocks()
+        for placement in ("source_alias", "foreign_scratch"):
+            with self.subTest(placement=placement):
+                changed = deepcopy(contracts)
+                external = ((self.plan.parent / "acceptance.py") if placement == "source_alias"
+                            else Path(changed[1]["verifier_commands"][0]["scratch_root"]) / "acceptance.py")
+                external.write_text("# offline external verifier fixture\n")
+                command = changed[0]["verifier_commands"][0]
+                command["argv"][1] = str(external)
+                command["pinned_files"] = [{"path": str(external), "scope": "verifier_only",
+                                            "sha256": hashlib.sha256(external.read_bytes()).hexdigest()}]
+                if placement == "source_alias":
+                    alias = self.workspace / "external-alias.py"
+                    os.link(external, alias)
+                    changed[1]["write_scopes"].append(alias.name)
+                    changed[1]["declared_targets"].append(alias.name)
+                for index, contract in enumerate(changed):
+                    self.bind_contract(index, contract)
+                pre.reset_mock()
+                with patch.object(batch, "worker_capacity", return_value=2), \
+                        self.assertRaisesRegex(EmbeddedNokiyError, "cross-member.*overlap"):
+                    batch.run_batch(self.plan, self.digest)
+                self.assertEqual(pre.call_count, 2)
+                exe.assert_not_called()
 
     def test_focused_verifier_executable_hardlink_conflicts_with_foreign_write(self):
         contracts = self.focused_verifiers()
@@ -714,6 +919,96 @@ class BatchFixture(unittest.TestCase):
         self.assertEqual([row["request_id"] for row in result["members"]],
                          [request.request_id for request in self.requests])
 
+    def test_unavailable_root_does_not_hide_other_completed_result(self):
+        pre, execute = self.mocks()
+        failed, healthy = self.requests
+        (healthy.artifact_root / healthy.request_id).mkdir()
+        failed.artifact_root.rmdir()
+        for shape in ("missing", "file", "symlink", "dangling_symlink"):
+            with self.subTest(shape=shape):
+                failed.artifact_root.unlink(missing_ok=True)
+                if shape == "file":
+                    failed.artifact_root.write_text("not a directory")
+                elif shape in {"symlink", "dangling_symlink"}:
+                    failed.artifact_root.symlink_to(
+                        healthy.artifact_root if shape == "symlink"
+                        else healthy.artifact_root / "absent")
+                with patch.object(batch.caller, "read_terminal",
+                                  return_value=self.terminal(healthy)) as reader, \
+                        patch.object(batch, "retain_inspection_summary",
+                                     side_effect=AssertionError("read-only recovery")):
+                    result = batch.read_batch(self.plan, self.digest)
+                self.assertEqual(result["status"], "BLOCKED")
+                self.assertEqual(result["members"][0]["first_typed_blocker"],
+                                 "NOKIY_BATCH_ARTIFACT_ROOT_UNAVAILABLE")
+                self.assertIsNone(result["members"][0]["terminal"])
+                self.assertEqual(result["members"][1]["status"], "RESULT_AVAILABLE")
+                reader.assert_called_once_with(healthy.artifact_root, healthy.request_id)
+                with self.assertRaises(EmbeddedNokiyError):
+                    batch.run_batch(self.plan, self.digest)
+                if shape != "missing":
+                    failed.artifact_root.unlink()
+        pre.assert_not_called()
+        execute.assert_not_called()
+
+    def test_unreadable_root_is_isolated_without_opening_receipts(self):
+        self.mocks()
+        failed, healthy = self.requests
+        (healthy.artifact_root / healthy.request_id).mkdir()
+        plain = batch.caller._plain_path
+
+        def readable(value, **kwargs):
+            if Path(value) == failed.artifact_root:
+                raise PermissionError("offline denied root")
+            return plain(value, **kwargs)
+
+        with patch.object(batch.caller, "_plain_path", side_effect=readable), \
+                patch.object(batch.caller, "read_terminal",
+                             return_value=self.terminal(healthy)) as reader:
+            result = batch.read_batch(self.plan, self.digest)
+        self.assertEqual(result["members"][0]["first_typed_blocker"],
+                         "NOKIY_BATCH_ARTIFACT_ROOT_UNAVAILABLE")
+        self.assertEqual(result["members"][1]["status"], "RESULT_AVAILABLE")
+        reader.assert_called_once_with(healthy.artifact_root, healthy.request_id)
+
+    def test_root_replaced_after_plan_load_is_not_followed(self):
+        self.mocks()
+        failed, healthy = self.requests
+        (healthy.artifact_root / healthy.request_id).mkdir()
+        load = batch._load_plan
+
+        def replaced(*args, **kwargs):
+            result = load(*args, **kwargs)
+            failed.artifact_root.rmdir()
+            failed.artifact_root.symlink_to(healthy.artifact_root)
+            return result
+
+        with patch.object(batch, "_load_plan", side_effect=replaced), \
+                patch.object(batch.caller, "read_terminal",
+                             return_value=self.terminal(healthy)) as reader:
+            result = batch.read_batch(self.plan, self.digest)
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["members"][0]["status"], "BLOCKED")
+        self.assertNotEqual(result["members"][0]["first_typed_blocker"],
+                            "NOKIY_BATCH_NOT_STARTED")
+        self.assertEqual(result["members"][1]["status"], "RESULT_AVAILABLE")
+        reader.assert_called_once_with(healthy.artifact_root, healthy.request_id)
+
+    def test_recovery_does_not_relax_plan_identity_or_overlap(self):
+        with self.assertRaises(EmbeddedNokiyError):
+            batch.read_batch(self.plan, "0" * 64)
+        self.requests[0].artifact_root.rmdir()
+        self.members[1]["artifact_root"] = str(self.requests[0].artifact_root / "nested")
+        self.save_plan()
+        with self.assertRaisesRegex(EmbeddedNokiyError, "overlapping artifact roots"):
+            batch.read_batch(self.plan, self.digest)
+        for malformed in ("relative", "/tmp/../escape", "/tmp/null\0", None):
+            with self.subTest(root=malformed):
+                self.members[0]["artifact_root"] = malformed
+                self.save_plan()
+                with self.assertRaises(EmbeddedNokiyError):
+                    batch.read_batch(self.plan, self.digest)
+
     def test_recovery_explicitly_omits_snapshot_without_publication(self):
         self.mocks(project=False)
         for member in self.members:
@@ -729,6 +1024,23 @@ class BatchFixture(unittest.TestCase):
         for row in compact["members"]:
             self.assertIsNone(row["inspection_summary"])
             self.assertEqual(row["inspection_summary_omission"], "READ_ONLY_RECOVERY")
+
+
+class DeliverySummaryTests(unittest.TestCase):
+    def test_summary_preserves_native_delivery_and_does_not_infer_from_text(self):
+        terminal = {"requested_terminal_delivery": "evidence_only",
+                    "observed_terminal_delivery": "assistant_reply", "terminal_evidence": None,
+                    "result_text": '{"mode":"evidence_only"}'}
+        result = {"status": "RESULT_AVAILABLE", "first_typed_blocker": None,
+                  "members": [{"request_id": "request", "artifact_root": "/scratch",
+                               "status": "RESULT_AVAILABLE", "first_typed_blocker": None,
+                               "cleanup_pass": True, "terminal": terminal}]}
+        summary = batch.expand_summary(batch.summarize(result))["members"][0]
+        for key in ("requested_terminal_delivery", "observed_terminal_delivery", "terminal_evidence"):
+            self.assertEqual(summary[key], terminal[key])
+        terminal.pop("observed_terminal_delivery")
+        summary = batch.expand_summary(batch.summarize(result))["members"][0]
+        self.assertNotIn("observed_terminal_delivery", summary)
 
 
 if __name__ == "__main__":

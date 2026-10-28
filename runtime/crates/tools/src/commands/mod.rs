@@ -4,6 +4,7 @@ pub mod command_safety;
 pub mod planning;
 pub mod shell_command;
 pub mod source_read;
+pub mod source_navigation;
 pub mod task_status;
 pub mod zsh;
 
