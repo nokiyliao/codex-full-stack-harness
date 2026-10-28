@@ -82,10 +82,6 @@ impl StreamedCommandRunState {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn should_finish_after_apply_patch_failure(&self) -> bool {
-        self.apply_patch_failed.load(Ordering::SeqCst) && !self.snapshot_results().is_empty()
-    }
-
     pub(crate) fn apply_patch_failed(&self) -> bool {
         self.apply_patch_failed.load(Ordering::SeqCst)
     }
@@ -1024,20 +1020,6 @@ pub(crate) fn apply_cancelled_streamed_command_run_result(
     runtime.push_tool_call(streamed_command_run_tool_record(commands, finished_at))
 }
 
-pub(crate) fn apply_patch_failed_streamed_command_run_result(
-    runtime: &mut RuntimeAggregate,
-    commands: &[Value],
-    events: &[Value],
-    results: &[Value],
-    finished_at: DateTime<Utc>,
-) -> Result<(), String> {
-    let mut output = streamed_command_run_output(commands, events, results);
-    output["streamed_command_run_result"]["early_finish_reason"] =
-        Value::String("apply_patch_failed".to_string());
-    runtime.set_output(output)?;
-    runtime.push_tool_call(streamed_command_run_tool_record(commands, finished_at))
-}
-
 pub(crate) fn apply_startup_apply_patch_discarded_streamed_command_run_result(
     runtime: &mut RuntimeAggregate,
     commands: &[Value],
@@ -1125,8 +1107,8 @@ fn streamed_command_run_provider_metadata(commands: &[Value]) -> Option<Value> {
 mod tests {
     use super::{
         SpawnStreamedCommandRunTask, StreamedCommandRunState,
-        apply_patch_failed_streamed_command_run_result, ensure_streamed_command_run_tool_record,
-        spawn_streamed_command_run_task, streamed_command_already_seen,
+        ensure_streamed_command_run_tool_record, spawn_streamed_command_run_task,
+        streamed_command_already_seen,
     };
     use chrono::Utc;
     use lifecycle::RuntimeState;
@@ -1309,54 +1291,6 @@ mod tests {
             },
             Utc::now(),
         )
-    }
-
-    #[test]
-    fn apply_patch_failure_result_marks_early_finish_without_runtime_cancellation() {
-        let mut runtime = runtime();
-        let commands = vec![json!({ "command": "apply_patch failed" })];
-        let events = vec![json!({ "status": "completed" })];
-        let results = vec![json!({ "success": false, "error": "patch failed" })];
-        let finished_at = runtime.created_at;
-
-        apply_patch_failed_streamed_command_run_result(
-            &mut runtime,
-            &commands,
-            &events,
-            &results,
-            finished_at,
-        )
-        .expect("apply_patch failure result should apply");
-
-        let output = runtime.output.as_ref().expect("output should be set");
-        assert_eq!(
-            output.pointer("/streamed_command_run_result/early_finish_reason"),
-            Some(&json!("apply_patch_failed"))
-        );
-        assert_eq!(
-            output.pointer("/streamed_command_run_result/cancelled"),
-            None
-        );
-        assert_eq!(runtime.tool_call.len(), 1);
-        assert_eq!(runtime.tool_call[0].tool_called_name, "command_run");
-        assert_eq!(
-            runtime.tool_call[0].tool_called_input,
-            json!({ "commands": commands })
-        );
-        assert_eq!(runtime.tool_call[0].tool_received_at, finished_at);
-        runtime
-            .mark_called(finished_at)
-            .expect("runtime should enter dispatching");
-        runtime
-            .mark_waiting_first_token()
-            .expect("runtime should wait for provider output");
-        runtime
-            .mark_first_token(finished_at)
-            .expect("tool result should count as provider output");
-        runtime
-            .finish_success(finished_at, None)
-            .expect("tool failure should still finish the provider runtime successfully");
-        assert_eq!(runtime.state, RuntimeState::Finished);
     }
 
     #[test]

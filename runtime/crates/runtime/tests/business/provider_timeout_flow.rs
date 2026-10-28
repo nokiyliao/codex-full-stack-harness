@@ -250,10 +250,13 @@ async fn failed_apply_patch_finishes_tool_turn_without_cancelling_runtime() {
     let source_path = workspace.path().join("app.txt");
     let skipped_path = workspace.path().join("must-not-run.txt");
     std::fs::write(&source_path, "actual\n").expect("write patch fixture");
-    let provider = CompletedResponsesProvider::start_batch(vec![
-        failed_apply_patch_command(),
-        marker_command(&skipped_path, 2),
-    ]);
+    let provider = CompletedResponsesProvider::start_batch_with_completion_delay(
+        vec![
+            failed_apply_patch_command(),
+            marker_command(&skipped_path, 2),
+        ],
+        Duration::from_millis(750),
+    );
     let router_addr = mock_command_run_router_addr();
     let _api_key = EnvGuard::set("OPENAI_API_KEY", "local-stream-patch-key");
     let _router_addr = EnvGuard::set("TURA_ROUTER_ADDR", router_addr.as_str());
@@ -350,6 +353,24 @@ async fn failed_apply_patch_finishes_tool_turn_without_cancelling_runtime() {
     );
     assert_eq!(result.tool_call.len(), 1);
     assert_eq!(result.tool_call[0].tool_called_name, "command_run");
+    assert_eq!(
+        result.usage.as_ref().map(|usage| (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens
+        )),
+        Some((1, 1, 2)),
+        "failed apply_patch must retain usage from delayed provider completion"
+    );
+    let finished_usage = result
+        .clone()
+        .take_uncommitted_events()
+        .into_iter()
+        .find_map(|event| match event {
+            lifecycle::RuntimeEvent::RuntimeFinished { usage, .. } => usage,
+            _ => None,
+        });
+    assert_eq!(finished_usage, result.usage);
 }
 
 #[tokio::test]
@@ -640,6 +661,13 @@ impl CompletedResponsesProvider {
     }
 
     fn start_batch(commands: Vec<serde_json::Value>) -> Self {
+        Self::start_batch_with_completion_delay(commands, Duration::ZERO)
+    }
+
+    fn start_batch_with_completion_delay(
+        commands: Vec<serde_json::Value>,
+        completion_delay: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind completed provider");
         let addr = listener.local_addr().expect("completed provider addr");
         let request = Arc::new(Mutex::new(None));
@@ -652,7 +680,7 @@ impl CompletedResponsesProvider {
             *thread_request
                 .lock()
                 .expect("completed provider request lock") = Some(request);
-            write_completed_command_run_stream(&mut stream, commands);
+            write_completed_command_run_stream(&mut stream, commands, completion_delay);
         });
         Self {
             endpoint: format!("http://{addr}"),
@@ -740,13 +768,17 @@ fn marker_command(output_path: &std::path::Path, step: u64) -> serde_json::Value
     })
 }
 
-fn write_completed_command_run_stream(stream: &mut TcpStream, commands: Vec<serde_json::Value>) {
+fn write_completed_command_run_stream(
+    stream: &mut TcpStream,
+    commands: Vec<serde_json::Value>,
+    completion_delay: Duration,
+) {
     let arguments = json!({
         "commands": commands,
         "step_summary": "Run a single local command before the provider stream completes."
     })
     .to_string();
-    let events = vec![
+    let mut events = vec![
         json!({
             "type": "response.output_item.added",
             "item": {
@@ -792,17 +824,21 @@ fn write_completed_command_run_stream(stream: &mut TcpStream, commands: Vec<serd
             }
         }),
     ];
-    let mut body = events
+    let completed = events.pop().expect("provider completion event");
+    let body = events
         .into_iter()
         .map(|event| format!("data: {event}\n\n"))
         .collect::<String>();
-    body.push_str("data: [DONE]\n\n");
+    let completion = format!("data: {completed}\n\ndata: [DONE]\n\n");
     let _ = write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
+        body.len() + completion.len(),
         body
     );
+    let _ = stream.flush();
+    thread::sleep(completion_delay);
+    let _ = stream.write_all(completion.as_bytes());
     let _ = stream.flush();
 }
 

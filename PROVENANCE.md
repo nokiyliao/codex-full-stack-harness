@@ -1,18 +1,20 @@
 # Source Provenance
 
-## Current V462 Surface
+## Current V463 Surface
 
 This is a source publication, not a redistribution of installed executables or machine configuration.
 
 | Component | Source commit | Correspondence |
 | --- | --- | --- |
-| Python caller | `ffafb43816ea188b080a7978894ca98711625e9b` | Preserves the existing public same-turn worker completion note separately from verified evidence; all 48 non-cache installed package files match byte-for-byte; installed wheel version 0.3.462.dev0 |
-| Rust worker payload | `5154083b3a2cee92dc3264920f0df480f0fda389` | All 602 recorded build-source inputs match; rebuilt with cargo --locked, four binary identities match the installed V457 image |
+| Python caller | `ffafb43816ea188b080a7978894ca98711625e9b` | Unchanged package source; all 48 non-cache installed package files match byte-for-byte; installed release wheel version 0.3.463.dev0 |
+| Rust worker payload | `a24086644e0df9328475a973f913a8c09f8dad24` | All 602 recorded build-source inputs match; rebuilt with cargo --locked, four binary identities match the installed V463 image; failed-patch usage retained without weakening dispatch fences |
 | Switchboard | `fa0b537ada314cdc17274e27d3956533bb4f3668` | Projects optional public notes with their model-claim classification and limits Efficient native implementation to one coherent branch; model/effort topology unchanged; private diagnostics and compiled caches excluded |
 
-These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in releases/v462.json identify the published contents. Publication-only documentation and preserved licenses are identified separately.
+These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in releases/v463.json identify the published contents. Publication-only documentation and preserved licenses are identified separately.
 
 The caller working tree contains an unrelated test modification, and the runtime working tree contains pending-message deletions; neither was adopted. Source was exported from exact commits, not by copying dirty worktrees or installed environment directories.
+
+The canonical V463 release validation includes that preserved local-context test delta among its eleven test modules; it was used as a bound test input, not installed package code or a published source change. Therefore its728test stage totals are not claimed to be byte-reproducible solely from the committed public test export. The six publication-verifier tests and source hashes have their own separate scope.
 
 ## Excluded Material
 
