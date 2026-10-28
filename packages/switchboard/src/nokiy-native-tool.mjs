@@ -856,6 +856,7 @@ export function nativeToolProjection(body, { worker, workerEffort = "max", worke
     worker, workerEffort, workflow, serviceTier: workerServiceTier, host: Object.freeze({ python: host.python, script: host.script }),
     coordinatorBindings: restricted?.bindings ?? null, adaptiveNative,
     nativeObservation, nativeExecution, observationBody, continuationCall,
+    recordedNativeCall: typeof recordedNativeCall === "function" ? recordedNativeCall : null,
     resultDeliveryEnabled: host.parent_result_delivery === "accept_v1", operations: Object.freeze(operations),
     // WS deltas omit earlier turns; the server carries this connection's operator texts.
     userTexts: Object.freeze(Array.isArray(operatorTexts) ? [...operatorTexts] : userMessageTexts(body)) };
@@ -1251,7 +1252,7 @@ export function nativeToolItem(item, projection) {
 }
 
 function matchesObservedNativeCall(item, projection) {
-  if (matchesProjectedNativeCall(item, projection)) return true;
+  if (matchesProjectedNativeCall(item, projection, projection.recordedNativeCall)) return true;
   if (!projection.nativeExecution || projection.target.type !== "custom" || item.type !== "custom_tool_call"
       || item.name !== projection.target.name || (item.namespace ?? null) !== projection.target.namespace
       || typeof item.input !== "string" || Buffer.byteLength(item.input) > 2 * MAX_PAYLOAD_BYTES) return false;
@@ -1285,7 +1286,8 @@ function matchesProjectedNativeCall(item, projection, recordedNativeCall = null)
     if (current) return true;
     // A previous release may have emitted a different immutable host path or wrapper.
     // Only an exact private replay-store record can explain that difference. This path
-    // is result delivery only; execution/observation still use the current strict match.
+    // recognizes dispatch provenance only; delivery/observation must independently
+    // verify terminal/running native metadata. It never authorizes execution.
     if (typeof recordedNativeCall !== "function" || envelope.worker !== projection.worker
         || envelope.reasoning_effort !== projection.workerEffort || envelope.service_tier !== projection.serviceTier
         || envelope.schema_version !== (projection.workflow === "nokiy" ? "nokiy_native_tool_v3" : "nokiy_native_tool_v2")

@@ -10,6 +10,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import { createSwitchboardServer } from "../src/server.mjs";
 import { nativeToolProjection, nativeToolItem, continueNativeObservation } from "../src/nokiy-native-tool.mjs";
 import { inputPair } from "../src/nokiy-result-delivery.mjs";
+import { createReplayRestorer } from "../src/nokiy-replay-restore.mjs";
 
 const host = { python: "/never/executed/python", script: "/never/executed/host.py", coordinator_mode: "dispatch_only_v1" };
 const options = { host, worker: "gpt-6.1-sol", workerEffort: "max", workflow: "nokiy" };
@@ -81,6 +82,79 @@ async function uncertainNativeOutput(item, session_id = 42) {
   assert.match(emitted[0].wait_error, /Recover the original session; do not replay/);
   return { type: "custom_tool_call_output", call_id: item.call_id, output: JSON.stringify(emitted[0]) };
 }
+
+for (const mode of ["nokiy", "nokiy-direct", "nokiy-efficient"]) test(`${mode} exact old dispatch retains observation provenance across host generations`, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "nokiy-observe-generation-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const request = (input = [], extra = {}) => ({ tools, input,
+    ...(mode === "nokiy-efficient" ? { model: "gpt-6.1-sol", reasoning: { effort: "max" } } : {}), ...extra });
+  const priorOptions = { ...options, workflow: mode === "nokiy" ? "nokiy" : "nokiy-direct", workerEffort: "xhigh",
+    ...(mode === "nokiy-efficient" ? { profile: { slug: mode, workflow: "nokiy-direct",
+      coordinator: { model: "gpt-6.1-sol", reasoning_effort: "max" } } } : {}),
+    host: { ...host, script: "/never/generation-a/host.py" } };
+  const nextOptions = { ...priorOptions, host: { ...host, script: "/never/generation-b/host.py" } };
+  const modelCall = { type: "custom_tool_call", name: "nokiy_execute", call_id: original.call_id,
+    input: JSON.stringify({ operation: "run", draft: { workspace: "/workspace", artifact_root: "/receipts",
+      authority_effect: "none", prompt: "Read one assigned file." }, action: { read_scopes: ["src/a.py"] } }) };
+  const previous = nativeToolProjection(request(), priorOptions);
+  const source = nativeToolItem(modelCall, previous);
+  const path = join(root, "replay.jsonl");
+  createReplayRestorer({ path }).record(modelCall, source);
+  const replay = createReplayRestorer({ path });
+  const next = (body, continuation = null, extra = {}) => continueNativeObservation(nativeToolProjection(body, {
+    ...nextOptions, recordedNativeCall: replay.originalCall, ...extra,
+  }), continuation);
+  const full = next(request([source, output(source)]));
+  assert.equal(full.nativeObservationState.references.length, 1);
+  if (mode === "nokiy-efficient") {
+    // Efficient already retains native tools; this change grants no new alias.
+    assert.ok(!full.body.tools.some(tool => tool.name === "nokiy_observe"));
+    return;
+  }
+  assert.deepEqual(await executeFixture(nativeToolItem(observe(), full)), {
+    waits: [{ session_id: 42, chars: "" }], emitted: [{ exit_code: 0, output: "fixture terminal" }],
+  });
+  const oldState = continueNativeObservation(nativeToolProjection(request([source, output(source)]), priorOptions));
+  const reloaded = next(request([source, output(source)], { previous_response_id: "r1" }), carry(oldState));
+  assert.equal(reloaded.nativeObservationState.references.length, 1, "Replayed full pair must not erase valid retained identity");
+  assert.equal(nativeToolItem(observe(), reloaded).name, "exec");
+  const oldEmpty = continueNativeObservation(previous);
+  const delta = next(request([output(source)], { previous_response_id: "r1" }), carry(oldEmpty, source));
+  assert.equal(nativeToolItem(observe(), delta).name, "exec");
+
+  const waitTool = { type: "function", name: "wait", parameters: { type: "object", properties: {
+    cell_id: { type: "string" }, terminate: { type: "boolean" },
+  }, required: ["cell_id"], additionalProperties: false } };
+  const waiting = { type: "function_call", name: "wait", namespace: "functions", call_id: "outer_wait",
+    arguments: '{"cell_id":"original_cell"}' };
+  const yielded = { ...output(source), output: "Script running with cell ID original_cell\nWall time 1 seconds\nOutput:\n" };
+  const uncertain = { type: "function_call_output", call_id: waiting.call_id,
+    output: "Script completed\nWall time 1 seconds\nOutput:\n" + JSON.stringify({ session_id: 42, recovery_session_id: 42,
+      terminal: false, exit_code: null, output: "PRIVATE_NATIVE_OUTPUT" }) };
+  const cells = next({ ...request([source, yielded, waiting, uncertain]),
+    tools: [{ ...tools[0], tools: [...tools[0].tools, waitTool] }] });
+  assert.equal(nativeToolItem(observe(), cells).input, 'text(await tools.write_stdin({"session_id":42,"chars":""}));');
+  assert.ok(!JSON.stringify(cells.nativeObservationState).includes("PRIVATE_"));
+
+  const rejects = (body, extra = {}, continuation = null) => assert.throws(
+    () => nativeToolItem(observe(), next(body, continuation, extra)), { code: "NOKIY_NATIVE_OBSERVATION_INVALID" });
+  rejects(request([source, output(source)]), { recordedNativeCall: null });
+  for (const changed of [{ ...source, input: source.input + " " }, { ...source, call_id: "changed_call" },
+    { ...source, namespace: "remote_mcp" }]) rejects(request([changed, output(changed)]));
+  for (const extra of [{ worker: "different-worker" }, { workerEffort: "max" }, { workerServiceTier: "priority" }]) {
+    rejects(request([source, output(source)]), extra);
+  }
+  for (const value of [JSON.stringify({ session_id: 42, exit_code: 0, terminal: true, output: "done" }),
+    JSON.stringify({ output: "log mentions session_id 42" })]) {
+    rejects(request([source, { ...output(source), output: value }]));
+  }
+  rejects(request([source]));
+  assert.throws(() => nativeToolItem(observe({ session_id: 43 }), full), { code: "NOKIY_NATIVE_OBSERVATION_INVALID" });
+  rejects(request([source, output(source, 43)], { previous_response_id: "r2" }), {}, carry(oldState));
+  rejects(request([output(source)], { previous_response_id: "r2" }), {}, {
+    state: { ...oldState.nativeObservationState, owner: "foreign" }, call: source,
+  });
+});
 
 test("full admitted pair retains metadata only and emits exactly one empty-stdin native wait", async () => {
   const body = request([original, output()]), before = structuredClone(body);

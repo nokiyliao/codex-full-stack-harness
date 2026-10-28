@@ -1,6 +1,6 @@
 # Nokiy Full-Stack Harness
 
-Current source surface: **V456 caller + V455 Rust payload + switchboard c975ad8**, synchronized on 2026-10-28.
+Current source surface: **V456 caller + V455 Rust payload + switchboard d53f7e4**, synchronized on 2026-10-28.
 
 This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. Version numbers identify different components: V456 did not rebuild or rename the V455 Rust binaries.
 
@@ -16,7 +16,7 @@ Native Codex thread / Goal / UI
 | --- | --- | --- | --- |
 | Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `1101c58096f42e6299002a9f1fceba2f021c7d0d` | MIT |
 | Modified Tura-derived execution engine | [runtime](runtime) | `d66a81c966aade525ec5f2ae2316c3236d62c68d` | AGPL-3.0-or-later |
-| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `c975ad840b08b24a1788b17f7de830e73dc928ec` | Repository AGPL-3.0-or-later |
+| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `d53f7e475940b39ff4f664a70eb7c4e808a2b826` | Repository AGPL-3.0-or-later |
 
 [Current source manifest](releases/v456.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
 
@@ -28,6 +28,7 @@ Native Codex thread / Goal / UI
 - Bound verifier-output pointers, settled-failure handling and same-batch verifier input identities.
 - Missing-exec coordinator fallback with advertised-tool diagnostics.
 - Supervised hot reload, immutable host generations and exact cross-release dispatch-result binding.
+- Cross-generation observation of original native handles, without replaying commands or granting execution or permissions.
 - Compact final-acceptance defaults for intent, ordinary and shared/delta batch members, using their existing read grants.
 - Typed intake validation rejections return correctable diagnostics without starting a worker; they are not worker success or permission grants.
 

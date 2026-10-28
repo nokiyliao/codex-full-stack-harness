@@ -8,7 +8,7 @@ This is a source publication, not a redistribution of installed executables or m
 | --- | --- | --- |
 | Python caller | `1101c58096f42e6299002a9f1fceba2f021c7d0d` | All 48 non-cache installed package files match byte-for-byte; installed wheel version 0.3.456.dev0 |
 | Rust worker payload | `d66a81c966aade525ec5f2ae2316c3236d62c68d` | All 602 recorded build-source inputs match; four binary hashes match the installed V456 image, inherited from V455 |
-| Switchboard | `c975ad840b08b24a1788b17f7de830e73dc928ec` | Committed source, tests and workflow topology; private diagnostic credentials/configuration and compiled caches excluded |
+| Switchboard | `d53f7e475940b39ff4f664a70eb7c4e808a2b826` | Committed source, tests and workflow topology; private diagnostic credentials/configuration and compiled caches excluded |
 
 These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in releases/v456.json identify the published contents. Publication-only documentation and preserved licenses are identified separately.
 

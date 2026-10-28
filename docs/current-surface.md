@@ -4,7 +4,7 @@ The publication binds three independent sources rather than inventing one compon
 
 - Caller release V456: source 1101c58; its 48 installed non-cache package files match the published package.
 - Rust payload inherited from V455: source d66a81c; 602 recorded build inputs and four recorded binary identities were checked. V456's image label does not imply a new Rust build.
-- Switchboard c975ad8: deployed as nokiy-ultra-intake-rejection-20261028 with canonical workflow-update; 1,031 regression tests passed. The signed desktop App, models and efforts were unchanged.
+- Switchboard d53f7e4: deployed as nokiy-observation-generation-20261028 with canonical workflow-update; 1,034 regression tests passed. The signed desktop App, models and efforts were unchanged.
 
 The switchboard source includes the actual workflow topology but excludes installation identities and credentials. It cannot safely be installed by cloning another machine's runtime directory. DCF/J-Space managed-project contracts, official Codex and companion repositories remain external dependencies; source publication does not grant their permissions or claim those repositories were updated.
 
@@ -17,3 +17,5 @@ The current source also fixes host generation alias drift: admitted script, cont
 Compact final-acceptance shorthand derives defaults for intent, ordinary and shared/delta batch members from their existing read grants. It does not expand write or execution authority; host admission and identity checks remain unchanged.
 
 Typed adapter intake validation rejections stay in the native tool loop as correctable diagnostics, without starting the host or worker. A rejection is not worker success or a permission grant; the caller must correct the rejected input under the original authorization, and unrelated execution and identity failures retain their boundaries.
+
+Cross-generation observation recognizes exact previously emitted dispatches only with paired running native metadata and the original handle. Emission alone is not execution evidence; observation grants no host launch, new session or additional permissions, and never replays the original command.
