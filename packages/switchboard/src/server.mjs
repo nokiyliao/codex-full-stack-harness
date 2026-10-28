@@ -58,6 +58,7 @@ import { projectImageModel } from "./image-model-route.mjs";
 import {
   createExternalEventBridge,
   externalToolShape,
+  flattenTools,
   normalizeExternalItemsForOfficial,
 } from "./tool-bridge.mjs";
 import { rememberSpawnPayloads } from "./spawn-payload-cache.mjs";
@@ -65,9 +66,34 @@ import { elideNativeStaleAppshots, projectNokiyDirect, trimNativePrediction } fr
 import { admittedHostSnapshot, nativeToolItem, nativeEventProjector, nativeSseProjector, verifyNativeContract, verifyNativeInterpreter, continueNativeObservation, userMessageTexts } from "./nokiy-native-tool.mjs";
 import { bindPendingResultWait, resultContinuationCall, prepareResultDeliveryDiagnostic } from "./nokiy-result-delivery.mjs";
 import { latestInputIsOperatorTurn, nativeRunAfterResponse, nativeRunReminder } from "./nokiy-workflow-profiles.mjs";
+import { coordinatorProjection } from "./nokiy-coordinator-policy.mjs";
 import { startStdoutLogRotation } from "./log-rotation.mjs";
 import { itemHashes, itemKinds, rememberChain, replayDivergence, templateDiff } from "./replay-diagnostic.mjs";
 import { sharedReplayRestorer } from "./nokiy-replay-restore.mjs";
+
+// Cost hints only: never use these bindings for execution permission or projection.
+export function nativeRunControlBindings(body, previous = null) {
+  const catalogKnown = previous ? previous.catalogKnown !== false : !body.previous_response_id;
+  try {
+    const input = (Array.isArray(body.input) ? body.input : []).filter((item) =>
+      ["additional_tools", "tool_search_output"].includes(item?.type));
+    const tools = new Map((previous?.tools ?? []).map((item) => [JSON.stringify(item), item]));
+    for (const item of flattenTools(body.tools, input).bridge.values()) {
+      if (item.adapter) continue;
+      const identity = { type: item.responseType, name: item.responseName, namespace: item.namespace ?? null };
+      tools.set(JSON.stringify(identity), identity);
+    }
+    const projected = coordinatorProjection({ tools: body.tools, input },
+      { type: "custom", name: "nokiy_execute" }, previous?.bindings);
+    const bindings = projected.bindings.filter((item) => item.name !== "nokiy_execute").map((item) =>
+      Object.freeze({ ...item, unqualifiedUnique: catalogKnown && [...tools.values()].filter((tool) =>
+        tool.type === item.type && tool.name === item.name).length === 1 }));
+    return Object.freeze({ bindings: Object.freeze(bindings), tools: Object.freeze([...tools.values()]), catalogKnown });
+  } catch {
+    // Unknown history stays unknown for this bound chain, not a fresh empty catalog.
+    return Object.freeze({ bindings: Object.freeze([]), tools: Object.freeze([]), catalogKnown: false });
+  }
+}
 
 const TERMINAL_EVENTS = new Set(["response.completed", "response.failed", "response.incomplete", "error"]);
 const TERMINAL_FAILURE_EVENTS = new Set(["response.failed", "error"]);
@@ -1381,7 +1407,7 @@ export async function createSwitchboardServer({
               // The raw output still names nokiy_execute; the projected one shows the native cell.
               if (event.type === "response.completed") {
                 nativeRun = nativeRunAfterResponse(nativeRun, officialTurn.requestedAlias, event.response?.output,
-                  event.response?.usage, officialTurn.coordinatorBindings);
+                  event.response?.usage, officialTurn.nativeRunControls?.bindings ?? officialTurn.coordinatorBindings);
               }
               const resultCall = officialTurn.resultDeliveryEnabled ? resultContinuationCall(output) : null;
               directContinuation = event.type === "response.completed" && event.response?.id && (officialTurn.nativeToolTarget || officialTurn.coordinatorFallback)
@@ -1390,6 +1416,7 @@ export async function createSwitchboardServer({
                   toolsIdentity: officialTurn.nativeToolsIdentity, responseId: event.response.id,
                   profileIdentity: officialTurn.profileIdentity, resultCall,
                   coordinatorBindings: officialTurn.coordinatorBindings,
+                  nativeRunControls: officialTurn.nativeRunControls,
                   nativeObservation: officialTurn.nativeObservationState
                     ? { state: officialTurn.nativeObservationState, call: resultContinuationCall(output) } : null,
                   pendingDelivery: bindPendingResultWait(officialTurn.pendingResultDelivery, resultCall) }
@@ -1788,6 +1815,8 @@ export async function createSwitchboardServer({
                 answerOnly: direct.fallbackAnswerOnly } : null,
             resultDeliveryEnabled: direct?.nativeTool?.resultDeliveryEnabled === true,
             coordinatorBindings: direct?.nativeTool?.coordinatorBindings ?? null,
+            nativeRunControls: direct?.nativeTool?.adaptiveNative
+              ? nativeRunControlBindings(projectionBody, continuation?.nativeRunControls) : null,
             pendingResultDelivery: direct?.nativeTool?.pendingResultDelivery ?? null,
             nativeObservationState: direct?.nativeTool?.nativeObservationState ?? null,
             nativeToolsIdentity: continuation?.fallback && body.tools === undefined

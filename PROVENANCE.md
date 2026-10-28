@@ -8,7 +8,7 @@ This is a source publication, not a redistribution of installed executables or m
 | --- | --- | --- |
 | Python caller | `ffafb43816ea188b080a7978894ca98711625e9b` | Unchanged package source; all 48 non-cache installed package files match byte-for-byte; installed release wheel version 0.3.464.dev0 |
 | Rust worker payload | `1304065c69b9c5c6a702a05754526395c9a41678` | All 602 recorded build-source inputs match; rebuilt with cargo --locked, four binary identities match the installed V464 image; fail-fast retained, ready metrics reused, cancelled usage UNKNOWN |
-| Switchboard | `58ea63786d78d5b10872562e3ab37891bc5603b9` | Retains public-note delivery and coherent-branch routing; excludes already-bound parent controls from advisory dispatch accounting; model/effort topology unchanged; private diagnostics and compiled caches excluded |
+| Switchboard | `89c7889dc9c6d8b53e142ae2270b09dc266efa61` | Retains public-note delivery and coherent-branch routing; identifies Ultra and Efficient native controls for advisory accounting without changing execution authority; model/effort topology unchanged; private diagnostics and compiled caches excluded |
 
 These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in releases/v464-controls.json identify the published contents. Publication-only documentation and preserved licenses are identified separately.
 

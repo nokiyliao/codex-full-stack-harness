@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { latestInputIsOperatorTurn, nativeRunAfterResponse, nativeRunReminder, NATIVE_RUN_REMINDER } from "../src/nokiy-workflow-profiles.mjs";
 import { nativeToolProjection } from "../src/nokiy-native-tool.mjs";
+import { nativeRunControlBindings } from "../src/server.mjs";
 
 const call = (name) => ({ type: "custom_tool_call", name, call_id: "c-" + name, input: "{}" });
 const usage = (input_tokens) => ({ input_tokens });
@@ -30,10 +31,11 @@ test("bound parent controls do not trigger a worker dispatch reminder", () => {
     { type: "custom_tool_call", name: "nokiy_native", namespace: null },
   ];
   for (const binding of bindings.slice(0, -1)) {
-    const next = nativeRunAfterResponse(state, "nokiy-direct", [binding], usage(120000), bindings);
+    const output = { ...binding, ...(binding.name === "write_stdin" ? { arguments: '{"session_id":42,"chars":""}' } : {}) };
+    const next = nativeRunAfterResponse(state, "nokiy-direct", [output], usage(120000), bindings);
     assert.equal(next.steps, 1, binding.name);
     assert.equal(nativeRunReminder(next, "nokiy-direct", false).text, null);
-    const { namespace: _, ...unqualified } = binding;
+    const { namespace: _, ...unqualified } = output;
     assert.equal(nativeRunAfterResponse(state, "nokiy-direct", [unqualified], usage(120000), bindings).steps, 1);
   }
   assert.equal(nativeRunAfterResponse(state, "nokiy-direct", [bindings[0], call("nokiy_native")], usage(120000), bindings).steps, 2);
@@ -42,6 +44,82 @@ test("bound parent controls do not trigger a worker dispatch reminder", () => {
   const ambiguous = [...bindings, { ...bindings[0], namespace: null }];
   const { namespace: _, ...unqualified } = bindings[0];
   assert.equal(nativeRunAfterResponse(state, "nokiy-direct", [unqualified], usage(120000), ambiguous).steps, 2);
+});
+
+test("Efficient derives advisory controls without restricting its native tools", () => {
+  const exec = { type: "function", name: "exec_command", parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } };
+  const body = { model: "gpt-6.1-sol", reasoning: { effort: "max" }, tools: [exec,
+    { type: "namespace", name: "functions", tools: [
+      { type: "function", name: "get_goal", parameters: { type: "object" } },
+      { type: "function", name: "write_stdin", parameters: { type: "object", properties: { chars: { type: "string" } } } },
+    ] },
+    { type: "namespace", name: "codex_app", tools: [
+      { type: "function", name: "read_thread", parameters: { type: "object" } },
+      { type: "function", name: "send_message_to_thread", parameters: { type: "object" } },
+    ] },
+  ], input: [] };
+  const before = structuredClone(body);
+  const advisory = nativeRunControlBindings(body);
+  const state = { alias: "nokiy-efficient", steps: 4, inputTokens: 150000 };
+  for (const binding of advisory.bindings) {
+    const output = { ...binding, ...(binding.name === "write_stdin" ? { arguments: '{"session_id":42}' } : {}) };
+    const { namespace: _, ...unqualified } = output;
+    for (const item of [output, unqualified]) {
+      const next = nativeRunAfterResponse(state, "nokiy-efficient", [item], usage(150000), advisory.bindings);
+      assert.equal(next.steps, 4, item.name);
+      assert.equal(nativeRunReminder(next, "nokiy-efficient", false).text, null);
+    }
+  }
+  assert.equal(advisory.bindings.length, 4);
+  const profile = { slug: "nokiy-efficient", workflow: "nokiy-direct", coordinator: { model: "gpt-6.1-sol", reasoning_effort: "max" } };
+  const projection = nativeToolProjection(body, { worker: "gpt-6.1-terra", workflow: "nokiy-direct", profile,
+    host: { python: "/not/executed/python", script: "/not/executed/host.py", coordinator_mode: "dispatch_only_v1" } });
+  assert.equal(projection.adaptiveNative, true);
+  assert.equal(projection.coordinatorBindings, null);
+  assert.deepEqual(projection.body.tools.slice(0, body.tools.length), before.tools);
+  assert.deepEqual(body, before);
+});
+
+test("advisory continuation preserves definitions but revokes invalid and ambiguous hints", () => {
+  const tool = { type: "function", name: "read_thread", namespace: "codex_app", parameters: { type: "object" } };
+  const state = { alias: "nokiy-efficient", steps: 4, inputTokens: 150000 };
+  const initial = nativeRunControlBindings({ input: [{ type: "tool_search_output", tools: [tool] }] });
+  const continued = nativeRunControlBindings({ input: [{ type: "function_call_output", output: "done" }] }, initial);
+  assert.equal(continued.bindings.length, 1);
+  const invalid = nativeRunControlBindings({ tools: [{ ...tool, parameters: null }] }, continued);
+  assert.equal(invalid.bindings.length, 0);
+  const duplicate = nativeRunControlBindings({ tools: [tool, tool] }, continued);
+  assert.equal(duplicate.bindings.length, 0);
+  assert.equal(nativeRunControlBindings({}, duplicate).bindings.length, 0);
+  const collided = nativeRunControlBindings({ tools: [tool, { ...tool, namespace: "foreign" }] });
+  const output = { type: "function_call", name: "read_thread", arguments: "{}" };
+  assert.equal(nativeRunAfterResponse(state, "nokiy-efficient", [output], usage(150000), collided.bindings).steps, 5);
+  assert.equal(nativeRunAfterResponse(state, "nokiy-efficient", [{ ...output, namespace: "codex_app" }], usage(150000), collided.bindings).steps, 4);
+  const retainedCollision = nativeRunControlBindings({}, collided);
+  assert.equal(nativeRunAfterResponse(state, "nokiy-efficient", [output], usage(150000), retainedCollision.bindings).steps, 5);
+  const conflictingHistory = nativeRunControlBindings({ tools: [tool], input: [
+    { type: "additional_tools", tools: [{ ...tool, namespace: "foreign", description: "first" }] },
+    { type: "additional_tools", tools: [{ ...tool, namespace: "foreign", description: "changed" }] },
+  ] }, collided);
+  assert.equal(conflictingHistory.catalogKnown, false);
+  const afterUnknown = nativeRunControlBindings({ tools: [tool] }, conflictingHistory);
+  assert.equal(afterUnknown.catalogKnown, false);
+  assert.equal(nativeRunAfterResponse(state, "nokiy-efficient", [output], usage(150000), afterUnknown.bindings).steps, 5);
+  assert.equal(nativeRunAfterResponse(state, "nokiy-efficient", [{ ...output, namespace: "codex_app" }], usage(150000), afterUnknown.bindings).steps, 4);
+  const unbound = nativeRunControlBindings({ tools: [tool], previous_response_id: "unknown-chain" });
+  assert.equal(unbound.bindings[0].unqualifiedUnique, false);
+});
+
+test("Efficient stdin input and mixed implementation are not control-only steps", () => {
+  const advisory = nativeRunControlBindings({ tools: [{ type: "function", name: "write_stdin", parameters: { type: "object" } }] });
+  const state = { alias: "nokiy-efficient", steps: 4, inputTokens: 150000 };
+  for (const args of ['{"session_id":42,"chars":"run"}', "[]", "null", "bad json"]) {
+    const output = { type: "function_call", name: "write_stdin", arguments: args };
+    assert.equal(nativeRunAfterResponse(state, "nokiy-efficient", [output], usage(150000), advisory.bindings).steps, 5);
+  }
+  const empty = { type: "function_call", name: "write_stdin", arguments: '{"session_id":42,"chars":""}' };
+  assert.equal(nativeRunAfterResponse(state, "nokiy-efficient", [empty], usage(150000), advisory.bindings).steps, 4);
+  assert.equal(nativeRunAfterResponse(state, "nokiy-efficient", [empty, call("exec")], usage(150000), advisory.bindings).steps, 5);
 });
 
 test("opaque code and foreign wait names are not classified by poll substrings", () => {

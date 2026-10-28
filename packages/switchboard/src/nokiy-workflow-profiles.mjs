@@ -21,10 +21,18 @@ export const NATIVE_RUN_REMINDER = Object.freeze({ "nokiy-efficient": 5, "nokiy-
 export const NATIVE_RUN_REMINDER_MIN_INPUT_TOKENS = 100_000;
 const RUN_CALL_TYPES = new Set(["function_call", "custom_tool_call", "local_shell_call"]);
 function coordinationOnlyCall(item, bindings) {
+  if (item.name === "write_stdin") {
+    try {
+      const args = JSON.parse(item.arguments);
+      if (!args || typeof args !== "object" || Array.isArray(args)
+          || (args.chars !== undefined && args.chars !== "")) return false;
+    } catch { return false; }
+  }
   if (bindings.length) {
     const matches = bindings.filter((binding) => binding.type === item.type && binding.name === item.name
       && (item.namespace == null || (binding.namespace ?? null) === item.namespace));
-    return matches.length === 1 && matches[0].name !== "nokiy_native";
+    return matches.length === 1 && matches[0].name !== "nokiy_native"
+      && (item.namespace != null || matches[0].unqualifiedUnique !== false);
   }
   return item.name === "wait" && (item.namespace == null || item.namespace === "functions");
 }

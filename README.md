@@ -1,6 +1,6 @@
 # Nokiy Full-Stack Harness
 
-Current source surface: **V464 runtime + coordinator-control correction: caller ffafb43 + rebuilt Rust 1304065 + switchboard 58ea637**, synchronized on 2026-10-28.
+Current source surface: **V464 runtime + Ultra/Efficient control correction: caller ffafb43 + rebuilt Rust 1304065 + switchboard 89c7889**, synchronized on 2026-10-28.
 
 This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V464 keeps failed-patch feedback fast: an already-finished provider uses its normal metrics path, while a still-running provider is cancelled without waiting just for accounting. Cancelled usage remains UNKNOWN, never zero. The intermediate V463 forced-drain approach was rejected for delaying repair. V462 optional worker notes and single-branch-only Efficient native implementation remain. These changes do not expand permissions or change models.
 
@@ -16,7 +16,7 @@ Native Codex thread / Goal / UI
 | --- | --- | --- | --- |
 | Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `ffafb43816ea188b080a7978894ca98711625e9b` | MIT |
 | Modified Tura-derived execution engine | [runtime](runtime) | `1304065c69b9c5c6a702a05754526395c9a41678` | AGPL-3.0-or-later |
-| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `58ea63786d78d5b10872562e3ab37891bc5603b9` | Repository AGPL-3.0-or-later |
+| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `89c7889dc9c6d8b53e142ae2270b09dc266efa61` | Repository AGPL-3.0-or-later |
 
 [Current source manifest](releases/v464-controls.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
 
