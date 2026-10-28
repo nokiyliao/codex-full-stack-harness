@@ -2,6 +2,26 @@
 
 These are descriptive engineering measurements, not universal speedups, subscription billing or isolated causal estimates. Complete reported coordinator, worker and native-child usage is included; unreported provider attempts are not asserted to be covered.
 
+## Complete R19 Pair At Switchboard 372c9b2
+
+One concurrent frozen R19 repair pair used earlier Switchboard `372c9b26b65b3ce9319877651bf63a1696232b24`, before the native-catalog fallback repair. Caller/Rust remained V464. Controls matched and both fixed quality gates passed, with no failures, errors or skips.
+
+| Metric | Efficient | Native Sol | Difference |
+| --- | ---: | ---: | ---: |
+| Workflow wall seconds | 240.9 | 390.1 | -38.25% |
+| API-equivalent USD | 0.2512 | 0.5439 | -53.82% |
+| Total input plus output tokens | 489262 | 1399271 | |
+| Uncached input | 122435 | 112787 | |
+| Reported calls | 15 | 26 | |
+| Workers / correlated native children | 2 / 0 | 0 / 1 | |
+| Quality | PASS, 67 tests | PASS, 73 tests | |
+
+All totals include both coordinators, Efficient's two Workers and the correlated native child. Root CLI counters reconciled and reported usage coverage was complete. Costs use fixed historical 2026-10-22 API-equivalent rates, not subscription billing or invoices; retained reported usage is not complete provider billing. Engineering investigations are not benchmark arms.
+
+This one pair observed joint time/cost gains. It is not evidence that the later native-catalog repair caused the gain, and it does not establish stable same-ID long-workflow gains. The earlier negative same-ID cost result, observation-only policy comparison and incomplete cancelled usage remain below.
+
+Current Switchboard `35e4fe45a0e6170e539bc567def3451e93c69ca3` is a verified hot deployment (`hot_reload`) with 1,056 passing source tests, no App restart and no permission/model changes; caller/Rust V464 is unchanged. Original affected target-task recovery remains unverified, and no latency/cost percentage is assigned to this protocol repair.
+
 Fixed-quality Efficient engineering pair, 2026-10-28, integration source d53f7e4:
 
 | Metric | Efficient | Native control |
@@ -95,7 +115,7 @@ Earlier whole-workflow reports that counted only the last response's tokens are 
 
 ## Earlier V464 / 89c7889 Efficient R19 Pair
 
-On2026-10-28, one fresh pair used the earlier V464 caller/runtime and Switchboard89c7889 composition, the same frozen R19 task, concurrent arms and independent fixed quality gate. This is not a measurement of the adopted 372c9b2 source. Both coordinators used Sol6.1/max; Efficient selected two Terra6.1/xhigh workers. Source/configuration controls, including server/profile/route/policy bytes before and after, matched. Root reported input/cached/output usage reconciled exactly to each CLI, and all worker/native-child usage was complete. Costs retain frozen2026-10-22 API-equivalent weights, not subscription billing or current invoices.
+On2026-10-28, one fresh pair used the earlier V464 caller/runtime and Switchboard89c7889 composition, the same frozen R19 task, concurrent arms and independent fixed quality gate. This is not a measurement of the current 35e4fe4 source. Both coordinators used Sol6.1/max; Efficient selected two Terra6.1/xhigh workers. Source/configuration controls, including server/profile/route/policy bytes before and after, matched. Root reported input/cached/output usage reconciled exactly to each CLI, and all worker/native-child usage was complete. Costs retain frozen2026-10-22 API-equivalent weights, not subscription billing or current invoices.
 
 | Metric | Efficient | Native Sol6.1 | Difference |
 | --- | ---: | ---: | ---: |
@@ -126,7 +146,7 @@ The complete retained 2026-10-28 sample compared Efficient with native Sol6.1/ma
 | Reported calls | 26 | 16 | |
 | Quality tests | 69 | 69 | |
 
-Active-turn durations are summed, not presented as an end-to-end workflow wall clock. Final executable control differed; filesystem replacement timestamps were after the measured phases. Treat this as descriptive observation, not a strict unchanged-executable causal comparison. The complete multi-turn sample establishes no joint cost/time improvement: Efficient cost more despite less summed active time.
+Active-turn durations are summed and exclude inter-turn gaps, not presented as an end-to-end workflow wall clock. End-of-run native-binary identity drift affected the control; filesystem replacement timestamps were after the measured phases. Treat this as descriptive observation, not a strict unchanged-executable causal comparison. The complete multi-turn sample establishes no joint cost/time improvement: Efficient cost more despite less summed active time.
 
 ## Efficient Observation-Policy Before/After Pair
 
@@ -143,4 +163,4 @@ On2026-10-29, one sequential fresh-CLI acceptance-only pair compared Efficient b
 
 Both root CLI usage totals reconciled exactly (REPORTED_TOTALS_MATCH). Controls were stable within each arm; the only cross-arm changes were coordinator observation-guidance source and admission release metadata. Totals include measured coordinator/correlated usage; engineering-chat usage is excluded by operator scope. Removing cached input reduces tokens with a lower API cost weight, so token savings need not equal cost savings.
 
-This one pair does not establish full repair-workflow or same-ID/multiturn stability. The small 2.52% wall-time difference is insufficient for a stable speedup claim. Costs use frozen2026-10-22 standard API-equivalent rates, not subscription consumption or invoices. Current Switchboard source is 372c9b2, while runtime remains V464; these model measurements were not rerun for the publisher receipt-directory fix and must not be relabeled as a complete latest-commit benchmark.
+This one pair does not establish full repair-workflow or same-ID/multiturn stability. The small 2.52% wall-time difference is insufficient for a stable speedup claim. Costs use frozen2026-10-22 standard API-equivalent rates, not subscription consumption or invoices. Current Switchboard source is 35e4fe4, while runtime remains V464. The complete R19 pair above was measured at 372c9b2 before the native-catalog repair; no model measurement here proves that repair caused a gain.

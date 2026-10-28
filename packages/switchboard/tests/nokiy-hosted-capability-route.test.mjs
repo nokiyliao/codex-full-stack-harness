@@ -194,7 +194,7 @@ describe("Responses admission stays inference-specific", () => {
       { code: "NOKIY_DIRECT_DECODER_MISMATCH", status: 400 });
   });
 
-  test("valid effort still requires native exec and forbids native subagent selection", () => {
+  test("valid effort preserves fresh native tools without Nokiy dispatch and forbids native subagent selection", () => {
     const withoutExec = [{ type: "namespace", name: "functions",
       tools: [{ type: "custom", name: "apply_patch", format: { type: "text" } }] }];
     // 2026-10-27: a full request with its own tools but no native exec is answered by the
@@ -205,7 +205,10 @@ describe("Responses admission stays inference-specific", () => {
     assert.equal(answered.body.model, selected.coordinator.model);
     assert.deepEqual(answered.nativeToolMissing.advertised_tools, ["custom:apply_patch"]);
     const chained = projectNokiyDirect({ ...body, tools: withoutExec, previous_response_id: "resp_1" }, options);
-    assert.equal(chained.body.tool_choice, "none");
+    assert.notEqual(chained.body.tool_choice, "none");
+    assert.deepEqual(chained.body.tools, withoutExec);
+    assert.equal(chained.nativeTool, null);
+    assert.equal(chained.dispatch, "none");
     assert.deepEqual(chained.nativeToolMissing.advertised_tools, ["custom:apply_patch"]);
     // 2026-10-25: a request advertising no tool at all is an app helper call, answered without dispatch.
     const helper = projectNokiyDirect({ ...body, tools: [] }, options);

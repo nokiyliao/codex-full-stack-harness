@@ -55,6 +55,74 @@ test("unbound exec-less chains answer without tool calls and full requests can a
   assert.equal(route(withoutTools).coordinatorFallback, true);
 });
 
+const appTools = [{ type: "namespace", name: "mcp__codex_app", tools: [{ type: "function", name: "read_thread",
+  parameters: { type: "object", properties: { thread_id: { type: "string" } }, required: ["thread_id"] } }] }];
+
+for (const slug of ["nokiy-efficient", "nokiy-direct"]) {
+  test(`${slug}: an unbound chain preserves a fresh native App catalog without dispatch`, () => {
+    const body = helper(slug, { previous_response_id: "unbound", tools: [...appTools,
+      { type: "function", name: "spawn_agent" }], tool_choice: "auto" });
+    const before = structuredClone(body), routed = route(body);
+    assert.deepEqual(body, before);
+    assert.deepEqual(routed.body.tools, appTools);
+    assert.equal(routed.body.tool_choice, "auto");
+    assert.equal(routed.fallbackAnswerOnly, false);
+    assert.equal(routed.nativeTool, null);
+    assert.equal(routed.dispatch, "none");
+    assert.equal(routed.coordinatorFallback, true);
+    assert.equal(routed.body.instructions, body.instructions);
+    assert.deepEqual(routed.body.input, body.input);
+    assert.deepEqual(routed.nativeToolMissing.advertised_tools,
+      ["function:read_thread", "function:spawn_agent"]);
+  });
+
+  test(`${slug}: absent, partial and stale catalogs cannot reopen an unbound chain`, () => {
+    for (const extra of [{}, { tools: [] }, { input: [{ type: "additional_tools", tools: appTools }] },
+      { input: [{ type: "tool_search_output", call_id: "discovery", tools: appTools }] },
+      { tools: appTools, input: [{ type: "additional_tools", tools: [{ type: "custom", name: NOKIY_TOOL }] }] },
+      ...[{ type: "function", name: "exec" }, { type: "custom", name: "exec_command" },
+        ...(slug === "nokiy-efficient" ? [{ type: "custom", name: "exec", description: "Run JavaScript only." }] : []),
+        ...[NOKIY_TOOL, "nokiy_native", "nokiy_observe", "nokiy_goal"].map((name) => ({ type: "custom", name }))]
+        .map((tool) => ({ tools: [...appTools, tool] }))]) {
+      const body = helper(slug, { previous_response_id: "unbound", tool_choice: "auto", ...extra });
+      if (!Object.hasOwn(extra, "tools")) delete body.tools;
+      const routed = route(body);
+      assert.equal(routed.body.tool_choice, "none");
+      assert.equal(routed.fallbackAnswerOnly, true);
+      assert.equal(routed.nativeTool, null);
+      assert.equal(routed.dispatch, "none");
+      assert.ok(routed.nativeToolMissing.advertised_tools.length <= 64);
+    }
+  });
+
+  test(`${slug}: answer-only fallback revalidates a fresh non-exec catalog on every continuation`, () => {
+    const state = (routed) => ({ wireEffort: routed.wireEffort,
+      nativeToolMissing: routed.nativeToolMissing, answerOnly: routed.fallbackAnswerOnly });
+    const fallback = route(helper(slug, { previous_response_id: "unbound" }));
+    const delta = { model: slug, reasoning: { effort: "medium" }, previous_response_id: "fallback",
+      tool_choice: "auto", input: [] };
+    const recovered = route({ ...delta, tools: appTools }, { continuationFallback: state(fallback) });
+    assert.equal(recovered.body.tool_choice, "auto");
+    assert.deepEqual(recovered.body.tools, appTools);
+    assert.equal(recovered.fallbackAnswerOnly, false);
+    assert.equal(recovered.nativeTool, null);
+    assert.equal(recovered.dispatch, "none");
+    assert.deepEqual(recovered.nativeToolMissing.advertised_tools, ["function:read_thread"]);
+    assert.equal(recovered.nativeToolMissing.continuation, true);
+    const omitted = route(delta, { continuationFallback: state(recovered) });
+    assert.equal(omitted.body.tool_choice, "auto");
+    assert.equal(omitted.fallbackAnswerOnly, false);
+    assert.deepEqual(omitted.nativeToolMissing.advertised_tools, []);
+    for (const update of [{ tools: [] },
+      { tools: [...appTools, { type: "custom", name: NOKIY_TOOL }] },
+      { input: [{ type: "additional_tools", tools: [{ type: "custom", name: NOKIY_TOOL }] }] }]) {
+      const invalidated = route({ ...delta, ...update }, { continuationFallback: state(recovered) });
+      assert.equal(invalidated.body.tool_choice, "none");
+      assert.equal(invalidated.fallbackAnswerOnly, true);
+    }
+  });
+}
+
 const efficient = profiles.find((profile) => profile.slug === "nokiy-efficient");
 const options = { host, profile: efficient, workflow: "nokiy-direct", worker: "gpt-6.1-sol", workerEffort: "xhigh",
   workerServiceTier: "default" };

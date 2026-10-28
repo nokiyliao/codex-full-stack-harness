@@ -2382,7 +2382,7 @@
       }
     },
     "packages/switchboard": {
-      "source_head": "372c9b26b65b3ce9319877651bf63a1696232b24",
+      "source_head": "35e4fe45a0e6170e539bc567def3451e93c69ca3",
       "includes_uncommitted_changes": false,
       "export": "committed source with documented exclusions and publication-only notices",
       "files": {
@@ -2406,7 +2406,7 @@
         "src/inference-attempt-evidence.mjs": "0660914425927767292dede0b759e1d9937fe53d600851cace360ac594bbb758",
         "src/log-rotation.mjs": "cc383fdc5dab1ed3b7c1ef5f37b4899844a4fe80173817acb4567f51532e2ae4",
         "src/nokiy-coordinator-policy.mjs": "76479dc5ccc756ea5d379e255c5e72c2acf52b6bca8e1f42a9351c756f47e709",
-        "src/nokiy-direct-route.mjs": "4ba4ad364d90c398467a435fa3ec99304f480bea520be85507af548e927c0bbf",
+        "src/nokiy-direct-route.mjs": "ef73031b3c41497ecfc1be9b10d321db4660ad4fdd8dff28665b38305e61bb90",
         "src/nokiy-http-evidence.py": "66fc8f5b15039d5829d4e5bc69f51617469c5e1ebc3116f06e43fc612abef57f",
         "src/nokiy-native-contract.json": "f95d35bb2ef9b2de1aaeea7f27f5945fb768a934401b0e8a30c711af250a4961",
         "src/nokiy-native-host.py": "7ce125be45d6824f85a2ef63b1f44936bcdf3d33f0cf9cc4138b40c641d393cb",
@@ -2468,7 +2468,7 @@
         "tests/nokiy-host-compact-batch.test.mjs": "8136ae9f11c1fabe4f614cb05081bbc5d148eadf3952403441bac63eb1a0c0b8",
         "tests/nokiy-host-interpreter.test.mjs": "0211e261f67f048c99c7c97afe5d4b483f41bc548bcd149b6e31d92bb0bb5dff",
         "tests/nokiy-host-snapshot.test.mjs": "b8cb6f1835fbb34adfb9906a0e94b878158eaabb465d274a14bb2510502e592e",
-        "tests/nokiy-hosted-capability-route.test.mjs": "c64f00d262dc3e13edfe325db5bc731d9f8f85826ef895e41893e2456e60bf37",
+        "tests/nokiy-hosted-capability-route.test.mjs": "e7623e82ccf1b57d5d6ba4c0e1a3d03b9697414b7437674d601cc71f12b0a822",
         "tests/nokiy-incomplete-continuation.test.mjs": "8e4251cc7e579219e0b7cdf276af77f187f79c0c8ccb1034b858e4f16d33ea47",
         "tests/nokiy-inspect-guidance.test.mjs": "961fb3175bd0bad7480b47a5493224e2f2ad26cc2ebade4025db48f6ad3bacac",
         "tests/nokiy-lite-prefix.test.mjs": "6c909f86a7cadec2f01fe0d7b24e5b79e98b63722cec65b15c9a653d9a28c32e",
@@ -2497,13 +2497,13 @@
         "tests/nokiy-result-delivery.test.mjs": "5f441ff6a206363bb4f07c63687164d926f2c89edbdb8eceaeb08bc2f31df0d4",
         "tests/nokiy-stale-appshots.test.mjs": "353c16d7f76d45de58effbc36fc20c7e43d0aef71da46234af8822463a1c7be9",
         "tests/nokiy-surface-query.test.mjs": "a18dcab5f58b844f62a57b7106abc1930dd928a9257ef2e54f7883628be8f3c2",
-        "tests/nokiy-tool-availability.test.mjs": "986f513768de11da5ed6bb6bb0ea54f5876a4a3c68aa95655c107870be655429",
+        "tests/nokiy-tool-availability.test.mjs": "f56e3fdb93a0243c8d0afc1243748aaa5cfcbe3bebeabbda69d46e3a728b772e",
         "tests/nokiy-tool-output-limit.test.mjs": "6bf7e67237b766fad314da24a66e3c2dc9e952f7f2b93392a38e9ad35d9212ca",
         "tests/nokiy-user-reference.test.mjs": "795b95a0214220cd4a13ca8770cad2a85bebc213b188be5bf771e61319810e17",
         "tests/nokiy-verifier-contract-guidance.test.mjs": "737b4c56004086ec2665577b3d1ebdb9e585be7942b5abb7d83d01907306a7f5",
         "tests/nokiy-worker-effort.test.mjs": "19af34d069151bbd858e1b308a2f9f8ff350135325344cf87dd06b9af3f1cb43",
         "tests/official-catalog-refresh.test.mjs": "b36259b9063bd64a830ede492ea791f9f0e2926811ca4670ede50b6419153678",
-        "tests/official-prewarm.test.mjs": "692bfb89ab878cf643bb58f1b6b2b8b1bd5365c7f80343b1ba8d60a7d754975b",
+        "tests/official-prewarm.test.mjs": "522d0fa8ed445205a5a20fa6a904f677d26bb889379c352cc12a0223e096e3bb",
         "tests/official-terminal.test.mjs": "3845a6fe904d1eee63696e0bdaa9c71fc6ed7fb9459fddf38c2c4de706121c24",
         "tests/openrouter-worker.test.mjs": "cc40894708af025eec16a4d154a3861e1a44a73991d15fde1271e4f9055548c4",
         "tests/picker-catalog.test.mjs": "3d57b070c2a84ad7b35a028bc1cd9ddb204f986ed59c56d85b50ea43e8617165",
@@ -2700,13 +2700,13 @@
     }
   },
   "publication_files": {
-    "README.md": "332870a09c795468a72b704638f5483bbfeb705da91345aa5764e26cc5d96074",
-    "PROVENANCE.md": "e5f9ff7c451a0c2770836b23f7a530761b2a5cb4ead6daed26eebbb09bcdad32",
+    "README.md": "b5d309b72128db89d6f51f137c7b8ada3a31c42d1b6434e7097cba0f26adf191",
+    "PROVENANCE.md": "3f75dcafc98c29ad114f7f7595acc91100bb760edf96a7762ac8802241a9a558",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "06ab5d66e2b05d23c5e95ff4c3a6960cb5f3080c4cef269833a906eeb1af9c8f",
-    "docs/current-surface.md": "a72938bb2d1d7cbdc956dc9008b36c6ea1001d5ea4d63edcc6b48d742efbc440",
-    "docs/benchmark-summary.md": "66d3e1ce080c4cca5fc6ddda5c798aecb40854d31d46425e7e749f881ae04c99"
+    "docs/current-surface.md": "b207eb99f2a15d7d3149719b6094448fdbee02e13703191b57f4e77c796dd1f0",
+    "docs/benchmark-summary.md": "a554a269b550b2eb71e2b606821fed9febd89948ad43748b1b76d00f49ab8dc9"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261028-v464-fail-fast-ready-usage",
@@ -3606,16 +3606,17 @@
         "bytes": 7602928
       }
     },
-    "switchboard_deployment": "nokiy-prepare-receipt-directory-20261029",
+    "switchboard_deployment": "nokiy-native-catalog-fallback-20261029",
     "switchboard_regression_tests": {
-      "passed": 1050,
+      "passed": 1056,
       "failed": 0,
       "skipped": 0,
-      "scope": "Full candidate Node suite; adopted source tree matches byte-for-byte. Focused prepare34overlaps and is not additive.",
+      "scope": "Complete candidate source suite; adopted live source matches byte-for-byte. Historical focused counts overlap and are not additive.",
       "focused_prepare_passed": 34,
       "live_focused_passed": null,
       "historical_live_focused_passed": 9,
-      "historical_live_focused_source": "89c7889dc9c6d8b53e142ae2270b09dc266efa61"
+      "historical_live_focused_source": "89c7889dc9c6d8b53e142ae2270b09dc266efa61",
+      "source_head": "35e4fe45a0e6170e539bc567def3451e93c69ca3"
     },
     "switchboard_focused_python_tests": {
       "staged_passed": 184,
@@ -3702,6 +3703,66 @@
       "real_native_plan_check": "READY",
       "hot_deployment_verified": true,
       "model_benchmark_rerun": false
+    },
+    "native_catalog_fallback_correction": {
+      "source_commit": "35e4fe45a0e6170e539bc567def3451e93c69ca3",
+      "fresh_complete_native_catalog_recovers_exec_less_chain": true,
+      "exact_same_connection_catalog_survives_omitted_tool_deltas": true,
+      "unknown_or_stale_binding_rejected": true,
+      "nokiy_dispatch_without_exec_binding": false,
+      "permissions_changed": false,
+      "model_effort_changed": false,
+      "verified_hot_deployment": true,
+      "app_restart_performed": false,
+      "original_affected_task_recovery": "UNVERIFIED",
+      "performance_gain_attributed_to_this_repair": false
+    },
+    "complete_r19_observation_at_372c9b2": {
+      "tested_switchboard_commit": "372c9b26b65b3ce9319877651bf63a1696232b24",
+      "native_payload_sha256": "d84a54b031085f01e3ad915ea7c72ebea4dcf69e90f0d1e0e4a637e8280991d2",
+      "controls_matched": true,
+      "reported_root_cli_usage_reconciled": true,
+      "summary": {
+        "efficient": {
+          "seconds": 240.9,
+          "cost": 0.2512,
+          "uncached": 122435,
+          "calls": 15,
+          "workers": 2,
+          "native_children": 0,
+          "usage_coverage": "complete",
+          "quality": "PASS",
+          "tests": {
+            "tests": 67,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+          }
+        },
+        "native": {
+          "seconds": 390.1,
+          "cost": 0.5439,
+          "uncached": 112787,
+          "calls": 26,
+          "workers": 0,
+          "native_children": 1,
+          "usage_coverage": "complete",
+          "quality": "PASS",
+          "tests": {
+            "tests": 73,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+          }
+        },
+        "status": "JOINT_GAIN_OBSERVED",
+        "time_delta_percent": -38.25,
+        "cost_delta_percent": -53.82,
+        "stable_gain_proven": false,
+        "scope": "one pair, reported API-equivalent cost, not subscription billing"
+      },
+      "chronology": "Measured before the native-catalog fallback repair; no performance causal attribution to commit 35e4fe4",
+      "scope": "One concurrent frozen R19 repair pair, coordinator + Workers + correlated native children included; fixed historical API-equivalent prices, not bills; not same-ID multi-round stability or causal proof of one patch"
     }
   },
   "exclusions": [

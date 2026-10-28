@@ -194,7 +194,8 @@ test("HTTP exec-less full and unbound chained requests answer and name advertise
     assert.match(await response.text(), /response.completed/);
     const sent = state.requests.at(-1);
     assert.equal(sent.model, "gpt-6.1-sol");
-    assert.equal(sent.tool_choice, previous_response_id ? "none" : undefined);
+    assert.equal(sent.tool_choice, undefined);
+    assert.deepEqual(sent.tools, [{ type: "function", name: "read_file", parameters: { type: "object" } }]);
     assert.deepEqual(state.diagnostics.at(-1).native_tool_missing.advertised_tools, ["function:read_file"]);
   }
 });

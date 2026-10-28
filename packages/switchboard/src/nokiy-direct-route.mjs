@@ -60,6 +60,13 @@ function coordinatorFallback(body, profile, wireEffort, diagnostic, answerOnly =
     ...(wireEffort === null ? {} : { reasoning: { ...body.reasoning, effort: wireEffort } }) };
   if (SUBAGENT_NAMES.has(body.tool_choice?.name) || SUBAGENT_NAMES.has(body.tool_choice)
       || (body.tool_choice === "required" && advertisedTools(projected).length === 0)) projected.tool_choice = "auto";
+  const unsafeFallbackTools = advertisedTools(projected).some((tool) => EXEC_NAMES.has(tool?.name)
+    || (typeof tool?.name === "string" && tool.name.startsWith("nokiy_")));
+  if (answerOnly || (body.previous_response_id && (Array.isArray(body.tools) || unsafeFallbackTools))) {
+    // A fresh complete catalog can recover tools; otherwise only the server's
+    // exact continuation binding may retain an already verified native catalog.
+    answerOnly = members(projected.tools).length === 0 || unsafeFallbackTools;
+  }
   if (answerOnly) projected.tool_choice = "none";
   return { body: projected, nativeTool: null, requestedAlias: body.model, profile, worker: null,
     wireEffort, nativeEffortObserved: null, dispatch: "none", coordinatorFallback: true,
@@ -435,7 +442,7 @@ export function projectNokiyDirect(body, { endpoint = "/responses", host = null,
   // A fresh advertisement goes through normal binding validation before it can recover tools.
   if (!nonExecution && continuationFallback !== null && !advertisedNativeExec) {
     return coordinatorFallback(body, profile, continuationFallback.wireEffort,
-      { ...continuationFallback.nativeToolMissing, chained, lite: isLiteRequest(body), continuation: true },
+      { ...continuationFallback.nativeToolMissing, ...missingExecDiagnostic(body), continuation: true },
       continuationFallback.answerOnly);
   }
   // An unchained /responses request that advertises no tool at all (app title, summary or other
@@ -454,8 +461,8 @@ export function projectNokiyDirect(body, { endpoint = "/responses", host = null,
   const hasNativeExec = continuationTarget !== null || advertisedNativeExec;
   if (!nonExecution && !hasNativeExec) {
     const nativeToolMissing = missingExecDiagnostic(body);
-    // An unbound chain may inherit projected tools we cannot reconstruct. It can still
-    // answer from the supplied results, but cannot make another tool call in that mode.
+    // An unbound chain needs a fresh native catalog before it can call tools;
+    // otherwise it can still answer from the supplied results.
     return coordinatorFallback(body, profile, expectedWireEffort,
       { ...nativeToolMissing, ...(chained ? { unbound_chain: true } : {}) }, chained);
   }
