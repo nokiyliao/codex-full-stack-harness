@@ -169,6 +169,53 @@ class SummaryBindingTests(unittest.TestCase):
                 self.assertEqual(row['first_typed_blocker'], result['first_typed_blocker'])
 
 
+class ProviderFailureSummaryTests(unittest.TestCase):
+    def summary(self, *, evidence_blocker='TERMINAL_NOT_AVAILABLE', category='decode'):
+        member = batch.Member(Path('/fixture/request.json'), 'a' * 64,
+                              'tura_embedded_' + 'a' * 64, Path('/fixture'))
+        terminal = {
+            'status': 'BLOCKED', 'cleanup_pass': True, 'runtime_exit_code': 2,
+            'first_typed_blocker': 'NOKIY_EMBEDDED_PROVIDER_EXECUTION_FAILED',
+            'usage': None, 'terminal_evidence': None,
+            'provider_failure_diagnostic': {
+                'schema_version': 'nokiy_provider_failure_diagnostic_v1',
+                'transport': {'phase': 'responses-sse', 'category': category,
+                              'cause': 'unexpected-eof', 'private': 'must-not-be-projected'},
+                'trajectory_artifact': {'path': 'must-not-be-projected'},
+            },
+            'result_inspection': {'status': 'INCOMPLETE_EVIDENCE',
+                                  'first_blocker': evidence_blocker},
+        }
+        row = batch._row(member, terminal=terminal)
+        result = batch._aggregate((member,), {member.request_id: row})
+        return batch.expand_summary(batch._compact_summary(batch.summarize(result)))
+
+    def test_transport_failure_is_visible_without_inventing_completion(self):
+        summary = self.summary()
+        row = summary['members'][0]
+        self.assertEqual(summary['first_typed_blocker'], 'NOKIY_EMBEDDED_PROVIDER_EXECUTION_FAILED')
+        self.assertEqual(row['first_typed_blocker'], summary['first_typed_blocker'])
+        self.assertEqual(row['provider_transport_failure'], {
+            'phase': 'responses-sse', 'category': 'decode', 'cause': 'unexpected-eof'})
+        self.assertEqual(row['evidence_first_blocker'], 'TERMINAL_NOT_AVAILABLE')
+        self.assertEqual(summary['status'], 'BLOCKED')
+        self.assertEqual(row['evidence_status'], 'INCOMPLETE_EVIDENCE')
+        self.assertIsNone(row['usage'])
+        self.assertIsNone(row['terminal_evidence'])
+        self.assertNotIn('must-not-be-projected', json.dumps(summary))
+
+    def test_integrity_failure_and_unsafe_labels_keep_the_original_blocker(self):
+        for blocker, category in (('RECEIPT_PROOF_INVALID', 'decode'),
+                                  ('REQUEST_BINDING_MISMATCH', 'decode'),
+                                  ('TERMINAL_NOT_AVAILABLE', 'unsafe label / private')):
+            with self.subTest(blocker=blocker, category=category):
+                summary = self.summary(evidence_blocker=blocker, category=category)
+                self.assertEqual(summary['first_typed_blocker'], blocker)
+                self.assertEqual(summary['status'], 'BLOCKED')
+                if category != 'decode':
+                    self.assertNotIn('provider_transport_failure', summary['members'][0])
+
+
 class OptionalVerifierContextBudgetTests(unittest.TestCase):
     def test_diff_context_reference_survives_only_with_complete_inline_diff(self):
         source, text, context = diff_context_fixture()

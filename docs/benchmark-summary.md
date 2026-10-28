@@ -2,9 +2,13 @@
 
 These are descriptive engineering measurements, not universal speedups, subscription billing or isolated causal estimates. Complete reported coordinator, worker and native-child usage is included; unreported provider attempts are not asserted to be covered.
 
+## Current Caller-Only V466
+
+The current caller source is 188e80b, with unchanged V464 Rust and Switchboard35e4fe4. V466 preserves a known provider transport failure in batch output rather than masking it with missing terminal proof. Normalized phase/category/cause labels are diagnostic only: incomplete evidence, UNKNOWN usage, integrity rejection and parent acceptance remain unchanged. Source/candidate/live stages each passed 175 focused tests with matching staged evidence reused. A read-only recovery of the original failed request confirmed the deployed change without replay. No model speedup, root-cause fix for the unexpected EOF, or original live-target recovery is inferred.
+
 ## Caller-Only V465 Deployment
 
-The deployed composition is caller V465 (`bf6463b`) + unchanged V464 Rust (`1304065`) + Switchboard `35e4fe4`; V465 is not a universal runtime version. Lossless batch diff context dedup preserves the complete diff and nontext proof; partial, mismatched or tiny cases retain independent context. There are no new caps or truncation, and permissions/model/effort configuration is unchanged.
+The V465 composition was caller `bf6463b` + unchanged V464 Rust (`1304065`) + Switchboard `35e4fe4`; V465 is not a universal runtime version. Lossless batch diff context dedup preserves the complete diff and nontext proof; partial, mismatched or tiny cases retain independent context. There are no new caps or truncation, and permissions/model/effort configuration is unchanged.
 
 A real-code-delta replay reduced encoded bytes from 58,078 to 44,285 (-23.75%). This was not historical exact-wire replay; provider token, cost and time savings remain UNMEASURED. A post-cutover native tool read succeeded. Deployment/test evidence and byte reduction are distinct from the model measurements below, all of which predate this caller change.
 
@@ -51,7 +55,7 @@ All totals include both coordinators, Efficient's two Workers and the correlated
 
 This one pair observed joint time/cost gains. It is not evidence that the later native-catalog repair caused the gain, and it does not establish stable same-ID long-workflow gains. The earlier negative same-ID cost result, observation-only policy comparison and incomplete cancelled usage remain below.
 
-Current Switchboard `35e4fe45a0e6170e539bc567def3451e93c69ca3` is a verified hot deployment (`hot_reload`) with 1,056 passing source tests, no App restart and no permission/model changes; Rust remains V464 and the current caller is V465. Original affected target-task recovery remains unverified, and no latency/cost percentage is assigned to this protocol repair.
+Current Switchboard `35e4fe45a0e6170e539bc567def3451e93c69ca3` is a verified hot deployment (`hot_reload`) with 1,056 passing source tests, no App restart and no permission/model changes; Rust remains V464 and the current caller is V466. Original affected target-task recovery remains unverified, and no latency/cost percentage is assigned to this protocol repair.
 
 Fixed-quality Efficient engineering pair, 2026-10-28, integration source d53f7e4:
 
@@ -194,4 +198,4 @@ On2026-10-29, one sequential fresh-CLI acceptance-only pair compared Efficient b
 
 Both root CLI usage totals reconciled exactly (REPORTED_TOTALS_MATCH). Controls were stable within each arm; the only cross-arm changes were coordinator observation-guidance source and admission release metadata. Totals include measured coordinator/correlated usage; engineering-chat usage is excluded by operator scope. Removing cached input reduces tokens with a lower API cost weight, so token savings need not equal cost savings.
 
-This one pair does not establish full repair-workflow or same-ID/multiturn stability. The small 2.52% wall-time difference is insufficient for a stable speedup claim. Costs use frozen2026-10-22 standard API-equivalent rates, not subscription consumption or invoices. Current Switchboard source is 35e4fe4 with caller-only V465 and unchanged V464 Rust. The complete R19 pair above was measured at 372c9b2 before the native-catalog repair; no model measurement here proves that repair caused a gain.
+This one pair does not establish full repair-workflow or same-ID/multiturn stability. The small 2.52% wall-time difference is insufficient for a stable speedup claim. Costs use frozen2026-10-22 standard API-equivalent rates, not subscription consumption or invoices. Current Switchboard source is 35e4fe4 with caller-only V466 and unchanged V464 Rust. The complete R19 pair above was measured at 372c9b2 before the native-catalog repair; no model measurement here proves that repair caused a gain.

@@ -1,18 +1,20 @@
 # Source Provenance
 
-## Current V465 Caller / V464 Rust / 2026-10-29 Source Surface
+## Current V466 Caller / V464 Rust / 2026-10-29 Source Surface
 
 This is a source publication, not a redistribution of installed executables or machine configuration.
 
 | Component | Source commit | Correspondence |
 | --- | --- | --- |
-| Python caller | `bf6463bfb2538d9dde675f13f44185bf6650d2d8` | Deployed caller-only V465; source package version 0.3.309.dev0, release wheel version 0.3.465.dev0 |
+| Python caller | `188e80bb270650fd648284f69d3898b0eb5858e0` | Deployed caller-only V466; source package version 0.3.309.dev0, release wheel version 0.3.466.dev0 |
 | Rust worker payload | `1304065c69b9c5c6a702a05754526395c9a41678` | All 602 recorded build-source inputs match; the existing V464 rebuild used cargo --locked, four binary identities match the installed V464 image; fail-fast retained, ready metrics reused, cancelled usage UNKNOWN |
 | Switchboard | `35e4fe45a0e6170e539bc567def3451e93c69ca3` | Verified hot deployment of native-catalog fallback repair; fresh complete catalogs recover exec-less chains; exact same-connection verified fallback survives omitted-tool deltas; prior continuation, observation and publisher-directory repairs retained |
 
-The current Switchboard source has 1,056 passing source tests and verified hot deployment (`hot_reload`), with no App restart or permission/model changes. Unsupported execution, synthetic stale catalogs and unknown unbound chains remain non-dispatching; full-request helper behavior is retained. Original affected target-task recovery remains unverified; no latency/cost percentage is assigned to this protocol repair. Rust remains V464, with no new rebuild; V465 changes only the caller, not a universal runtime version. Permissions, model/effort configuration and trading behavior are unchanged; private diagnostics and compiled caches remain excluded.
+The current Switchboard source has 1,056 passing source tests and verified hot deployment (`hot_reload`), with no App restart or permission/model changes. Unsupported execution, synthetic stale catalogs and unknown unbound chains remain non-dispatching; full-request helper behavior is retained. Original affected target-task recovery remains unverified; no latency/cost percentage is assigned to this protocol repair. Rust remains V464, with no new rebuild; V465 and V466 change only the caller, not a universal runtime version. Permissions, model/effort configuration and trading behavior are unchanged; private diagnostics and compiled caches remain excluded.
 
-The caller release is `nokiy-20261029-v465-batch-diff-context`; wheel SHA-256 is `3ef04c96aa3d0f0f4d9a644e8fae2bbd617f368ecaa0573b2260b6b91b193a4c`. Lossless batch diff context dedup preserves the complete diff and nontext proof, retains independent context for partial/mismatched/tiny cases, and adds no caps or truncation. A real-code-delta replay measured 58,078 to 44,285 encoded bytes (-23.75%), not historical exact-wire replay or measured provider token/cost/time savings. A post-cutover native tool read succeeded.
+The current caller release is `nokiy-20261029-v466-provider-failure-diagnostic`; wheel SHA-256 is `d411e4af2bd6ca499191740e8b71c9c09f174bbf392eb939414bde32fc031180`. V466 carries the known provider failure and normalized transport labels through batch delivery rather than masking them with missing terminal evidence. The original request was read back without replay; it remains BLOCKED with incomplete evidence and UNKNOWN usage. Integrity/binding failures retain priority. Source/candidate/live stages each passed 175 focused tests, with matching staged evidence reused, not additional unique tests. This diagnostic correction does not establish the origin of the EOF or model acceleration.
+
+The preceding V465 lossless batch diff context dedup preserves the complete diff and nontext proof, retains independent context for partial/mismatched/tiny cases, and adds no caps or truncation. A real-code-delta replay measured 58,078 to 44,285 encoded bytes (-23.75%), not historical exact-wire replay or measured provider token/cost/time savings. A post-cutover native tool read succeeded.
 
 V465 native focused tests passed 49 tests. The full source run executed 2,290 tests (2,166 passed, 124 skipped, zero failures/errors), including pre-existing uncommitted local-context tests preserved but neither adopted nor published; this is not a clean exported-tree count. Source/candidate/staged tests and paired-wire checks passed; staged receipts reused equivalent candidate evidence, so overlapping counts must not be summed.
 
@@ -22,7 +24,7 @@ The complete concurrent frozen R19 pair used earlier Switchboard `372c9b26b65b3c
 
 The earlier 89c7889 R19 observation (253.9s/$0.2467354 versus 439.4s/$0.4943428) remains separate. The negative same-ID cost result (+15.66%, with end-of-run native-binary identity drift) and the Efficient-only acceptance observation-policy pair (-13.42% cost/-2.52% time) retain their existing measurement and control limits.
 
-These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in [releases/v465-caller-controls.json](releases/v465-caller-controls.json) identify the published contents. Publication-only documentation and preserved licenses are identified separately.
+These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in [releases/v466-caller-controls.json](releases/v466-caller-controls.json) identify the published contents. Publication-only documentation and preserved licenses are identified separately.
 
 The caller working tree contains pre-existing local-context test changes, and the runtime working tree contains pending-message deletions; neither was adopted. Source was exported from exact commits, not by copying dirty worktrees or installed environment directories.
 

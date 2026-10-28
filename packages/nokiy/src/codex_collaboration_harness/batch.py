@@ -714,16 +714,39 @@ def _project(member: Member, terminal: dict[str, Any]) -> dict[str, Any]:
                             require_request_binding=True)
 
 
+def _provider_transport_failure(terminal: dict[str, Any]) -> dict[str, str] | None:
+    diagnostic = terminal.get("provider_failure_diagnostic")
+    if (not isinstance(diagnostic, dict)
+            or diagnostic.get("schema_version") != "nokiy_provider_failure_diagnostic_v1"):
+        return None
+    transport = diagnostic.get("transport")
+    if not isinstance(transport, dict):
+        return None
+    labels = {key: transport.get(key) for key in ("phase", "category", "cause")}
+    if not all(isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,47}", value)
+               for value in labels.values()):
+        return None
+    return labels
+
+
 def _row(member: Member, *, terminal: dict[str, Any] | None = None,
          blocker: str | None = None) -> dict[str, Any]:
     inspection = terminal.get("result_inspection") if terminal is not None else None
     evidence_blocker = (inspection.get("first_blocker") if isinstance(inspection, dict)
                         and inspection.get("status") != "EVIDENCE_VERIFIED" else None)
+    terminal_blocker = terminal.get("first_typed_blocker") if terminal is not None else None
+    primary_blocker = evidence_blocker or terminal_blocker
+    # A failed provider cannot emit a successful runtime terminal. Keep that
+    # missing proof separate from its known transport failure, not ahead of it.
+    if (terminal is not None and terminal.get("status") == "BLOCKED"
+            and evidence_blocker == "TERMINAL_NOT_AVAILABLE"
+            and terminal_blocker == "NOKIY_EMBEDDED_PROVIDER_EXECUTION_FAILED"
+            and _provider_transport_failure(terminal) is not None):
+        primary_blocker = terminal_blocker
     return {"request_path": str(member.path), "request_file_sha256": member.file_sha256,
             "request_id": member.request_id, "artifact_root": str(member.artifact_root),
             "status": terminal.get("status", "BLOCKED") if terminal is not None else "BLOCKED",
-            "first_typed_blocker": (blocker if terminal is None else
-                                    evidence_blocker or terminal.get("first_typed_blocker")),
+            "first_typed_blocker": blocker if terminal is None else primary_blocker,
             "cleanup_pass": terminal.get("cleanup_pass") if terminal is not None else None,
             "terminal": terminal}
 
@@ -1199,6 +1222,7 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
             text = answer["text"]
         delivery = _delivery_binding(terminal, inspection, text, verified_answer)
         verifier_delivery = _verifier_delivery(inspection)
+        transport_failure = _provider_transport_failure(terminal)
         recovery_observations = [
             {"event_index": command.get("event_index"),
              "observation": command["verifier_recovery_observation"]}
@@ -1233,6 +1257,7 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
             "evidence_status": inspection.get("status"),
             "evidence_counts": inspection.get("counts"),
             "evidence_first_blocker": inspection.get("first_blocker"),
+            **({"provider_transport_failure": transport_failure} if transport_failure else {}),
             **({"verifier_delivery": verifier_delivery} if verifier_delivery else {}),
             **({"verifier_failure_resolution": inspection["verifier_failure_resolution"]}
                if isinstance(inspection.get("verifier_failure_resolution"), dict) else {}),
