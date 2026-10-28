@@ -1,5 +1,11 @@
 # Current Source Surface
 
+## Native Tool Continuation Correction
+
+The latest deployed Switchboard follow-up is `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`. A deterministic loopback WebSocket regression reproduced a full-catalog continuation incorrectly falling into `tools_mismatch` and forcing `tool_choice=none`. The correction preserves an exact bound catalog through repeated omitted-tools deltas, for both full and Lite input. Explicit empty/replaced catalogs and mismatched connection, model or response identity do not acquire inherited authority. The existing guarded hot deployment is verified; all 1,058 source tests passed, including the two new regression cases. No App restart, permission expansion or model benchmark was needed.
+
+Caller source `9ce42ea6a1f8114e9d6a379652ba0a3dc3731188` corrects only a native-root test fixture. Installed V468 runtime code remains from `b336f5b82768a76844ecc0bacaa922021d54e622`. Native parent tests passed 98 with 34 existing skips; the worker's nested-sandbox test limitation is not claimed fixed. The user's specific latest Ultra failure remains uncorrelated, and unsupported App history endpoints remain a separate limitation. Historical performance observations below are not measurements of this new Switchboard composition.
+
 As of2026-10-29, the publication binds three independent sources rather than inventing one component version. V468 is a caller-only release; the Rust payload remains V464:
 
 - Caller V468: source b336f5b; source package version 0.3.309.dev0 and installed release wheel 0.3.468.dev0. The manifest records its 48 non-cache package files separately from the unchanged Rust payload.

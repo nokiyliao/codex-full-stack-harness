@@ -8,7 +8,7 @@
   "clean_machine_installation_verified": false,
   "components": {
     "packages/nokiy": {
-      "source_head": "b336f5b82768a76844ecc0bacaa922021d54e622",
+      "source_head": "9ce42ea6a1f8114e9d6a379652ba0a3dc3731188",
       "includes_uncommitted_changes": false,
       "export": "committed source with documented exclusions and publication-only notices",
       "files": {
@@ -101,7 +101,7 @@
         "tests/test_batch_cancellation.py": "d14a62a088bb6f711266040e4b32a72f2f1e9fc14f38e8ec8b49626df29564b4",
         "tests/test_batch_delivery_binding.py": "175cb678aea8a1899d6c1bf82c9969583ad71f741e63214f1f9f6505cac33cdb",
         "tests/test_batch_diagnostics.py": "162665d3eb8b48ab6759c5d8abb2f30d889b187a6b2db06cc7e6b4316345d1aa",
-        "tests/test_batch_optimization.py": "9ce69548a64ba9dae78cde8f60e9fe0f1b501114a8422473013d1434458a252a",
+        "tests/test_batch_optimization.py": "945b8e59c01760831d091c621785f40c28bd451c3872c6a837d41a49f04765c7",
         "tests/test_batch_verifier_delivery.py": "7f59777d744642c6de8df1230bf62da40ccfa1db43b1b7c0bebf64123f885f8d",
         "tests/test_caller_release_preparation.py": "8b7e6fd8b8aa4652a938a522fe79f0dff4aae7c6b2fdeeabe3a76909762311a9",
         "tests/test_capability_gap_envelopes.py": "bc57f3188f0b986c4cee34e69b6315670aa6ecf252a9ff17b294f1259929f970",
@@ -2382,7 +2382,7 @@
       }
     },
     "packages/switchboard": {
-      "source_head": "35e4fe45a0e6170e539bc567def3451e93c69ca3",
+      "source_head": "116d1adb43f7c88aa449aaf963dd3ee9df9846f8",
       "includes_uncommitted_changes": false,
       "export": "committed source with documented exclusions and publication-only notices",
       "files": {
@@ -2421,7 +2421,7 @@
         "src/post-restart.mjs": "67dce96846956682cef4828fded7544e46a980d6ecc72f562e9c61aea8ab12dc",
         "src/replay-diagnostic.mjs": "93e753fd6510e7ecf5deb734d6e26aa2599258883e0ed50e51447e2a5e8b5f71",
         "src/route-ownership.mjs": "b4dc135ca6b52a3bfee311934ccdfbd7284c8c3e50a2d4d330308d00d1be7564",
-        "src/server.mjs": "fbd4f7135cd99fd9d29d39631f84b4341a945fe089d2639f546aa81f9ce52271",
+        "src/server.mjs": "fa9c109eba13568abdb9834d356920435b663f7debb2df268e658d07c89f2f43",
         "src/shared.mjs": "e2b95504b30e7f83cfe47456efb1ee3f61b31c95b864c02018bbf39acda44f9c",
         "src/spawn-payload-cache.mjs": "52f29e0ef70a0cf498cbe146571abe7b52b07ef39daeb8504a56bcbacc37478d",
         "src/tool-bridge.mjs": "aec2eb733b54109548d466d8272a0e63dcab73ac0bcd2a5faf2ca69efb51130e",
@@ -2503,7 +2503,7 @@
         "tests/nokiy-verifier-contract-guidance.test.mjs": "737b4c56004086ec2665577b3d1ebdb9e585be7942b5abb7d83d01907306a7f5",
         "tests/nokiy-worker-effort.test.mjs": "19af34d069151bbd858e1b308a2f9f8ff350135325344cf87dd06b9af3f1cb43",
         "tests/official-catalog-refresh.test.mjs": "b36259b9063bd64a830ede492ea791f9f0e2926811ca4670ede50b6419153678",
-        "tests/official-prewarm.test.mjs": "522d0fa8ed445205a5a20fa6a904f677d26bb889379c352cc12a0223e096e3bb",
+        "tests/official-prewarm.test.mjs": "12d5d1756a3204d3d618a1525778fad22103b627c46fa408f43a12bd973f97e6",
         "tests/official-terminal.test.mjs": "3845a6fe904d1eee63696e0bdaa9c71fc6ed7fb9459fddf38c2c4de706121c24",
         "tests/openrouter-worker.test.mjs": "cc40894708af025eec16a4d154a3861e1a44a73991d15fde1271e4f9055548c4",
         "tests/picker-catalog.test.mjs": "3d57b070c2a84ad7b35a028bc1cd9ddb204f986ed59c56d85b50ea43e8617165",
@@ -2701,11 +2701,11 @@
   },
   "publication_files": {
     "README.md": "b6ce5668cbb4c0e4faf375a2d83b840a217c1de26d6b2591caa10b07f07bb2c2",
-    "PROVENANCE.md": "3984aba4bb5b237ff5147537af62d996ff84ddcadb33fb90f8e022102cd04e20",
+    "PROVENANCE.md": "6f6d89aafbb6b00102d9937cae730e15163a8a2b17ca4aa522953df4b770dacb",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "4e7831d2051fc12873a467cd97be2fa8cf1e2256c986db74c48169cddd14305a",
-    "docs/current-surface.md": "a1c2a96a809e3f3d9299e6c31b938b614c7d62d738ca4d00011e99bc60b3703e",
+    "docs/current-surface.md": "eb299b5182109f0e1d24a6b39e9da246fae525cb736c78145604ee10dc64eafc",
     "docs/benchmark-summary.md": "3c107c8a1d6e790ace0a509a186e3f2477368eb583b5a8a259ce28ecc5ba1456"
   },
   "installed_composition": {
@@ -3965,6 +3965,42 @@
         "seconds": 96.60549020790495,
         "scope": "Native full source tree including preserved uncommitted local_context tests; not a clean exported-tree count."
       }
+    },
+    "native_tool_continuation_correction": {
+      "deployed": true,
+      "switchboard_source_commit": "116d1adb43f7c88aa449aaf963dd3ee9df9846f8",
+      "reload_mode": "hot_reload",
+      "same_connection_model_response_binding_preserved": true,
+      "omitted_catalog_retains_verified_tools": true,
+      "explicit_empty_or_replaced_catalog_revalidated": true,
+      "regression_forms": [
+        "full",
+        "lite"
+      ],
+      "switchboard_source_tests": {
+        "tests": 1058,
+        "passed": 1058,
+        "failed": 0,
+        "skipped": 0
+      },
+      "native_permissions_changed": false,
+      "model_configuration_changed": false,
+      "app_restart_performed": false,
+      "original_user_session_recovery": "UNVERIFIED",
+      "model_cost_time_gain": "NOT_MEASURED_FOR_THIS_COMPOSITION"
+    },
+    "caller_test_only_followup": {
+      "source_commit": "9ce42ea6a1f8114e9d6a379652ba0a3dc3731188",
+      "installed_source_commit": "b336f5b82768a76844ecc0bacaa922021d54e622",
+      "runtime_modules_unchanged": true,
+      "native_parent_tests": {
+        "run": 132,
+        "passed": 98,
+        "skipped": 34,
+        "failed": 0
+      },
+      "worker_focused_verifier_nested_sandbox_admission": "UNAVAILABLE_NOT_CLAIMED_FIXED",
+      "guards_or_sandbox_weakened": false
     }
   },
   "exclusions": [

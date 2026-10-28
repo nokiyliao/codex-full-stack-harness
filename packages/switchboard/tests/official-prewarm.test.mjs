@@ -159,6 +159,42 @@ function turn(ws, body) {
   });
 }
 
+for (const form of ["full", "lite"]) test(`native ${form} catalogs survive omitted-tools continuations`, async (t) => {
+  const state = await fixture(t, true), ws = await state.connect();
+  const request = { model: "nokiy-direct", reasoning: { effort: "max" } };
+  const catalog = [
+    { type: "function", name: "exec_command", parameters: { type: "object",
+      properties: { cmd: { type: "string" } }, required: ["cmd"] } },
+    { type: "namespace", name: "mcp__codex_app", tools: [
+      { type: "function", name: "read_thread", parameters: { type: "object",
+        properties: { thread_id: { type: "string" } }, required: ["thread_id"] } },
+    ] },
+  ];
+  const prefix = form === "full"
+    ? { instructions: "Use the advertised native tools.", tools: catalog, input: [user("task")] }
+    : { input: [{ type: "additional_tools", role: "developer", tools: catalog },
+        { type: "message", role: "developer", content: "Use the advertised native tools." }, user("task")] };
+  let response = await turn(ws, { ...request, ...prefix });
+  assert.equal(response.terminal.type, "response.completed");
+  const initial = state.requests[0];
+  const initialNames = names(initial.tools ?? initial.input.find((item) => item.type === "additional_tools").tools);
+  for (const name of ["nokiy_native", "nokiy_execute", "read_thread"]) assert.ok(initialNames.includes(name));
+  for (let index = 0; index < 2; index++) {
+    const previous = response.terminal.response.id;
+    response = await turn(ws, { ...request, previous_response_id: previous,
+      input: [user("Continue with the same tools.")] });
+    assert.equal(response.terminal.type, "response.completed");
+    assert.equal(state.requests.at(-1).previous_response_id, previous);
+    assert.notEqual(state.requests.at(-1).tool_choice, "none");
+    assert.equal(state.diagnostics.length, 0);
+  }
+  const cleared = await turn(ws, { ...request, previous_response_id: response.terminal.response.id,
+    tools: [], input: [user("No tools on this turn.")] });
+  assert.equal(cleared.terminal.type, "response.completed");
+  assert.equal(state.requests.at(-1).tool_choice, "none");
+  assert.equal(state.diagnostics.at(-1).native_tool_missing.unbound_chain, true);
+});
+
 test("exec-less coordinator calls can return tool results on their own bound chain", async (t) => {
   const state = await fixture(t, true), ws = await state.connect();
   const request = { model: "nokiy-efficient", reasoning: { effort: "max" } };

@@ -1,5 +1,11 @@
 # Source Provenance
 
+## Native Tool Continuation Follow-Up
+
+Current Switchboard source is `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`, deployed by the existing guarded workflow-update path with verified hot reload. Exact same-WebSocket, same-model, same-response continuations now retain their previously verified catalog when tools are omitted; an explicit replacement, including an empty catalog, still invalidates it. No native permissions, model settings, signed App or trading service changed. All 1,058 Switchboard tests passed.
+
+Caller source `9ce42ea6a1f8114e9d6a379652ba0a3dc3731188` adds only a native-root test-fixture correction after V468. The installed caller remains V468 built from `b336f5b82768a76844ecc0bacaa922021d54e622`; runtime modules were not rebuilt or changed. Parent-native verification ran 132 tests: 98 passed and 34 existing native-integration skips. This is not a passing worker focused-verifier result: nested Seatbelt admission remains unavailable there. Earlier benchmark observations retain their original compositions; this follow-up has no new model cost/time claim, and the reported user's live-thread recovery remains unverified.
+
 ## Current V468 Caller / V464 Rust / 2026-10-29 Source Surface
 
 This is a source publication, not a redistribution of installed executables or machine configuration.

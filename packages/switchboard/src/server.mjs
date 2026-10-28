@@ -1647,7 +1647,7 @@ export async function createSwitchboardServer({
           : directContinuation.model !== body.model ? "model_mismatch"
           : directContinuation.responseId !== body.previous_response_id ? "response_mismatch"
           : directContinuation.toolsIdentity !== nativeToolsIdentity
-            && !(directContinuation.fallback && body.tools === undefined) ? "tools_mismatch" : "bound";
+            && body.tools !== undefined ? "tools_mismatch" : "bound";
         const continuation = continuationCondition === "bound" ? directContinuation : null;
         operatorTexts = body.previous_response_id
           ? [...operatorTexts, ...userMessageTexts(body)].slice(-16) : userMessageTexts(body);
@@ -1835,7 +1835,7 @@ export async function createSwitchboardServer({
               ? nativeRunControlBindings(projectionBody, continuation?.nativeRunControls) : null,
             pendingResultDelivery: direct?.nativeTool?.pendingResultDelivery ?? null,
             nativeObservationState: direct?.nativeTool?.nativeObservationState ?? null,
-            nativeToolsIdentity: continuation?.fallback && body.tools === undefined
+            nativeToolsIdentity: continuation && body.tools === undefined
               ? continuation.toolsIdentity : nativeToolsIdentity,
             profileIdentity,
             started,

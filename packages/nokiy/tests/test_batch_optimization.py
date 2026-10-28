@@ -3,14 +3,17 @@
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
 import random
+import subprocess
+import sys
 import threading
 import time
 import unittest
 from unittest.mock import patch
 
-from codex_collaboration_harness import batch, post_batch_verifier as post
+from codex_collaboration_harness import batch, graph_process, post_batch_verifier as post
 from codex_collaboration_harness.embedded_nokiy import EmbeddedNokiyError
 import test_nokiy_batch as fixtures
 from test_batch_verifier_delivery import diff_context_fixture, public_note, verified_evidence
@@ -399,7 +402,30 @@ class ParallelPreflightTests(unittest.TestCase):
     mocks = fixtures.BatchFixture.mocks
     terminal = staticmethod(fixtures.BatchFixture.terminal)
 
+    def at_native_root(self, method):
+        if sys.platform != 'darwin':
+            getattr(self, method)()
+            return
+        # A verifier workload inherits its supervisor's sandbox, not ownership
+        # of that scope. Run this fixture as the root of a fresh signal fence.
+        root = Path(__file__).resolve().parents[1]
+        code = (
+            f'import sys, unittest; sys.path[:0] = {[str(root / "src"), str(root / "tests")]!r}\n'
+            'from test_batch_optimization import ParallelPreflightTests\n'
+            f'suite = unittest.TestSuite([ParallelPreflightTests({method!r})])\n'
+            'result = unittest.TextTestRunner(verbosity=2).run(suite)\n'
+            'raise SystemExit(not result.wasSuccessful())\n'
+        )
+        profile = '(version 1) (allow default) (deny signal) (allow signal (target same-sandbox))'
+        result = subprocess.run(
+            ['/usr/bin/sandbox-exec', '-p', profile, sys.executable, '-B', '-c', code],
+            cwd=root / 'tests', capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_preflight_overlaps_but_all_complete_before_execution(self):
+        self.at_native_root('_check_preflight_overlaps_but_all_complete_before_execution')
+
+    def _check_preflight_overlaps_but_all_complete_before_execution(self):
         barrier = threading.Barrier(2, timeout=3)
         finished = set()
         lock = threading.Lock()
@@ -415,6 +441,26 @@ class ParallelPreflightTests(unittest.TestCase):
         result = batch.run_batch(self.plan, self.digest)
         self.assertEqual(result['status'], 'RESULT_AVAILABLE')
         self.assertEqual((pre.call_count, exe.call_count), (2, 2))
+
+    def test_inherited_child_cannot_claim_native_root(self):
+        self.at_native_root('_check_inherited_child_cannot_claim_native_root')
+
+    def _check_inherited_child_cannot_claim_native_root(self):
+        parent = graph_process.inherited_root_parent()
+        if sys.platform != 'darwin':
+            self.assertIsNone(parent)
+            return
+        self.assertEqual(parent, os.getppid())
+        source = Path(__file__).resolve().parents[1] / 'src'
+        code = (
+            f'import sys; sys.path.insert(0, {str(source)!r})\n'
+            'from codex_collaboration_harness.graph_process import inherited_root_parent\n'
+            'inherited_root_parent()\n'
+        )
+        result = subprocess.run([sys.executable, '-B', '-c', code],
+                                capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('GRAPH_SUPERVISOR_SIGNAL_ISOLATION_REQUIRED', result.stderr)
 
     def test_first_member_failure_wins_even_when_it_finishes_last(self):
         barrier = threading.Barrier(2, timeout=3)
