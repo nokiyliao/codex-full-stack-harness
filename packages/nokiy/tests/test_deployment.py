@@ -1,4 +1,5 @@
 """Real supervised fixture processes; no broker or system service manager."""
+import io
 import json
 from pathlib import Path
 import signal
@@ -124,6 +125,83 @@ class DeploymentTests(unittest.TestCase):
     def test_path_escape(self):
         self.plan["action_id"] = "../escape"
         self.rejected("PLAN_ID_INVALID")
+
+    def test_missing_artifact_root_cli_before_effects(self):
+        artifacts = Path(self.plan["artifact_root"])
+        artifacts.rmdir()
+        digest = self.save()
+        for command in ("check-deployment", "deploy"):
+            with self.subTest(command=command):
+                output = io.StringIO()
+                with patch("sys.stdout", output), patch.object(c, "_run_process") as spawned:
+                    code = c.main([command, "--plan", str(self.path), "--approved-plan-sha256", digest])
+                spawned.assert_not_called()
+                result = json.loads(output.getvalue())
+                self.assertEqual(code, 2)
+                self.assertEqual(result["first_typed_blocker"],
+                                 "NOKIY_DEPLOYMENT_ARTIFACT_ROOT_CANONICAL_PATH_REQUIRED")
+                self.assertEqual(result["status"], "BLOCKED_PREEXECUTION")
+                self.assertEqual(result["authority_effect"], "none")
+                self.assertEqual(result["native_codex_control_plane_mutation_count"], 0)
+                self.assertNotIn(str(self.root), output.getvalue())
+                self.assertNotIn(self.plan["commands"]["apply"]["argv"][0], output.getvalue())
+                self.assertFalse(artifacts.exists())
+                self.assertFalse((self.root / "effects").exists())
+                self.assertEqual((self.root / "version").read_text(), "v1")
+
+    def test_missing_closeout_artifact_root_before_effects(self):
+        import test_task_closeout as fixture
+        case = fixture.CloseoutTests()
+        self.addCleanup(case.doCleanups)
+        case.setUp()
+        case.plan["schema_version"] = d.CLOSEOUT_SCHEMA
+        for field in ("commands", "target", "release"):
+            del case.plan[field]
+        case.path.write_text(json.dumps(case.plan))
+        digest = c._canonical_sha256(case.plan)
+        self.assertEqual(d.execute_closeout(case.path, digest, check_only=True)["status"], "READY")
+        artifacts = Path(case.plan["artifact_root"])
+        artifacts.rmdir()
+        with patch.object(c, "_run_process") as spawned:
+            for check_only in (True, False):
+                with self.subTest(check_only=check_only), self.assertRaisesRegex(
+                        c.EmbeddedNokiyError, "ARTIFACT_ROOT_CANONICAL_PATH_REQUIRED"):
+                    d.execute_closeout(case.path, digest, check_only=check_only)
+        spawned.assert_not_called()
+        self.assertFalse(artifacts.exists())
+        self.assertFalse((case.root / "order").exists())
+        self.assertTrue((case.root / "leases" / "active.json").is_file())
+        self.assertFalse((case.root / "leases" / "complete.json").exists())
+
+    def test_required_directory_bad_paths_remain_rejected(self):
+        alias = self.root / "artifact-alias"
+        alias.symlink_to(self.root / "artifacts", target_is_directory=True)
+        loop = self.root / "loop"
+        loop.symlink_to(loop)
+        for field, value, code in (
+                ("workspace", str(self.root / "missing"), "WORKSPACE_CANONICAL_PATH_REQUIRED"),
+                ("artifact_root", "relative", "ARTIFACT_ROOT_ABSOLUTE_PATH_REQUIRED"),
+                ("artifact_root", str(self.root / ".." / "artifacts"), "ARTIFACT_ROOT_ABSOLUTE_PATH_REQUIRED"),
+                ("artifact_root", str(alias), "ARTIFACT_ROOT_CANONICAL_PATH_REQUIRED"),
+                ("artifact_root", str(self.root / "grant.txt"), "ARTIFACT_ROOT_CANONICAL_PATH_REQUIRED"),
+                ("artifact_root", str(loop), "ARTIFACT_ROOT_CANONICAL_PATH_REQUIRED"),
+                ("artifact_root", str(self.root) + "/bad\0path", "ARTIFACT_ROOT_CANONICAL_PATH_REQUIRED")):
+            with self.subTest(field=field, value=value):
+                original = self.plan[field]
+                self.plan[field] = value
+                try:
+                    self.rejected(code)
+                finally:
+                    self.plan[field] = original
+        self.assertFalse((self.root / "effects").exists())
+        self.assertEqual(list((self.root / "artifacts").iterdir()), [])
+
+    def test_required_directory_permission_failure_is_typed(self):
+        with patch.object(Path, "resolve", side_effect=PermissionError("private native path")):
+            with self.assertRaises(c.EmbeddedNokiyError) as caught:
+                d.absolute(str(self.root), directory=True, field="artifact_root")
+        self.assertEqual(caught.exception.code, "NOKIY_DEPLOYMENT_ARTIFACT_ROOT_CANONICAL_PATH_REQUIRED")
+        self.assertEqual(caught.exception.detail, "ARTIFACT_ROOT_CANONICAL_PATH_REQUIRED")
 
     def test_source_drift(self):
         (self.root / "deploy.py").write_text("changed")

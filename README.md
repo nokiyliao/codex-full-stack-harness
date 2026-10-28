@@ -1,5 +1,9 @@
 # Nokiy Full-Stack Harness
 
+## Current Reliability Follow-Up
+
+V469 adds field-specific deployment/closeout path diagnostics without changing admission or execution rights. The installed native interface now identifies an invalid `artifact_root` instead of hiding it behind a generic input error; the negative canary remained pre-execution with zero control-plane mutations. Source, candidate and live focused suites each passed 108 tests (overlapping counts). No new model performance result is claimed; earlier V468 measurements retain their original composition.
+
 Current source surface: **caller-only V468 + unchanged V464 Rust + Switchboard native-catalog/continuation/observation repairs: caller b336f5b + Rust 1304065 + switchboard 35e4fe4**, synchronized on 2026-10-29.
 
 This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V464 keeps failed-patch feedback fast: an already-finished provider uses its normal metrics path, while a still-running provider is cancelled without waiting just for accounting. Cancelled usage remains UNKNOWN, never zero. The intermediate V463 forced-drain approach was rejected for delaying repair. V462 optional worker notes and single-branch-only Efficient native implementation remain. These changes do not expand permissions or change models.

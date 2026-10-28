@@ -43,12 +43,17 @@ def save(path: Path, value: dict[str, Any]) -> None:
     sync_directory(path.parent)
 
 
-def absolute(value: Any, *, directory: bool = False) -> Path:
+def absolute(value: Any, *, directory: bool = False, field: str | None = None) -> Path:
+    prefix = field.upper() + "_" if field else ""
     if not isinstance(value, str) or not Path(value).is_absolute() or ".." in Path(value).parts:
-        fail("ABSOLUTE_PATH_REQUIRED")
+        fail(prefix + "ABSOLUTE_PATH_REQUIRED")
     path = Path(value)
-    if path.resolve(strict=True) != path or (directory and not path.is_dir()):
-        fail("CANONICAL_PATH_REQUIRED")
+    try:
+        canonical = path.resolve(strict=True) == path and (not directory or path.is_dir())
+    except (OSError, RuntimeError, ValueError):
+        canonical = False
+    if not canonical:
+        fail(prefix + "CANONICAL_PATH_REQUIRED")
     return path
 
 
@@ -111,8 +116,8 @@ def load(path: Path, approved: str, *, schema: str = SCHEMA) -> tuple[dict[str, 
     for field in (() if schema == CLOSEOUT_SCHEMA else ("target", "release")):
         if not isinstance(plan[field], str) or not plan[field].strip() or len(plan[field]) > 256:
             fail("TARGET_BINDING_REQUIRED")
-    absolute(plan["workspace"], directory=True)
-    absolute(plan["artifact_root"], directory=True)
+    for field in ("workspace", "artifact_root"):
+        absolute(plan[field], directory=True, field=field)
     if schema == SCHEMA and (not isinstance(plan["commands"], dict) or set(plan["commands"]) != set(STAGES)):
         fail("THREE_STAGES_REQUIRED")
     if type(plan["expires_at"]) not in (int, float):

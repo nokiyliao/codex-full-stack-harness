@@ -1,6 +1,12 @@
 # Source Provenance
 
-## Native Tool Continuation Follow-Up
+## Current V469 Caller
+
+Current caller source is `eb61be3818ed34362cc03408144bd8fdd5c19303`, installed as V469 (`0.3.469.dev0`). Required workspace/artifact directory failures retain a safe, field-specific typed blocker before any execution, rather than falling through to a generic input error. Missing directories are not silently created and all existing path, identity, ownership, pin, expiry and effect checks remain. Source/candidate/live focused suites each passed 108 tests; staged execution reused candidate evidence. The real native-interface negative canary returned `NOKIY_DEPLOYMENT_ARTIFACT_ROOT_CANONICAL_PATH_REQUIRED`, pre-execution and with zero native control-plane mutations. Earlier model observations were not rerun or relabeled as V469 performance evidence.
+
+The maintained Switchboard producer already creates its native artifact directory. The incident used an older immutable execution entrypoint for preparation; use the current maintained producer for preparation, not a predecessor's pinned execution command. That diagnosis did not require another Switchboard patch. Switchboard `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`, Rust V464, models, permissions, signed App and trading services remain unchanged.
+
+## Earlier Native Tool Continuation Follow-Up
 
 Current Switchboard source is `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`, deployed by the existing guarded workflow-update path with verified hot reload. Exact same-WebSocket, same-model, same-response continuations now retain their previously verified catalog when tools are omitted; an explicit replacement, including an empty catalog, still invalidates it. No native permissions, model settings, signed App or trading service changed. All 1,058 Switchboard tests passed.
 

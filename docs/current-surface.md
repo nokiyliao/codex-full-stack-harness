@@ -1,6 +1,12 @@
 # Current Source Surface
 
-## Native Tool Continuation Correction
+## Current V469 Path Diagnostics
+
+Caller source `eb61be3818ed34362cc03408144bd8fdd5c19303` is deployed as V469. Invalid required `workspace` or `artifact_root` directories now produce field-specific typed diagnostics, without leaking native paths/argv, creating directories or allowing execution. The existing native check interface was exercised after deployment: a missing-root canary returned `NOKIY_DEPLOYMENT_ARTIFACT_ROOT_CANONICAL_PATH_REQUIRED`, `BLOCKED_PREEXECUTION`, authority `none` and zero native control-plane mutations. Source, candidate and live each passed the same 108 focused tests; counts overlap and staged execution reused candidate evidence. No new model benchmark or cost/time percentage accompanies this correctness change.
+
+The current Switchboard prepare producer already creates its receipt directory; preparation must not be routed through an older immutable executor merely because a predecessor plan pins it for execution. No duplicate producer fix was made. Switchboard remains at `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`; the specific user's latest Ultra recovery and the independent App history-endpoint limitation remain unresolved. Historical performance observations below keep their actual tested compositions.
+
+## Earlier Native Tool Continuation Correction
 
 The latest deployed Switchboard follow-up is `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`. A deterministic loopback WebSocket regression reproduced a full-catalog continuation incorrectly falling into `tools_mismatch` and forcing `tool_choice=none`. The correction preserves an exact bound catalog through repeated omitted-tools deltas, for both full and Lite input. Explicit empty/replaced catalogs and mismatched connection, model or response identity do not acquire inherited authority. The existing guarded hot deployment is verified; all 1,058 source tests passed, including the two new regression cases. No App restart, permission expansion or model benchmark was needed.
 
