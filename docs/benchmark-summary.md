@@ -2,7 +2,29 @@
 
 These are descriptive engineering measurements, not universal speedups, subscription billing or isolated causal estimates. Complete reported coordinator, worker and native-child usage is included; unreported provider attempts are not asserted to be covered.
 
-## Current V466 Frozen R19 Pair
+## Current V468 Frozen R19 Pair
+
+The composition was caller V468 sourceb336f5b + unchanged V464 Rust1304065 + Switchboard35e4fe4, using the same native CLI0.165.0-alpha.1.2 and frozen task/validator/manifest. Both coordinators were observed as Sol6.1 with max on the request wire. Efficient used two reported Terra6.1 workers (xhigh configured; provider-internal effort unobserved). Native used one Sol child, also counted. Before/after configuration controls matched, both root CLI usage counters reconciled and both fixed required quality gates passed.
+
+| Metric | Efficient | Native Sol |
+| --- | ---: | ---: |
+| CLI execution seconds | 245.8 | 412.0 |
+| Reported API-equivalent USD | 0.2718504 | 0.6797552 |
+| Reported total tokens | 450825 | 2182748 |
+| Uncached input | 127885 | 117936 |
+| Coordinator calls | 3 | 23 |
+| Worker calls | 11 | 0 |
+| Native-child calls | 0 | 14 |
+| Quality tests | 67 | 74 |
+| Failures / errors / skips | 0 / 0 / 0 | 0 / 0 / 0 |
+
+The observed execution-time difference was -40.34% and API-equivalent cost about -60%. Uncached input was 8.44% higher, demonstrating why lower overall cost does not require every token category to fall. Efficient includes coordinator $0.1568348 plus workers $0.1150156; native includes coordinator $0.4099276 plus child $0.2698276. Frozen2026-10-22 API-equivalent weights are not invoices or subscription billing. Complete retained reported usage is not proof covering hidden provider attempts.
+
+Live delivery included a complete 1,041-byte quality.log with matching SHA and unchanged untrusted-file authority. The coordinator issued no further command after the PASSED live-return gate, compared with later log and validator-selection reads in V466. Both worker results were EVIDENCE_VERIFIED. The coordinator also combined its initial intake differently, and optional added tests differed (the fixed required suite still passed on both). Thus three versus five coordinator rounds and the cross-observation timing/cost change cannot be attributed solely to optional log delivery.
+
+Per-arm times cover native CLI execution with internal delegation/checks, not setup or independent benchmark quality audits run after the model barrier. Full contiguous user-acceptance E2E is unmeasured. Publication checks overlapped model waits without changing frozen execution controls. Cache warmth was not controlled. This is one qualified full-route observation, not statistical stability, a DCF/J-Space ablation or isolated V468 causal proof. Original live Ultra recovery and the underlying EOF origin remain unverified.
+
+## Prior V466 Frozen R19 Pair
 
 The measured composition was caller V466 source188e80b + unchanged V464 Rust1304065 + Switchboard35e4fe4, using native CLI0.165.0-alpha.1.2. Both coordinators used observed Sol6.1 with max on the request wire. Efficient selected two Terra6.1 workers (xhigh configured; internal provider effort unobserved); native used one Sol child, also counted. The task bytes, frozen validator and manifest were identical. Code/configuration controls matched before/after, and both root CLI token counters reconciled to retained provider totals.
 

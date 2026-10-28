@@ -2700,13 +2700,13 @@
     }
   },
   "publication_files": {
-    "README.md": "7112ea5c661ddaf65f03008d29ec2c14d104c14877740c126894f5e4f0410433",
-    "PROVENANCE.md": "99e3efc27953409ecd6555a1c7bb8ac3b03810291e88d6dcb86a549e59e04dd8",
+    "README.md": "b6ce5668cbb4c0e4faf375a2d83b840a217c1de26d6b2591caa10b07f07bb2c2",
+    "PROVENANCE.md": "3984aba4bb5b237ff5147537af62d996ff84ddcadb33fb90f8e022102cd04e20",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "4e7831d2051fc12873a467cd97be2fa8cf1e2256c986db74c48169cddd14305a",
-    "docs/current-surface.md": "6e889b3fbb7941d59c6a86a3426d7b13792d04cd28ddc7e54f791f53153809b4",
-    "docs/benchmark-summary.md": "be5ee1c5e67dac667fa78ff8ade7d909a113f01595f415a50d41cf7acd3a7d8a"
+    "docs/current-surface.md": "a1c2a96a809e3f3d9299e6c31b938b614c7d62d738ca4d00011e99bc60b3703e",
+    "docs/benchmark-summary.md": "3c107c8a1d6e790ace0a509a186e3f2477368eb583b5a8a259ce28ecc5ba1456"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v468-verifier-log-dedup",
@@ -3870,8 +3870,101 @@
         "log_bytes": 1041,
         "old_metadata_stdout_stderr_diff_identical": true
       },
-      "model_round_cost_time_gain": "UNMEASURED at source-publication time",
+      "model_round_cost_time_gain": "Qualified current-task observation with3 coordinator rounds and no post-gate commands; not isolated patch causality or statistical stability.",
       "focused_verifier_signal_isolation_gap": "Native parent completed required tests; worker failure was not promoted to success."
+    },
+    "current_v468_r19_observation": {
+      "schema_version": "nokiy_v468_current_pair_acceptance_v1",
+      "observed_at": "2026-10-28T23:07:01.660576+00:00",
+      "status": "ACCEPTED_QUALIFIED_JOINT_GAIN_AND_LOG_ACTIVATION",
+      "tested_composition": {
+        "caller": "V468 sourceb336f5b",
+        "rust": "V464 source1304065",
+        "switchboard": "35e4fe4",
+        "native": "0.165.0-alpha.1.2 d84a54b"
+      },
+      "efficient": {
+        "execution_wall_seconds": 245.8,
+        "reported_api_equivalent_usd": 0.2718504,
+        "coordinator_api_equivalent_usd": 0.1568348,
+        "worker_api_equivalent_usd": 0.1150156,
+        "native_child_api_equivalent_usd": 0,
+        "coordinator_calls": 3,
+        "worker_calls": 11,
+        "native_child_calls": 0,
+        "worker_count": 2,
+        "native_child_count": 0,
+        "input": 440845,
+        "cached": 312960,
+        "uncached": 127885,
+        "output": 9980,
+        "reasoning": 4135,
+        "total_tokens": 450825,
+        "quality": {
+          "tests": 67,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "root_cli_reconciliation": "REPORTED_TOTALS_MATCH",
+        "reported_usage_complete": true
+      },
+      "native": {
+        "execution_wall_seconds": 412.0,
+        "reported_api_equivalent_usd": 0.6797552,
+        "coordinator_api_equivalent_usd": 0.40992760000000006,
+        "worker_api_equivalent_usd": 0,
+        "native_child_api_equivalent_usd": 0.2698276,
+        "coordinator_calls": 23,
+        "worker_calls": 0,
+        "native_child_calls": 14,
+        "worker_count": 0,
+        "native_child_count": 1,
+        "input": 2158768,
+        "cached": 2040832,
+        "uncached": 117936,
+        "output": 23980,
+        "reasoning": 12995,
+        "total_tokens": 2182748,
+        "quality": {
+          "tests": 74,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "root_cli_reconciliation": "REPORTED_TOTALS_MATCH",
+        "reported_usage_complete": true
+      },
+      "execution_wall_change_percent": -40.33980582524271,
+      "reported_cost_change_percent": -60.00760273698531,
+      "uncached_input_change_percent": 8.435931352598015,
+      "controls_matched": true,
+      "live_log_activation": [
+        {
+          "file": "quality.log",
+          "bytes": 1041,
+          "hash_matched": true
+        }
+      ],
+      "post_gate_coordinator_commands": 0,
+      "initial_intake_also_batched": true,
+      "optional_added_tests_differ": true,
+      "isolated_patch_effect_proven": false,
+      "stable_gain_proven": false,
+      "cache_warmth_controlled": false,
+      "cost_scope": "Frozen2026-10-22 API-equivalent reported root+workers+correlated native-child usage, not invoices/subscription/all hidden attempts. Engineering parent excluded by operator scope.",
+      "timing_scope": "CLI execution wall with internal delegation/checks; setup and post-barrier independent quality audit excluded; full contiguous user acceptance E2E unmeasured.",
+      "original_live_ultra_recovery": "UNVERIFIED",
+      "eof_origin": "UNKNOWN",
+      "focused_verifier_signal_isolation_gap": "Remains; native parent verification succeeded without changing or disabling the guard.",
+      "full_source_validation": {
+        "run": 2297,
+        "passed": 2173,
+        "skipped": 124,
+        "failed": 0,
+        "seconds": 96.60549020790495,
+        "scope": "Native full source tree including preserved uncommitted local_context tests; not a clean exported-tree count."
+      }
     }
   },
   "exclusions": [
