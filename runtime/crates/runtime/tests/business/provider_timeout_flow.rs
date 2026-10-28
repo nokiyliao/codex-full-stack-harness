@@ -246,6 +246,14 @@ async fn streamed_command_run_waits_for_commands_after_provider_stream_completes
 #[tokio::test]
 async fn failed_apply_patch_finishes_tool_turn_without_cancelling_runtime() {
     let _guard = TEST_ENV.lock().await;
+    failed_apply_patch_case(Duration::from_millis(750), None).await;
+    failed_apply_patch_case(Duration::ZERO, Some((1, 1, 2))).await;
+}
+
+async fn failed_apply_patch_case(
+    completion_delay: Duration,
+    expected_usage: Option<(u64, u64, u64)>,
+) {
     let workspace = physical_tempdir().expect("workspace");
     let source_path = workspace.path().join("app.txt");
     let skipped_path = workspace.path().join("must-not-run.txt");
@@ -255,7 +263,7 @@ async fn failed_apply_patch_finishes_tool_turn_without_cancelling_runtime() {
             failed_apply_patch_command(),
             marker_command(&skipped_path, 2),
         ],
-        Duration::from_millis(750),
+        completion_delay,
     );
     let router_addr = mock_command_run_router_addr();
     let _api_key = EnvGuard::set("OPENAI_API_KEY", "local-stream-patch-key");
@@ -287,6 +295,7 @@ async fn failed_apply_patch_finishes_tool_turn_without_cancelling_runtime() {
         "local-stream-patch-model",
     );
 
+    let started = std::time::Instant::now();
     let result = call_runtime(
         CallRuntimeInput {
             runtime,
@@ -316,6 +325,13 @@ async fn failed_apply_patch_finishes_tool_turn_without_cancelling_runtime() {
     .await
     .expect("failed apply_patch should return a tool result");
 
+    if !completion_delay.is_zero() {
+        assert!(
+            started.elapsed() < completion_delay,
+            "failed apply_patch must return before delayed provider completion: {:?}",
+            started.elapsed()
+        );
+    }
     assert_eq!(result.state, RuntimeState::Finished);
     assert_eq!(
         result.call_result_status(),
@@ -359,8 +375,8 @@ async fn failed_apply_patch_finishes_tool_turn_without_cancelling_runtime() {
             usage.output_tokens,
             usage.total_tokens
         )),
-        Some((1, 1, 2)),
-        "failed apply_patch must retain usage from delayed provider completion"
+        expected_usage,
+        "failed apply_patch retains ready usage without waiting for unfinished providers"
     );
     let finished_usage = result
         .clone()
