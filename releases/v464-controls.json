@@ -1,7 +1,7 @@
 {
   "schema_version": "nokiy_public_source_snapshot_v2",
   "release": "v464-controls",
-  "snapshot_date": "2026-10-28",
+  "snapshot_date": "2026-10-29",
   "status": "PUBLIC_SOURCE_SNAPSHOT",
   "binary_distribution": false,
   "reproducible_binary_build_verified": false,
@@ -2382,7 +2382,7 @@
       }
     },
     "packages/switchboard": {
-      "source_head": "89c7889dc9c6d8b53e142ae2270b09dc266efa61",
+      "source_head": "372c9b26b65b3ce9319877651bf63a1696232b24",
       "includes_uncommitted_changes": false,
       "export": "committed source with documented exclusions and publication-only notices",
       "files": {
@@ -2406,7 +2406,7 @@
         "src/inference-attempt-evidence.mjs": "0660914425927767292dede0b759e1d9937fe53d600851cace360ac594bbb758",
         "src/log-rotation.mjs": "cc383fdc5dab1ed3b7c1ef5f37b4899844a4fe80173817acb4567f51532e2ae4",
         "src/nokiy-coordinator-policy.mjs": "76479dc5ccc756ea5d379e255c5e72c2acf52b6bca8e1f42a9351c756f47e709",
-        "src/nokiy-direct-route.mjs": "54f89769d718047a59bbd5af92225f3b03e7144bf7d1c94c444554a27936934a",
+        "src/nokiy-direct-route.mjs": "4ba4ad364d90c398467a435fa3ec99304f480bea520be85507af548e927c0bbf",
         "src/nokiy-http-evidence.py": "66fc8f5b15039d5829d4e5bc69f51617469c5e1ebc3116f06e43fc612abef57f",
         "src/nokiy-native-contract.json": "f95d35bb2ef9b2de1aaeea7f27f5945fb768a934401b0e8a30c711af250a4961",
         "src/nokiy-native-host.py": "7ce125be45d6824f85a2ef63b1f44936bcdf3d33f0cf9cc4138b40c641d393cb",
@@ -2414,20 +2414,20 @@
         "src/nokiy-native-tool.mjs": "5c67183181e66a8af23a8d1bb4c3a1d0d76af6c4001459b90a0d42ce7879a2a3",
         "src/nokiy-replay-restore.mjs": "4c74e69e2c9ea8adcd78b2d42c89633a7eb4c9f5fdf04bd7584ca9469083dc3f",
         "src/nokiy-result-delivery.mjs": "6b979a179c2f36ebb43eac7361295d236dc70090599c5ee44b7244cda0131496",
-        "src/nokiy-workflow-profiles.mjs": "7ab2dd2849536e2d44068e0463c487c21fd98edba56acfeceff99e1e8749ca0a",
+        "src/nokiy-workflow-profiles.mjs": "bca39f5ca12c9d14a21a6f91abbaa6f7e3c1cd1f9d87eda1c4f847dd03308b01",
         "src/official-catalog-refresh.mjs": "59d7762f90bfcdb319d15e13461bda44f38e3ce969a0d36693e77730ad73f413",
         "src/openrouter-worker.mjs": "e4e4055ce92a87c136c2e3773cbc67af4ce4c80e22aa2afff0ab524ec33e200f",
         "src/picker-catalog.mjs": "01c4046ad93f8412c0b5b7890415c2b52b4d2554c13a0beb99f43277fba62a37",
         "src/post-restart.mjs": "67dce96846956682cef4828fded7544e46a980d6ecc72f562e9c61aea8ab12dc",
         "src/replay-diagnostic.mjs": "93e753fd6510e7ecf5deb734d6e26aa2599258883e0ed50e51447e2a5e8b5f71",
         "src/route-ownership.mjs": "b4dc135ca6b52a3bfee311934ccdfbd7284c8c3e50a2d4d330308d00d1be7564",
-        "src/server.mjs": "1ae69d7b2b2ad14cd6c20a395491934afbd261e946a1ce061ad8b58a0d7100e3",
+        "src/server.mjs": "fbd4f7135cd99fd9d29d39631f84b4341a945fe089d2639f546aa81f9ce52271",
         "src/shared.mjs": "e2b95504b30e7f83cfe47456efb1ee3f61b31c95b864c02018bbf39acda44f9c",
         "src/spawn-payload-cache.mjs": "52f29e0ef70a0cf498cbe146571abe7b52b07ef39daeb8504a56bcbacc37478d",
         "src/tool-bridge.mjs": "aec2eb733b54109548d466d8272a0e63dcab73ac0bcd2a5faf2ca69efb51130e",
         "src/update-lock.mjs": "540cd406a82c33256ee5e3894201a533190056881700ca88f08a9114a7b8e39c",
         "src/worker-client.mjs": "f0a890259592436c306746501e9008f3091614cb83acebf832250c056658d485",
-        "src/workflow-update.mjs": "f005fbc607ca81b959b130e86696f84c8793f0dd97638a0d9103fcc0a0e35f66",
+        "src/workflow-update.mjs": "20cd2face4010fdc0492fffaf80fa0d6235b37e642b4fe8bb5f8647ea46a2ef9",
         "src/xai-worker.mjs": "48fa213818b0ac46e3ccc268bff89b5185c23564f254ff36005c805033a60b1b",
         "tests/admission-recovery.test.mjs": "8f956c18ed2c1248f36edac4d0d914b0cdec07e1ec3dde043623e556e180ccdf",
         "tests/agy-persistent-session.test.mjs": "92ea827bca88628f3e9084f601bf98742023bda2960913bdb496c8428e25eaee",
@@ -2462,12 +2462,14 @@
         "tests/nokiy-efficient-create-read.test.mjs": "6cb1bcd25f54211013242d0ee3fa22d11968f370c1f27a3a39b95d1601c43487",
         "tests/nokiy-efficient-first-dispatch.test.mjs": "c8687a1bc5337c0aadcf5fe981262b2a5319ed99d99eafc1a6589d470ebc7283",
         "tests/nokiy-efficient-known-context.test.mjs": "b99579a3fc9c11862fd42a73a36b2f0c6fcd65c5132514585f6fc4ab1cda7bd4",
+        "tests/nokiy-efficient-observation-policy.test.mjs": "65bafdc0094f4734ec1ad965b0ea309d761c71a326723059518fe8d43b55cf76",
         "tests/nokiy-efficient-tool-rejection.test.mjs": "47d7d77ce7c83a6669275c3fc62a54479ca8e7e46cb4ac77ed3031fb053b2780",
         "tests/nokiy-first-level-dispatch.test.mjs": "a27bac5ec673575c0c81aa79d28623123e3931bd5e11ec8299e298bdf23e05c4",
         "tests/nokiy-host-compact-batch.test.mjs": "8136ae9f11c1fabe4f614cb05081bbc5d148eadf3952403441bac63eb1a0c0b8",
         "tests/nokiy-host-interpreter.test.mjs": "0211e261f67f048c99c7c97afe5d4b483f41bc548bcd149b6e31d92bb0bb5dff",
         "tests/nokiy-host-snapshot.test.mjs": "b8cb6f1835fbb34adfb9906a0e94b878158eaabb465d274a14bb2510502e592e",
         "tests/nokiy-hosted-capability-route.test.mjs": "c64f00d262dc3e13edfe325db5bc731d9f8f85826ef895e41893e2456e60bf37",
+        "tests/nokiy-incomplete-continuation.test.mjs": "8e4251cc7e579219e0b7cdf276af77f187f79c0c8ccb1034b858e4f16d33ea47",
         "tests/nokiy-inspect-guidance.test.mjs": "961fb3175bd0bad7480b47a5493224e2f2ad26cc2ebade4025db48f6ad3bacac",
         "tests/nokiy-lite-prefix.test.mjs": "6c909f86a7cadec2f01fe0d7b24e5b79e98b63722cec65b15c9a653d9a28c32e",
         "tests/nokiy-member-intent.test.mjs": "2b5d7cd8ea4a5bb099357ae531149e8d3e5842961029b2cc728d59699fd21fbc",
@@ -2495,7 +2497,7 @@
         "tests/nokiy-result-delivery.test.mjs": "5f441ff6a206363bb4f07c63687164d926f2c89edbdb8eceaeb08bc2f31df0d4",
         "tests/nokiy-stale-appshots.test.mjs": "353c16d7f76d45de58effbc36fc20c7e43d0aef71da46234af8822463a1c7be9",
         "tests/nokiy-surface-query.test.mjs": "a18dcab5f58b844f62a57b7106abc1930dd928a9257ef2e54f7883628be8f3c2",
-        "tests/nokiy-tool-availability.test.mjs": "1696ba0ed15e68397b6a1bcc19c6418ddd5020e22e523d67832164e2cba01473",
+        "tests/nokiy-tool-availability.test.mjs": "986f513768de11da5ed6bb6bb0ea54f5876a4a3c68aa95655c107870be655429",
         "tests/nokiy-tool-output-limit.test.mjs": "6bf7e67237b766fad314da24a66e3c2dc9e952f7f2b93392a38e9ad35d9212ca",
         "tests/nokiy-user-reference.test.mjs": "795b95a0214220cd4a13ca8770cad2a85bebc213b188be5bf771e61319810e17",
         "tests/nokiy-verifier-contract-guidance.test.mjs": "737b4c56004086ec2665577b3d1ebdb9e585be7942b5abb7d83d01907306a7f5",
@@ -2534,7 +2536,7 @@
         "tests/web-cancellation.test.mjs": "33d405d190c4ec84fa3d71cbfe1c6f426bcf024a6ca37eeed10a04e5cbf3a95f",
         "tests/web-native-history.test.mjs": "94d6c73dc7429b0ff3103f3dc02990d0852d46a8837dd53e61c09a6588bffa55",
         "tests/worker-client.test.mjs": "bfea40dfe937a7f7490739503143430f5a6f1130fd4706c3c37af1777b4547b6",
-        "tests/workflow-update-prepare.test.mjs": "caacb54535c3f24ad1114dea38a50132f14599b83e2a77c8bd56d51fb74f6908",
+        "tests/workflow-update-prepare.test.mjs": "356e96656ca6958dd50c8ef6cd3bf47f18b334363e65984592c762156caf7d11",
         "tests/workflow-update-restart.test.mjs": "a7b67bbfac8f32698fe8f034f87e52e3c05681fefd7ad40b4223bded4d6605f5",
         "tests/ws-error-diagnostic.test.mjs": "c9f10fb604adbcee920c92b47f6202f8c4e7e597944b4b9c6ee46c8281788cce",
         "tests/xai-worker.test.mjs": "645e70f94cadea0cc11864de43e84876b303d0aeb62d8ef31375bb040a0e98d2"
@@ -2616,12 +2618,14 @@
         "tests/nokiy-efficient-create-read.test.mjs": "100644",
         "tests/nokiy-efficient-first-dispatch.test.mjs": "100644",
         "tests/nokiy-efficient-known-context.test.mjs": "100644",
+        "tests/nokiy-efficient-observation-policy.test.mjs": "100644",
         "tests/nokiy-efficient-tool-rejection.test.mjs": "100644",
         "tests/nokiy-first-level-dispatch.test.mjs": "100644",
         "tests/nokiy-host-compact-batch.test.mjs": "100644",
         "tests/nokiy-host-interpreter.test.mjs": "100644",
         "tests/nokiy-host-snapshot.test.mjs": "100644",
         "tests/nokiy-hosted-capability-route.test.mjs": "100644",
+        "tests/nokiy-incomplete-continuation.test.mjs": "100644",
         "tests/nokiy-inspect-guidance.test.mjs": "100644",
         "tests/nokiy-lite-prefix.test.mjs": "100644",
         "tests/nokiy-member-intent.test.mjs": "100644",
@@ -2696,13 +2700,13 @@
     }
   },
   "publication_files": {
-    "README.md": "1611f7734e7dc682b35f2aefb037e50712f691b0cc82dd8bc882af5d2baf4ec8",
-    "PROVENANCE.md": "f2898de75a674479ec8e7dac89986421cb42e83da30651ae10a9a69ddf7279f0",
+    "README.md": "332870a09c795468a72b704638f5483bbfeb705da91345aa5764e26cc5d96074",
+    "PROVENANCE.md": "e5f9ff7c451a0c2770836b23f7a530761b2a5cb4ead6daed26eebbb09bcdad32",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "06ab5d66e2b05d23c5e95ff4c3a6960cb5f3080c4cef269833a906eeb1af9c8f",
-    "docs/current-surface.md": "ff68dba9923f08cf76fca847d9769d36b8d2cc32706de151993af27d4c642a62",
-    "docs/benchmark-summary.md": "f43d09bf48ba9a721b2fc358e3d0aeb048124b9a802dbfeca72ed10f5d745e00"
+    "docs/current-surface.md": "a72938bb2d1d7cbdc956dc9008b36c6ea1001d5ea4d63edcc6b48d742efbc440",
+    "docs/benchmark-summary.md": "66d3e1ce080c4cca5fc6ddda5c798aecb40854d31d46425e7e749f881ae04c99"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261028-v464-fail-fast-ready-usage",
@@ -3602,13 +3606,16 @@
         "bytes": 7602928
       }
     },
-    "switchboard_deployment": "nokiy-efficient-control-advisory-20261028",
+    "switchboard_deployment": "nokiy-prepare-receipt-directory-20261029",
     "switchboard_regression_tests": {
-      "passed": 1045,
+      "passed": 1050,
       "failed": 0,
       "skipped": 0,
-      "scope": "complete candidate source; identical changed bytes deployed",
-      "live_focused_passed": 9
+      "scope": "Full candidate Node suite; adopted source tree matches byte-for-byte. Focused prepare34overlaps and is not additive.",
+      "focused_prepare_passed": 34,
+      "live_focused_passed": null,
+      "historical_live_focused_passed": 9,
+      "historical_live_focused_source": "89c7889dc9c6d8b53e142ae2270b09dc266efa61"
     },
     "switchboard_focused_python_tests": {
       "staged_passed": 184,
@@ -3658,6 +3665,43 @@
       "unknown_catalog_stays_unknown_on_bound_continuation": true,
       "models_efforts_thresholds_unchanged": true,
       "model_performance_remeasured": false
+    },
+    "native_capability_continuation_correction": {
+      "source_commit": "af384004f171e03788b93fc5529ae765c9df25a2",
+      "same_connection_identity_required": true,
+      "incomplete_is_not_successful_delivery": true,
+      "fresh_supported_catalog_can_recover_fallback": true,
+      "permissions_changed": false
+    },
+    "efficient_observation_policy": {
+      "source_commit": "37f9dda133819dfe404a3cdc2a190dc48bde2b96",
+      "measured_scope": "One sequential fresh-CLI acceptance-only pair,69tests each, Sol6.1/max, no workers; not native comparator or same-ID stability.",
+      "calls_before_after": [
+        6,
+        3
+      ],
+      "waits_before_after": [
+        3,
+        0
+      ],
+      "api_equivalent_usd_before_after": [
+        0.1049896,
+        0.0908988
+      ],
+      "wall_seconds_before_after": [
+        68.6287695,
+        66.897328125
+      ],
+      "stable_speedup_proven": false,
+      "explicit_native_arguments_rewritten": false
+    },
+    "publisher_prepare_receipt_directory": {
+      "created_before_plan_publication": true,
+      "mode": "0700",
+      "manual_post_prepare_setup_required": false,
+      "real_native_plan_check": "READY",
+      "hot_deployment_verified": true,
+      "model_benchmark_rerun": false
     }
   },
   "exclusions": [

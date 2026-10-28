@@ -48,7 +48,7 @@ Both public notes actually reached the coordinator's batch result unchanged:270/
 
 Against the earlier zero-worker candidate itself, revised-policy Efficient is29.95% faster and30.44% cheaper, but native also changed332.4to451.7s. Against V461 Efficient330.9s, the new candidate is27.6s faster. These are descriptive observations, not isolated policy/note causal effects or stable universal gains. The prior negative pair is retained, not retried unchanged for a prettier ratio. All coordinator contract drafting, discovery, implementation and delivery costs remain in the totals regardless of their labels.
 
-## Current Efficient On The Second Task
+## Earlier V462 Efficient On The Second Task
 
 One fresh DCF2 engineering pair used the same V462 caller/fa0b537 policy/V457 runtime, Sol6.1/max coordinator and native baseline, Terra6.1/xhigh worker profile, frozen task/quality rules and price basis. Policy/route hashes were included in the unchanged before/after controls; controls matched with no issues and both root CLI usage totals reconciled exactly.
 
@@ -65,7 +65,7 @@ Observed time-55.76%, estimate-39.13%. Efficient's two workers cost$0.1085864 co
 
 The parent prepared at10.692s, dispatched at80.038s, received its original batch at195.130s and produced the final response at229.830s. No post-batch tool call or source reread occurred. Two worker command envelopes overlap58.033s; that is not full-lifecycle/provider-span overlap. Both bound public notes reached the coordinator unchanged,244/285text bytes (3345bytes including metadata), complete MODEL_REPORTED with parent acceptance required. Neither final verifier/done shared an array; locations combined its final mechanical readback with done instead. No terminal-shortcut speedup is established.
 
-The coordinator made no DCF navigation call: DCF is the source being repaired, not evidence that navigation was invoked. Do not attribute total gains to DCF navigation or the optional note alone. Current-surface gains were observed on R19 and DCF2, one pair each; provider/native timing varies, and transfer observations are not stable universal or isolated causal estimates. The negative zero-worker pair remains above. No production source change, new release or additional model pair was needed after this cross-task acceptance.
+The coordinator made no DCF navigation call: DCF is the source being repaired, not evidence that navigation was invoked. Do not attribute total gains to DCF navigation or the optional note alone. Gains under that V462 composition were observed on R19 and DCF2, one pair each; provider/native timing varies, and transfer observations are not stable universal or isolated causal estimates. The negative zero-worker pair remains above. No production source change, new release or additional model pair was needed after this cross-task acceptance.
 
 ## Ultra Picker Profiles And Second Task
 
@@ -89,13 +89,13 @@ V462 quality/integrity passed692/705tests with the same ten accepted-reference s
 
 Ultra parent dispatch143.583s, batch return266.908s and final331.601s included no post-batch source reread; root local catalog/listing needed two calls before dispatch. One worker emitted a bound292-byte note, the other ended question after its verifier imported a sibling's not-yet-created projection module. The joined gate later passed and the coordinator correctly accepted both source changes using parent-owned acceptance; the member's BLOCKED/COMMAND_FAILURE history was not erased. Command envelopes overlap35.873s, not complete worker/provider lifetimes. Neither final verifier/done was merged. No extra integration ledger or permission relaxation was required.
 
-The missing usage came from local early cancellation after a failed patch. V463 tried waiting for provider completion to collect usage, but that introduced a demonstrated repair-latency regression (750ms delayed mock returned after854.9345ms). It was superseded rather than retained for prettier accounting. V464 preserves fail-fast cancellation and uses the normal metrics path only when the provider is already finished; cancelled usage remains UNKNOWN. Its regression covers both fast failure/usageNone and ready usage1/1/2, with no later command effects. Neither version reconstructs historical usage or makes this V462 cost complete, and no fresh model pair was run to replace it. Existing launch_arms/prep_run evidence is ephemeral single-turn execution, not same-native-session multistage resume or compaction acceptance; long-session gains remain unmeasured in these current pairs.
+The missing usage came from local early cancellation after a failed patch. V463 tried waiting for provider completion to collect usage, but that introduced a demonstrated repair-latency regression (750ms delayed mock returned after854.9345ms). It was superseded rather than retained for prettier accounting. V464 preserves fail-fast cancellation and uses the normal metrics path only when the provider is already finished; cancelled usage remains UNKNOWN. Its regression covers both fast failure/usageNone and ready usage1/1/2, with no later command effects. Neither version reconstructs historical usage or makes this V462 cost complete, and no fresh model pair was run to replace it. Existing launch_arms/prep_run evidence is ephemeral single-turn execution, not same-native-session multistage resume or compaction acceptance; long-session gains were not measured in those frozen pairs.
 
 Earlier whole-workflow reports that counted only the last response's tokens are not reused. Source/tests/deployment receipts and private raw traces are different evidence; raw private traces are not included here. No upstream acceptance or independent replication is claimed.
 
-## Current V464 Efficient R19 Confirmation
+## Earlier V464 / 89c7889 Efficient R19 Pair
 
-On2026-10-28, one fresh pair used V464 caller/runtime and switchboard89c7889, the same frozen R19 task, concurrent arms and independent fixed quality gate. Both coordinators used Sol6.1/max; Efficient selected two Terra6.1/xhigh workers. Source/configuration controls, including server/profile/route/policy bytes before and after, matched. Root reported input/cached/output usage reconciled exactly to each CLI, and all worker/native-child usage was complete. Costs retain frozen2026-10-22 API-equivalent weights, not subscription billing or current invoices.
+On2026-10-28, one fresh pair used the earlier V464 caller/runtime and Switchboard89c7889 composition, the same frozen R19 task, concurrent arms and independent fixed quality gate. This is not a measurement of the adopted 372c9b2 source. Both coordinators used Sol6.1/max; Efficient selected two Terra6.1/xhigh workers. Source/configuration controls, including server/profile/route/policy bytes before and after, matched. Root reported input/cached/output usage reconciled exactly to each CLI, and all worker/native-child usage was complete. Costs retain frozen2026-10-22 API-equivalent weights, not subscription billing or current invoices.
 
 | Metric | Efficient | Native Sol6.1 | Difference |
 | --- | ---: | ---: | ---: |
@@ -113,3 +113,34 @@ The native baseline was allowed its ordinary native child; this is not a no-suba
 Efficient coordinator cost was$0.1442472(58.46% of its total); workers cost$0.1024882. Coordinator cached-input share was60.78% versus native93.64%, yet complete cost halved. Lower cache ratio or higher uncached input alone is therefore not a failure criterion. Root request timing reported124.935s summed upstream spans and0.015s local predispatch; spans include transport/provider scheduling and are not pure reasoning or an additive whole-workflow decomposition.
 
 Versus the earlier V462 positive R19 pair, Efficient itself changed303.3to253.9s and$0.2662306to$0.2467354(-16.29% time/-7.32% cost), with root calls4to3. Observed prep-return-to-dispatch did not improve(72.682to72.910s). Batch span fell147.716to125.772s, and return-to-terminal fell73.498to44.238s; the older post-batch source check was absent in the new run. Expanded CLI batch bytes are not model-authored output, and public captures alone do not establish optional-note activation. These are descriptive execution differences, not a controlled causal effect of the advisory-reminder or fail-fast patches. Preserve the earlier zero-worker regression and incomplete Ultra cost. Statistical stability and sustained same-ID continuation/compaction benefits remain unproven.
+
+## Mixed Same-ID Three-Phase Sample
+
+The complete retained 2026-10-28 sample compared Efficient with native Sol6.1/max across planning, implementation and acceptance in the same-ID workflow. It includes all retained correlated provider telemetry, with no independent CLI usage reconciliation for these App turns.
+
+| Metric | Efficient | Native Sol6.1/max | Difference |
+| --- | ---: | ---: | ---: |
+| API-equivalent USD | 0.63624948 | 0.5501194 | +15.66% |
+| Total tokens | 1826678 | 1311551 | |
+| Sum of active-turn seconds | 629.473 | 766.505 | -17.88% |
+| Reported calls | 26 | 16 | |
+| Quality tests | 69 | 69 | |
+
+Active-turn durations are summed, not presented as an end-to-end workflow wall clock. Final executable control differed; filesystem replacement timestamps were after the measured phases. Treat this as descriptive observation, not a strict unchanged-executable causal comparison. The complete multi-turn sample establishes no joint cost/time improvement: Efficient cost more despite less summed active time.
+
+## Efficient Observation-Policy Before/After Pair
+
+On2026-10-29, one sequential fresh-CLI acceptance-only pair compared Efficient before and after the observation-policy change. Both coordinators used gpt-6.1-sol/max (Sol6.1/max), with zero workers each. This is an Efficient before/after comparison, not Efficient-versus-native.
+
+| Metric | Before | After | Difference |
+| --- | ---: | ---: | ---: |
+| Coordinator calls | 6 | 3 | |
+| Wait calls | 3 | 0 | |
+| Total tokens | 213834 | 106463 | -50.21% |
+| API-equivalent USD | 0.1049896 | 0.0908988 | -13.42% |
+| Wall seconds | 68.62877 | 66.89733 | -2.52% |
+| Quality tests | 69 | 69 | |
+
+Both root CLI usage totals reconciled exactly (REPORTED_TOTALS_MATCH). Controls were stable within each arm; the only cross-arm changes were coordinator observation-guidance source and admission release metadata. Totals include measured coordinator/correlated usage; engineering-chat usage is excluded by operator scope. Removing cached input reduces tokens with a lower API cost weight, so token savings need not equal cost savings.
+
+This one pair does not establish full repair-workflow or same-ID/multiturn stability. The small 2.52% wall-time difference is insufficient for a stable speedup claim. Costs use frozen2026-10-22 standard API-equivalent rates, not subscription consumption or invoices. Current Switchboard source is 372c9b2, while runtime remains V464; these model measurements were not rerun for the publisher receipt-directory fix and must not be relabeled as a complete latest-commit benchmark.

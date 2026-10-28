@@ -1,14 +1,18 @@
 # Source Provenance
 
-## Current V464 Surface
+## Current V464 Runtime / 2026-10-29 Source Surface
 
 This is a source publication, not a redistribution of installed executables or machine configuration.
 
 | Component | Source commit | Correspondence |
 | --- | --- | --- |
 | Python caller | `ffafb43816ea188b080a7978894ca98711625e9b` | Unchanged package source; all 48 non-cache installed package files match byte-for-byte; installed release wheel version 0.3.464.dev0 |
-| Rust worker payload | `1304065c69b9c5c6a702a05754526395c9a41678` | All 602 recorded build-source inputs match; rebuilt with cargo --locked, four binary identities match the installed V464 image; fail-fast retained, ready metrics reused, cancelled usage UNKNOWN |
-| Switchboard | `89c7889dc9c6d8b53e142ae2270b09dc266efa61` | Retains public-note delivery and coherent-branch routing; identifies Ultra and Efficient native controls for advisory accounting without changing execution authority; model/effort topology unchanged; private diagnostics and compiled caches excluded |
+| Rust worker payload | `1304065c69b9c5c6a702a05754526395c9a41678` | All 602 recorded build-source inputs match; the existing V464 rebuild used cargo --locked, four binary identities match the installed V464 image; fail-fast retained, ready metrics reused, cancelled usage UNKNOWN |
+| Switchboard | `372c9b26b65b3ce9319877651bf63a1696232b24` | Adopted current source; exact verified response.incomplete continuation retains same-chain capability without claiming successful delivery; fresh supported native tool advertisements recover answer-only fallback; Efficient observation guidance preserves explicit tool arguments; publisher prepare creates its declared 0700 native receipt directory |
+
+The Switchboard source has 1,050 full-suite passes and 34 focused prepare passes; these overlap and must not be summed. Model benchmarks were not rerun for the publisher directory fix. Caller and Rust source remain unchanged, with no new Rust rebuild or universal runtime version: the runtime release remains V464. Permissions, models and trading behavior are unchanged; private diagnostics and compiled caches remain excluded.
+
+Measurements retain their actual source/policy composition in [Benchmark observations](docs/benchmark-summary.md). In particular, the positive 253.9s/$0.2467354 versus 439.4s/$0.4943428 R19 pair used the earlier 89c7889 Switchboard composition, not the adopted 372c9b2 source. The mixed same-ID sample and the Efficient before/after observation-policy pair have separate measurement and control limits.
 
 These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in releases/v464-controls.json identify the published contents. Publication-only documentation and preserved licenses are identified separately.
 

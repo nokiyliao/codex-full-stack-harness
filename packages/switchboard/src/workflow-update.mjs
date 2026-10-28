@@ -516,6 +516,7 @@ async function preparePacket(file) {
   // All validation precedes the first effect. Exclusive creation leaves a failed
   // publication non-replayable; never overwrite or clean up an uncertain packet.
   await mkdir(r.output, { mode: 0o700 });
+  await mkdir(plan.artifact_root, { mode: 0o700 });
   for (const [name, bytes] of [[authorizationPath, authBytes], [manifestPath, manifestBytes], [planPath, planBytes]]) {
     const fd = await open(name, "wx", 0o600);
     try { await fd.writeFile(bytes); await fd.sync(); } finally { await fd.close(); }

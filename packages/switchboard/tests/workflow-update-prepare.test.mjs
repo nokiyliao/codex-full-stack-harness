@@ -369,8 +369,16 @@ test("prepare produces the existing native packet and validates with the unchang
   f.env.NOKIY_DEPLOYMENT_ACTION_ID = f.request.action_id;
   f.env.NOKIY_DEPLOYMENT_PLAN_SHA256 = result.plan_sha256;
   assert.deepEqual(await f.api.boundManifest(result.manifest_ref.path), manifest);
-  assert.deepEqual(await fs.readdir(f.request.output), ["authorization.json", "manifest.json", "native-plan.json"]);
-  assert.deepEqual(f.effects, [["mkdir", f.request.output], ...["authorization.json", "manifest.json", "native-plan.json"].map(name => ["open", path.join(f.request.output, name)])]);
+  const receipts = await fs.lstat(plan.artifact_root);
+  assert.equal(plan.artifact_root, path.join(f.request.output, "native-artifacts"));
+  assert.equal(receipts.isDirectory(), true);
+  assert.equal(receipts.isSymbolicLink(), false);
+  assert.equal(receipts.uid, process.getuid());
+  assert.equal(receipts.mode & 0o777, 0o700);
+  assert.deepEqual(await fs.readdir(plan.artifact_root), []);
+  assert.deepEqual(await fs.readdir(f.request.output), ["authorization.json", "manifest.json", "native-artifacts", "native-plan.json"]);
+  assert.deepEqual(f.effects, [["mkdir", f.request.output], ["mkdir", plan.artifact_root],
+    ...["authorization.json", "manifest.json", "native-plan.json"].map(name => ["open", path.join(f.request.output, name)])]);
   for (const [name, bytes] of f.originals) assert.deepEqual(await fs.readFile(name), bytes, `Input changed: ${name}`);
   const effects = [...f.effects];
   await assert.rejects(f.run(), /output already exists/);

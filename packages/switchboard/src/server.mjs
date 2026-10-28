@@ -1383,13 +1383,23 @@ export async function createSwitchboardServer({
             ].includes(event.type)) {
               officialTurn.firstOutputEventMs = Math.max(0, Math.floor(performance.now() - officialTurn.timingStarted));
             }
-            const projected = officialTurn?.project ? officialTurn.project(event) : event;
+            // An incomplete terminal can carry an unfinished call in response.output.
+            // Keep the terminal, but never project that partial call as executable output.
+            const projectionEvent = event.type === "response.incomplete" && officialTurn?.nativeToolTarget
+              && Array.isArray(event.response?.output)
+              ? { ...event, response: { ...event.response, output: event.response.output.filter((item) =>
+                !["custom_tool_call", "function_call"].includes(item?.type) || item.status === "completed") } }
+              : event;
+            const partialToolDone = officialTurn?.nativeToolTarget && event.type === "response.output_item.done"
+              && ["custom_tool_call", "function_call"].includes(event.item?.type)
+              && ["in_progress", "incomplete"].includes(event.item?.status);
+            const projected = partialToolDone ? null : officialTurn?.project ? officialTurn.project(projectionEvent) : event;
             const projectedEvents = [projected].flat();
             for (const item of projectedEvents) {
               if (item) sendDownstream(item === event ? data.toString() : JSON.stringify(item));
             }
             rememberSpawnPayloads(event);
-            if (event.type === "response.output_item.done" && event.item && officialTurn?.cacheCandidate) {
+            if (event.type === "response.output_item.done" && !partialToolDone && event.item && officialTurn?.cacheCandidate) {
               officialTurn.cacheOutput.push(event.item);
             }
             if (TERMINAL_EVENTS.has(event.type) && officialTurn) {
@@ -1410,10 +1420,13 @@ export async function createSwitchboardServer({
                   event.response?.usage, officialTurn.nativeRunControls?.bindings ?? officialTurn.coordinatorBindings);
               }
               const resultCall = officialTurn.resultDeliveryEnabled ? resultContinuationCall(output) : null;
-              directContinuation = event.type === "response.completed" && event.response?.id && (officialTurn.nativeToolTarget || officialTurn.coordinatorFallback)
+              // Capability belongs to this exact response chain, even when generation stops
+              // incomplete. Only completed output above can bind a call or result delivery.
+              directContinuation = ["response.completed", "response.incomplete"].includes(event.type)
+                && event.response?.id && (officialTurn.nativeToolTarget || officialTurn.coordinatorFallback)
                 ? { model: officialTurn.requestedAlias, target: officialTurn.nativeToolTarget,
                   fallback: officialTurn.coordinatorFallback,
-                  toolsIdentity: officialTurn.nativeToolsIdentity, responseId: event.response.id,
+                  toolsIdentity: officialTurn.nativeToolsIdentity, responseId: event.response.id, terminalEvent: event.type,
                   profileIdentity: officialTurn.profileIdentity, resultCall,
                   coordinatorBindings: officialTurn.coordinatorBindings,
                   nativeRunControls: officialTurn.nativeRunControls,
@@ -1444,7 +1457,7 @@ export async function createSwitchboardServer({
                       rememberChain(cacheChain.correlation?.client_thread_id, cacheChain.template, cacheChain.hashes, cacheChain.kinds);
                     } catch {}
                   }
-                } else if (event.type === "response.completed") {
+                } else if (event.type === "response.completed" || event.type === "response.incomplete") {
                   cacheChain = null;
                 }
               } catch {
@@ -1683,7 +1696,10 @@ export async function createSwitchboardServer({
           diagnostic: { ...direct.resultCompaction, full_request: direct.fullRequest } });
         if (direct?.nativeToolMissing) safeLog({ request_id: requestId, model: direct.body?.model ?? body.model,
           requested_alias: direct.requestedAlias ?? null, route: "nokiy-native-tool-missing", transport: "ws",
-          diagnostic: { native_tool_missing: direct.nativeToolMissing, dispatch: direct.dispatch } });
+          request_correlation: officialRequestCorrelation(body, req.headers),
+          diagnostic: { native_tool_missing: { ...direct.nativeToolMissing,
+            continuation_condition: continuationCondition,
+            continuation_terminal_event: directContinuation?.terminalEvent ?? null }, dispatch: direct.dispatch } });
         const profileIdentity = JSON.stringify(direct?.profile ?? null);
         if (direct && directContinuation?.model === body.model
             && directContinuation.responseId === body.previous_response_id

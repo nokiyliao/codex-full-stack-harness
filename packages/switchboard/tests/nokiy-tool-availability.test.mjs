@@ -138,3 +138,28 @@ test("fallback preserves native replay pairs rather than restoring unavailable N
   const routed = route(body, { replayRestore() { throw Error("fallback must not restore projected calls"); } });
   assert.deepEqual(routed.body.input, body.input);
 });
+
+test("fallback continuations revalidate fresh exec catalogs before recovering native tools", () => {
+  const fallback = route(helper("nokiy-direct", { previous_response_id: "unbound" }));
+  const continuationFallback = { wireEffort: fallback.wireEffort,
+    nativeToolMissing: fallback.nativeToolMissing, answerOnly: fallback.fallbackAnswerOnly };
+  const delta = { model: "nokiy-direct", reasoning: { effort: "medium" },
+    previous_response_id: "fallback", tool_choice: "auto", input: [] };
+  const retained = route(delta, { continuationFallback });
+  assert.equal(retained.body.tool_choice, "none");
+  assert.equal(retained.nativeTool, null);
+
+  const unsupported = route({ ...delta, input: [{ type: "additional_tools",
+    tools: [{ type: "function", name: "exec" }] }] }, { continuationFallback });
+  assert.equal(unsupported.nativeTool, null);
+  assert.equal(unsupported.body.tool_choice, "none");
+  assert.equal(unsupported.nativeToolMissing.reason, "unsupported_native_exec_binding");
+
+  const recovered = route({ ...codeMode('declare const tools: { exec_command(args: { cmd: string; }): Promise<unknown>; };'),
+    ...delta }, { continuationFallback });
+  assert.equal(recovered.dispatch, "native-tool");
+  assert.equal(recovered.coordinatorFallback, undefined);
+  assert.equal(recovered.nativeTool.target.name, "exec");
+  assert.equal(recovered.body.tool_choice, "auto");
+  assert.ok(recovered.body.tools.some((tool) => tool.name === NOKIY_TOOL));
+});

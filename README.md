@@ -1,8 +1,10 @@
 # Nokiy Full-Stack Harness
 
-Current source surface: **V464 runtime + Ultra/Efficient control correction: caller ffafb43 + rebuilt Rust 1304065 + switchboard 89c7889**, synchronized on 2026-10-28.
+Current source surface: **V464 runtime (unchanged) + Switchboard continuation/observation repairs: caller ffafb43 + Rust 1304065 + switchboard 372c9b2**, synchronized on 2026-10-29.
 
 This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V464 keeps failed-patch feedback fast: an already-finished provider uses its normal metrics path, while a still-running provider is cancelled without waiting just for accounting. Cancelled usage remains UNKNOWN, never zero. The intermediate V463 forced-drain approach was rejected for delaying repair. V462 optional worker notes and single-branch-only Efficient native implementation remain. These changes do not expand permissions or change models.
+
+Current Switchboard repairs retain verified same-chain capability through exact response.incomplete continuation without claiming successful delivery, and recover answer-only fallback when fresh supported native tools are advertised. Efficient's long-observation guidance preserves actual explicit tool arguments; publisher prepare creates its declared 0700 native receipt directory. The full Switchboard suite passed 1,050 tests and focused prepare passed 34 (overlapping, not additive). This adoption makes no permission, model or trading changes.
 
 ```text
 Native Codex thread / Goal / UI
@@ -16,7 +18,7 @@ Native Codex thread / Goal / UI
 | --- | --- | --- | --- |
 | Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `ffafb43816ea188b080a7978894ca98711625e9b` | MIT |
 | Modified Tura-derived execution engine | [runtime](runtime) | `1304065c69b9c5c6a702a05754526395c9a41678` | AGPL-3.0-or-later |
-| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `89c7889dc9c6d8b53e142ae2270b09dc266efa61` | Repository AGPL-3.0-or-later |
+| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `372c9b26b65b3ce9319877651bf63a1696232b24` | Repository AGPL-3.0-or-later |
 
 [Current source manifest](releases/v464-controls.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
 
@@ -55,7 +57,7 @@ cd runtime
 cargo build --locked --release --bin tura_router --bin tura_runtime --bin tura_session_db --bin tura_exec
 ```
 
-The Rust names preserve their actual source lineage. The caller source package version remains `0.3.21.dev0`; the installed release wheel was stamped `0.3.464.dev0` by its existing release process. V464 rebuilt the actual four-binary payload with cargo --locked; it is not a version-only relabeling.
+The Rust names preserve their actual source lineage. The caller source package version remains `0.3.21.dev0`; the installed release wheel was stamped `0.3.464.dev0` by its existing release process. The existing V464 release rebuilt the actual four-binary payload with cargo --locked. This Switchboard source synchronization does not rebuild Rust or introduce a new universal runtime version.
 
 Switchboard source requires Node.js 22.15+ and Python 3.11+ for its host/tests:
 
@@ -77,7 +79,11 @@ That V462 Efficient surface also completed the second frozen DCF engineering tas
 
 A subsequent V462 Ultra/Astra-xhigh DCF2 pair completed in332.3s versus nativeAstra-xhigh538.7s with quality692/705PASS. One failed-patch call was cancelled without provider usage; Ultra's complete cost is UNKNOWN, not the known subtotal$0.8686608. V463's attempt to wait for usage was deployed but rejected after a fail-fast regression test. V464 preserves fast cancellation and only keeps metrics already available at completion; it cannot backfill that historical call. No causal performance gain from these failure-accounting changes is claimed. Frozen snapshot pairs do not establish sustained native-session continuation/compaction gains.
 
-The current V464 runtime/89c7889 switchboard also completed a fresh frozen R19 pair: Efficient253.9s/$0.2467354 versus nativeSol439.4s/$0.4943428, time-42.22% and cost-50.09%, both fixed quality gates PASS. Totals include the Efficient coordinator/two Terra workers and the native coordinator/one Sol child. Efficient had three coordinator calls and no post-batch parent source read, but its uncached input was8.27% higher. This confirms one current-composition execution result, not isolated causality, statistical stability or long-session behavior.
+An earlier V464 runtime/89c7889 Switchboard composition completed a frozen R19 pair: Efficient253.9s/$0.2467354 versus nativeSol439.4s/$0.4943428, time-42.22% and cost-50.09%, both fixed quality gates PASS. Totals include the Efficient coordinator/two Terra workers and the native coordinator/one Sol child. Efficient had three coordinator calls and no post-batch parent source read, but its uncached input was8.27% higher. This is one earlier-composition execution result, not a measurement of 372c9b2, isolated causality, statistical stability or long-session behavior.
+
+The complete retained 2026-10-28 same-ID planning/implementation/acceptance sample was mixed: Efficient versus native Sol6.1/max cost $0.63624948/$0.5501194 (+15.66%), while summed active-turn durations were629.473s/766.505s (-17.88%). Both quality counts were69. These are correlated provider-telemetry totals without independent CLI usage reconciliation. Final executable control differed and filesystem replacement timestamps were after the measured phases; this is descriptive evidence, not strict unchanged-executable causal proof or a joint cost/time gain.
+
+On2026-10-29, one sequential fresh-CLI Efficient before/after observation-policy pair used Sol6.1/max, zero workers and69tests each, with both CLI usage totals reconciled. Coordinator calls fell6to3, waits3to0, tokens213834to106463 (-50.21%) and API-equivalent cost$0.1049896to$0.0908988 (-13.42%); wall time was68.62877to66.89733s (-2.52%). Removed cached input has a lower API weight, so token savings need not equal cost savings. This acceptance-only pair is not Efficient-versus-native or full repair/multiturn stability evidence, and the small time difference does not establish a stable speedup. Model benchmarks were not rerun for the publisher directory fix.
 
 The source export matches all 48 non-cache files in the installed caller package, all 602 recorded Rust build-source inputs, and the current switchboard commit except explicitly excluded operator-only diagnostics and compiled caches. Recorded binary hashes are provenance, not a byte-reproducible-build claim. Clean-machine installation and cross-platform service operation have not been established by this publication.
 

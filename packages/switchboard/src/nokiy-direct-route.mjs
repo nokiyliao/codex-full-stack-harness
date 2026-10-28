@@ -429,8 +429,11 @@ export function projectNokiyDirect(body, { endpoint = "/responses", host = null,
     && body.input.some((item) => item?.type === "compaction_trigger"));
   const nonExecution = prewarm || compact;
   const chained = typeof body.previous_response_id === "string" && body.previous_response_id !== "";
+  const advertisedNativeExec = advertisedTools(body).some((tool) => EXEC_NAMES.has(tool?.name)
+    && (tool?.type === "function" || tool?.type === "custom"));
   // Only the server's exact same-connection response binding can inherit this mode.
-  if (!nonExecution && continuationFallback !== null) {
+  // A fresh advertisement goes through normal binding validation before it can recover tools.
+  if (!nonExecution && continuationFallback !== null && !advertisedNativeExec) {
     return coordinatorFallback(body, profile, continuationFallback.wireEffort,
       { ...continuationFallback.nativeToolMissing, chained, lite: isLiteRequest(body), continuation: true },
       continuationFallback.answerOnly);
@@ -448,8 +451,7 @@ export function projectNokiyDirect(body, { endpoint = "/responses", host = null,
     return coordinatorFallback(body, profile, supported ? effort ?? null : expectedWireEffort,
       missingExecDiagnostic(body));
   }
-  const hasNativeExec = continuationTarget !== null || advertisedTools(body).some((tool) => EXEC_NAMES.has(tool?.name)
-    && (tool?.type === "function" || tool?.type === "custom"));
+  const hasNativeExec = continuationTarget !== null || advertisedNativeExec;
   if (!nonExecution && !hasNativeExec) {
     const nativeToolMissing = missingExecDiagnostic(body);
     // An unbound chain may inherit projected tools we cannot reconstruct. It can still
