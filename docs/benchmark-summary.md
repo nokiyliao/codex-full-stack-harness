@@ -92,3 +92,24 @@ Ultra parent dispatch143.583s, batch return266.908s and final331.601s included n
 The missing usage came from local early cancellation after a failed patch. V463 tried waiting for provider completion to collect usage, but that introduced a demonstrated repair-latency regression (750ms delayed mock returned after854.9345ms). It was superseded rather than retained for prettier accounting. V464 preserves fail-fast cancellation and uses the normal metrics path only when the provider is already finished; cancelled usage remains UNKNOWN. Its regression covers both fast failure/usageNone and ready usage1/1/2, with no later command effects. Neither version reconstructs historical usage or makes this V462 cost complete, and no fresh model pair was run to replace it. Existing launch_arms/prep_run evidence is ephemeral single-turn execution, not same-native-session multistage resume or compaction acceptance; long-session gains remain unmeasured in these current pairs.
 
 Earlier whole-workflow reports that counted only the last response's tokens are not reused. Source/tests/deployment receipts and private raw traces are different evidence; raw private traces are not included here. No upstream acceptance or independent replication is claimed.
+
+## Current V464 Efficient R19 Confirmation
+
+On2026-10-28, one fresh pair used V464 caller/runtime and switchboard89c7889, the same frozen R19 task, concurrent arms and independent fixed quality gate. Both coordinators used Sol6.1/max; Efficient selected two Terra6.1/xhigh workers. Source/configuration controls, including server/profile/route/policy bytes before and after, matched. Root reported input/cached/output usage reconciled exactly to each CLI, and all worker/native-child usage was complete. Costs retain frozen2026-10-22 API-equivalent weights, not subscription billing or current invoices.
+
+| Metric | Efficient | Native Sol6.1 | Difference |
+| --- | ---: | ---: | ---: |
+| Workflow wall seconds | 253.9 | 439.4 | -42.22% |
+| Full estimated cost USD | 0.2467354 | 0.4943428 | -50.09% |
+| Total input plus output tokens | 456451 | 1194949 | -61.80% |
+| Uncached input | 115546 | 106719 | +8.27% |
+| Output tokens, including reasoning | 8489 | 17382 | -51.16% |
+| Coordinator calls | 3 | 16 | |
+| Execution-child calls | 11 across2Terra workers | 7 in1Sol native child | |
+| Fixed quality/integrity | PASS67tests | PASS71tests | Same validator, no failures/errors/skips |
+
+The native baseline was allowed its ordinary native child; this is not a no-subagent or separately isolated DCF/J-Space ablation. No custom Nokiy/navigation use was observed in root command traces. External independent quality evaluation occurred after the model barrier, as in earlier pairs, and is not included in CLI workflow wall time.
+
+Efficient coordinator cost was$0.1442472(58.46% of its total); workers cost$0.1024882. Coordinator cached-input share was60.78% versus native93.64%, yet complete cost halved. Lower cache ratio or higher uncached input alone is therefore not a failure criterion. Root request timing reported124.935s summed upstream spans and0.015s local predispatch; spans include transport/provider scheduling and are not pure reasoning or an additive whole-workflow decomposition.
+
+Versus the earlier V462 positive R19 pair, Efficient itself changed303.3to253.9s and$0.2662306to$0.2467354(-16.29% time/-7.32% cost), with root calls4to3. Observed prep-return-to-dispatch did not improve(72.682to72.910s). Batch span fell147.716to125.772s, and return-to-terminal fell73.498to44.238s; the older post-batch source check was absent in the new run. Expanded CLI batch bytes are not model-authored output, and public captures alone do not establish optional-note activation. These are descriptive execution differences, not a controlled causal effect of the advisory-reminder or fail-fast patches. Preserve the earlier zero-worker regression and incomplete Ultra cost. Statistical stability and sustained same-ID continuation/compaction benefits remain unproven.

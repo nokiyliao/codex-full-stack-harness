@@ -2696,13 +2696,13 @@
     }
   },
   "publication_files": {
-    "README.md": "581e9d5c6053da8ca6db93cc9c69c65ea530ca17900c9455a8b4cd3c7a920cfc",
+    "README.md": "1611f7734e7dc682b35f2aefb037e50712f691b0cc82dd8bc882af5d2baf4ec8",
     "PROVENANCE.md": "f2898de75a674479ec8e7dac89986421cb42e83da30651ae10a9a69ddf7279f0",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "06ab5d66e2b05d23c5e95ff4c3a6960cb5f3080c4cef269833a906eeb1af9c8f",
     "docs/current-surface.md": "ff68dba9923f08cf76fca847d9769d36b8d2cc32706de151993af27d4c642a62",
-    "docs/benchmark-summary.md": "7ec6f8dc31cb636f3493175cb13ed71b28ade26bb6114b84df1d36d1b80894e7"
+    "docs/benchmark-summary.md": "f43d09bf48ba9a721b2fc358e3d0aeb048124b9a802dbfeca72ed10f5d745e00"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261028-v464-fail-fast-ready-usage",
