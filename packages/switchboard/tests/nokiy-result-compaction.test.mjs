@@ -121,6 +121,35 @@ test("verified definition and delta context semantics survive provider compactio
   }
 });
 
+test("public terminal notes keep MODEL_REPORTED schema, bindings and acceptance semantics", () => {
+  const summary = batchSummary();
+  const note = {
+    schema_version: "nokiy_task_status_final_reply_v1", status: "MODEL_REPORTED",
+    binding: { request_id: "tura_embedded_" + H("1"), request_sha256: H("1"), native_thread_id: "thread",
+      runtime_id: "runtime", event_sha256: H("2") },
+    source_artifact: { path: "/work/a/core.jsonl", sha256: H("3"), bytes: 100 },
+    output_json_pointer: "/task_status/final_reply", text: "Public semantic delta; evidence refs; parent review pending.",
+    complete: false, truncated: true, truncation_reason: "MAX_RESULT_BYTES", content_sha256: H("4"),
+    content_bytes: 200, parent_acceptance_required: true,
+  };
+  summary.members[0].task_status_final_reply = note;
+  const original = structuredClone(summary);
+  const result = compactNokiyResults([toolOutput(JSON.stringify(summary))]);
+  const projected = JSON.parse(result.input[0].output);
+  assert.deepEqual(projected.members[0].task_status_final_reply, note);
+  assert.equal(projected.members[0].result_text, summary.members[0].result_text);
+  assert.equal(projected.members[0].changes.diff, summary.members[0].changes.diff);
+  assert.equal(projected.members[0].evidence_status, summary.members[0].evidence_status);
+  assert.deepEqual(summary, original);
+  assert.equal(compactNokiyResults(result.input), null);
+  for (const invalid of [{ schema_version: "unknown" }, { status: "EVIDENCE_VERIFIED" }, { parent_acceptance_required: false }]) {
+    summary.members[0].task_status_final_reply = { ...note, ...invalid };
+    const output = JSON.parse(compactNokiyResults([toolOutput(JSON.stringify(summary))]).input[0].output);
+    assert.equal(Object.hasOwn(output.members[0].task_status_final_reply, "schema_version"), false);
+    assert.equal(Object.hasOwn(output.members[0].task_status_final_reply.binding, "request_sha256"), false);
+  }
+});
+
 test("desktop code-mode command results are projected inside their output string or object", () => {
   const stdout = output();
   const wrapped = JSON.stringify({ chunk_id: "abc123", wall_time_seconds: 0.5, exit_code: 0, original_token_count: 9000, output: stdout });

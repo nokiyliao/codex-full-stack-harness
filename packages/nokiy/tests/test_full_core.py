@@ -1506,6 +1506,20 @@ finally:
             with self.subTest(clause=clause):
                 self.assertIn(clause, prompt)
 
+    def test_code_change_guidance_uses_public_note_in_same_terminal_tool_turn(self):
+        grant = {"allowed_operations": ["read", "command", "modify"], "denied_operations": [],
+                 "write_scopes": ["source.py"], "verifier_commands": [{"argv": ["python", "check.py"]}]}
+        prompt = core._provider_prompt("caller prompt", grant, terminal_delivery="evidence_only")
+        for clause in ("concise public plain-string final_reply", "SAME task_status done", "semantic delta",
+                       "retained invariants", "evidence refs absent from receipts", "no extra recap turn",
+                       "hidden reasoning", "Required checks/readbacks and conclusions must be known",
+                       "not result-dependent"):
+            with self.subTest(clause=clause):
+                self.assertIn(clause, prompt)
+        self.assertNotIn("omit final_reply", prompt)
+        self.assertIn("Failed/timed-out/unknown results block done", prompt)
+        self.assertIn("Others unchanged", prompt)
+
     def test_assistant_reply_prompt_bytes_are_unchanged_by_evidence_only_guidance(self):
         text = "caller prompt\n"
         grants = ({}, json.loads(self._request().jspace_contract.path.read_text()))

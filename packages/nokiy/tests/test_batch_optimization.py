@@ -12,7 +12,7 @@ from unittest.mock import patch
 from codex_collaboration_harness import batch
 from codex_collaboration_harness.embedded_nokiy import EmbeddedNokiyError
 import test_nokiy_batch as fixtures
-from test_batch_verifier_delivery import verified_evidence
+from test_batch_verifier_delivery import public_note, verified_evidence
 from test_summary_compaction import fixture as result_fixture
 
 
@@ -170,6 +170,20 @@ class SummaryBindingTests(unittest.TestCase):
 
 
 class OptionalVerifierContextBudgetTests(unittest.TestCase):
+    def test_twenty_public_notes_yield_before_original_diff_text_and_receipts(self):
+        source = summary_fixture([f'unique result {index}' for index in range(20)])
+        for index, row in enumerate(source['members']):
+            row['changes'] = {'diff': f'unique diff {index}'}
+            row['verifier_delivery'] = batch._verifier_delivery(verified_evidence())
+            row['verifier_delivery']['receipts'][0].pop('source_postimage_context')
+            row['task_status_final_reply'] = public_note(f'public note {index} ' + 'x' * 12000)
+        expected = deepcopy(source)
+        for row in expected['members']:
+            row.pop('task_status_final_reply')
+        actual = batch.expand_summary(batch._fit_summary(source, max_bytes=batch.MAX_BATCH_SUMMARY_BYTES))
+        self.assertEqual(actual, batch.expand_summary(batch._fit_summary(
+            expected, max_bytes=batch.MAX_BATCH_SUMMARY_BYTES)))
+
     def test_fit_drops_context_before_receipts_results_or_previews(self):
         source = summary_fixture(['unique result'])
         source['members'][0]['result_artifact_preview'] = {'text': 'preview'}
@@ -213,12 +227,14 @@ class OptionalVerifierContextBudgetTests(unittest.TestCase):
                           artifact_root=f'/fixture/{index}')
             member['terminal'] = {'result_text': 'bounded answer', 'result_inspection': verified_evidence(
                 'def support():\n    return "' + str(index) + 'x' * 24000 + '"\n')}
+            member['terminal']['task_status_final_reply'] = public_note(f'public delta {index}')
             diff = f'--- a/file{index}.py\n+++ b/file{index}.py\n@@ -1 +1 @@\n-old\n+unique-{index}\n'
             member['changes'] = {'status': 'COMPLETE', 'diff': diff, 'diff_bytes': len(diff),
                                  'diff_path': f'/fixture/{index}/changes.diff',
                                  'files': [{'path': f'file{index}.py', 'added': 1, 'removed': 1}]}
         baseline = deepcopy(source)
         for member in baseline['members']:
+            member['terminal'].pop('task_status_final_reply')
             for context in member['terminal']['result_inspection']['parent_review_context']['verifier_contexts']:
                 context['source_postimages'].pop('schema_version')
         budgets = []
@@ -234,6 +250,7 @@ class OptionalVerifierContextBudgetTests(unittest.TestCase):
         self.assertEqual(budgets[0], budgets[1])
         without_context = deepcopy(actual)
         for row in without_context['members']:
+            row.pop('task_status_final_reply', None)
             row['verifier_delivery']['receipts'][0].pop('source_postimage_context', None)
         self.assertEqual(without_context, expected)
         for original, row in zip(source['members'], actual['members']):
@@ -242,6 +259,7 @@ class OptionalVerifierContextBudgetTests(unittest.TestCase):
             self.assertEqual(row['result_text'], 'bounded answer')
             self.assertIn('verifier_delivery', row)
             self.assertEqual('source_postimage_context' in row['verifier_delivery']['receipts'][0], count == 2)
+            self.assertEqual('task_status_final_reply' in row, count == 2)
         self.assertLessEqual(len(json.dumps(actual, ensure_ascii=True, sort_keys=True).encode()),
                              batch.MAX_BATCH_SUMMARY_BYTES)
 

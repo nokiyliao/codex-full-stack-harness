@@ -626,9 +626,9 @@ def _provider_prompt(prompt: str, jspace: dict[str, Any],
                      "Include task_status done alone at a strictly later final positive step "
                      "in that SAME commands array. Required checks/readbacks and conclusions must be known, "
                      "not result-dependent. Failed/timed-out/unknown results block done; "
-                     "interpretation requires a later model turn. In evidence_only delivery, omit final_reply "
-                     "when native receipts contain the required result; add only task-required conclusions "
-                     "absent from those receipts. Other delivery modes retain their final_reply contract.\n")
+                     "interpretation requires a later model turn. evidence_only: SAME task_status done, "
+                     "concise public plain-string final_reply: semantic delta, retained invariants, "
+                     "evidence refs absent from receipts; no extra recap turn/hidden reasoning. Others unchanged.\n")
     if read_write_allowed:
         text += ("Complete source_delta: readback per apply_patch rules; else source_read. "
                  "Task-required reads prevail.\n")

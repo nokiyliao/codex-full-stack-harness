@@ -215,7 +215,9 @@ const RESULT_AUDIT_KEYS = new Set(["sha256", "request_sha256", "terminal_sha256"
 function compactResultValue(value, key, depth) {
   if (Array.isArray(value)) return value.map((item) => compactResultValue(item, key, depth + 1));
   if (!value || typeof value !== "object" || key === "source_postimages"
-      || (key === "source_postimage_context" && SOURCE_POSTIMAGE_CONTEXT_SCHEMAS.has(value.schema_version))) return value;
+      || (key === "source_postimage_context" && SOURCE_POSTIMAGE_CONTEXT_SCHEMAS.has(value.schema_version))
+      || (key === "task_status_final_reply" && value.schema_version === "nokiy_task_status_final_reply_v1"
+        && value.status === "MODEL_REPORTED" && value.parent_acceptance_required === true)) return value;
   const out = {};
   for (const [name, item] of Object.entries(value)) {
     if (RESULT_AUDIT_KEYS.has(name) || (depth > 0 && name === "schema_version")) continue;

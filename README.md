@@ -1,8 +1,8 @@
 # Nokiy Full-Stack Harness
 
-Current source surface: **V461 caller 62bb896 + unchanged V457 Rust 5154083 + switchboard 472f90e**, synchronized on 2026-10-28.
+Current source surface: **V462 caller ffafb43 + unchanged V457 Rust 5154083 + switchboard fa0b537**, synchronized on 2026-10-28.
 
-This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V461 preserves already-verified definition context in parent batch delivery and prevents explicitly unpinned planned files from hiding valid existing-file context. V459's stable external-evidence preparation identity, V458 execution-context projection and V457 typed missing-file repair remain. These changes do not expand permissions or change models.
+This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V462 preserves a worker's existing public same-turn completion note as an optional model claim alongside receipts and diffs, without another report turn or automatic acceptance. Efficient's native implementation exception is limited to one coherent branch, not every small task. V461 parent definition context, V459 stable preparation identity, V458 execution-context projection and V457 typed missing-file repair remain. These changes do not expand permissions or change models.
 
 ```text
 Native Codex thread / Goal / UI
@@ -14,11 +14,11 @@ Native Codex thread / Goal / UI
 
 | Component | Published directory | Source identity | License |
 | --- | --- | --- | --- |
-| Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `da72a7d67910b149b523d075ea29a53bf3190018` | MIT |
+| Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `ffafb43816ea188b080a7978894ca98711625e9b` | MIT |
 | Modified Tura-derived execution engine | [runtime](runtime) | `5154083b3a2cee92dc3264920f0df480f0fda389` | AGPL-3.0-or-later |
-| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `e5f757d8cdd810bbe625f9660129b6979d054ae2` | Repository AGPL-3.0-or-later |
+| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `fa0b537ada314cdc17274e27d3956533bb4f3668` | Repository AGPL-3.0-or-later |
 
-[Current source manifest](releases/v461.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
+[Current source manifest](releases/v462.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
 
 ## What Is Included
 
@@ -55,7 +55,7 @@ cd runtime
 cargo build --locked --release --bin tura_router --bin tura_runtime --bin tura_session_db --bin tura_exec
 ```
 
-The Rust names preserve their actual source lineage. The caller source package version remains `0.3.21.dev0`; the installed release wheel was stamped `0.3.456.dev0` by its existing release process. No version-only rebuild is claimed.
+The Rust names preserve their actual source lineage. The caller source package version remains `0.3.21.dev0`; the installed release wheel was stamped `0.3.462.dev0` by its existing release process. No version-only Rust rebuild is claimed.
 
 Switchboard source requires Node.js 22.15+ and Python 3.11+ for its host/tests:
 
@@ -71,7 +71,7 @@ Do not start or admit a service by copying another machine's configuration. Inst
 
 [Benchmark summary](docs/benchmark-summary.md) includes positive and negative controls. The V458 DCF2 pair observed -35.13% time/-71.15% API-equivalent cost versus native Astra/xhigh; earlier default R19/DCF gains and the slower high/Sol arm remain visible. All coordinator and execution-child usage is included. Each is one descriptive pair, not subscription charges, stable universal speedups or causal proof of an individual patch. Initial read-scope choices also differed between the two DCF2 pairs.
 
-Two subsequent Efficient/Sol pairs observed 283.1s/$0.3191698 versus382.8s/$0.6064524, and315.8s/$0.2425276 versus555.1s/$0.6306024. The candidate itself became32.7s slower between them, despite the improved native-relative ratio. V460's new context did not activate because explicit null snapshot entries disabled upstream capture; the final V461 omission repair passed deterministic original-contract replay but has not received another model benchmark. No speed gain is attributed to that repair.
+Subsequent Efficient/Sol pairs include both gains and regressions. V461 activated definition context but did not reduce coordinator calls. V462 observed433.0s/$0.3827504 versus332.4s/$0.7042340: cost-45.64%, time+30.26%. Its coordinator implemented both branches with zero workers, so this pair did not exercise the public completion note. The later single-branch routing correction passed source/deployment checks but has no model-adherence or speed measurement yet. No unchanged model retry was run merely to replace that negative result.
 
 The source export matches all 48 non-cache files in the installed caller package, all 602 recorded Rust build-source inputs, and the current switchboard commit except explicitly excluded operator-only diagnostics and compiled caches. Recorded binary hashes are provenance, not a byte-reproducible-build claim. Clean-machine installation and cross-platform service operation have not been established by this publication.
 

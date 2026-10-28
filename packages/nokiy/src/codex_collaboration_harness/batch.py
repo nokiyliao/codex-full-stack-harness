@@ -832,12 +832,14 @@ def expand_summary(summary: dict[str, Any]) -> dict[str, Any]:
             "schema_version": "nokiy_direct_batch_summary_v1", "members": rows}
 
 
-def _drop_postimage_context(rows: list[dict[str, Any]]) -> list[tuple[dict, dict]]:
+def _drop_optional_handoff(rows: list[dict[str, Any]]) -> list[tuple[dict, str, dict]]:
     dropped = []
     for row in rows:
+        if "task_status_final_reply" in row:
+            dropped.append((row, "task_status_final_reply", row.pop("task_status_final_reply")))
         for receipt in row.get("verifier_delivery", {}).get("receipts", []):
             if "source_postimage_context" in receipt:
-                dropped.append((receipt, receipt.pop("source_postimage_context")))
+                dropped.append((receipt, "source_postimage_context", receipt.pop("source_postimage_context")))
     return dropped
 
 
@@ -856,7 +858,7 @@ def _fit_summary(summary: dict[str, Any], *, max_bytes: int = 8000) -> dict[str,
         if compact_size < size:
             summary, size = compact, compact_size
             rows = summary["members"]
-    if size > max_bytes and _drop_postimage_context(rows):
+    if size > max_bytes and _drop_optional_handoff(rows):
         size = len(encoded(summary))
     if size > max_bytes and any("result_artifact_preview" in row for row in rows):
         # Optional report transport must not displace legacy text or artifact references.
@@ -1119,7 +1121,8 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
             "requested_service_tier": terminal.get("requested_service_tier"),
             "observed_service_tier": terminal.get("observed_service_tier"),
             **{key: terminal[key] for key in ("requested_terminal_delivery",
-                                              "observed_terminal_delivery", "terminal_evidence")
+                                              "observed_terminal_delivery", "terminal_evidence",
+                                              "task_status_final_reply")
                if key in terminal},
             "usage": terminal.get("usage"),
             "wall_time_seconds": terminal.get("wall_time_seconds"),
@@ -1164,9 +1167,9 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
     # Mutation batches: deliver each member's exact diff so the parent reviews it
     # directly; the full diff and its record stay in the member artifact root.
     base = len(json.dumps(summary, ensure_ascii=True, sort_keys=True).encode("ascii"))
-    contexts = (_drop_postimage_context(rows)
+    handoffs = (_drop_optional_handoff(rows)
                 if base > MAX_BATCH_SUMMARY_BYTES - MAX_INLINE_DIFF_BYTES - 4096 else [])
-    if contexts:
+    if handoffs:
         base = len(json.dumps(summary, ensure_ascii=True, sort_keys=True).encode("ascii"))
     if base > MAX_BATCH_SUMMARY_BYTES - MAX_INLINE_DIFF_BYTES - 4096:
         for row in rows:
@@ -1174,10 +1177,10 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
         base = len(json.dumps(summary, ensure_ascii=True, sort_keys=True).encode("ascii"))
     plain = json.loads(json.dumps(summary))
     _inline_diffs(rows, min(MAX_INLINE_DIFF_BYTES, MAX_BATCH_SUMMARY_BYTES - base - 4096))
-    # Reserve the original diff share first; context may use only actual spare space.
+    # Reserve the original diff share first; optional handoffs use only actual spare space.
     # Receipts removed by the legacy fallback are no longer part of the summary.
-    for receipt, context in contexts:
-        receipt["source_postimage_context"] = context
+    for container, key, value in handoffs:
+        container[key] = value
     fitted = _fit_summary(summary, max_bytes=MAX_BATCH_SUMMARY_BYTES)
     if fitted.get("status") == "COMPACT_METADATA_TOO_LARGE":
         fitted = _fit_summary(plain, max_bytes=MAX_BATCH_SUMMARY_BYTES)

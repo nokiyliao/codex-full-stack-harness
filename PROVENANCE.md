@@ -1,16 +1,16 @@
 # Source Provenance
 
-## Current V461 Surface
+## Current V462 Surface
 
 This is a source publication, not a redistribution of installed executables or machine configuration.
 
 | Component | Source commit | Correspondence |
 | --- | --- | --- |
-| Python caller | `62bb896be5693217aad4b7efd86dde5526826169` | Verified parent source-context delivery and explicit-null capture omission repair; all 48 non-cache installed package files match byte-for-byte; installed wheel version 0.3.461.dev0 |
+| Python caller | `ffafb43816ea188b080a7978894ca98711625e9b` | Preserves the existing public same-turn worker completion note separately from verified evidence; all 48 non-cache installed package files match byte-for-byte; installed wheel version 0.3.462.dev0 |
 | Rust worker payload | `5154083b3a2cee92dc3264920f0df480f0fda389` | All 602 recorded build-source inputs match; rebuilt with cargo --locked, four binary identities match the installed V457 image |
-| Switchboard | `472f90e35df498dc1825881d2b1267584b13cbcf` | Preserves verified definition/delta schema semantics in parent delivery, retaining stable external-evidence preparation identity; unchanged workflow topology; private diagnostics and compiled caches excluded |
+| Switchboard | `fa0b537ada314cdc17274e27d3956533bb4f3668` | Projects optional public notes with their model-claim classification and limits Efficient native implementation to one coherent branch; model/effort topology unchanged; private diagnostics and compiled caches excluded |
 
-These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in releases/v461.json identify the published contents. Publication-only documentation and preserved licenses are identified separately.
+These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in releases/v462.json identify the published contents. Publication-only documentation and preserved licenses are identified separately.
 
 The caller working tree contains an unrelated test modification, and the runtime working tree contains pending-message deletions; neither was adopted. Source was exported from exact commits, not by copying dirty worktrees or installed environment directories.
 

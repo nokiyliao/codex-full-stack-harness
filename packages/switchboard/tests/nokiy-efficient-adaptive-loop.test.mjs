@@ -348,8 +348,8 @@ test("Efficient guidance chooses useful branches, honors explicit runtimes and h
 test("Efficient assesses independent outputs before offering native execution", () => {
   const text = coordinatorContract(efficient);
   const assessment = text.indexOf("proactively check for at least two useful independent authorized");
-  const batch = text.indexOf("Two or more independent implementation branches belong to workers");
-  const fallback = text.indexOf("Keep the same native loop for one coherent branch or a tiny task");
+  const batch = text.indexOf("Two or more independently implementable and verifiable branches with nonoverlapping write scopes belong to workers");
+  const fallback = text.indexOf("Keep native implementation within one coherent dependent branch");
   const nativeRole = text.indexOf("is the native-capable coordinator for this Efficient task");
   const nativeGuidance = text.indexOf("one coherent branch in the SAME native Codex loop");
   assert.ok(assessment >= 0 && assessment < batch && batch < fallback
@@ -365,7 +365,7 @@ test("Efficient keeps independent long branches useful and its native fallback e
   assert.match(text, /each can be completed and verified from the authorized starting evidence without another's produced result or changed artifact/);
   assert.match(text, /A common final report is a downstream consumer, not a dependency between those outputs/);
   assert.match(text, /dispatch every such branch in one run_batch instead of implementing one yourself/);
-  assert.match(text, /retain a parent branch beside workers only when it is tiny or needs a worker's result/);
+  assert.match(text, /retain a parent implementation branch beside workers only when it needs a worker's result/);
   assert.match(text, /Dispatch-first: when the task already names two or more independent implementation branches and their files/);
   assert.match(text, /dispatch them all as member intents in one run_batch after at most one preparatory call/);
   assert.match(text, /chain independent reads in one command or script, never one call per question/);
@@ -374,14 +374,26 @@ test("Efficient keeps independent long branches useful and its native fallback e
   assert.match(text, /J-Space enforces each member's write scope and the batch summary returns every changed file with its diff, so do not snapshot workspace hashes or read the acceptance harness before dispatch/);
   assert.doesNotMatch(text, /keep a substantial branch for this native loop/);
   assert.match(text, /total execution\/input\/coordination cost at equal quality/);
-  assert.match(text, /Do not split tiny tasks merely for concurrency/);
+  assert.match(text, /Do not split one coherent dependent branch merely for concurrency or file count/);
   assert.match(text, /Retain run for one coherent delegated deliverable with an existing valid artifact root/);
-  assert.match(text, /Keep the same native loop for one coherent branch or a tiny task/);
+  assert.match(text, /Keep native implementation within one coherent dependent branch/);
   assert.doesNotMatch(text, /complete the task in the same native loop, including multiple independent branches/);
   assert.match(text, /including worker context reconstruction, dispatch, integration and final acceptance/);
   assert.doesNotMatch(text, /Select the same native loop only|changed line .* every|under about 100 changed lines/);
   assert.match(text, /honor explicit independent-runtime or selected-worker requests even for one branch/);
   assert.doesNotMatch(text, /otherwise complete one coherent branch in the same native loop/);
+});
+
+test("Efficient's small-task exception never merges independent branches", () => {
+  const text = coordinatorContract(efficient);
+  assert.match(text, /Two or more independently implementable and verifiable branches with nonoverlapping write scopes belong to workers even when small or in the same worktree/);
+  assert.doesNotMatch(text, /one coherent branch or a tiny task|only when it is tiny|Do not split tiny tasks/);
+  assert.match(text, /Keep producer-consumer chains ordered and coherent/);
+  assert.match(text, /Honor explicit independent-runtime or selected-worker requests even when native execution would otherwise be chosen/);
+  const tools = flatten(nativeToolProjection(request(), options()).body.tools);
+  for (const name of ["exec_command", "apply_patch", "nokiy_execute"]) {
+    assert.ok(tools.some((tool) => tool.name === name), `${name} remains available`);
+  }
 });
 
 test("branch-first ordering is specific to the validated Efficient mode", () => {

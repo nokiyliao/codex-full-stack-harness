@@ -76,7 +76,7 @@ test("Efficient fixes small acceptance defects natively; Ultra keeps corrective 
 
 test("Efficient overlaps only beneficial delegation without universal line-rate assumptions", () => {
   const efficient = coordinatorContract(profile("nokiy-efficient"));
-  assert.match(efficient, /Two or more independent implementation branches belong to workers/);
+  assert.match(efficient, /Two or more independently implementable and verifiable branches with nonoverlapping write scopes belong to workers even when small or in the same worktree/);
   assert.match(efficient, /dispatch every such branch in one run_batch instead of implementing one yourself/);
   assert.match(efficient, /Set "observe":"later" only when the parent has independent work/);
   assert.match(efficient, /omit observe so the existing executor waits on the original batch/);

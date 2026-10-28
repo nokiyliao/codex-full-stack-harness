@@ -26,16 +26,22 @@ Negative control: three earlier Efficient-versus-native-Terra pairs averaged 323
 
 ## Subsequent Efficient Acceptance
 
-Both pairs below retain the frozen real R19 task, Sol6.1/max coordinator/native baseline and Terra6.1/xhigh workers. All fixed quality/integrity checks, configuration continuity, complete reported usage and root CLI reconciliation passed; native children and both workers are counted.
+The pairs below retain the frozen real R19 task, Sol6.1/max coordinator/native baseline and Terra6.1/xhigh worker profile. All fixed quality/integrity checks, configuration continuity, complete reported usage and root CLI reconciliation passed; every executed worker and native child is counted. The V462 Efficient arm chose no workers.
 
 | Surface | Efficient / native seconds | Efficient / native API-equivalent USD | Efficient / native total tokens | Time delta | Cost delta |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | V459 host, V458 caller | 283.1 / 382.8 | 0.3191698 / 0.6064524 | 496556 / 1360695 | -26.04% | -47.37% |
 | V460 parent-context candidate | 315.8 / 555.1 | 0.2425276 / 0.6306024 | 445097 / 1812498 | -43.11% | -61.54% |
+| V461 activated definition context | 330.9 / 469.2 | 0.2838406 / 0.4855232 | 519732 / 1084500 | -29.48% | -41.54% |
+| V462 same-turn note candidate; zero workers | 433.0 / 332.4 | 0.3827504 / 0.7042340 | 895244 / 1485197 | +30.26% | -45.64% |
 
 The Efficient arm itself became32.7s slower (+11.55%) between these pairs, while its estimate fell24.01% and tokens fell10.36%. Native also slowed172.3s. The better relative time ratio is not proof that V460 accelerated the candidate. Coordinator calls remained4 to4: an extra post-batch source read disappeared, but a pre-dispatch manifest/directory read replaced it. Root cached-input share rose51.99% to72.57%, and root estimate fell$0.2146052 to$0.1502276; that is not proof of fewer model round trips. Test totals67/71 and68/75 include permitted additions, not changed fixed quality rules.
 
-Crucially, actual V460 receipts had no new source-context envelopes: explicit null snapshots for planned absent test files disabled upstream context capture. Thus no observed pair gain is attributed to the context-delivery code. Final V461 repairs that omission and passes deterministic original-contract fixtures through the provider projection; no further model pair was launched merely to replace the unfavorable timing. Current V461 end-to-end performance and stable gains remain unproven. Frozen2026-10-22 API weights are not current billing or subscription charges.
+Crucially, actual V460 receipts had no new source-context envelopes: explicit null snapshots for planned absent test files disabled upstream context capture. Thus no observed pair gain is attributed to the context-delivery code. V461 repaired the omission and delivered9,300/6,597-byte definition envelopes in the actual pair, but coordinator calls rose4to5 and its acceptance tail rose60.159to81.525s. Efficient itself slowed15.1s and cost rose17.03% against V460. Necessary unseen tests and controller/CAS source were not automatically classified as redundant reads. Stable or isolated gains remain unproven. Frozen2026-10-22 API weights are not current billing or subscription charges.
+
+V462 quality/integrity passed71/73 tests with complete usage and exact root CLI reconciliation. Efficient made13 root calls, no workers or native children; native made16 root plus11 child calls. Efficient input879448/cached807424/uncached72024/output15796 versus native1465379/1276160/189219/19818. The worker tool was advertised, with no preparation denial or native-fallback event. Its coordinator implemented both independent branches, so the optional same-turn worker note was never generated and its performance effect remains untested. These observations are not an excuse to omit the slower end-to-end result.
+
+The subsequent source/deployment correction restricts Efficient's native merge exception to one coherent branch, removing a contradictory tiny-task exception. Contract tests and hot-deployment readback passed, but no later model pair was run under this bounded experiment. This is not evidence that the coordinator now follows the revised branch routing, nor that the note accelerates acceptance. All coordinator contract drafting, discovery, implementation and delivery costs remain in the totals regardless of their labels.
 
 ## Ultra Picker Profiles And Second Task
 
