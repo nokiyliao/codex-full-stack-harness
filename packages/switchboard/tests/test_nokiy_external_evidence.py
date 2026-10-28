@@ -60,6 +60,65 @@ class ExternalEvidenceTests(unittest.TestCase):
         self.assertEqual(repairs, [{'path': 'action.read_scopes', 'rule': 'external_read_to_inline_evidence', 'count': 2}])
         self.assertEqual(self.draft['prompt'], 'Implement pkg/module.py.', 'input draft is not mutated')
 
+    def test_explicit_small_verifier_pin_is_context_without_changing_authority(self):
+        data = '{"label": "\u96ea"}\r\n'.encode('utf-8')
+        self.rubric.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        for pin_digest in (digest, None):
+            with self.subTest(pin_digest=pin_digest):
+                pin = {'path': str(self.rubric), 'scope': 'verifier_only'}
+                if pin_digest is not None:
+                    pin['sha256'] = pin_digest
+                commands = [{'argv': ['/usr/bin/python3', str(self.rubric)], 'pinned_files': [pin]}]
+                source = self.action(['pkg/module.py', str(self.rubric)], verifier_commands=commands,
+                                     forbidden_effects=['deployment', 'broker', 'order'])
+                action, draft, repairs = host.inline_external_reads(source, self.draft, self.workspace)
+                self.assertEqual(action, {**source, 'read_scopes': ['pkg/module.py']})
+                self.assertEqual(action['verifier_commands'], commands)
+                self.assertEqual(source['read_scopes'], ['pkg/module.py', str(self.rubric)])
+                self.assertIn(host.INLINE_EVIDENCE_NOTE, draft['prompt'])
+                self.assertIn(str(self.rubric) + '\nSHA-256: ' + digest, draft['prompt'])
+                self.assertIn('BEGIN EVIDENCE\n' + data.decode('utf-8') + '\nEND EVIDENCE',
+                              draft['prompt'])
+                self.assertEqual(self.draft['prompt'], 'Implement pkg/module.py.')
+                self.assertEqual(repairs, [{'path': 'action.read_scopes',
+                    'rule': 'external_read_to_inline_evidence', 'count': 1}])
+
+    def test_a_pin_without_an_explicit_read_is_not_worker_context(self):
+        commands = [{'pinned_files': [{'path': str(self.rubric), 'scope': 'verifier_only',
+                                      'sha256': host.sha(self.rubric)}]}]
+        source = self.action(['pkg/module.py'], verifier_commands=commands)
+        self.assertEqual(host.inline_external_reads(source, self.draft, self.workspace),
+                         (source, self.draft, []))
+
+    def test_identity_projection_and_context_use_the_same_observed_bytes(self):
+        data = self.rubric.read_bytes()
+        commands = [{'pinned_files': [{'path': str(self.rubric), 'scope': 'verifier_only',
+                                      'sha256': hashlib.sha256(data).hexdigest()}]}]
+        source = self.action(['pkg/module.py', str(self.rubric)], verifier_commands=commands)
+        observations = {}
+        identity, identity_draft, _ = host.inline_external_reads(
+            source, self.draft, self.workspace, verifier_context=False, observations=observations)
+        self.rubric.write_text('changed after the shared observation\n')
+        action, draft, _ = host.inline_external_reads(
+            source, self.draft, self.workspace, observations=observations)
+        self.assertEqual(identity, action)
+        self.assertEqual(identity_draft, self.draft)
+        self.assertIn('BEGIN EVIDENCE\n' + data.decode() + '\nEND EVIDENCE', draft['prompt'])
+        self.assertIn('SHA-256: ' + hashlib.sha256(data).hexdigest(), draft['prompt'])
+        self.assertNotIn(self.rubric.read_text(), draft['prompt'])
+        self.assertEqual(action['verifier_commands'], commands)
+
+    def test_binary_verifier_pin_keeps_its_dependency_fallback(self):
+        commands = [{'pinned_files': [{'path': str(self.binary), 'scope': 'verifier_only',
+                                      'sha256': host.sha(self.binary)}]}]
+        source = self.action(['pkg/module.py', str(self.binary)], verifier_commands=commands)
+        action, draft, repairs = host.inline_external_reads(source, self.draft, self.workspace)
+        self.assertEqual(action, {**source, 'read_scopes': ['pkg/module.py']})
+        self.assertEqual(draft, self.draft)
+        self.assertEqual(repairs, [{'path': 'action.read_scopes',
+            'rule': 'external_read_to_verifier_dependency', 'count': 1}])
+
     def test_large_exact_verifier_dependency_is_not_worker_context(self):
         self.rubric.write_text('x' * 10000)
         commands = [{'pinned_files': [{'path': str(self.rubric), 'scope': 'verifier_only',

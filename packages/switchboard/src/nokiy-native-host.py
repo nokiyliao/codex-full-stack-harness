@@ -472,7 +472,8 @@ INLINE_EVIDENCE_NOTE = ('\n\nExact read-only evidence inlined by the native host
                         'workspace (context only, not a read grant; do not request these paths with tools):')
 
 
-def inline_external_reads(action, draft, workspace, limit=INLINE_PROMPT_LIMIT_BYTES):
+def inline_external_reads(action, draft, workspace, limit=INLINE_PROMPT_LIMIT_BYTES, *,
+                          verifier_context=True, observations=None):
     """Exact files a task names outside the worker workspace (frozen tests, rubrics, contracts) are
     read-only evidence the workspace compiler cannot admit. Instead of refusing them as unsafe
     paths, inline their exact UTF-8 bytes with SHA-256 into the worker prompt while it fits the
@@ -481,6 +482,8 @@ def inline_external_reads(action, draft, workspace, limit=INLINE_PROMPT_LIMIT_BY
     reads, prompt = action.get('read_scopes'), draft.get('prompt')
     if type(reads) is not list or type(prompt) is not str:
         return action, draft, []
+    if observations is None:
+        observations = {}
     used = len(prompt.encode('utf-8')) + len(INLINE_EVIDENCE_NOTE.encode('utf-8')) + 1
     blocks, inlined, verifier_only = [], [], []
     pins = {}
@@ -511,15 +514,22 @@ def inline_external_reads(action, draft, workspace, limit=INLINE_PROMPT_LIMIT_BY
         if (type(name) is not str or not name.startswith('/') or name.startswith('//')
                 or name in inlined or any(c in name for c in '*?[]\x00\r\n')):
             continue
-        path = Path(canonical_spelling(name))
-        try:
-            if (path.is_symlink() or not path.is_file() or path.resolve(strict=True) != path
-                    or path.is_relative_to(workspace)):
+        if name not in observations:
+            observations[name] = None
+            path = Path(canonical_spelling(name))
+            try:
+                if (path.is_symlink() or not path.is_file() or path.resolve(strict=True) != path
+                        or path.is_relative_to(workspace)):
+                    continue
+                observations[name] = path, path.read_bytes()
+            except (OSError, RuntimeError):
                 continue
-            data = path.read_bytes()
-            # Transport dependencies remain in the original verifier grant, not worker reads.
+        if observations[name] is None:
+            continue
+        path, data = observations[name]
+        try:
             declared = pins.get(name)
-            if declared and declared <= {hashlib.sha256(data).hexdigest(), None}:
+            if not verifier_context and declared and declared <= {hashlib.sha256(data).hexdigest(), None}:
                 verifier_only.append(name)
                 continue
             try:
@@ -532,7 +542,10 @@ def inline_external_reads(action, draft, workspace, limit=INLINE_PROMPT_LIMIT_BY
                  % (path, hashlib.sha256(data).hexdigest(), text))
         size = 0 if block is None else len(block.encode('utf-8'))
         if block is None or used + size > limit:
-            if name in operands:
+            # Explicit admissible context wins; an uninlineable pin remains a verifier dependency.
+            if declared and declared <= {hashlib.sha256(data).hexdigest(), None}:
+                verifier_only.append(name)
+            elif name in operands:
                 # V430: a verifier operand too large or binary to inline (a 216 KiB manifest the
                 # validator reads) is that verifier's dependency, not a worker read.
                 dependencies[name] = hashlib.sha256(data).hexdigest()
@@ -2169,18 +2182,47 @@ def prepare_action(envelope, entry, thread, worker, effort, tier, payload, draft
         repairs += batch_repairs
     action, discovery_repairs = normalize_local_discovery(action, directory(draft['workspace']))
     repairs += discovery_repairs
-    action, draft, inline_repairs = inline_external_reads(action, draft, directory(draft['workspace']))
+    base_action, base_draft, observations = action, draft, {}
+    identity_action, identity_draft, _ = inline_external_reads(
+        base_action, base_draft, directory(draft['workspace']), verifier_context=False,
+        observations=observations)
+    action, draft, inline_repairs = inline_external_reads(
+        base_action, base_draft, directory(draft['workspace']), observations=observations)
     repairs += inline_repairs
+    same_projection = identity_action == action and identity_draft == draft
+    if not same_projection:
+        identity_action, _ = complete_verifier_commands(identity_action, identity_draft,
+            directory(draft['workspace']), **({'post_batch_verifier': True} if post_batch_verifier else {}))
     action, verifier_repairs = complete_verifier_commands(action, draft, directory(draft['workspace']),
         **({'post_batch_verifier': True} if post_batch_verifier else {}))
     repairs += verifier_repairs
+    if same_projection:
+        identity_action = action
+    if action.get('verifier_commands') != identity_action.get('verifier_commands'):
+        raise ValueError('NOKIY_NATIVE_REPAIR_UNCERTAIN: verifier inputs changed during identity projection')
+    original_commands, completed_commands = base_action.get('verifier_commands'), action.get('verifier_commands')
+    for before, after in zip(original_commands if isinstance(original_commands, list) else [],
+                             completed_commands if isinstance(completed_commands, list) else []):
+        pins = before.get('pinned_files') if isinstance(before, dict) else None
+        completed = after.get('pinned_files') if isinstance(after, dict) else None
+        for pin in pins if isinstance(pins, list) else []:
+            observed = observations.get(pin.get('path')) if isinstance(pin, dict) else None
+            if observed and pin.get('scope') == 'verifier_only' and pin.get('sha256') is None:
+                digest = hashlib.sha256(observed[1]).hexdigest()
+                if (not isinstance(completed, list) or not any(isinstance(item, dict)
+                        and item.get('path') == pin['path'] and item.get('sha256') == digest for item in completed)):
+                    raise ValueError('NOKIY_NATIVE_REPAIR_UNCERTAIN: external pin changed after observation')
     raw_draft = payload.get('draft')
     repairs += [{'path': 'draft.' + key, 'rule': 'path_to_canonical_spelling'}
                 for key in ('artifact_root', 'workspace')
                 if isinstance(raw_draft, dict) and type(raw_draft.get(key)) is str
                 and raw_draft[key] != draft.get(key)]
     normalized_envelope = {**envelope, 'payload': {**payload, 'draft': draft, 'action': action}}
-    digest = hashlib.sha256(canonical({'thread': thread, 'envelope': normalized_envelope}).encode()).hexdigest()
+    normalized_digest = hashlib.sha256(canonical({'thread': thread, 'envelope': normalized_envelope}).encode()).hexdigest()
+    # Enrich context without changing the pre-upgrade exclusive preparation key. Old and new
+    # hosts must contend for one directory even when the other publishes after the last check.
+    identity_envelope = {**envelope, 'payload': {**payload, 'draft': identity_draft, 'action': identity_action}}
+    digest = hashlib.sha256(canonical({'thread': thread, 'envelope': identity_envelope}).encode()).hexdigest()
     # Preserve pre-upgrade request IDs; defaulting must never duplicate an old run.
     def evidence_exists(key):
         return any((artifact / (prefix + key)).exists() or (artifact / (prefix + key)).is_symlink()
@@ -2285,7 +2327,9 @@ def prepare_action(envelope, entry, thread, worker, effort, tier, payload, draft
         if repairs:
             with (inputs / 'input-repairs.json').open('x') as stream:
                 stream.write(canonical({'original_input_sha256': original_digest,
-                                        'normalized_input_sha256': digest, 'repairs': repairs}) + '\n')
+                                        'normalized_input_sha256': normalized_digest,
+                                        **({'preparation_input_sha256': digest} if digest != normalized_digest else {}),
+                                        'repairs': repairs}) + '\n')
         commands = action.get('verifier_commands')
         separate_scratch = (post_batch_verifier and isinstance(commands, list) and len(commands) == 1
             and isinstance(commands[0], dict) and isinstance(commands[0].get('scratch_root'), str)

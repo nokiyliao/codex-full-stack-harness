@@ -1,8 +1,8 @@
 # Nokiy Full-Stack Harness
 
-Current source surface: **V458 caller da72a7d + unchanged V457 Rust 5154083 + switchboard e5f757d**, synchronized on 2026-10-28.
+Current source surface: **V459 publication: unchanged V458 caller da72a7d + V457 Rust 5154083 + switchboard ae4091e**, synchronized on 2026-10-28.
 
-This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V458 exposes verified worker/verifier execution roots and verifier-only input roles, retaining V457's typed missing-file repair. Neither change expands permissions or changes models.
+This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V459 delivers explicitly requested external verifier text as context while preserving the original exclusive preparation identity, including across old/new host races. The V458 execution-context projection and V457 typed missing-file repair remain. These changes do not expand permissions or change models.
 
 ```text
 Native Codex thread / Goal / UI
@@ -18,7 +18,7 @@ Native Codex thread / Goal / UI
 | Modified Tura-derived execution engine | [runtime](runtime) | `5154083b3a2cee92dc3264920f0df480f0fda389` | AGPL-3.0-or-later |
 | Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `e5f757d8cdd810bbe625f9660129b6979d054ae2` | Repository AGPL-3.0-or-later |
 
-[Current source manifest](releases/v458.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
+[Current source manifest](releases/v459.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
 
 ## What Is Included
 

@@ -2,7 +2,7 @@
 
 import base64
 import copy
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 import hashlib
 import importlib.util
 import io
@@ -10,6 +10,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -628,6 +630,295 @@ class NativeReferenceTests(unittest.TestCase):
             self.assertEqual(host.prepared_request_id(path), request_id)
         self.assertEqual(set(self.artifact.iterdir()), original_names)
         self.prepare_process.assert_not_called()
+
+    def external_verifier_payload(self):
+        external = self.root / 'validator.py'
+        external.write_text('pass\n')
+        scratch = self.artifact / 'verifier-0'
+        scratch.mkdir()
+        payload = self.payload()
+        payload['action']['read_scopes'].append(str(external))
+        payload['action']['verifier_commands'] = [{
+            'argv': ['/never-execute/python3', str(external)], 'executable_sha256': '0' * 64,
+            'pinned_files': [{'path': str(external), 'scope': 'verifier_only',
+                              'sha256': host.sha(external)}],
+            'network': False, 'timeout_seconds': 300, 'scratch_root': str(scratch),
+        }]
+        return payload
+
+    def external_verifier_cache(self, state='prepared'):
+        payload = self.external_verifier_payload()
+        # The old host removed the explicit read as a verifier dependency without inlining it.
+        legacy = copy.deepcopy(payload)
+        legacy['action']['read_scopes'] = ['source.py']
+        legacy['draft'] = host.normalize_draft(legacy['draft'])
+        legacy['action'] = host.validate_action_format(legacy['action'], self.workspace)[0]
+        digest = self.digest(legacy)
+        inputs = self.artifact / ('native-input-' + digest)
+        inputs.mkdir()
+        repairs = [{'path': 'action.read_scopes', 'rule': 'external_read_to_verifier_dependency', 'count': 1}]
+        request = {**legacy['draft'], 'runtime_image': {'path': '/not-executed', 'sha256': '0' * 64},
+                   'codex': {'path': '/not-executed', 'sha256': '0' * 64},
+                   'native_thread_id': self.thread, 'model': self.worker, 'reasoning_effort': self.effort,
+                   'execution_profile': 'direct', 'service_tier': self.tier, 'allow_provider_network': True}
+        (inputs / 'draft.json').write_text(host.canonical(request) + '\n')
+        (inputs / 'action.json').write_text(host.canonical(legacy['action']) + '\n')
+        (inputs / 'input-repairs.json').write_text(host.canonical({
+            'original_input_sha256': self.digest(payload, normalized=False),
+            'normalized_input_sha256': digest, 'repairs': repairs}) + '\n')
+        path, request_id = self.artifact / ('native-prepared-' + digest) / 'request.json', None
+        if state != 'uncertain':
+            outcome = {'schema_version': 'nokiy_native_prepare_outcome_v1', 'phase': 'prepare',
+                'status': 'PREPARED' if state == 'prepared' else 'REJECTED_PREPARATION',
+                'provider_execution_started': False, 'same_input_retry_allowed': False,
+                'safe_to_correct_input': state != 'prepared', 'exit_code': 0 if state == 'prepared' else 2,
+                'input_repairs': repairs}
+            if state == 'prepared':
+                path, request_id = self.cached_request(legacy)
+                path.write_text(host.canonical(request) + '\n')
+            else:
+                failure = {'schema_version': 'tura_embedded_failure_v1', 'status': 'BLOCKED_PREEXECUTION',
+                           'authority_effect': 'none', 'first_typed_blocker': 'NOKIY_PREPARATION_FAILED'}
+                stdout = host.canonical(failure)
+                (inputs / 'prepare.stdout').write_text(stdout)
+                (inputs / 'prepare.stderr').write_text('')
+                outcome.update(first_typed_blocker=failure['first_typed_blocker'],
+                               diagnostic_sha256=hashlib.sha256(stdout.encode()).hexdigest())
+            (inputs / 'prepare-outcome.json').write_text(host.canonical(outcome) + '\n')
+        return payload, path, request_id, inputs
+
+    def test_explicit_verifier_read_reuses_its_pre_upgrade_normalized_request(self):
+        payload, path, request_id, _ = self.external_verifier_cache()
+        original_names = set(self.artifact.iterdir())
+        before = {p: p.read_bytes() for p in self.artifact.rglob('*') if p.is_file()}
+        for value in (payload, self.reference(payload)):
+            host.run(self.envelope(value))
+            self.assertIn(str(path), self.execv.call_args.args[1])
+            self.assertEqual(host.prepared_request_id(path), request_id)
+        self.assertEqual(set(self.artifact.iterdir()), original_names)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.artifact.rglob('*') if p.is_file()})
+        self.prepare_process.assert_not_called()
+        self.recovery_process.assert_not_called()
+
+    def test_prior_normalized_uncertain_input_is_not_reprepared(self):
+        payload, _, _, _ = self.external_verifier_cache('uncertain')
+        for value in (payload, self.reference(payload)):
+            with self.assertRaisesRegex(ValueError, 'PREPARATION_UNCERTAIN'):
+                host.run(self.envelope(value))
+        self.prepare_process.assert_not_called()
+        self.execv.assert_not_called()
+
+    def test_prior_normalized_prepared_request_without_outcome_keeps_original_identity(self):
+        payload, path, request_id, inputs = self.external_verifier_cache()
+        (inputs / 'prepare-outcome.json').unlink()
+        host.run(self.envelope(payload))
+        self.assertIn(str(path), self.execv.call_args.args[1])
+        self.assertEqual(host.prepared_request_id(path), request_id)
+        self.prepare_process.assert_not_called()
+
+    def test_prior_normalization_rejection_is_preserved_without_retry(self):
+        payload, _, _, inputs = self.external_verifier_cache('rejected')
+        for value in (payload, self.reference(payload)):
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(host.run(self.envelope(value)), 2)
+            result = json.loads(output.getvalue())
+            self.assertEqual(result['status'], 'REJECTED_PREPARATION')
+            self.assertEqual(result['preparation_ref']['input_id'], inputs.name)
+            self.assertIs(result['same_input_retry_allowed'], False)
+        self.prepare_process.assert_not_called()
+        self.execv.assert_not_called()
+
+    def test_diagnostic_repair_provenance_is_not_an_execution_identity(self):
+        payload, path, _, inputs = self.external_verifier_cache()
+        marker = inputs / 'input-repairs.json'
+        outside = self.root / 'malformed-diagnostic'
+        outside.write_bytes(b'{')
+        marker.unlink()
+        marker.symlink_to(outside)
+        host.run(self.envelope(payload))
+        self.assertIn(str(path), self.execv.call_args.args[1])
+        self.prepare_process.assert_not_called()
+
+    def test_omitted_external_pin_drift_after_observation_blocks_preparation(self):
+        payload = self.external_verifier_payload()
+        pin = payload['action']['verifier_commands'][0]['pinned_files'][0]
+        pin.pop('sha256')
+        original = host.complete_verifier_commands
+
+        def changed(*args, **kwargs):
+            Path(pin['path']).write_text('changed before pin completion\n')
+            return original(*args, **kwargs)
+
+        with mock.patch.object(host, 'complete_verifier_commands', side_effect=changed):
+            with self.assertRaisesRegex(ValueError, 'REPAIR_UNCERTAIN.*external pin changed'):
+                host.run(self.envelope(payload))
+        self.prepare_process.assert_not_called()
+        self.execv.assert_not_called()
+
+    def test_verifier_pin_drift_between_projections_blocks_preparation(self):
+        payload = self.external_verifier_payload()
+        executable = self.root / 'test-python'
+        executable.write_text('original program, never executed\n')
+        command = payload['action']['verifier_commands'][0]
+        command['argv'][0] = str(executable)
+        command.pop('executable_sha256')
+        original = host.complete_verifier_commands
+        calls = []
+
+        def changed(*args, **kwargs):
+            result = original(*args, **kwargs)
+            calls.append(True)
+            if len(calls) == 1:
+                executable.write_text('changed program, never executed\n')
+            return result
+
+        with mock.patch.object(host, 'complete_verifier_commands', side_effect=changed):
+            with self.assertRaisesRegex(ValueError, 'REPAIR_UNCERTAIN.*verifier inputs changed'):
+                host.run(self.envelope(payload))
+        self.prepare_process.assert_not_called()
+        self.execv.assert_not_called()
+
+    def baseline_host(self):
+        source = SOURCE.parents[2] / 'baseline/src/nokiy-native-host.py'
+        if not source.is_file():
+            self.skipTest('Frozen pre-upgrade host evidence is not present')
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),
+                         '97fa5fe3461bdea509f463d494ddf3953aa0c8aad1eb80ff515a87a02222e51c')
+        self.assertEqual(hashlib.sha256(source.with_name('nokiy-native-contract.json').read_bytes()).hexdigest(),
+                         'f95d35bb2ef9b2de1aaeea7f27f5945fb768a934401b0e8a30c711af250a4961')
+        spec = importlib.util.spec_from_file_location('pre_upgrade_native_host', source)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @contextmanager
+    def preparation_boundary(self, older=None):
+        image = self.home / 'runtime-image'
+        image.write_text('Never executed runtime image fixture.')
+        (self.home / 'caller-binding.json').write_text(json.dumps({'runtime_image': {
+            'path': str(image), 'sha256': host.sha(image)}}))
+        native_root = Path('/Applications/ChatGPT.app/Contents/Resources')
+        native = native_root / 'codex'
+        original_exists, original_resolve, original_sha = Path.exists, Path.resolve, host.sha
+
+        def native_exists(path):
+            return False if path.is_relative_to(native_root) else original_exists(path)
+
+        def native_resolve(path, strict=False):
+            return native if path.is_relative_to(native_root) else original_resolve(path, strict=strict)
+
+        def native_sha(path):
+            return 'c' * 64 if Path(path) == native else original_sha(path)
+
+        def prepare(command, **kwargs):
+            draft = Path(command[command.index('--request') + 1])
+            prepared = Path(command[command.index('--output-dir') + 1])
+            prepared.mkdir()
+            (prepared / 'request.json').write_bytes(draft.read_bytes())
+            digest = hashlib.sha256(draft.read_bytes()).hexdigest()
+            request_id = 'tura_embedded_' + digest
+            (prepared / 'preparation.json').write_text(host.canonical({
+                'status': 'PREPARED', 'request_id': request_id,
+                'preflight': {'status': 'READY', 'request_id': request_id, 'request_sha256': digest}}))
+            return SimpleNamespace(returncode=0, stdout='{}', stderr='')
+
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(Path, 'exists', autospec=True, side_effect=native_exists))
+            stack.enter_context(mock.patch.object(Path, 'resolve', autospec=True, side_effect=native_resolve))
+            stack.enter_context(mock.patch.object(host, 'sha', side_effect=native_sha))
+            if older is not None:
+                stack.enter_context(mock.patch.object(older, 'sha', side_effect=native_sha))
+            self.prepare_process.side_effect = prepare
+            yield
+
+    def test_actual_auto_unicode_request_recovers_without_a_second_preparation(self):
+        payload = self.external_verifier_payload()
+        payload['draft']['prompt'] = '\u96ea' * 18000
+        envelope = self.envelope(payload, 'nokiy_native_tool_v1')
+        envelope['service_tier'] = 'auto'
+        with self.preparation_boundary():
+            host.run(envelope)
+            path = Path(self.execv.call_args.args[1][3])
+            before = path.read_bytes()
+            self.assertGreater(len(before), host.MAX_PAYLOAD_BYTES)
+            self.assertLess(len(json.loads(before)['prompt'].encode()), 64 * 1024)
+            host.run(envelope)
+            self.assertEqual(Path(self.execv.call_args.args[1][3]), path)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(json.loads(before)['service_tier'], 'default')
+        self.assertEqual(self.prepare_process.call_count, 1)
+
+    def test_canonical_old_and_new_hosts_share_the_preparation_key_in_both_orders(self):
+        older = self.baseline_host()
+        payload = self.external_verifier_payload()
+        with self.preparation_boundary(older):
+            for first, second in ((older, host), (host, older)):
+                with self.subTest(first=first.__name__):
+                    artifact = self.artifact / first.__name__
+                    artifact.mkdir()
+                    current = copy.deepcopy(payload)
+                    current['draft']['artifact_root'] = str(artifact)
+                    current['action']['verifier_commands'][0]['scratch_root'] = str(artifact / 'verifier-0')
+                    self.prepare_process.reset_mock()
+                    first.run(self.envelope(current))
+                    path = Path(self.execv.call_args.args[1][3])
+                    before = path.read_bytes()
+                    second.run(self.envelope(current))
+                    self.assertEqual(Path(self.execv.call_args.args[1][3]), path)
+                    self.assertEqual(path.read_bytes(), before)
+                    self.assertEqual(self.prepare_process.call_count, 1)
+                    self.assertEqual(len(list(artifact.glob('native-input-*'))), 1)
+                    self.assertEqual(len(list(artifact.glob('native-prepared-*'))), 1)
+                    inputs = next(artifact.glob('native-input-*'))
+                    repairs = json.loads((inputs / 'input-repairs.json').read_text())
+                    stored = json.loads((inputs / 'draft.json').read_text())
+                    action = json.loads((inputs / 'action.json').read_text())
+                    actual_draft = {k: v for k, v in stored.items() if k in host.CONTRACT['draft']['properties']}
+                    actual = {**self.envelope(current), 'payload': {**current, 'draft': actual_draft, 'action': action}}
+                    actual_sha = hashlib.sha256(host.canonical({'thread': self.thread, 'envelope': actual}).encode()).hexdigest()
+                    self.assertEqual(repairs['normalized_input_sha256'], actual_sha)
+                    self.assertEqual(repairs.get('preparation_input_sha256', actual_sha),
+                                     inputs.name.removeprefix('native-input-'))
+                    self.assertEqual(host.INLINE_EVIDENCE_NOTE in stored['prompt'], first is host)
+
+    def test_old_new_publication_race_claims_one_key_even_after_the_last_check(self):
+        older = self.baseline_host()
+        payload = self.external_verifier_payload()
+        original_mkdir = Path.mkdir
+        with self.preparation_boundary(older):
+            for delayed, winner in ((host, older), (older, host)):
+                with self.subTest(delayed=delayed.__name__):
+                    artifact = self.artifact / ('race-' + delayed.__name__)
+                    artifact.mkdir()
+                    current = copy.deepcopy(payload)
+                    current['draft']['artifact_root'] = str(artifact)
+                    current['action']['verifier_commands'][0]['scratch_root'] = str(artifact / 'verifier-0')
+                    waiting, release = threading.Event(), threading.Event()
+
+                    def gated_mkdir(path, *args, **kwargs):
+                        if path.name.startswith('native-input-') and threading.current_thread().name.startswith('delayed'):
+                            waiting.set()
+                            if not release.wait(5):
+                                raise AssertionError('publication barrier timed out')
+                        return original_mkdir(path, *args, **kwargs)
+
+                    self.prepare_process.reset_mock()
+                    with mock.patch.object(Path, 'mkdir', autospec=True, side_effect=gated_mkdir), \
+                            ThreadPoolExecutor(max_workers=1, thread_name_prefix='delayed') as pool:
+                        future = pool.submit(delayed.run, self.envelope(current))
+                        try:
+                            self.assertTrue(waiting.wait(5), 'delayed host must reach its exclusive claim')
+                            winner.run(self.envelope(current))
+                            path = Path(self.execv.call_args.args[1][3])
+                        finally:
+                            release.set()
+                        with self.assertRaises(FileExistsError):
+                            future.result(timeout=5)
+                    delayed.run(self.envelope(current))
+                    self.assertEqual(Path(self.execv.call_args.args[1][3]), path)
+                    self.assertEqual(self.prepare_process.call_count, 1)
+                    self.assertEqual(len(list(artifact.glob('native-input-*'))), 1)
+                    self.assertEqual(len(list(artifact.glob('native-prepared-*'))), 1)
 
     def test_uncertain_or_ambiguous_preparation_is_never_reprepared(self):
         payload = self.payload()
