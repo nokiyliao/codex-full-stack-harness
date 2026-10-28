@@ -348,10 +348,12 @@ def _provider_prompt(prompt: str, jspace: dict[str, Any],
                      observed_digest_reference: bool = False,
                      directory_source_read: bool = False,
                      capsule: dict | None = None,
-                     capsule_digest_reference: bool = False) -> str:
+                     capsule_digest_reference: bool = False,
+                     workspace: str | None = None) -> str:
     """Present verified tool capabilities, without changing their enforcement."""
     if terminal_delivery == "evidence_only":
         prompt += _EVIDENCE_ONLY_COMPLETION_GUIDANCE
+    execution_workspace = _exact_presentation_path(workspace, absolute=True)
     operations = jspace.get("allowed_operations", [])
     command_allowed = isinstance(operations, list) and "command" in operations
     inspect_shell = jspace.get("inspect_shell")
@@ -410,6 +412,9 @@ def _provider_prompt(prompt: str, jspace: dict[str, Any],
     if read_allowed:
         projection.update(schema_version="nokiy_source_read_presentation_v1",
                           source_read=True, read_scopes=jspace.get("read_scopes", []))
+        source_root = _exact_presentation_path(jspace.get("repo_root"), absolute=True)
+        if execution_workspace is not None and source_root is not None:
+            projection["source_read_root"] = source_root
         if observed_digest_reference is True and _observed_digest_eligible(jspace):
             projection["observed_source_digest_reference"] = True
         if capsule_digest_reference is True:
@@ -464,6 +469,24 @@ def _provider_prompt(prompt: str, jspace: dict[str, Any],
             "example": {"commands": [{"command_type": "focused_verifier",
                                       "command_line": '{"verifier_index":0}', "step": 1}]},
         }
+        contexts = []
+        for index, command in enumerate(verifiers if execution_workspace is not None else []):
+            context = {"verifier_index": index}
+            cwd = _exact_presentation_path(command.get("cwd", execution_workspace), absolute=True)
+            if cwd is not None:
+                context["cwd"] = cwd
+            pins = command.get("pinned_files")
+            inputs = sorted({path for pin in pins if isinstance(pin, dict)
+                and pin.get("scope") == "verifier_only"
+                and (path := _exact_presentation_path(pin.get("path"), absolute=True)) is not None
+            }) if isinstance(pins, list) else []
+            if inputs:
+                context["verifier_only_inputs"] = inputs
+                context["verifier_only_inputs_grant_source_read"] = False
+            if len(context) > 1:
+                contexts.append(context)
+        if contexts:
+            projection["focused_verifier"]["execution_context"] = contexts
     write_scopes = jspace.get("write_scopes")
     read_scopes = projection.get("read_scopes")
     denied = projection["denied_operations"]
@@ -581,7 +604,7 @@ def _provider_prompt(prompt: str, jspace: dict[str, Any],
                  "No argv/cwd/timeout overrides or blocked/cancel bypass.\n"
                  # Measured I23 Ultra worker: two corrective verifier rounds came from these facts,
                  # which coordinators relay inconsistently; state them where tests are written.
-                 "Verifier sandbox: cwd draft.workspace; writes only its scratch, TMPDIR. Added tests "
+                 "Verifier sandbox: admitted cwd; writes only its scratch, TMPDIR. Added tests "
                  "use tempfile/TMPDIR and resolve fixture/helper/data paths from their own file's "
                  "directory, never cwd.\n")
         if read_write_allowed:
@@ -1943,6 +1966,7 @@ def _execute_created_run(request: caller.EmbeddedNokiyRequest, run: Path, root_p
     with (run / "prompt.txt").open("xb") as output:
         output.write(_provider_prompt(request.prompt, jspace,
                                      terminal_delivery=request.terminal_delivery,
+                                     workspace=str(request.workspace),
                                      admitted_digest_reference=ready.get(
                                          "admitted_source_digest_reference") is True,
                                      observed_digest_reference=ready.get(

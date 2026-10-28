@@ -112,6 +112,59 @@ class VerifierPromptTests(unittest.TestCase):
                       "at a strictly later positive step in the same command_run response.", guidance)
         self.assertIn("No dependent same-step verification or missing-evidence edits.", guidance)
 
+    def test_verified_roots_and_verifier_inputs_are_context_not_read_grants(self):
+        contract = json.loads(json.dumps(self.jspace))
+        contract["repo_root"] = "/source/root"
+        contract["verifier_commands"] = [{
+            "argv": ["/usr/bin/python3", "/external/validate.py", "--token", "do-not-leak"],
+            "cwd": "/verifier/root",
+            "pinned_files": [
+                {"path": "/external/validate.py", "scope": "verifier_only", "sha256": "a" * 64},
+                {"path": "/external/not-a-verifier-input", "scope": "read"},
+            ],
+        }, {"argv": ["/usr/bin/true"]}]
+        before = json.loads(json.dumps(contract))
+        task = "Implement the assigned branch."
+        text = full_core._provider_prompt(task, contract, workspace="/worker/root")
+        projection, guidance = self._prompt_parts(task, text)
+        self.assertEqual(projection["source_read_root"], "/source/root")
+        self.assertEqual(projection["focused_verifier"]["execution_context"], [
+            {"verifier_index": 0, "cwd": "/verifier/root",
+             "verifier_only_inputs": ["/external/validate.py"],
+             "verifier_only_inputs_grant_source_read": False},
+            {"verifier_index": 1, "cwd": "/worker/root"},
+        ])
+        self.assertNotIn("do-not-leak", text)
+        self.assertNotIn("--token", text)
+        self.assertNotIn("not-a-verifier-input", text)
+        self.assertEqual(contract, before)
+        self.assertEqual(projection["read_scopes"], ["answer.txt"])
+        self.assertIn("Verifier sandbox: admitted cwd", guidance)
+
+    def test_missing_request_workspace_does_not_invent_verifier_cwd(self):
+        contract = {**self.jspace, "repo_root": "/not-the-request-workspace"}
+        task = "Run the admitted verifier."
+        projection, _ = self._prompt_parts(task, full_core._provider_prompt(task, contract))
+        self.assertNotIn("source_read_root", projection)
+        self.assertNotIn("execution_context", projection["focused_verifier"])
+
+    def test_verifier_context_ignores_nonliteral_paths_without_io(self):
+        contract = {**self.jspace, "repo_root": "/source/../other", "verifier_commands": [{
+            "argv": ["/usr/bin/true"], "cwd": "../other", "pinned_files": [
+                {"path": "/outside/*", "scope": "verifier_only"},
+                {"path": "relative.py", "scope": "verifier_only"},
+                {"path": "/outside/ok.py", "scope": "verifier_only"},
+                {"path": "/outside/ok.py", "scope": "verifier_only"},
+            ]}]}
+        task = "Use only the admitted verifier."
+        with patch.object(Path, "open", side_effect=AssertionError("projection must not read files")):
+            projection, _ = self._prompt_parts(task, full_core._provider_prompt(task, contract,
+                workspace="/worker/root"))
+        self.assertNotIn("source_read_root", projection)
+        self.assertEqual(projection["focused_verifier"]["execution_context"], [
+            {"verifier_index": 0, "verifier_only_inputs": ["/outside/ok.py"],
+             "verifier_only_inputs_grant_source_read": False}])
+
     def test_explicit_whole_array_verifier_restriction_takes_precedence(self):
         task = ("The WHOLE command_run commands array must contain only focused_verifier "
                 "commands. Do not patch in this response.")
@@ -287,7 +340,7 @@ class VerifierPromptTests(unittest.TestCase):
     def test_verifier_environment_reaches_the_worker_that_writes_tests(self):
         task = "Patch and verify answer.txt."
         _, guidance = self._prompt_parts(task, full_core._provider_prompt(task, self.jspace))
-        self.assertIn("Verifier sandbox: cwd draft.workspace; writes only its scratch, TMPDIR.", guidance)
+        self.assertIn("Verifier sandbox: admitted cwd; writes only its scratch, TMPDIR.", guidance)
         self.assertIn("resolve fixture/helper/data paths from their own file's directory, never cwd.", guidance)
 
     def test_source_postimages_context_is_review_evidence_not_authority_or_auto_done(self):

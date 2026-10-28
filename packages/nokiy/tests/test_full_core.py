@@ -1460,11 +1460,13 @@ finally:
                             core.execute_full_core(request)
                     provider_prompt.assert_called_once_with(
                         request.prompt, jspace, terminal_delivery=request.terminal_delivery,
+                        workspace=str(request.workspace),
                         admitted_digest_reference=False, observed_digest_reference=False,
                         directory_source_read=False, capsule={}, capsule_digest_reference=False)
                     self.assertEqual(request.terminal_delivery, requested_mode or "assistant_reply")
                     self.assertEqual(captured, [render_prompt(
-                        request.prompt, jspace, terminal_delivery=request.terminal_delivery)])
+                        request.prompt, jspace, terminal_delivery=request.terminal_delivery,
+                        workspace=str(request.workspace))])
                     self.assertEqual(core._EVIDENCE_ONLY_COMPLETION_GUIDANCE in captured[0],
                                      requested_mode == "evidence_only")
 

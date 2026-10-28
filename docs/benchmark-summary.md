@@ -33,11 +33,12 @@ All three rows below use an Astra/xhigh coordinator and a fresh native Astra/xhi
 | R19 / high, Sol6.1-xhigh | 475.8 | 334.0 | +42.46% | 0.9655116 / 3.2562060 | -70.35% |
 | R19 / deployed medium default, Terra6.1-xhigh | 245.5 | 289.4 | -15.17% | 0.7196218 / 2.9877760 | -75.92% |
 | DCF2 / deployed medium default, Terra6.1-xhigh | 420.6 | 522.1 | -19.44% | 1.1305374 / 3.9113420 | -71.10% |
+| DCF2 / V458 medium default, Terra6.1-xhigh | 327.6 | 505.0 | -35.13% | 0.8433554 / 2.9232180 | -71.15% |
 
 Each is one descriptive pair, not a stable or randomized causal estimate. The earlier slow Sol-worker result is retained, not replaced by the faster default profile. Native timing also varied; Efficient/Sol and Ultra/Astra baselines must not be pooled.
 
 DCF2's four Terra workers include an initial two-worker batch that returned without source changes, followed by corrected read-context delegation to two replacement workers. Initial absent/unadmitted validator and storage reads, failed combined acceptance and repair costs remain charged. Both final fixed quality/integrity checks passed (688/701 tests, ten allowed skips each); the pre-existing accepted-reference exclusions are identical for all arms, not a whole-repository acceptance claim.
 
-These measurements precede V457. The typed missing-file repair was validated deterministically, not credited with these percentages or used as a reason to rerun an otherwise unchanged model benchmark.
+The first three Ultra rows precede V457. The typed missing-file repair was validated deterministically, not credited with those percentages. The last row follows V458's verified worker/verifier context projection: both workers finished in one dispatch, root had four calls, and quality/integrity passed (688/693 tests, ten allowed skips each). Total coordinator and worker/native-child costs are included. The parent also added storage and other relevant dependencies to its initial read scopes, unlike the earlier failed first batch. Thus absence of repair and faster time are observed, not a controlled causal effect of the new metadata alone. Coordinator contract drafting, discovery and delivery remain charged; calling them coordination does not remove their tokens or time from accounting.
 
 Earlier whole-workflow reports that counted only the last response's tokens are not reused. Source/tests/deployment receipts and private raw traces are different evidence; raw private traces are not included here. No upstream acceptance or independent replication is claimed.
