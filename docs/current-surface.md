@@ -4,11 +4,13 @@ The publication binds three independent sources rather than inventing one compon
 
 - Caller package in V464: unchanged source ffafb43; its 48 installed non-cache package files match the published package.
 - Rebuilt V464 Rust payload: source 1304065; 602 recorded build inputs and four recorded binary identities were checked. This is an actual cargo --locked rebuild, not a version-only relabeling.
-- Switchboard fa0b537: deployed as nokiy-efficient-single-branch-native-20261028 with canonical workflow-update; 1,040 Node regression tests passed. The signed desktop App, models and efforts were unchanged.
+- Switchboard 58ea637: deployed as nokiy-parent-control-reminder-20261028 with canonical workflow-update hot reload; 1,042 Node regression tests passed after deployment. The signed desktop App, caller/Rust payloads, models, efforts and dispatch thresholds were unchanged.
 
 The switchboard source includes the actual workflow topology but excludes installation identities and credentials. It cannot safely be installed by cloning another machine's runtime directory. DCF/J-Space managed-project contracts, official Codex and companion repositories remain external dependencies; source publication does not grant their permissions or claim those repositories were updated.
 
-Published source is byte-bound by releases/v464.json. The installed binary hashes are observations, not a source-to-binary reproducibility claim. No clean-machine install or cross-platform service acceptance was run for this source synchronization.
+Published source is byte-bound by releases/v464-controls.json. The installed binary hashes are observations, not a source-to-binary reproducibility claim. No clean-machine install or cross-platform service acceptance was run for this source synchronization.
+
+The advisory dispatch reminder now reuses the strict coordinator's existing unique type/name/namespace bindings. Parent-only Goal, App/session and original-handle observation controls do not advance the execution counter; deterministic nokiy_native execution still does. Opaque code cells conservatively count instead of receiving a poll-word exemption. Reminder text preserves native control and deployment exceptions. Efficient raw controls without strict bindings remain unclassified. This correction has regression and deployment evidence, not a measured model-time or dollar-saving claim.
 
 Source verification starts no model or service. Existing component test/build evidence is reused only for matching source. Runtime db/, trace-evidence/, caches, private config and raw benchmark logs are not published.
 

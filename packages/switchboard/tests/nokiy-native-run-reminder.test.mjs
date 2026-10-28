@@ -13,15 +13,48 @@ test("native run counts tool steps, keeps waits and resets on dispatch or final 
   assert.deepEqual({ ...state }, { alias: "nokiy-efficient", steps: 2, inputTokens: 130000 });
   state = nativeRunAfterResponse(state, "nokiy-efficient", [call("wait")], usage(131000));
   assert.equal(state.steps, 2);
-  const poll = { type: "custom_tool_call", name: "exec", call_id: "p",
-    input: "const r = await tools.mcp__codex_app__wait_threads({targets: []}); text(r);" };
-  assert.equal(nativeRunAfterResponse(state, "nokiy-efficient", [poll], usage(132000)).steps, 2);
-  const work = { ...poll, input: "await tools.mcp__codex_app__read_thread({}); await tools.exec_command({cmd: 'ls'});" };
-  assert.equal(nativeRunAfterResponse(state, "nokiy-efficient", [work], usage(132000)).steps, 3);
   assert.equal(nativeRunAfterResponse(state, "nokiy-efficient", [call("nokiy_execute")], usage(1)).steps, 0);
   assert.equal(nativeRunAfterResponse(state, "nokiy-efficient", [{ type: "message", role: "assistant" }], usage(1)).steps, 0);
   assert.equal(nativeRunAfterResponse(state, "nokiy-direct", [call("exec")], usage(1)).steps, 1);
   assert.equal(nativeRunAfterResponse(state, "gpt-6.1-sol", [call("exec")], usage(1)), null);
+});
+
+test("bound parent controls do not trigger a worker dispatch reminder", () => {
+  const state = { alias: "nokiy-direct", steps: 1, inputTokens: 120000 };
+  const bindings = [
+    { type: "function_call", name: "get_goal", namespace: "functions" },
+    { type: "function_call", name: "list_threads", namespace: "codex_app" },
+    { type: "function_call", name: "wait_threads", namespace: "mcp__codex_app" },
+    { type: "function_call", name: "write_stdin", namespace: "functions" },
+    { type: "custom_tool_call", name: "nokiy_observe", namespace: null },
+    { type: "custom_tool_call", name: "nokiy_native", namespace: null },
+  ];
+  for (const binding of bindings.slice(0, -1)) {
+    const next = nativeRunAfterResponse(state, "nokiy-direct", [binding], usage(120000), bindings);
+    assert.equal(next.steps, 1, binding.name);
+    assert.equal(nativeRunReminder(next, "nokiy-direct", false).text, null);
+    const { namespace: _, ...unqualified } = binding;
+    assert.equal(nativeRunAfterResponse(state, "nokiy-direct", [unqualified], usage(120000), bindings).steps, 1);
+  }
+  assert.equal(nativeRunAfterResponse(state, "nokiy-direct", [bindings[0], call("nokiy_native")], usage(120000), bindings).steps, 2);
+  const foreign = { ...bindings[0], namespace: "external" };
+  assert.equal(nativeRunAfterResponse(state, "nokiy-direct", [foreign], usage(120000), bindings).steps, 2);
+  const ambiguous = [...bindings, { ...bindings[0], namespace: null }];
+  const { namespace: _, ...unqualified } = bindings[0];
+  assert.equal(nativeRunAfterResponse(state, "nokiy-direct", [unqualified], usage(120000), ambiguous).steps, 2);
+});
+
+test("opaque code and foreign wait names are not classified by poll substrings", () => {
+  const state = { alias: "nokiy-direct", steps: 1, inputTokens: 120000 };
+  for (const input of [
+    'const label = "read_thread"; await tools.web__run({});',
+    'await tools.mcp__codex_app__wait_threads({}); await tools.web__run({});',
+    'await tools.mcp__codex_app__wait_threads({}); await tools.exec_command({cmd: "ls"});',
+    'const r = await tools.mcp__codex_app__wait_threads({}); text(r);',
+  ]) {
+    assert.equal(nativeRunAfterResponse(state, "nokiy-direct", [{ ...call("exec"), input }], usage(120000)).steps, 2);
+  }
+  assert.equal(nativeRunAfterResponse(state, "nokiy-direct", [{ ...call("wait"), namespace: "external" }], usage(120000)).steps, 2);
 });
 
 test("reminder fires once at the alias threshold on a long conversation", () => {
@@ -41,6 +74,8 @@ test("reminder fires once at the alias threshold on a long conversation", () => 
   const ultra = nativeRunReminder({ alias: "nokiy-direct", steps: NATIVE_RUN_REMINDER["nokiy-direct"], inputTokens: 300000 }, "nokiy-direct", false);
   assert.match(ultra.text, /^Ultra dispatch reminder: /);
   assert.match(ultra.text, /run_batch/);
+  assert.match(ultra.text, /App\/cross-session/);
+  assert.match(ultra.text, /deployment/);
 });
 
 test("only a trailing operator message counts as a new operator turn", () => {

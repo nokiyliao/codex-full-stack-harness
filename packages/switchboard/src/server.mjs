@@ -1380,7 +1380,8 @@ export async function createSwitchboardServer({
                 ?.filter((item) => item?.type !== "reasoning");
               // The raw output still names nokiy_execute; the projected one shows the native cell.
               if (event.type === "response.completed") {
-                nativeRun = nativeRunAfterResponse(nativeRun, officialTurn.requestedAlias, event.response?.output, event.response?.usage);
+                nativeRun = nativeRunAfterResponse(nativeRun, officialTurn.requestedAlias, event.response?.output,
+                  event.response?.usage, officialTurn.coordinatorBindings);
               }
               const resultCall = officialTurn.resultDeliveryEnabled ? resultContinuationCall(output) : null;
               directContinuation = event.type === "response.completed" && event.response?.id && (officialTurn.nativeToolTarget || officialTurn.coordinatorFallback)

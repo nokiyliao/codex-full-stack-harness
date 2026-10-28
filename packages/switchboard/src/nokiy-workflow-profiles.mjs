@@ -15,19 +15,18 @@ export const ULTRA_DISPATCH_GUIDANCE = "Ultra dispatch rule: the Astra coordinat
 // a tool other than nokiy_execute; every step re-sends the whole thread. Past the alias
 // threshold on a long conversation, the next request gets one appended developer reminder
 // and the count restarts. An operator turn, a final answer or a nokiy_execute call resets it;
-// a response that only waits (a native wait, or a code cell that only polls other threads)
-// leaves it unchanged, since a worker cannot take that step over.
+// Already-bound parent coordination controls leave it unchanged. Opaque code cells
+// still count: poll words in strings or mixed work do not prove control-only work.
 export const NATIVE_RUN_REMINDER = Object.freeze({ "nokiy-efficient": 5, "nokiy-direct": 2 });
 export const NATIVE_RUN_REMINDER_MIN_INPUT_TOKENS = 100_000;
 const RUN_CALL_TYPES = new Set(["function_call", "custom_tool_call", "local_shell_call"]);
-// Tool names appear namespaced (mcp__codex_app__wait_threads), so no leading word boundary.
-const THREAD_POLL = /(?:wait_threads|read_thread)\b/;
-const LOCAL_WORK = /(?:exec_command|apply_patch|write_stdin)\b/;
-
-function waitOnlyCall(item) {
-  if (item.name === "wait") return true;
-  const code = typeof item.input === "string" ? item.input : typeof item.arguments === "string" ? item.arguments : "";
-  return item.name === "exec" && THREAD_POLL.test(code) && !LOCAL_WORK.test(code);
+function coordinationOnlyCall(item, bindings) {
+  if (bindings.length) {
+    const matches = bindings.filter((binding) => binding.type === item.type && binding.name === item.name
+      && (item.namespace == null || (binding.namespace ?? null) === item.namespace));
+    return matches.length === 1 && matches[0].name !== "nokiy_native";
+  }
+  return item.name === "wait" && (item.namespace == null || item.namespace === "functions");
 }
 
 export function latestInputIsOperatorTurn(input) {
@@ -40,7 +39,7 @@ export function latestInputIsOperatorTurn(input) {
   return false;
 }
 
-export function nativeRunAfterResponse(state, alias, output, usage) {
+export function nativeRunAfterResponse(state, alias, output, usage, coordinatorBindings = []) {
   if (!Object.hasOwn(NATIVE_RUN_REMINDER, alias)) return null;
   const same = state?.alias === alias;
   const steps = same ? state.steps : 0;
@@ -48,7 +47,7 @@ export function nativeRunAfterResponse(state, alias, output, usage) {
   const calls = (Array.isArray(output) ? output : []).filter((item) => RUN_CALL_TYPES.has(item?.type));
   let next = steps + 1;
   if (calls.length === 0 || calls.some((item) => item.name === "nokiy_execute")) next = 0;
-  else if (calls.every(waitOnlyCall)) next = steps;
+  else if (calls.every((item) => coordinationOnlyCall(item, coordinatorBindings ?? []))) next = steps;
   return Object.freeze({ alias, steps: next, inputTokens });
 }
 
@@ -63,11 +62,13 @@ export function nativeRunReminder(state, alias, operatorTurn) {
     ? "Ultra dispatch reminder: " + state.steps + " consecutive native coordinator steps at about " + size
       + " tokens of context; every Astra step re-sends this whole thread. Hand the remaining execution of this chunk"
       + " (reads, edits, tests, analysis) to workers now through nokiy_execute run or run_batch, one member per"
-      + " independent chunk; keep only planning, live owner/CAS decisions and acceptance native."
+      + " independent chunk. Keep planning, App/cross-session operations, original-handle observation, Goal controls,"
+      + " live owner/CAS/account or deployment decisions and acceptance native; do not delegate those controls."
     : "Cost reminder: " + state.steps + " consecutive native steps at about " + size
       + " tokens of context; every step re-sends this whole thread. If the current chunk still needs three or more"
       + " tool calls, delegate it to one worker through nokiy_execute; keep short checks, full-context judgment,"
-      + " live owner/CAS decisions and acceptance native.";
+      + " App/cross-session operations, original-handle observation, Goal controls, live owner/CAS/account or deployment"
+      + " decisions and acceptance native; do not delegate those controls.";
   return { state: Object.freeze({ ...state, steps: 0 }), text,
     diagnostic: { steps: state.steps, input_tokens: state.inputTokens } };
 }
