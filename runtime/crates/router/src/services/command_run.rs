@@ -5,7 +5,9 @@
 
 use anyhow::{Context, Result, anyhow};
 use code_tools::runtime::tool::CancellationToken;
-use code_tools::commands::source_read::{SourceReadPreExecutionRejection, SourceReadRejectionKind};
+use code_tools::commands::source_read::{
+    SourceReadPreExecutionRejection, SourceReadRejectionKind, SourceReadTargetError,
+};
 use parking_lot::Mutex;
 use runtime_contract::{CapsuleSourceReadBinding, CapsuleSourceReadContext};
 use serde::{Deserialize, Serialize};
@@ -767,16 +769,19 @@ fn validate_jspace_arguments_with_capsule(
                 matcher.check_source_read(Path::new(request.path()))?;
                 continue;
             }
-            let target =
-                code_tools::commands::source_read::target_path(matcher.repo_root(), &request)
-                    .map_err(|error| {
-                        JSpaceError::new(
-                            "JSPACE_SOURCE_READ_PATH_DENIED",
-                            "read",
-                            request.path(),
-                            error,
-                        )
-                    })?;
+            let target = match code_tools::commands::source_read::target_path_typed(
+                matcher.repo_root(), &request,
+            ) {
+                Ok(target) => target,
+                Err(SourceReadTargetError::NotFound) => {
+                    // Missing data is an ordinary read failure only within an explicit read grant.
+                    matcher.check_source_read(&matcher.repo_root().join(request.path()))?;
+                    continue;
+                }
+                Err(error) => return Err(JSpaceError::new(
+                    "JSPACE_SOURCE_READ_PATH_DENIED", "read", request.path(), error.to_string(),
+                ).into()),
+            };
             matcher.check_source_read(&target)?;
             continue;
         }
@@ -1804,6 +1809,61 @@ mod tests {
             }), Some("denied-read")).await.expect("denied response");
             assert!(response["result"]["results"].as_array().unwrap().iter().all(|result| result["success"] == false));
             assert!(!response.to_string().contains("nokiy_source_read_pre_execution_rejection_v1"), "scenario {scenario}");
+        }
+    }
+
+    #[cfg(unix)]
+    async fn check_missing_target_paths(schema: &str) {
+        let workspace = canonical_tempdir();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/other.rs"), "outside\n").unwrap();
+        std::os::unix::fs::symlink("other.rs", workspace.path().join("src/link.rs")).unwrap();
+        let mut contract = jspace_contract(workspace.path());
+        contract["read_scopes"] = json!(["src/missing.rs", "src/link.rs"]);
+        contract["source_read"] = json!(true);
+        contract["command_templates"] = json!([]);
+        if schema == "jspace_contract_v3" {
+            contract["schema_version"] = json!(schema);
+            contract["allowed_operations"] = json!(["command"]);
+            contract["effect_capabilities"] = json!([{
+                "domain_id":"source", "root":workspace.path(),
+                "read_scopes":["src/missing.rs", "src/link.rs"], "write_scopes":[],
+                "allowed_operations":["read"], "declared_targets":[]
+            }]);
+            for field in ["read_scopes", "write_scopes", "declared_targets"] {
+                contract.as_object_mut().unwrap().remove(field);
+            }
+        }
+        let contract = reseal_jspace(contract);
+        let service = CommandRunService::new();
+        let read = |path: &str| json!({
+            "session_id":"missing-source-session", "runtime_id":"missing-source-runtime",
+            "session_directory":workspace.path(), "jspace_contract":contract,
+            "allowed_commands":["source_read"], "arguments":{"commands":[{
+                "command_type":"source_read", "command_line":json!({
+                    "path":path, "start_line":1, "end_line":1}).to_string()}]}
+        });
+        let missing = service.execute(read("src/missing.rs")).await.unwrap();
+        let result = &missing["result"]["results"][0];
+        assert_eq!(result["success"], false, "{missing}");
+        assert!(result.get("jspace_error_code").is_none(), "{missing}");
+        assert_eq!(result["output"]["error_type"], "SOURCE_READ_TARGET_NOT_FOUND", "{missing}");
+        assert_eq!(result["output"]["terminal_receipt"]["termination_proven"], true);
+        assert_eq!(result["output"]["terminal_receipt"]["authority_effect"], "none");
+        for path in ["src/other.rs", "src/outside-missing.rs"] {
+            let denied = service.execute(read(path)).await.unwrap();
+            assert_eq!(denied["result"]["results"][0]["jspace_error_code"],
+                "JSPACE_EXPANSION_REQUIRED", "{denied}");
+        }
+        let symlink = service.execute(read("src/link.rs")).await.unwrap();
+        assert_eq!(symlink["result"]["results"][0]["jspace_error_code"], "JSPACE_SOURCE_READ_PATH_DENIED");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_read_missing_target_keeps_scope_and_symlink_guards() {
+        for schema in ["jspace_contract_v2", "jspace_contract_v3"] {
+            check_missing_target_paths(schema).await;
         }
     }
 

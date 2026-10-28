@@ -1,16 +1,16 @@
 # Source Provenance
 
-## Current V456 Surface
+## Current V457 Surface
 
 This is a source publication, not a redistribution of installed executables or machine configuration.
 
 | Component | Source commit | Correspondence |
 | --- | --- | --- |
-| Python caller | `1101c58096f42e6299002a9f1fceba2f021c7d0d` | All 48 non-cache installed package files match byte-for-byte; installed wheel version 0.3.456.dev0 |
-| Rust worker payload | `d66a81c966aade525ec5f2ae2316c3236d62c68d` | All 602 recorded build-source inputs match; four binary hashes match the installed V456 image, inherited from V455 |
+| Python caller | `1101c58096f42e6299002a9f1fceba2f021c7d0d` | Unchanged source; all 48 non-cache installed package files match byte-for-byte; installed wheel version 0.3.457.dev0 |
+| Rust worker payload | `5154083b3a2cee92dc3264920f0df480f0fda389` | All 602 recorded build-source inputs match; rebuilt with cargo --locked, four binary identities match the installed V457 image |
 | Switchboard | `e5f757d8cdd810bbe625f9660129b6979d054ae2` | Committed source, tests and workflow topology; private diagnostic credentials/configuration and compiled caches excluded |
 
-These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in releases/v456.json identify the published contents. Publication-only documentation and preserved licenses are identified separately.
+These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in releases/v457.json identify the published contents. Publication-only documentation and preserved licenses are identified separately.
 
 The caller working tree contains an unrelated test modification, and the runtime working tree contains pending-message deletions; neither was adopted. Source was exported from exact commits, not by copying dirty worktrees or installed environment directories.
 

@@ -561,7 +561,43 @@ fn validate_json_pointer(pointer: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug)]
+pub enum SourceReadTargetError {
+    NotFound,
+    Invalid(String),
+}
+
+impl From<String> for SourceReadTargetError {
+    fn from(error: String) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+impl std::fmt::Display for SourceReadTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("SOURCE_READ_TARGET_NOT_FOUND"),
+            Self::Invalid(error) => formatter.write_str(error),
+        }
+    }
+}
+
+fn target_resolution_error(error: std::io::Error) -> SourceReadTargetError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        SourceReadTargetError::NotFound
+    } else {
+        SourceReadTargetError::Invalid(format!("SOURCE_READ_TARGET_INVALID: {error}"))
+    }
+}
+
 pub fn target_path(workspace: &Path, request: &SourceReadRequest) -> Result<PathBuf, String> {
+    target_path_typed(workspace, request).map_err(|error| error.to_string())
+}
+
+pub fn target_path_typed(
+    workspace: &Path,
+    request: &SourceReadRequest,
+) -> Result<PathBuf, SourceReadTargetError> {
     validate_request(request).map_err(|error| error.to_string())?;
     let root = workspace
         .canonicalize()
@@ -572,29 +608,29 @@ pub fn target_path(workspace: &Path, request: &SourceReadRequest) -> Result<Path
             .map(|metadata| metadata.file_type().is_symlink())
             .unwrap_or(true)
     {
-        return Err("SOURCE_READ_WORKSPACE_INVALID".to_string());
+        return Err("SOURCE_READ_WORKSPACE_INVALID".to_string().into());
     }
     let mut target = root;
     for component in Path::new(&request.path).components() {
         let Component::Normal(part) = component else {
-            return Err("SOURCE_READ_PATH_INVALID".to_string());
+            return Err("SOURCE_READ_PATH_INVALID".to_string().into());
         };
         target.push(part);
         let metadata = target
             .symlink_metadata()
-            .map_err(|error| format!("SOURCE_READ_TARGET_INVALID: {error}"))?;
+            .map_err(target_resolution_error)?;
         if metadata.file_type().is_symlink() {
-            return Err("SOURCE_READ_SYMLINK_DENIED".to_string());
+            return Err("SOURCE_READ_SYMLINK_DENIED".to_string().into());
         }
     }
     let metadata = target
         .metadata()
-        .map_err(|error| format!("SOURCE_READ_TARGET_INVALID: {error}"))?;
+        .map_err(target_resolution_error)?;
     if !metadata.is_file() {
-        return Err("SOURCE_READ_NOT_REGULAR_FILE".to_string());
+        return Err("SOURCE_READ_NOT_REGULAR_FILE".to_string().into());
     }
     if metadata.len() > MAX_FILE_BYTES {
-        return Err("SOURCE_READ_FILE_TOO_LARGE".to_string());
+        return Err("SOURCE_READ_FILE_TOO_LARGE".to_string().into());
     }
     Ok(target)
 }
@@ -1613,7 +1649,11 @@ fn open_no_follow(root: &File, relative: &str) -> Result<File, String> {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW
         };
         let next = openat(&directory, *part, flags, Mode::empty())
-            .map_err(|_| "SOURCE_READ_TARGET_INVALID".to_string())?;
+            .map_err(|error| if error == rustix::io::Errno::NOENT {
+                "SOURCE_READ_TARGET_NOT_FOUND".to_string()
+            } else {
+                "SOURCE_READ_TARGET_INVALID".to_string()
+            })?;
         if last {
             return Ok(next.into());
         }
@@ -3292,6 +3332,18 @@ mod tests {
                     if error == "SOURCE_READ_RECEIPT_INVALID: receipt name must be one bounded ASCII filename component"
             ));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_read_missing_target_is_not_a_policy_denial() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::create_dir(root.path().join("src")).expect("source directory");
+        let request = parse_command_line(r#"{"path":"src/missing.rs","start_line":1,"end_line":1}"#)
+            .expect("request");
+        assert_eq!(target_path(root.path(), &request).unwrap_err(), "SOURCE_READ_TARGET_NOT_FOUND");
+        let admitted = open_admitted_root(&root.path().canonicalize().unwrap()).expect("root");
+        assert_eq!(read_range_from_root(&request, &admitted).unwrap_err(), "SOURCE_READ_TARGET_NOT_FOUND");
     }
 
     #[cfg(unix)]

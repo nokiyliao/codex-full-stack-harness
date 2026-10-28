@@ -1,8 +1,8 @@
 # Nokiy Full-Stack Harness
 
-Current source surface: **V456 caller + V455 Rust payload + switchboard e5f757d**, synchronized on 2026-10-28.
+Current source surface: **V457 release: unchanged V456 caller source + rebuilt Rust 5154083 + switchboard e5f757d**, synchronized on 2026-10-28.
 
-This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. Version numbers identify different components: V456 did not rebuild or rename the V455 Rust binaries.
+This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V457 rebuilds the Rust payload to distinguish admitted missing source files from permission denials; it does not expand read scopes or change models.
 
 ```text
 Native Codex thread / Goal / UI
@@ -15,10 +15,10 @@ Native Codex thread / Goal / UI
 | Component | Published directory | Source identity | License |
 | --- | --- | --- | --- |
 | Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `1101c58096f42e6299002a9f1fceba2f021c7d0d` | MIT |
-| Modified Tura-derived execution engine | [runtime](runtime) | `d66a81c966aade525ec5f2ae2316c3236d62c68d` | AGPL-3.0-or-later |
+| Modified Tura-derived execution engine | [runtime](runtime) | `5154083b3a2cee92dc3264920f0df480f0fda389` | AGPL-3.0-or-later |
 | Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `e5f757d8cdd810bbe625f9660129b6979d054ae2` | Repository AGPL-3.0-or-later |
 
-[Current source manifest](releases/v456.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
+[Current source manifest](releases/v457.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
 
 ## What Is Included
 
@@ -69,7 +69,7 @@ Do not start or admit a service by copying another machine's configuration. Inst
 
 ## Measured Results and Limits
 
-[Benchmark summary](docs/benchmark-summary.md) includes positive and negative controls. One current fixed-quality pair observed Efficient at 279.3s / $0.2746386 versus native Sol at 357.1s / $0.5229860, including reported coordinator, worker and native-child usage. These are API-equivalent estimates, not subscription charges, universal speedups or causal proof of every change.
+[Benchmark summary](docs/benchmark-summary.md) includes positive and negative controls. Default Ultra with Terra workers observed -15.17% time/-75.92% API-equivalent cost on R19 and -19.44%/-71.10% on a second DCF task versus native Astra/xhigh. The high/Sol worker R19 arm was slower (+42.46%) and remains visible. All coordinator and execution-child usage is included. Each is one descriptive pair, measured before V457; these are not subscription charges, stable universal speedups or causal proof of the new missing-file fix.
 
 The source export matches all 48 non-cache files in the installed caller package, all 602 recorded Rust build-source inputs, and the current switchboard commit except explicitly excluded operator-only diagnostics and compiled caches. Recorded binary hashes are provenance, not a byte-reproducible-build claim. Clean-machine installation and cross-platform service operation have not been established by this publication.
 
