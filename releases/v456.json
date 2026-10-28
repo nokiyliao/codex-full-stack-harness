@@ -2702,7 +2702,7 @@
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "965e67e14587a9bbdad8e343d5794b948ef8edb25a9e1dff11c6389caa4843da",
     "docs/current-surface.md": "c49d5b76c6fac8bd82ae3d21c06cdf13a9604ada0eaae772ca3b9fa6be7e0502",
-    "docs/benchmark-summary.md": "9235a735858b9dc1431c2fa1dec8267d2c056bf077bfa5502fdbf7d10674e285"
+    "docs/benchmark-summary.md": "c2a98a16bd22f867c46555fc007551197e8cd08d7c5766066d5917c9e7499140"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261028-v456-model-gap-final-gate",

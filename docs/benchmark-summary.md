@@ -2,21 +2,25 @@
 
 These are descriptive engineering measurements, not universal speedups, subscription billing or isolated causal estimates. Complete reported coordinator, worker and native-child usage is included; unreported provider attempts are not asserted to be covered.
 
-Latest fixed-quality offline engineering pair:
+Latest fixed-quality offline engineering pair, 2026-10-28, integration source d53f7e4:
 
 | Metric | Efficient | Native control |
 | --- | ---: | ---: |
 | Coordinator | Sol 6.1/max | Sol 6.1/max |
 | Workers | Two Terra 6.1/xhigh | One native Sol child |
-| End-to-end seconds | 279.3 | 357.1 |
-| API-equivalent USD | 0.2746386 | 0.5229860 |
-| Total tokens | 561,229 | 1,219,945 |
-| Uncached input | 120,409 | 100,486 |
+| End-to-end seconds | 319.7 | 360.3 |
+| API-equivalent USD | 0.2526554 | 0.5840620 |
+| Total tokens | 490,239 | 1,784,779 |
+| Uncached input | 125,625 | 120,942 |
 | Fixed quality and source integrity | PASS | PASS |
 
-Observed time -21.79%, cost -47.50%, total tokens -54.00%; uncached input +19.83%. The final test counts included permitted additions (69/76), not a reduction of frozen acceptance. This one pair does not establish stable gains.
+Observed time -11.27%, cost -56.74%, total tokens -72.53%; uncached input +3.87%. The final test counts included permitted additions (67/71), not a reduction of frozen acceptance. Efficient's coordinator had 3 calls costing $0.1332712, plus two workers with 14 calls costing $0.1193842. Native's 21 parent and 11 child calls are included. This one pair does not establish stable or causal gains.
 
-The coordinator retained serial validators. A separate no-model native-fence check ran the same 42 JUnit IDs in 64.8545s serial and 17.2444s with four test processes; that local speed reduction did not establish automatic workflow adoption and must not be credited for the matched pair's timing.
+Source/configuration and log-continuity guards passed; root coordinator usage reconciled exactly to each CLI's reported input/cached/output totals. Prices use frozen standard short-context API weights read on 2026-10-22, not current billing or subscription charges. Efficient coordinator cached-input share was 64.59%; its 142.812s of observed upstream request spans are not pure reasoning time or an additive wall-time decomposition.
+
+The preceding pair observed 279.3s/$0.2746386 versus 357.1s/$0.5229860 (time -21.79%, cost -47.50%). Keep both samples; their variation is not an isolated effect of a particular patch.
+
+The preceding coordinator retained serial validators. A separate no-model native-fence check ran the same 42 JUnit IDs in 64.8545s serial and 17.2444s with four test processes; that local speed reduction did not establish automatic workflow adoption and must not be credited for the matched pair's timing.
 
 Negative control: three earlier Efficient-versus-native-Terra pairs averaged 323.6s/$0.374 versus 180.9s/$0.219. Efficient was 78.9% slower and 70.7% more expensive on those controls. Baseline model and workload shape matter.
 
