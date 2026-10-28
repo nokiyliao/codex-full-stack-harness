@@ -1,6 +1,6 @@
 # Codex-Compatible Local Switchboard Source
 
-Source snapshot: d53f7e475940b39ff4f664a70eb7c4e808a2b826. License: repository AGPL-3.0-or-later.
+Source snapshot: e5f757d8cdd810bbe625f9660129b6979d054ae2. License: repository AGPL-3.0-or-later.
 
 This component supplies workflow model projection, native tool transport, capability fallback, cache/replay handling and supervised hot deployment for the local Nokiy stack. Codex retains its native thread, Goal, permission and UI ownership.
 

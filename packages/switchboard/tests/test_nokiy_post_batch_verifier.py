@@ -125,6 +125,28 @@ class PostBatchVerifierTransportTests(fixtures.NativeReferenceTests):
         self.assertEqual(self.execv.call_args.args[1][1], 'run-batch')
         self.prepare_process.assert_not_called()
 
+    def test_large_compact_batch_keeps_per_member_identity_admission_and_recovery(self):
+        payload = self.compact(self.missing_batch_payload())
+        payload['shared']['draft']['prompt'] = 'shared context\n' * 2800
+        expanded = host.expand_batch_input(self.envelope(payload))
+        self.assertGreater(len(host.canonical(expanded['payload']).encode()), host.MAX_PAYLOAD_BYTES)
+        identity = {'thread': self.thread, 'max_parallel_workers': 3,
+                    'envelopes': [self.envelope({'operation': 'run', **m}) for m in expanded['payload']['members']]}
+        expected = 'native-batch-plan-' + hashlib.sha256(host.canonical(identity).encode()).hexdigest() + '.json'
+        original = copy.deepcopy(payload)
+        with self.caller_boundary():
+            reference = self.dispatch(payload)
+            self.assertEqual(Path(reference['plan_path']).name, expected)
+            self.assertEqual(self.prepare_process.call_count, 3)
+            for request, _ in self.preparations:
+                self.assertTrue(request['prompt'].startswith(payload['shared']['draft']['prompt']))
+                self.assertEqual((request['native_thread_id'], request['model'], request['reasoning_effort']),
+                                 (self.thread, self.worker, self.effort))
+            self.assertEqual(self.dispatch(payload), reference)
+            self.assertEqual(self.prepare_process.call_count, 3)
+            self.assertEqual(self.execv.call_args.args[1][1], 'read-batch')
+        self.assertEqual(payload, original)
+
     def test_one_dispatch_prepares_gate_and_members_with_host_identity(self):
         payload = self.missing_batch_payload()
         # The gate may use the same automatic artifact leaf creation as members.
