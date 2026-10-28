@@ -352,7 +352,7 @@ def _status(observation, request, contract, binding):
 
 
 def _verifier_outputs(binding):
-    """Regular top-level files in the verifier scratch root after a live return; pointers only."""
+    """Regular scratch-root files, with optional complete text from the hashing read."""
     command = binding.get("command") if isinstance(binding, dict) else None
     root = command.get("scratch_root") if isinstance(command, dict) else None
     if not isinstance(root, str):
@@ -374,6 +374,15 @@ def _verifier_outputs(binding):
         row = {"path": entry.path, "bytes": size}
         if len(data) <= LIMIT:
             row["sha256"] = hashlib.sha256(data).hexdigest()
+        if (len(data) == size and len(data) <= INLINE_EVIDENCE_BYTES
+                and Path(entry.name).suffix.lower() in {".log", ".txt"}):
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+            else:
+                if all(char.isprintable() or char in "\t\r\n" for char in text):
+                    row["text"] = text
         rows.append(row)
     return {"files": rows, "truncated": len(entries) > VERIFIER_OUTPUT_FILES}
 
@@ -405,6 +414,7 @@ def _attach(result, status, spec, *, raw=None, observation=None, binding=None, d
         if outputs is not None:
             gate.update(verifier_outputs=outputs,
                         verifier_outputs_authority="untrusted_verifier_written_files_not_parent_acceptance")
+        file_texts = batch._drop_optional_verifier_text(gate)
         preview = {key: observation[key] for key in ("stdout", "stderr")
                    if isinstance(observation.get(key), str)}
         candidate = {**gate, "output_preview": preview,
@@ -413,6 +423,14 @@ def _attach(result, status, spec, *, raw=None, observation=None, binding=None, d
             gate = candidate
         else:
             gate["output_preview_omission"] = "INLINE_EVIDENCE_BYTE_LIMIT"
+        visible_preview = gate.get("output_preview") or {}
+        for file, key, text in file_texts:
+            if not text or any(text in visible_preview.get(channel, "")
+                               for channel in ("stdout", "stderr")):
+                continue
+            file[key] = text
+            if len(caller._canonical_bytes(gate)) > INLINE_EVIDENCE_BYTES:
+                file.pop(key)
     result = {**result, "post_batch_verifier": gate}
     if status != "PASSED" and result["status"] == "RESULT_AVAILABLE":
         result.update(status="BLOCKED", first_typed_blocker="NOKIY_POST_BATCH_VERIFIER_" + status)

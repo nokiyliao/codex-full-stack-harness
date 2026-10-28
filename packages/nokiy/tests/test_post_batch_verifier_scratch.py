@@ -1,5 +1,6 @@
 """Postgate-only external scratch binding; ordinary worker authority is unchanged."""
 from copy import deepcopy
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -122,6 +123,95 @@ class SeparatePostgateScratchTests(unittest.TestCase):
         result = post.finish(gate, {"status": "RESULT_AVAILABLE"})
         self.assertEqual(result["post_batch_verifier"]["status"], "UNKNOWN")
         self.f.gate_call.assert_not_called()
+
+    def test_live_logs_use_hashing_read_and_keep_unsafe_files_metadata_only(self):
+        self.prepare()
+        contents = {"summary.log": "Checks complete: café 中\n".encode("utf-8"),
+                    "notes.txt": b"first\tsecond\r\n", "report.json": b'{"ok":true}\n',
+                    "invalid.log": b"invalid\xff", "binary.log": b"binary\x00data",
+                    "unsafe.txt": b"\x1b[31mterminal control\n",
+                    "large.log": b"x" * (post.INLINE_EVIDENCE_BYTES + 1)}
+        observe = self.f.observation
+        def produce(*args):
+            for name, data in contents.items():
+                (self.scratch / name).write_bytes(data)
+            outside = self.scratch.parent / "outside.log"
+            outside.write_text("outside scratch\n")
+            (self.scratch / "alias.log").symlink_to(outside)
+            (self.scratch / ".hidden.log").write_text("hidden\n")
+            (self.scratch / "nested").mkdir()
+            (self.scratch / "nested" / "nested.log").write_text("nested\n")
+            return observe(*args)
+        self.f.gate_call.side_effect = produce
+        with patch.object(post.os, "open", wraps=post.os.open) as opened:
+            result = batch.run_batch(self.f.plan, self.f.digest)
+        gate = result["post_batch_verifier"]
+        self.assertEqual((result["status"], gate["status"]), ("RESULT_AVAILABLE", "PASSED"))
+        expected = []
+        for name, data in sorted(contents.items()):
+            row = {"path": str(self.scratch / name), "bytes": len(data),
+                   "sha256": hashlib.sha256(data).hexdigest()}
+            if name in {"summary.log", "notes.txt"}:
+                row["text"] = data.decode("utf-8")
+            expected.append(row)
+            self.assertEqual(sum(call.args[0] == row["path"] for call in opened.call_args_list), 1)
+        self.assertFalse(any(call.args[0] == str(self.scratch / "alias.log")
+                             for call in opened.call_args_list))
+        self.assertEqual(gate["verifier_outputs"], {"files": expected, "truncated": False})
+        self.assertEqual(gate["verifier_outputs_authority"],
+                         "untrusted_verifier_written_files_not_parent_acceptance")
+        self.assertEqual(gate["output_preview"], {"stdout": "raw stdout\n", "stderr": "raw stderr\n"})
+        self.assertTrue(gate["parent_acceptance_required"])
+        self.assertFalse(gate["auto_retry_allowed"])
+        before = deepcopy(result)
+        self.assertEqual(batch.summarize(result)["post_batch_verifier"], gate)
+        self.assertEqual(result, before)
+        recovered = batch.read_batch(self.f.plan, self.f.digest)["post_batch_verifier"]
+        self.assertEqual(recovered["status"], "UNKNOWN")
+        self.assertNotIn("verifier_outputs", recovered)
+        self.f.gate_call.assert_called_once()
+
+    def test_log_text_yields_to_gate_stdout_stderr_and_evidence(self):
+        data = b"x" * (post.INLINE_EVIDENCE_BYTES // 2)
+        path = self.scratch / "summary.log"
+        path.write_bytes(data)
+        metadata = {"files": [{"path": str(path), "bytes": len(data),
+                                "sha256": hashlib.sha256(data).hexdigest()}], "truncated": False}
+        observation = {"stdout": "s" * (post.INLINE_EVIDENCE_BYTES // 2), "stderr": "details\n",
+                       "exit_code": 0, "outcome": "known", "process_reaped": True,
+                       "process_group_empty": True}
+        binding = {"command": self.command}
+        with patch.object(post, "_verifier_outputs", return_value=metadata):
+            expected = post._attach({"status": "RESULT_AVAILABLE"}, "PASSED", self.f.spec,
+                                    binding=binding, observation=observation)
+        actual = post._attach({"status": "RESULT_AVAILABLE"}, "PASSED", self.f.spec,
+                              binding=binding, observation=observation)
+        self.assertEqual(actual, expected)
+        gate = actual["post_batch_verifier"]
+        self.assertEqual(gate["output_preview"], {key: observation[key] for key in ("stdout", "stderr")})
+        self.assertEqual(gate["binding"], binding)
+        self.assertLessEqual(len(caller._canonical_bytes(gate)), post.INLINE_EVIDENCE_BYTES)
+
+    def test_log_text_is_not_duplicated_or_lost_with_visible_preview(self):
+        data = b"diagnostic detail\n"
+        path = self.scratch / "summary.log"
+        path.write_bytes(data)
+        for stdout in ("prefix\n" + data.decode() + "suffix\n",
+                       "s" * post.INLINE_EVIDENCE_BYTES):
+            with self.subTest(stdout_fits=len(stdout) < post.INLINE_EVIDENCE_BYTES):
+                observation = {"stdout": stdout, "stderr": "", "exit_code": 0,
+                               "outcome": "known", "process_reaped": True,
+                               "process_group_empty": True}
+                gate = post._attach({"status": "RESULT_AVAILABLE"}, "PASSED", self.f.spec,
+                                    binding={"command": self.command},
+                                    observation=observation)["post_batch_verifier"]
+                row = gate["verifier_outputs"]["files"][0]
+                self.assertEqual(row["sha256"], hashlib.sha256(data).hexdigest())
+                if "output_preview" in gate:
+                    self.assertEqual(gate["output_preview"]["stdout"], stdout)
+                    self.assertNotIn("text", row)
+                else:
+                    self.assertEqual(row["text"], data.decode())
 
     def test_postgate_cli_has_no_model_run_option(self):
         arguments = caller.build_parser().parse_args(["prepare-post-batch-verifier", "--request", "draft.json",

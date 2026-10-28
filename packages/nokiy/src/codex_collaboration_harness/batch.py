@@ -16,6 +16,7 @@ import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from contextvars import copy_context
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -952,6 +953,16 @@ def _deduplicate_diff_context(row: dict[str, Any]) -> None:
                 receipt["source_postimage_context"] = replacement
 
 
+def _drop_optional_verifier_text(gate: Any) -> list[tuple[dict, str, Any]]:
+    """Remove optional file text without changing its metadata or gate authority."""
+    outputs = gate.get("verifier_outputs") if isinstance(gate, dict) else None
+    files = outputs.get("files") if isinstance(outputs, dict) else None
+    if not isinstance(files, list):
+        return []
+    return [(file, "text", file.pop("text")) for file in files
+            if isinstance(file, dict) and "text" in file]
+
+
 def _drop_optional_handoff(rows: list[dict[str, Any]]) -> list[tuple[dict, str, dict]]:
     dropped = []
     for row in rows:
@@ -979,6 +990,8 @@ def _fit_summary(summary: dict[str, Any], *, max_bytes: int = 8000) -> dict[str,
         if compact_size < size:
             summary, size = compact, compact_size
             rows = summary["members"]
+    if size > max_bytes and _drop_optional_verifier_text(summary.get("post_batch_verifier")):
+        size = len(encoded(summary))
     if size > max_bytes and _drop_optional_handoff(rows):
         size = len(encoded(summary))
     if size > max_bytes and any("result_artifact_preview" in row for row in rows):
@@ -1284,12 +1297,16 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
                "members": rows, "continuation_owner": "codex",
                "mission_acceptance": "parent_owned"}
     if "post_batch_verifier" in result:
-        summary["post_batch_verifier"] = result["post_batch_verifier"]
+        summary["post_batch_verifier"] = deepcopy(result["post_batch_verifier"])
     if not any("changes" in row for row in rows):
         return _fit_summary(summary, max_bytes=MAX_PROJECTED_BYTES)
     # Mutation batches: deliver each member's exact diff so the parent reviews it
     # directly; the full diff and its record stay in the member artifact root.
     base = len(json.dumps(summary, ensure_ascii=True, sort_keys=True).encode("ascii"))
+    file_texts = (_drop_optional_verifier_text(summary.get("post_batch_verifier"))
+                  if base > MAX_BATCH_SUMMARY_BYTES - MAX_INLINE_DIFF_BYTES - 4096 else [])
+    if file_texts:
+        base = len(json.dumps(summary, ensure_ascii=True, sort_keys=True).encode("ascii"))
     handoffs = (_drop_optional_handoff(rows)
                 if base > MAX_BATCH_SUMMARY_BYTES - MAX_INLINE_DIFF_BYTES - 4096 else [])
     if handoffs:
@@ -1302,7 +1319,7 @@ def summarize(result: dict[str, Any]) -> dict[str, Any]:
     _inline_diffs(rows, min(MAX_INLINE_DIFF_BYTES, MAX_BATCH_SUMMARY_BYTES - base - 4096))
     # Reserve the original diff share first; optional handoffs use only actual spare space.
     # Receipts removed by the legacy fallback are no longer part of the summary.
-    for container, key, value in handoffs:
+    for container, key, value in handoffs + file_texts:
         container[key] = value
     fitted = _fit_summary(summary, max_bytes=MAX_BATCH_SUMMARY_BYTES)
     if fitted.get("status") == "COMPACT_METADATA_TOO_LARGE":

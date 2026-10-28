@@ -1,18 +1,22 @@
 # Source Provenance
 
-## Current V466 Caller / V464 Rust / 2026-10-29 Source Surface
+## Current V468 Caller / V464 Rust / 2026-10-29 Source Surface
 
 This is a source publication, not a redistribution of installed executables or machine configuration.
 
 | Component | Source commit | Correspondence |
 | --- | --- | --- |
-| Python caller | `188e80bb270650fd648284f69d3898b0eb5858e0` | Deployed caller-only V466; source package version 0.3.309.dev0, release wheel version 0.3.466.dev0 |
+| Python caller | `b336f5b82768a76844ecc0bacaa922021d54e622` | Deployed caller-only V468; source package version 0.3.309.dev0, release wheel version 0.3.468.dev0 |
 | Rust worker payload | `1304065c69b9c5c6a702a05754526395c9a41678` | All 602 recorded build-source inputs match; the existing V464 rebuild used cargo --locked, four binary identities match the installed V464 image; fail-fast retained, ready metrics reused, cancelled usage UNKNOWN |
 | Switchboard | `35e4fe45a0e6170e539bc567def3451e93c69ca3` | Verified hot deployment of native-catalog fallback repair; fresh complete catalogs recover exec-less chains; exact same-connection verified fallback survives omitted-tool deltas; prior continuation, observation and publisher-directory repairs retained |
 
 The current Switchboard source has 1,056 passing source tests and verified hot deployment (`hot_reload`), with no App restart or permission/model changes. Unsupported execution, synthetic stale catalogs and unknown unbound chains remain non-dispatching; full-request helper behavior is retained. Original affected target-task recovery remains unverified; no latency/cost percentage is assigned to this protocol repair. Rust remains V464, with no new rebuild; V465 and V466 change only the caller, not a universal runtime version. Permissions, model/effort configuration and trading behavior are unchanged; private diagnostics and compiled caches remain excluded.
 
-The current caller release is `nokiy-20261029-v466-provider-failure-diagnostic`; wheel SHA-256 is `d411e4af2bd6ca499191740e8b71c9c09f174bbf392eb939414bde32fc031180`. V466 carries the known provider failure and normalized transport labels through batch delivery rather than masking them with missing terminal evidence. The original request was read back without replay; it remains BLOCKED with incomplete evidence and UNKNOWN usage. Integrity/binding failures retain priority. Source/candidate/live stages each passed 175 focused tests, with matching staged evidence reused, not additional unique tests. This diagnostic correction does not establish the origin of the EOF or model acceleration.
+The current caller release is `nokiy-20261029-v468-verifier-log-dedup`; wheel SHA-256 is `af463a733415014f91219861f04704a77f1418a3a2df47b8f1b4931d1085154c`. V468 includes optional complete safe UTF-8 scratch logs from the same read used for hashing, without adding authority or readers. File text yields before existing stdout/stderr, proof, results and diff allocation; already-visible text is not duplicated. Source/candidate/live stages each passed 260 focused tests, with matching staged evidence reused rather than counted as another execution. The writing worker's existing signal-isolation test failed in its focused environment; the native parent completed the required tests without disabling that guard. No worker done or EVIDENCE_VERIFIED claim is made for that failed request.
+
+The original-output offline replay delivered a 1,041-byte log: encoded summary size was 43,210 to 44,279 bytes, with prior metadata, previews, diffs and authority unchanged. This intentionally adds useful context; it is not a token-saving or fresh execution proof. Subsequent V468 native regressions also preserve the only visible log when stdout/stderr cannot fit, and avoid duplicate visible content. Model-round, cost and time effects remain unmeasured at this source publication.
+
+V466's known provider failure and normalized transport-label correction is retained. Its original request was read back without replay and remains BLOCKED with incomplete evidence and UNKNOWN usage. Integrity/binding failures retain priority. That preceding source/candidate/live validation ran 175 focused tests per executed stage, not additive unique totals. The correction does not establish the origin of the EOF or model acceleration.
 
 The preceding V465 lossless batch diff context dedup preserves the complete diff and nontext proof, retains independent context for partial/mismatched/tiny cases, and adds no caps or truncation. A real-code-delta replay measured 58,078 to 44,285 encoded bytes (-23.75%), not historical exact-wire replay or measured provider token/cost/time savings. A post-cutover native tool read succeeded.
 
@@ -24,7 +28,7 @@ The complete concurrent frozen R19 pair used earlier Switchboard `372c9b26b65b3c
 
 The earlier 89c7889 R19 observation (253.9s/$0.2467354 versus 439.4s/$0.4943428) remains separate. The negative same-ID cost result (+15.66%, with end-of-run native-binary identity drift) and the Efficient-only acceptance observation-policy pair (-13.42% cost/-2.52% time) retain their existing measurement and control limits.
 
-These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in [releases/v466-caller-controls.json](releases/v466-caller-controls.json) identify the published contents. Publication-only documentation and preserved licenses are identified separately.
+These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in [releases/v468-caller-controls.json](releases/v468-caller-controls.json) identify the published contents. Publication-only documentation and preserved licenses are identified separately.
 
 The caller working tree contains pre-existing local-context test changes, and the runtime working tree contains pending-message deletions; neither was adopted. Source was exported from exact commits, not by copying dirty worktrees or installed environment directories.
 

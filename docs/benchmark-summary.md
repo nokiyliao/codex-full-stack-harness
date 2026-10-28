@@ -2,9 +2,33 @@
 
 These are descriptive engineering measurements, not universal speedups, subscription billing or isolated causal estimates. Complete reported coordinator, worker and native-child usage is included; unreported provider attempts are not asserted to be covered.
 
-## Current Caller-Only V466
+## Current V466 Frozen R19 Pair
 
-The current caller source is 188e80b, with unchanged V464 Rust and Switchboard35e4fe4. V466 preserves a known provider transport failure in batch output rather than masking it with missing terminal proof. Normalized phase/category/cause labels are diagnostic only: incomplete evidence, UNKNOWN usage, integrity rejection and parent acceptance remain unchanged. Source/candidate/live stages each passed 175 focused tests with matching staged evidence reused. A read-only recovery of the original failed request confirmed the deployed change without replay. No model speedup, root-cause fix for the unexpected EOF, or original live-target recovery is inferred.
+The measured composition was caller V466 source188e80b + unchanged V464 Rust1304065 + Switchboard35e4fe4, using native CLI0.165.0-alpha.1.2. Both coordinators used observed Sol6.1 with max on the request wire. Efficient selected two Terra6.1 workers (xhigh configured; internal provider effort unobserved); native used one Sol child, also counted. The task bytes, frozen validator and manifest were identical. Code/configuration controls matched before/after, and both root CLI token counters reconciled to retained provider totals.
+
+| Metric | Efficient | Native Sol | Difference |
+| --- | ---: | ---: | ---: |
+| CLI execution seconds | 278.8 | 397.3 | -29.83% |
+| Reported API-equivalent USD | 0.308291 | 0.6258504 | -50.74% |
+| Reported total tokens | 498402 | 1690990 | -70.53% |
+| Uncached input | 145581 | 122351 | +18.99% |
+| Coordinator calls | 5 | 21 | |
+| Worker calls | 10 | 0 | |
+| Native-child calls | 0 | 8 | |
+| Quality tests | 70 | 74 | |
+| Failures / errors / skips | 0 / 0 / 0 | 0 / 0 / 0 | |
+
+The fixed required quality gate passed on both arms; optional added tests explain different totals. Efficient cost includes coordinator $0.180634 plus workers $0.127657. Native includes coordinator $0.4249388 plus child $0.2009116. These are complete retained reported costs under frozen2026-10-22 API-equivalent weights, not invoices, subscription billing or proof covering every hidden provider attempt. The engineering parent is excluded by operator scope, not the measured coordinator.
+
+Per-arm timing covers native CLI execution including its internal delegation and checks. Setup and post-barrier independent quality audits are excluded, so full contiguous user-acceptance E2E is unmeasured. Source-publication checks ran during model waits without changing benchmark inputs or deployment. Cache warmth was not controlled. This one pair shows a qualified joint gain, not statistical stability or an isolated causal effect of V465 diff dedup or V466 diagnostics. The original live Ultra task recovery and unexpected-EOF origin remain unverified.
+
+## Current Caller-Only V468
+
+Current caller source b336f5b retains unchanged V464 Rust and Switchboard35e4fe4. Optional complete safe UTF-8 logs come from existing verifier scratch reads, within unchanged output budgets; duplicate visible stdout/stderr is not repeated. File text yields before original previews, proof, results and diffs, and remains untrusted context. Native source/candidate/live stages each passed 260 focused tests with equivalent staged evidence reused. The source-bound original-output replay added the previously separate 1,041-byte log, increasing encoded summary bytes43,210to44,279 while preserving old metadata/previews/diffs. It does not prove fewer model rounds or lower cost/time, and no such effect is claimed at publication. The existing worker-focused signal-isolation gap remains; native parent verification did not disable it.
+
+## Prior Caller-Only V466
+
+The V466 caller source was 188e80b, with unchanged V464 Rust and Switchboard35e4fe4. V466 preserves a known provider transport failure in batch output rather than masking it with missing terminal proof. Normalized phase/category/cause labels are diagnostic only: incomplete evidence, UNKNOWN usage, integrity rejection and parent acceptance remain unchanged. Source/candidate/live stages each passed 175 focused tests with matching staged evidence reused. A read-only recovery of the original failed request confirmed the deployed change without replay. No model speedup, root-cause fix for the unexpected EOF, or original live-target recovery is inferred.
 
 ## Caller-Only V465 Deployment
 
@@ -55,7 +79,7 @@ All totals include both coordinators, Efficient's two Workers and the correlated
 
 This one pair observed joint time/cost gains. It is not evidence that the later native-catalog repair caused the gain, and it does not establish stable same-ID long-workflow gains. The earlier negative same-ID cost result, observation-only policy comparison and incomplete cancelled usage remain below.
 
-Current Switchboard `35e4fe45a0e6170e539bc567def3451e93c69ca3` is a verified hot deployment (`hot_reload`) with 1,056 passing source tests, no App restart and no permission/model changes; Rust remains V464 and the current caller is V466. Original affected target-task recovery remains unverified, and no latency/cost percentage is assigned to this protocol repair.
+Current Switchboard `35e4fe45a0e6170e539bc567def3451e93c69ca3` is a verified hot deployment (`hot_reload`) with 1,056 passing source tests, no App restart and no permission/model changes; Rust remains V464 and the current caller is V468. Original affected target-task recovery remains unverified, and no latency/cost percentage is assigned to this protocol repair.
 
 Fixed-quality Efficient engineering pair, 2026-10-28, integration source d53f7e4:
 
@@ -198,4 +222,4 @@ On2026-10-29, one sequential fresh-CLI acceptance-only pair compared Efficient b
 
 Both root CLI usage totals reconciled exactly (REPORTED_TOTALS_MATCH). Controls were stable within each arm; the only cross-arm changes were coordinator observation-guidance source and admission release metadata. Totals include measured coordinator/correlated usage; engineering-chat usage is excluded by operator scope. Removing cached input reduces tokens with a lower API cost weight, so token savings need not equal cost savings.
 
-This one pair does not establish full repair-workflow or same-ID/multiturn stability. The small 2.52% wall-time difference is insufficient for a stable speedup claim. Costs use frozen2026-10-22 standard API-equivalent rates, not subscription consumption or invoices. Current Switchboard source is 35e4fe4 with caller-only V466 and unchanged V464 Rust. The complete R19 pair above was measured at 372c9b2 before the native-catalog repair; no model measurement here proves that repair caused a gain.
+This one pair does not establish full repair-workflow or same-ID/multiturn stability. The small 2.52% wall-time difference is insufficient for a stable speedup claim. Costs use frozen2026-10-22 standard API-equivalent rates, not subscription consumption or invoices. Current Switchboard source is 35e4fe4 with caller-only V468 and unchanged V464 Rust. The complete R19 pair above was measured at 372c9b2 before the native-catalog repair; no model measurement here proves that repair caused a gain.

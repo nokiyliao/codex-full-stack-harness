@@ -1,12 +1,16 @@
 # Nokiy Full-Stack Harness
 
-Current source surface: **caller-only V466 + unchanged V464 Rust + Switchboard native-catalog/continuation/observation repairs: caller 188e80b + Rust 1304065 + switchboard 35e4fe4**, synchronized on 2026-10-29.
+Current source surface: **caller-only V468 + unchanged V464 Rust + Switchboard native-catalog/continuation/observation repairs: caller b336f5b + Rust 1304065 + switchboard 35e4fe4**, synchronized on 2026-10-29.
 
 This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V464 keeps failed-patch feedback fast: an already-finished provider uses its normal metrics path, while a still-running provider is cancelled without waiting just for accounting. Cancelled usage remains UNKNOWN, never zero. The intermediate V463 forced-drain approach was rejected for delaying repair. V462 optional worker notes and single-branch-only Efficient native implementation remain. These changes do not expand permissions or change models.
 
 V465 losslessly removes duplicate batch diff context while preserving the complete diff and nontext proof, with no new caps or truncation. A real-code-delta replay reduced encoded bytes from 58,078 to 44,285 (-23.75%); it was not a historical exact-wire replay, and provider token, cost and time savings remain UNMEASURED. Partial, mismatched or tiny cases retain independent context.
 
 V466 preserves a known provider transport failure instead of hiding it behind missing runtime-terminal evidence. Batch delivery includes only normalized phase/category/cause labels; incomplete evidence, UNKNOWN usage, integrity rejection and parent acceptance remain unchanged. The original failed request was read back without replay. This fixes diagnostic propagation, not the underlying unexpected EOF or a measured performance bottleneck; 175 focused tests passed at each executed source/candidate/live stage, with equivalent staged evidence reused.
+
+V468 includes complete safe UTF-8 verifier logs as optional untrusted context from the existing scratch-file hashing read. Text already visible in stdout/stderr is not repeated, and optional file text yields before existing previews, proof, results and diffs within unchanged budgets. Native source/candidate/live stages each passed 260 focused tests. A source-bound original-output replay delivered the previously separate 1,041-byte log without changing metadata, stdout/stderr or diffs; reducing later model rounds remains unmeasured at publication.
+
+A fresh V466 frozen R19 pair observed Efficient 278.8s/$0.308291 versus native Sol 397.3s/$0.6258504: execution time -29.83% and historical API-equivalent cost -50.74%. Totals include both coordinators, two Efficient Terra workers and the native Sol child; both fixed quality gates passed, root CLI counters reconciled and configuration controls matched. Efficient uncached input was 18.99% higher. This is one descriptive pair, not stable or isolated V465/V466 causal gain; setup and post-barrier independent audits are outside the per-arm timing. [Benchmark observations](docs/benchmark-summary.md) retain the full boundary and earlier negative results.
 
 Current Switchboard native-catalog fallback repair is a verified hot deployment (`hot_reload`), backed by 1,056 passing source tests. Fresh complete native catalogs can recover an exec-less chain; the exact same-connection verified fallback remains usable when tool deltas omit tools. Unsupported execution, synthetic stale catalogs and unknown unbound chains remain non-dispatching; full-request helper behavior is retained. No App restart, permission or model changes were made. Recovery of the original affected target task remains unverified, and no latency/cost percentage is assigned to this repair.
 
@@ -22,11 +26,11 @@ Native Codex thread / Goal / UI
 
 | Component | Published directory | Source identity | License |
 | --- | --- | --- | --- |
-| Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `188e80bb270650fd648284f69d3898b0eb5858e0` | MIT |
+| Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `b336f5b82768a76844ecc0bacaa922021d54e622` | MIT |
 | Modified Tura-derived execution engine | [runtime](runtime) | `1304065c69b9c5c6a702a05754526395c9a41678` | AGPL-3.0-or-later |
 | Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `35e4fe45a0e6170e539bc567def3451e93c69ca3` | Repository AGPL-3.0-or-later |
 
-[Current source manifest](releases/v466-caller-controls.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
+[Current source manifest](releases/v468-caller-controls.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
 
 ## What Is Included
 
@@ -63,7 +67,7 @@ cd runtime
 cargo build --locked --release --bin tura_router --bin tura_runtime --bin tura_session_db --bin tura_exec
 ```
 
-The Rust names preserve their actual source lineage. The caller source package version is `0.3.309.dev0`; the deployed release wheel is `0.3.466.dev0`. The existing V464 release rebuilt the actual four-binary payload with cargo --locked. V465 and V466 change only the caller: there is no Rust rebuild or new universal runtime version.
+The Rust names preserve their actual source lineage. The caller source package version is `0.3.309.dev0`; the deployed release wheel is `0.3.468.dev0`. The existing V464 release rebuilt the actual four-binary payload with cargo --locked. V465 through V468 change only the caller: there is no Rust rebuild or new universal runtime version.
 
 Switchboard source requires Node.js 22.15+ and Python 3.11+ for its host/tests:
 

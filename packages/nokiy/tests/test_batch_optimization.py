@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Deterministic concurrent preflight and byte-identical bounded summaries."""
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import random
@@ -9,7 +10,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from codex_collaboration_harness import batch
+from codex_collaboration_harness import batch, post_batch_verifier as post
 from codex_collaboration_harness.embedded_nokiy import EmbeddedNokiyError
 import test_nokiy_batch as fixtures
 from test_batch_verifier_delivery import diff_context_fixture, public_note, verified_evidence
@@ -51,6 +52,19 @@ def summary_fixture(texts, *, metadata_size=0):
     return {'schema_version': 'nokiy_direct_batch_summary_v1', 'status': 'RESULT_AVAILABLE',
             'first_typed_blocker': None, 'members': rows, 'continuation_owner': 'codex',
             'mission_acceptance': 'parent_owned'}
+
+
+def verifier_gate_fixture(text):
+    data = text.encode('utf-8')
+    return {'status': 'PASSED', 'receipt_path': '/fixture/receipt.json',
+            'receipt_sha256': 'a' * 64, 'evidence_authority': 'live_return',
+            'parent_acceptance_required': True, 'auto_retry_allowed': False,
+            'output_preview': {'stdout': 'complete stdout\n', 'stderr': 'complete stderr\n'},
+            'output_preview_authority': 'untrusted_verifier_output_not_parent_acceptance',
+            'verifier_outputs_authority': 'untrusted_verifier_written_files_not_parent_acceptance',
+            'verifier_outputs': {'files': [{'path': '/fixture/summary.log', 'bytes': len(data),
+                                           'sha256': hashlib.sha256(data).hexdigest(), 'text': text}],
+                                 'truncated': False}}
 
 
 class SummaryDifferentialTests(unittest.TestCase):
@@ -217,6 +231,48 @@ class ProviderFailureSummaryTests(unittest.TestCase):
 
 
 class OptionalVerifierContextBudgetTests(unittest.TestCase):
+    def test_file_text_yields_before_existing_context_receipts_results_and_previews(self):
+        source = summary_fixture(['unique result'])
+        row = source['members'][0]
+        row.update(task_status_final_reply=public_note(), result_artifact_preview={'text': 'preview'},
+                   verifier_delivery={'receipts': [{'receipt_sha256': 'b' * 64,
+                       'source_postimage_context': {'text': 'required source context'}}]},
+                   changes={'diff': 'complete diff', 'diff_inline_truncated': False})
+        source['post_batch_verifier'] = verifier_gate_fixture('log' * (post.INLINE_EVIDENCE_BYTES // 4))
+        expected = deepcopy(source)
+        expected['post_batch_verifier']['verifier_outputs']['files'][0].pop('text')
+        budget = len(json.dumps(expected, ensure_ascii=True, sort_keys=True).encode('ascii'))
+        actual = batch.expand_summary(batch._fit_summary(deepcopy(source), max_bytes=budget))
+        self.assertEqual(actual, batch.expand_summary(batch._fit_summary(expected, max_bytes=budget)))
+        self.assertFalse(actual['members'][0]['result_truncated'])
+        self.assertLessEqual(len(json.dumps(actual, ensure_ascii=True, sort_keys=True).encode('ascii')), budget)
+
+    def test_file_text_preserves_original_diff_allocation_and_input_gate(self):
+        source, text, _ = diff_context_fixture()
+        source['post_batch_verifier'] = verifier_gate_fixture(
+            'file output\n' * (post.INLINE_EVIDENCE_BYTES // 16))
+        before = deepcopy(source)
+        baseline = deepcopy(source)
+        baseline['post_batch_verifier']['verifier_outputs']['files'][0].pop('text')
+        budgets = []
+        inline = batch._inline_diffs
+        def record_inline(rows, budget):
+            budgets.append(budget)
+            inline(rows, budget)
+        with patch.object(batch, '_diff_text', return_value=text), \
+                patch.object(batch, '_inline_diffs', side_effect=record_inline), \
+                patch.object(Path, 'open', side_effect=AssertionError('new I/O')):
+            expected = batch.expand_summary(batch.summarize(baseline))
+            actual = batch.expand_summary(batch.summarize(source))
+        self.assertEqual(budgets[0], budgets[1])
+        self.assertEqual(source, before)
+        self.assertEqual(actual['members'][0]['changes']['diff'], text)
+        self.assertFalse(actual['members'][0]['changes']['diff_inline_truncated'])
+        self.assertEqual(actual['members'][0]['verifier_delivery'], expected['members'][0]['verifier_delivery'])
+        self.assertEqual(actual['post_batch_verifier']['verifier_outputs']['files'][0].pop('text'),
+                         source['post_batch_verifier']['verifier_outputs']['files'][0]['text'])
+        self.assertEqual(actual, expected)
+
     def test_diff_context_reference_survives_only_with_complete_inline_diff(self):
         source, text, context = diff_context_fixture()
         encoded = lambda value: json.dumps(value, ensure_ascii=True, sort_keys=True).encode('ascii')
