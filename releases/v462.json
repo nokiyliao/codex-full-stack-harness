@@ -2696,13 +2696,13 @@
     }
   },
   "publication_files": {
-    "README.md": "e61d06b2400e936864dfcb52911c20547d5e03929aa1e29660a20f421f200b8e",
+    "README.md": "3f35db09a456754ba6a2f0e11ff9863770c528c4ff365cce358365e3117290f9",
     "PROVENANCE.md": "c74757ffcd8e463b916baa54ae76f6552cffb54e08574947f190ff52588bf9bc",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "5c95317036cf08f900b1a5fd0160e99ec91a14b986616cbce5f08772a68b6269",
-    "docs/current-surface.md": "dd42c0e63a9f398c5c0d0c0e7191fbff6e49317b612caeaceb0b7a45c1939687",
-    "docs/benchmark-summary.md": "eaf03c8024b127b2f1fd95517f5c773c375947afc4a4db6c4a84a6825e1a16b4"
+    "docs/current-surface.md": "71149c0a8e15f012070eaabc1b9881a9be281f8d6838de3fd2411b36976dd1d0",
+    "docs/benchmark-summary.md": "2122a06e5259148d3f52a6c0a2d7686587e019cc92f7085a80fac2ac499e2e02"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261028-v462-worker-semantic-handoff",
