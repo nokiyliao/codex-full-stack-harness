@@ -1,8 +1,14 @@
 # Current Source Surface
 
-## Accepted V2 Continuation Observation
+## Current Qualification
 
-The unchanged deployed caller V471/Switchboard `914f345`/Rust V464 composition now has one accepted three-turn observation on the strengthened DCF2-v2 task. Both arms retained their own exact native ID for planning, implementation and acceptance, with matched controls and no cross-arm phase/quality barrier. The stricter oracle retained all prior checks/exclusions, added four declared cases, passed its positive reference, and rejected both retained v1 counterexamples. It also preserved independently verifiable product branches.
+Current published source is caller V471, Switchboard `5b16a5b` and Rust V464. The plan-only policy update passed 1,075 source tests and guarded hot deployment; this remains source/deployment evidence, not a performance pass. Its follow-up kept six planning calls and did not demonstrate the intended round reduction.
+
+Both latest v2 timing/cost observations are held for equal-quality gain claims after focused v3 regression tests exposed missing owner override-pool retention; the newer Efficient product also fails full-FQN collision isolation. The private v3 positive reference passes 690 recorded cases including ten skips, with original exclusions unchanged. Old source/measurement receipts are preserved. Detailed arithmetic and limitations are in the [benchmark summary](benchmark-summary.md).
+
+## Historical V2 Continuation Observation
+
+The caller V471/Switchboard `914f345`/Rust V464 composition originally received one accepted three-turn observation on DCF2-v2; that equal-quality interpretation is now superseded by the qualification above. Both arms retained their own exact native ID for planning, implementation and acceptance, with matched controls and no cross-arm phase/quality barrier. That oracle retained all prior checks/exclusions, added four declared cases, passed its positive reference, and rejected both retained v1 counterexamples. It also preserved independently verifiable product branches.
 
 Efficient passed 696 total cases and native 713, each with ten skips and zero failures/errors/integrity failures; 688 cases are the shared immutable minimum. Counts are not a quality ranking. Parent source review and three current-to-recorded Efficient postimage checks found no remaining failure for this declared task. The observed apply phase contains one Nokiy batch/two root calls, delivering runtime, CLI and projection changes plus focused tests from the workers. It no longer shows the v1 native-products-then-test-workers pattern.
 

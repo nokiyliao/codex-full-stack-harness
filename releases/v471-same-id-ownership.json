@@ -2706,13 +2706,13 @@
     }
   },
   "publication_files": {
-    "README.md": "4e2b438763639c0a57af0ea39d225fc497d56ee435a6cf73e35a00a9641cf772",
-    "PROVENANCE.md": "2b0df16d4bfa53c5d2e1af23a7f0dc53f39d49b23e21ca43317f90c9df8974f7",
+    "README.md": "70c84ccadf10825c0000f67249afa963989846554986eed81a9d4fa85a01fc93",
+    "PROVENANCE.md": "51f495f6d9e7948a460d8449b9e21e805b93f1c4b13a7e33ee571ef685b99b63",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "743b19fe21417f5cf804d7d1f077178b456f7fa7e2b48f5ba9e60f5c1a82406a",
-    "docs/current-surface.md": "a107023daa97bfa21bc6cf004a42b641cc1bfb0fae7a54adf9d5e413bf70e3f8",
-    "docs/benchmark-summary.md": "999bc2f21041e0c39b1bfa90d089eb871bafc593b868fdc5e46a216d20a0ea62"
+    "docs/current-surface.md": "0b1c00940db94e6ca0f75abd814a659232f5041e111e767e159a10a64ad587b5",
+    "docs/benchmark-summary.md": "b5233b4a7f1edf6286eec427510799ed20232187d546cd30d026e44f16548155"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v471-context-file-count-diagnostics",
@@ -4841,7 +4841,17 @@
         "fraction_of_efficient_cost": 0.44998432875600824,
         "plan_seconds": 271.6195282919798,
         "claim": "Measured component, not proof every read is unnecessary or a saving forecast"
-      }
+      },
+      "later_semantic_qualification": {
+        "status": "EQUAL_QUALITY_GAIN_HELD",
+        "later_oracle": "dcf2-v3",
+        "confirmed_failure": "owner-selected override pool retention",
+        "earlier_recorded_metrics_and_original_receipts_preserved": true,
+        "new_locations_branch": "PASS",
+        "new_cache_branch": "FAIL",
+        "scope": "Only the earlier corrected DCF2-v2 observation; not a blanket invalidation of other historical workloads"
+      },
+      "equal_quality_gain_accepted": false
     },
     "latest_plan_only_guidance": {
       "status": "GUARDED_WORKFLOW_UPDATE_VERIFIED",
@@ -4857,7 +4867,44 @@
       "app_restart_performed": false,
       "prior_measurement_unchanged": true,
       "additional_time_or_cost_gain_measured": false,
-      "scope": "Ultra/Efficient planning reuses supplied targets/interfaces/checks and stops at established facts. Needed dependency/unclear-contract reads and authority remain; serial behavior unchanged."
+      "scope": "Ultra/Efficient planning reuses supplied targets/interfaces/checks and stops at established facts. Needed dependency/unclear-contract reads and authority remain; serial behavior unchanged.",
+      "performance_followup": {
+        "planning_calls_before": 6,
+        "planning_calls_after": 6,
+        "round_reduction_demonstrated": false,
+        "equal_quality_gain_accepted": false,
+        "quality_hold_reasons": [
+          "full target FQN incorrectly matches unrelated same-leaf transitive symbol",
+          "owner-selected shared override pool does not prune unreachable entries"
+        ]
+      }
+    },
+    "plan_only_followup_observation": {
+      "status": "HELD_SEMANTIC_REGRESSIONS",
+      "requested_profile": "Efficient/medium Sol6.1max + Terra6.1xhigh vs nativeSol6.1max",
+      "efficient_seconds_reported": 701.121,
+      "native_seconds_reported": 1014.218,
+      "efficient_cost_estimate": 0.5897856,
+      "native_cost_estimate": 1.5106064,
+      "efficient_calls": {
+        "coordinator": 14,
+        "workers": 12
+      },
+      "native_calls": {
+        "coordinator": 41,
+        "children": 42
+      },
+      "all_recorded_participants_counted_once": true,
+      "current_v2_gate_counts_including_skips": {
+        "efficient": 691,
+        "native": 708
+      },
+      "v3_positive_cases_including_ten_skips": 690,
+      "v3_current_efficient_confirmed_failures": 2,
+      "v3_previous_efficient_confirmed_failures": 1,
+      "original_subjects_unchanged": true,
+      "pricing": "Source-pinned model weights, not invoices or verified dated/current prices; provider-observed Terra identity/effort unavailable",
+      "v3_paid_pair_run": false
     }
   },
   "exclusions": [
@@ -4872,6 +4919,7 @@
     "runtime/LICENSE retained from the existing public publication",
     "component README files describe publication boundaries; they are not claims of source-to-binary reproducibility",
     "companion repositories and private managed-workspace DCF contracts remain external",
-    "The latest plan-only guidance update passed 1,075 existing/new tests and guarded hot deployment. Its additional latency/cost effect is not yet measured. The accepted three-turn v2 observation remains bound to the preceding switchboard commit; do not attribute that historical 44.02% time / 64.66% cost observation to this later update."
+    "The latest plan-only guidance update passed 1,075 existing/new tests and guarded hot deployment. Its additional latency/cost effect is not yet measured. The accepted three-turn v2 observation remains bound to the preceding switchboard commit; do not attribute that historical 44.02% time / 64.66% cost observation to this later update.",
+    "Later v3 regressions hold both corrected DCF2-v2 same-ID pairs for equal-quality gain claims. Raw time/cost/frozen-PASS records are retained; current Efficient fails full-FQN collision isolation and owner override retention, earlier Efficient fails retention. The existing runner now admits an explicit hash-pinned v3 oracle, but no paid pair has used it."
   ]
 }

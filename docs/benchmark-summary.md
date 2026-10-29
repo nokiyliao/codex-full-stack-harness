@@ -1,6 +1,28 @@
 # Benchmark Observations
 
-## Accepted Corrected Three-Turn V2 Pair
+## Plan-Only Follow-up: Quality Held
+
+The deployed source is caller V471 / Switchboard `5b16a5b` / Rust V464. No task, native binary or requested profile was changed for the concurrent v2 follow-up; before/after controls match within the pair. Native Sol 6.1/max again chose two children freely.
+
+| Metric | Efficient | Concurrent Native |
+| --- | ---: | ---: |
+| Machine-acceptance wall time | 701.121 s | 1,014.218 s |
+| Complete recorded API-equivalent cost | $0.5897856 | $1.5106064 |
+| Coordinator calls | 14 | 41 |
+| Worker/native-child calls | 12 | 42 |
+| Original v2 gate cases, including ten skips | 691 | 708 |
+
+Arithmetic is 30.87% less time and 60.96% lower estimated cost, **not an accepted equal-quality gain**. All recorded participants are counted once; cumulative three-turn totals are reconciled as deltas and overlapping worker durations are not summed into wall time. Native-child usage is complete for the whole run, but its exact apply/accept allocation is unavailable.
+
+Planning did not meet the intended round-reduction hypothesis: Efficient stayed at six model calls, commands increased 10 to 12, and completed root-command output fell from 131,413 to 115,608 bytes. Planning cost/time changed from $0.2360292 / 271.620 s to $0.2227592 / 182.306 s, while complete Efficient cost rose 12.44% and time rose 0.30%. These cross-run changes do not isolate policy effects from model/cache variance; no stable benefit is claimed for the new guidance.
+
+Semantic review and offline v3 regressions found two missing requirements in current Efficient: a different fully qualified symbol sharing the final name is incorrectly classified as the target, and a valid owner does not prune its selected override pool. The earlier Efficient product fails the second case, so its formerly accepted 44.02% time / 64.66% cost observation is also held for equal-quality claims. A staged reviewed Native reference passes all 690 v3 cases including ten skips; product-only counterexample clones fail the exact new assertions without integrity errors. Original v2 subjects and receipts remain unchanged. CLI/test changes after the follow-up's worker batch mean final artifacts do not all match its post-batch postimages; the inspected receipts do not identify the later editor. The later independent gate, not the earlier batch gate, covers the final v2 bytes.
+
+Cost arithmetic matches source-pinned weights per million uncached/cached/output tokens: Sol $2/$0.10/$10 and requested Terra $1/$0.05/$5. A separately retained dated price table is unavailable, and worker exports do not establish provider-observed Terra identity or effort. These are reproducible estimates under those weights, not current-price, billing, hidden-attempt or subscription-use claims. Reasoning is included in output rather than billed twice.
+
+The v3 fixture is private engineering evidence, not a portable public benchmark distribution. The existing paired runner now accepts its explicit, hash-pinned `dcf2-v3` selector; prior modes and executor semantics are retained and the offline unit module passed. No additional paid pair has yet used it. No measured code was repaired to manufacture a pass; the ambiguous outside-Git override concern is explicitly deferred.
+
+## Recorded Corrected V2 Pair (Later Held)
 
 Composition: caller V471, Switchboard `914f345`, Rust V464. The separately versioned DCF2-v2 task clarifies already intended resolved-edge targets and CLI cache reporting, with four frozen regression cases. The staged reference passes 688 tests/ten skips; both retained v1 product candidates fail exactly two cases, without source-integrity failure. Branch closure passes independently with only owned product changes: locations 90 cases/one skip, cache 141/zero skips. Original exclusions are unchanged. CLI reporting is checked by the CLI-owned locations branch, not made a dependency of runtime-only cache verification.
 

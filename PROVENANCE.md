@@ -1,8 +1,14 @@
 # Source Provenance
 
-## Latest Measurement and Oracle Revision
+## Later Semantic Qualification
 
-The new observation changes no published runtime source: caller V471, Switchboard `914f345` and Rust V464 remain current. A separately versioned private DCF2-v2 fixture adds four focused cases for resolution-edge targets and current-only CLI cache reporting. Its staged positive reference passed 688 tests with ten skips. Two candidates containing the original recorded v1 product bytes each failed exactly two cases with no integrity failure. V1 fixtures, outputs and reports were not overwritten. Positive reference code is test data, not production adoption; private contracts/raw logs are not published.
+The earlier accepted DCF2-v2 pair and its plan-only follow-up are now held for equal-quality gain claims. A new v3 oracle adds only full-FQN collision isolation and owner override-pool reachability retention, preserving prior checks, exclusions and skip caps. Its reference records 690 cases/ten skips with zero failures or integrity errors. Product-only clones reject the current Efficient implementation on both new cases; the earlier Efficient passes the new locations branch but fails override retention. Original fixtures, measured subjects and receipts are retained, not retroactively edited.
+
+The staged v3 reference uses the reviewed follow-up Native product bytes as offline test data, not production adoption. No new model run is claimed for those offline oracle checks. The outside-Git override-eligibility concern remains specification-ambiguous and is not a third mandatory test. Recorded cost arithmetic uses source-pinned model weights, not invoices; an independently retained dated price-table artifact and provider-observed Terra identity/effort are unavailable.
+
+## Historical V2 Measurement and Oracle
+
+That observation changed no published runtime source: caller V471, Switchboard `914f345` and Rust V464 were pinned for it. A separately versioned private DCF2-v2 fixture adds four focused cases for resolution-edge targets and current-only CLI cache reporting. Its staged positive reference recorded 688 cases including ten skips. Two candidates containing the original recorded v1 product bytes each failed exactly two cases with no integrity failure. V1 fixtures, outputs and reports were not overwritten. Positive reference code is test data, not production adoption; private contracts/raw logs are not published.
 
 The CLI oracle was integrated into the CLI/locations test file rather than the runtime-only cache file. Branch closure passed with only each branch's own products: locations 90 cases/one skip and cache 141/zero skips. No new deselection or relaxed skip cap was introduced. The existing recipe gained an explicit approved `dcf2-v2` selector; old modes and the same native executor remain. Both arms received identical neutral phase instructions and the same clarified v2 task, so no isolated causal comparison with v1 is claimed.
 
