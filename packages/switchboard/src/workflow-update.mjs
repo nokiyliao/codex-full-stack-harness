@@ -236,6 +236,7 @@ function exactSourceFiles(files) {
 }
 const expectedServer = m => m.files.find(f => f.target === "src/server.mjs")?.sha256
   ?? m.invariants?.[`${TARGET}/src/server.mjs`];
+const requestedHost = m => sourceOnly(m) ? m.files.find(f => f.target === "src/nokiy-native-host.py") : undefined;
 async function checkInvariants(m) {
   for (const [file, hash] of Object.entries(m.invariants)) {
     assert.match(hash, SHA256);
@@ -563,6 +564,14 @@ async function preflight(m) {
     assert.equal(local?.admitted, true, "Existing Nokiy workflow admission required");
     assert.deepEqual(await read(WORKFLOW_PATH), local.profiles, "Installed workflow profiles drifted");
     assert.equal(current.admission.catalog_sha256, m.catalog_preimage);
+    const host = requestedHost(m);
+    if (host) {
+      assert.equal(local.host?.script, path.join(TARGET, host.target), "Existing exact native host binding required");
+      assert.match(local.host.sha256 || "", SHA256, "Valid existing native host digest required");
+      // Admission and source preimages are independent: a prior source-only
+      // publication may have installed these bytes without refreshing admission.
+      assert.notEqual(host.preimage, null, "Existing native host source required");
+    }
     verifyNativeInterpreter(local.host);
     const { stdout } = await run(m.native, ["debug", "models"], { timeout: 30000, maxBuffer: 8 * 1024 * 1024 });
     const loaded = JSON.parse(stdout);
@@ -634,9 +643,12 @@ async function apply(m) {
   const admission = before.current.admission;
   if (sourceOnly(m)) {
     await checkInvariants(m);
-    // Keep profiles, host binding, catalog and all other admission fields.
-    // /ready reports this release; only source identity bookkeeping changes.
+    const host = requestedHost(m);
+    if (host) assert.equal(await identity(path.join(TARGET, host.target)), host.sha256, "Installed native host postimage drifted");
+    // Only an explicit host source entry refreshes its admitted digest. Keep
+    // its script, interpreter, contract and controls, and all other admission fields.
     admission.local_nokiy_direct = { ...admission.local_nokiy_direct, release: m.release,
+      ...(host ? { host: { ...admission.local_nokiy_direct.host, sha256: host.sha256 } } : {}),
       source_manifest_sha256: digest(Buffer.from(canonical(m.files))) };
     const bytes = Buffer.from(JSON.stringify(admission, null, 2) + "\n");
     state.admission_sha256 = digest(bytes);
@@ -699,6 +711,11 @@ async function verify(m) {
   }
   for (const f of m.files) assert.equal(await identity(path.join(TARGET, f.target)), f.sha256);
   const admission = await read(ADMISSION_PATH);
+  const host = requestedHost(m);
+  if (host) {
+    assert.equal(admission.local_nokiy_direct?.host?.script, path.join(TARGET, host.target), "Requested native host component identity changed");
+    assert.equal(admission.local_nokiy_direct.host.sha256, host.sha256, "Requested native host source postimage differs from admission");
+  }
   const runtime = await read(RUNTIME_PATH);
   const base = `http://127.0.0.1:${runtime.port}/${runtime.installation_capability}`;
   const hot = state.restart_window?.mode === "hot_reload" ? state.restart_window : null;

@@ -1,6 +1,12 @@
 # Nokiy Full-Stack Harness
 
-## Current Native-Host Correctness Follow-Up
+## Current Admitted Host Binding
+
+Switchboard `bd9ade07e95fe5abdcad28a2760a02c23f5667e9` fixes source-only publication retaining the predecessor host digest. Exact native-host updates now refresh and verify that admitted identity; ordinary module updates preserve the host binding. Independent admission/source preimages also permit recovery when source bytes were already installed. The combined canonical candidate suite passed 1,073 tests with no failures or skips.
+
+Both guarded hot deployments passed. Native App execution metadata now identifies the corrected snapshot, and the original read-only advertised-tool route returns its indexed budget refusal before provider execution instead of starting an inspection worker. Existing immutable snapshots and requests are not rewritten. See [current surface](docs/current-surface.md); the earlier negative observation below is retained, not relabeled. No new model performance pair or universal session-recovery claim is made.
+
+## Earlier Native-Host Correctness Follow-Up
 
 Switchboard `b856bc102833bae2b348b13be6842a5f4a4c47b7` includes the native-host diagnostic fix from `5ab348c8451e15868298c6d45ee8397e20e9f4e7` and the publisher succession correction. The parent exported five exact committed source/test files. Caller V470 and Rust V464 retain their existing identities; this publication creates no new caller/Rust version or rebuild.
 
@@ -20,7 +26,7 @@ The accepted V470 workflow measured Efficient477.2s/$0.36723 versus native Sol55
 
 V469 adds field-specific deployment/closeout path diagnostics without changing admission or execution rights. The installed native interface now identifies an invalid `artifact_root` instead of hiding it behind a generic input error; the negative canary remained pre-execution with zero control-plane mutations. Source, candidate and live focused suites each passed 108 tests (overlapping counts). A subsequent frozen DCF2 pair observed256.2s/$0.409027 versus native Sol433.5s/$0.7551816, with passing functional acceptance but an unresolved branch-verifier warning. This is CLI execution, not full acceptance E2E or causal/stable gain proof. See the benchmark summary; earlier V468 measurements retain their original composition.
 
-Current source surface: **caller-only V470 `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` + unchanged V464 Rust `1304065c69b9c5c6a702a05754526395c9a41678` + Switchboard `b856bc102833bae2b348b13be6842a5f4a4c47b7`**, synchronized on 2026-10-29. The accepted V470 pair above used earlier Switchboard `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`.
+Current source surface: **caller-only V470 `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` + unchanged V464 Rust `1304065c69b9c5c6a702a05754526395c9a41678` + Switchboard `bd9ade07e95fe5abdcad28a2760a02c23f5667e9`**, synchronized on 2026-10-29. The accepted V470 pair above used earlier Switchboard `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`.
 
 This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V464 keeps failed-patch feedback fast: an already-finished provider uses its normal metrics path, while a still-running provider is cancelled without waiting just for accounting. Cancelled usage remains UNKNOWN, never zero. The intermediate V463 forced-drain approach was rejected for delaying repair. V462 optional worker notes and single-branch-only Efficient native implementation remain. These changes do not expand permissions or change models.
 
@@ -48,7 +54,7 @@ Native Codex thread / Goal / UI
 | --- | --- | --- | --- |
 | Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` | MIT |
 | Modified Tura-derived execution engine | [runtime](runtime) | `1304065c69b9c5c6a702a05754526395c9a41678` | AGPL-3.0-or-later |
-| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `b856bc102833bae2b348b13be6842a5f4a4c47b7` | Repository AGPL-3.0-or-later |
+| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `bd9ade07e95fe5abdcad28a2760a02c23f5667e9` | Repository AGPL-3.0-or-later |
 
 [Current source manifest](releases/v470-caller-controls.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
 

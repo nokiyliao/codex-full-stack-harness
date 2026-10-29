@@ -1,6 +1,10 @@
 # Benchmark Observations
 
-## Current Correctness Deployment: No New Performance Benchmark
+## Current Binding Repair: No New Performance Benchmark
+
+Switchboard `bd9ade07e95fe5abdcad28a2760a02c23f5667e9` corrects source-only publication leaving stale admitted host metadata. The 1,073-test canonical candidate suite and both guarded hot deployments passed; native App evidence confirms the corrected snapshot, and the original-shaped read-only advertised-tool canary now returns the indexed budget refusal before provider execution. The earlier inspection-worker launch remains a negative historical observation, not a successful zero-provider test. This is verified correctness, not a new model performance pair; the accepted V470 cost/time observations below retain Switchboard `116d1ad` and their original scope.
+
+## Earlier Correctness Deployment: No New Performance Benchmark
 
 Current Switchboard source is `b856bc102833bae2b348b13be6842a5f4a4c47b7`, following native-host fix `5ab348c8451e15868298c6d45ee8397e20e9f4e7`. Caller remains V470 `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` and Rust remains V464 `1304065c69b9c5c6a702a05754526395c9a41678`; neither is rebuilt or versioned anew. The native-host change returns indexed, actionable byte-budget diagnostics for oversized inline external UTF-8 evidence before caller/provider execution on the corrected path, retaining the 65,536-byte total prompt cap, valid-small-evidence and path/symlink/UTF-8/verifier-dependency fences. It neither drops/truncates evidence nor expands authority or adds a store. The publisher adds only the named `src/nokiy-native-host.py` to existing source targets and separates complete historical predecessor pins from fresh same-byte CURRENT executor bindings, preserving mismatch/stale/missing-pin rejection and immutable publisher provenance.
 

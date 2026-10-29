@@ -115,6 +115,8 @@ function fixture(legacy = false) {
     local_nokiy_direct: { admitted: true, release: "old-release", profiles, preserved: { nested: "yes" },
       host: { python: "/native/python", python_sha256: hash(bytes("/native/python")), script: `${TARGET}/src/nokiy-native-host.py`,
         sha256: hash(bytes(`${TARGET}/src/nokiy-native-host.py`)),
+        coordinator_mode: "dispatch_only_v1", parent_result_delivery: "accept_v1", parent_closeout: "direct_v1",
+        batch_reference: "direct_v1", parent_deployment: "direct_v1", future_extension: { preserved: true },
         contract: { path: `${TARGET}/src/nokiy-native-contract.json`, sha256: hash(bytes(`${TARGET}/src/nokiy-native-contract.json`)) } },
       source_manifest_sha256: "b".repeat(64) } }));
   const files = [];
@@ -193,6 +195,14 @@ function fixture(legacy = false) {
   };
 }
 
+function nativeHostFixture(unchanged = false) {
+  const f = fixture(), target = "src/nokiy-native-host.py", source = `/candidate/${target}`;
+  f.put(source, unchanged ? f.bytes(`${TARGET}/${target}`) : "# updated native host\n");
+  f.manifest.files = [{ target, source, sha256: hash(f.bytes(source)), preimage: hash(f.bytes(`${TARGET}/${target}`)) }];
+  f.seal();
+  return f;
+}
+
 test("exact source scope admits only the named native host in addition to modules", async t => {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "native-source-scope-")));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -263,6 +273,72 @@ test("exact scoped source install/verify uses shared lock, CAS, restart and real
   assert.equal(f.nodes.has(LOCK), false);
   await f.run("verify");
   await assert.rejects(f.run("apply"), /already attempted/);
+  assert.equal(f.control.restarts, 1);
+});
+
+test("authorized exact host publication refreshes only its admitted digest and source bookkeeping", async () => {
+  const f = nativeHostFixture(), prior = f.object(ADMISSION_PATH);
+  const protectedBytes = [WORKFLOW_PATH, CATALOG_PATH, PICKER_CATALOG_PATH, RUNTIME_PATH].map(file => [file, f.bytes(file)]);
+  await f.run("preflight"); f.noEffects();
+  await f.run("apply");
+  const after = f.object(ADMISSION_PATH);
+  assert.deepEqual(after, { ...prior, local_nokiy_direct: { ...prior.local_nokiy_direct,
+    release: f.manifest.release, source_manifest_sha256: after.local_nokiy_direct.source_manifest_sha256,
+    host: { ...prior.local_nokiy_direct.host, sha256: f.manifest.files[0].sha256 } } });
+  assert.equal(hash(f.bytes(`${TARGET}/src/nokiy-native-host.py`)), after.local_nokiy_direct.host.sha256);
+  for (const [file, bytes] of protectedBytes) assert.deepEqual(f.bytes(file), bytes);
+  assert.equal((await f.run("verify")).verified, true);
+  assert.equal(f.control.restarts, 1); assert.equal(f.control.publish, 0); assert.equal(f.control.generation, 0);
+});
+
+test("byte-unchanged exact host publication repairs stale admission under independent preimages", async () => {
+  const f = nativeHostFixture(true), prior = f.object(ADMISSION_PATH);
+  prior.local_nokiy_direct.host.sha256 = hash("# older admitted host\n");
+  f.put(ADMISSION_PATH, encoded(prior));
+  f.manifest.admission_preimage = hash(f.bytes(ADMISSION_PATH)); f.seal();
+  const source = f.manifest.files[0], installed = f.bytes(`${TARGET}/${source.target}`);
+  assert.equal(source.preimage, source.sha256);
+  assert.notEqual(prior.local_nokiy_direct.host.sha256, source.preimage);
+  await f.run("apply");
+  assert.deepEqual(f.bytes(`${TARGET}/${source.target}`), installed);
+  assert.deepEqual(f.object(ADMISSION_PATH).local_nokiy_direct.host, { ...prior.local_nokiy_direct.host, sha256: source.sha256 });
+  assert.equal((await f.run("verify")).verified, true);
+});
+
+for (const [name, change] of [
+  ["different script", (f, admission) => { admission.local_nokiy_direct.host.script = "/other/nokiy-native-host.py"; }],
+  ["missing script", (f, admission) => { delete admission.local_nokiy_direct.host.script; }],
+  ["invalid digest", (f, admission) => { admission.local_nokiy_direct.host.sha256 = "invalid"; }],
+  ["missing source", f => { f.nodes.delete(`${TARGET}/src/nokiy-native-host.py`); f.manifest.files[0].preimage = null; }],
+]) test(`exact host publication requires an existing component binding before effects: ${name}`, async () => {
+  const f = nativeHostFixture(), admission = f.object(ADMISSION_PATH);
+  change(f, admission); f.put(ADMISSION_PATH, encoded(admission));
+  f.manifest.admission_preimage = hash(f.bytes(ADMISSION_PATH)); f.seal();
+  await assert.rejects(f.run("apply")); f.noEffects();
+  assert.equal(f.nodes.has("/deployment/apply-state.json"), false);
+});
+
+for (const file of [ADMISSION_PATH, `${TARGET}/src/nokiy-native-host.py`]) {
+  test(`exact host publication rejects preimage drift after earlier preflight before effects: ${file}`, async () => {
+    const f = nativeHostFixture(true);
+    await f.run("preflight"); f.put(file, f.bytes(file).toString() + "\n");
+    await assert.rejects(f.run("apply")); f.noEffects();
+    assert.equal(f.nodes.has("/deployment/apply-state.json"), false);
+  });
+}
+
+for (const field of ["sha256", "script"]) test(`verify rejects a pinned but wrong requested host binding: ${field}`, async () => {
+  const f = nativeHostFixture(), prior = f.object(ADMISSION_PATH).local_nokiy_direct.host;
+  await f.run("apply");
+  // Model the old publisher's internally consistent receipt, not external drift.
+  const admission = f.object(ADMISSION_PATH), state = f.object("/deployment/apply-state.json");
+  admission.local_nokiy_direct.host[field] = field === "sha256" ? prior.sha256 : "/other/nokiy-native-host.py";
+  f.put(ADMISSION_PATH, encoded(admission)); state.admission_sha256 = hash(f.bytes(ADMISSION_PATH));
+  f.put("/deployment/apply-state.json", encoded(state));
+  const count = f.effects.length;
+  await assert.rejects(f.run("verify"), field === "sha256" ? /Requested native host source postimage/ : /Requested native host component identity/);
+  assert.equal(f.nodes.has("/deployment/verification.json"), false);
+  assert.equal(f.effects.slice(count).some(([, file]) => file !== LOCK), false);
   assert.equal(f.control.restarts, 1);
 });
 

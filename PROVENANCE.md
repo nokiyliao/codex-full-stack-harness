@@ -1,6 +1,10 @@
 # Source Provenance
 
-## Current Switchboard Native-Host and Publisher Correctness
+## Current Native-Host Admission Binding
+
+Switchboard source `bd9ade07e95fe5abdcad28a2760a02c23f5667e9` adds only the publisher's conditional host-admission refresh and its focused regressions after `b856bc1`. The two exact committed exports are `src/workflow-update.mjs` and `tests/native-source-update.test.mjs`; all other source identities remain unchanged. Both guarded hot deployments and the 1,073-test canonical candidate suite passed. Actual native App command metadata and source/admission/snapshot SHA-256 now agree on `b9fe14d272ad64fe7214a486d2e171bb4733ad57627c33ca0ae00196d86c840d`; the original-shaped read-only tool canary rejects before provider execution. This closes the current advertised-route disagreement, not recovery of every historical user session or a new performance claim. Details and historical limits remain in [current surface](docs/current-surface.md).
+
+## Earlier Switchboard Native-Host and Publisher Correctness
 
 Current Switchboard source is `b856bc102833bae2b348b13be6842a5f4a4c47b7`, following native-host fix `5ab348c8451e15868298c6d45ee8397e20e9f4e7`. The parent exported exactly `src/nokiy-native-host.py`, `src/workflow-update.mjs`, `tests/test_nokiy_external_evidence.py`, `tests/workflow-update-prepare.test.mjs` and `tests/native-source-update.test.mjs` from that committed source into `packages/switchboard`. Only their five component file hashes and the current Switchboard source identity are refreshed; all other component hashes/modes and historical observations are retained. The installed native-host hash matched the prior component source hash and is updated to the exported host identity, without relabeling any frozen historical binding.
 

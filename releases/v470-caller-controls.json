@@ -2382,7 +2382,7 @@
       }
     },
     "packages/switchboard": {
-      "source_head": "b856bc102833bae2b348b13be6842a5f4a4c47b7",
+      "source_head": "bd9ade07e95fe5abdcad28a2760a02c23f5667e9",
       "includes_uncommitted_changes": false,
       "export": "committed source with documented exclusions and publication-only notices",
       "files": {
@@ -2427,7 +2427,7 @@
         "src/tool-bridge.mjs": "aec2eb733b54109548d466d8272a0e63dcab73ac0bcd2a5faf2ca69efb51130e",
         "src/update-lock.mjs": "540cd406a82c33256ee5e3894201a533190056881700ca88f08a9114a7b8e39c",
         "src/worker-client.mjs": "f0a890259592436c306746501e9008f3091614cb83acebf832250c056658d485",
-        "src/workflow-update.mjs": "94b800790d3dc4f976b13e87599f022b5a4148cbaa601e9c331bedcb3683cd5f",
+        "src/workflow-update.mjs": "bb2b29790edb850125b54c1ec7209a0062446bb60ba55fe6e25eea7d884d69b7",
         "src/xai-worker.mjs": "48fa213818b0ac46e3ccc268bff89b5185c23564f254ff36005c805033a60b1b",
         "tests/admission-recovery.test.mjs": "8f956c18ed2c1248f36edac4d0d914b0cdec07e1ec3dde043623e556e180ccdf",
         "tests/agy-persistent-session.test.mjs": "92ea827bca88628f3e9084f601bf98742023bda2960913bdb496c8428e25eaee",
@@ -2448,7 +2448,7 @@
         "tests/log-rotation.test.mjs": "b086728e6370b98b41f68cddaaae7da93e9d0693dbe17692ed962ea45523b202",
         "tests/native-installation-paths.test.mjs": "58079975f91fe87a5ec324c850f1bd97959ad72730a3aa62a59408648711beb6",
         "tests/native-prediction-trim.test.mjs": "f2fd93c391ff7fde2153707c5c2222d0a2c6118d4da390d1a62f3298ceb84f64",
-        "tests/native-source-update.test.mjs": "0ee15dca1953720b2bc8cc8030f5f874193962957bde3b44516fd772d3113664",
+        "tests/native-source-update.test.mjs": "38311e2a541c50c194c40677457fd5597f515750a3b407283c246d4f00041ee8",
         "tests/native-stale-appshots.test.mjs": "7965042a76b839b39cc1ca0c8baeaaa46456c951c697e898ff3fb98fa57a4e25",
         "tests/nokiy-acceptance-intent.test.mjs": "d19bd93bba5ec5988d71ce13461b7474a934afda78d2ff969d28698ce4ddd433",
         "tests/nokiy-admission-decoupling.test.mjs": "18198e6cf68e0721e9e157b25786b73c0f4c184bcf8144efc7967bbaeb965b17",
@@ -2700,13 +2700,13 @@
     }
   },
   "publication_files": {
-    "README.md": "56cdd20cfbe0d816b3589d32ff6a510e1c3d45fb68b65027d0f488ace1b8f9a2",
-    "PROVENANCE.md": "12f772cff4f63508d5cdc9317d9a471d314c01e4541efa8a5a41624da3a386da",
+    "README.md": "a174257beda5db58357c9765a6b5b3b6d6e9850755fb011a5dd6133578d2da42",
+    "PROVENANCE.md": "a724b98d240b8f87b84c07ea5b31cd981058e55914cf834657c28ae0bf9b4ad6",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "b69d7fb92ce5cbe8d9fc0a82be7194225ae18ed9e7d6cdd3817ccc39fc4199fd",
-    "docs/current-surface.md": "c465256110c711611fb57e37a099c0b7935a58df598d5f090617d2a1be0742d5",
-    "docs/benchmark-summary.md": "108e8ed3fb37aba185782103852c7fdd882e712d673b79a2e8c63a4373ab773a"
+    "docs/current-surface.md": "6219183ac68d9c5e0b85be0e6ceb5d908ec3be8be03a2e5a082d32dc9dfbde1f",
+    "docs/benchmark-summary.md": "7f99468a3294ba39a8d4e0e7503d34feb888259ab301e28983cc22ba6e0650fd"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v470-dependency-first-publication",
@@ -3606,17 +3606,12 @@
         "bytes": 7602928
       }
     },
-    "switchboard_deployment": "nokiy-external-evidence-budget-diagnostics-20261029",
+    "switchboard_deployment": "nokiy-native-host-binding-refresh-20261029",
     "switchboard_regression_tests": {
-      "passed": 1056,
+      "passed": 1073,
       "failed": 0,
       "skipped": 0,
-      "scope": "Complete candidate source suite; adopted live source matches byte-for-byte. Historical focused counts overlap and are not additive.",
-      "focused_prepare_passed": 34,
-      "live_focused_passed": null,
-      "historical_live_focused_passed": 9,
-      "historical_live_focused_source": "89c7889dc9c6d8b53e142ae2270b09dc266efa61",
-      "source_head": "35e4fe45a0e6170e539bc567def3451e93c69ca3"
+      "scope": "combined canonical candidate npm test at bd9ade0; overlapping earlier counts are not summed"
     },
     "switchboard_focused_python_tests": {
       "staged_passed": 184,
@@ -4167,7 +4162,11 @@
         "missing_usage_count": 0,
         "unknown_models": [],
         "both_root_cli_reconciliation": "REPORTED_TOTALS_MATCH",
-        "root_native_minus_recorded_input_cached_output": [0, 0, 0],
+        "root_native_minus_recorded_input_cached_output": [
+          0,
+          0,
+          0
+        ],
         "hidden_provider_attempts_covered": false,
         "provider_internal_effort": "UNKNOWN",
         "reported_cache_writes_status": "UNKNOWN_OR_PARTIAL"
@@ -4196,7 +4195,12 @@
         "native_child_calls": 0,
         "quality": {
           "status": "PASS",
-          "tests": {"tests": 689, "failures": 0, "errors": 0, "skipped": 10},
+          "tests": {
+            "tests": 689,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 10
+          },
           "integrity_failures": [],
           "exit_code": 0,
           "scope": "Root and independent final validation AFTER parent semantic correction; offline fixed DCF two-branch episode"
@@ -4225,7 +4229,12 @@
         "native_children_usd": 0.195394,
         "quality": {
           "status": "PASS",
-          "tests": {"tests": 688, "failures": 0, "errors": 0, "skipped": 10},
+          "tests": {
+            "tests": 688,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 10
+          },
           "integrity_failures": [],
           "exit_code": 0,
           "scope": "Independent final validation; offline fixed DCF two-branch episode"
@@ -4253,7 +4262,11 @@
       },
       "parent_semantic_correction": {
         "required_for_accepted_workflow": true,
-        "joined_gate_before_edit": {"status": "PASS", "tests": 688, "skipped": 10},
+        "joined_gate_before_edit": {
+          "status": "PASS",
+          "tests": 688,
+          "skipped": 10
+        },
         "native_coordinator_capture": "capture/events.jsonl",
         "capture_line": 13,
         "item": "item_6",
@@ -4267,21 +4280,40 @@
         "post_gate_edit_occurred": true,
         "original_live_return_source_binding_scope": "BEFORE parent semantic correction only; no fresh original binding for final edited state",
         "workers_alone_independently_delivered_final_correctness": false,
-        "root_and_independent_final_validation": {"status": "PASS", "tests": 689, "skipped": 10, "failures": 0, "errors": 0, "integrity_failures": []},
+        "root_and_independent_final_validation": {
+          "status": "PASS",
+          "tests": 689,
+          "skipped": 10,
+          "failures": 0,
+          "errors": 0,
+          "integrity_failures": []
+        },
         "all_five_coordinator_calls_cost_and_time_included": true,
         "meaningful_review_retained": true
       },
       "cli_time_change_percent": -13.2865,
-      "cost_change_percent": -44.1600,
+      "cost_change_percent": -44.16,
       "whole_two_arm_runner_wall_seconds": 597.8256695410237,
       "timing": "Per-arm CLI execution includes internal delegation/checks. Independent final audits are separate. Whole two-arm runner wall is NOT per-arm acceptance E2E; uninterrupted per-arm user-acceptance E2E is NOT MEASURED.",
       "pricing": "Frozen2026-10-22 API-equivalent prices, not invoices/subscription billing. Includes all measured root/worker/native-child calls and parent correction. Engineering chat/review excluded by operator scope; hidden attempts and complete provider billing unknown.",
       "v469_comparison": {
         "both_arms_slower": true,
-        "efficient_coordinator_request_spans_seconds_sum_before_after": [118.449, 289.45],
-        "efficient_coordinator_calls_before_after": [3, 5],
-        "cache_verification_seconds_before_after": [0.824, 39.910],
-        "cache_verification_status_before_after": ["failed", "passed"],
+        "efficient_coordinator_request_spans_seconds_sum_before_after": [
+          118.449,
+          289.45
+        ],
+        "efficient_coordinator_calls_before_after": [
+          3,
+          5
+        ],
+        "cache_verification_seconds_before_after": [
+          0.824,
+          39.91
+        ],
+        "cache_verification_status_before_after": [
+          "failed",
+          "passed"
+        ],
         "request_span_scope": "Includes provider/network/queue/overlap; not pure reasoning or additive wall-time attribution"
       },
       "cache_warmth_controlled": false,
@@ -4426,7 +4458,10 @@
       },
       "earlier_current_turn_advertised_tool_canary": {
         "tool": "functions.nokiy_execute",
-        "adaptation": ["unsafe_path", "read_only_refusal_to_inspect"],
+        "adaptation": [
+          "unsafe_path",
+          "read_only_refusal_to_inspect"
+        ],
         "read_only_sol_worker_started": true,
         "reported_tokens": 38378,
         "zero_provider_execution_proven": false,
@@ -4452,6 +4487,77 @@
         "historical_positive_negative_incomplete_records_preserved": true
       },
       "parent_owned_git_publication_durable_reconciliation_and_acceptance": "PARENT_ACCEPTED; native Git publication and durable state are recorded outside this self-referential manifest"
+    },
+    "native_host_admission_binding_refresh": {
+      "source_commit": "bd9ade07e95fe5abdcad28a2760a02c23f5667e9",
+      "root_cause": "source-only publication preserved stale host digest despite installing the authorized Python host",
+      "prior_admitted_sha256": "7ce125be45d6824f85a2ef63b1f44936bcdf3d33f0cf9cc4138b40c641d393cb",
+      "current_admitted_source_and_actual_snapshot_sha256": "b9fe14d272ad64fe7214a486d2e171bb4733ad57627c33ca0ae00196d86c840d",
+      "exact_host_only_refresh": true,
+      "other_host_profile_contract_fields_preserved": true,
+      "independent_admission_and_source_preimages": true,
+      "byte_unchanged_binding_recovery_verified": true,
+      "requested_postimage_checked": true,
+      "deployments": [
+        {
+          "action_id": "nokiy-host-binding-publisher-20261029",
+          "admitted": true,
+          "verified": true,
+          "healthy": true,
+          "observed_release": "nokiy-host-binding-publisher-20261029",
+          "reload_mode": "hot_reload",
+          "app_restart_performed": false,
+          "verified_at": "2026-10-29T03:44:38.081Z"
+        },
+        {
+          "action_id": "nokiy-native-host-binding-refresh-20261029",
+          "admitted": true,
+          "verified": true,
+          "healthy": true,
+          "observed_release": "nokiy-native-host-binding-refresh-20261029",
+          "reload_mode": "hot_reload",
+          "app_restart_performed": false,
+          "verified_at": "2026-10-29T03:46:05.634Z"
+        }
+      ],
+      "canonical_candidate_tests": {
+        "passed": 1073,
+        "failed": 0,
+        "skipped": 0
+      },
+      "previous_primary_regression_test_record": {
+        "passed": 1056,
+        "failed": 0,
+        "skipped": 0,
+        "scope": "Complete candidate source suite; adopted live source matches byte-for-byte. Historical focused counts overlap and are not additive.",
+        "focused_prepare_passed": 34,
+        "live_focused_passed": null,
+        "historical_live_focused_passed": 9,
+        "historical_live_focused_source": "89c7889dc9c6d8b53e142ae2270b09dc266efa61",
+        "source_head": "35e4fe45a0e6170e539bc567def3451e93c69ca3"
+      },
+      "actual_advertised_original_read_only_canary": {
+        "status": "BLOCKED_BEFORE_EXECUTION",
+        "provider_execution_started": false,
+        "issue_path": "action.read_scopes[0]",
+        "reason": "external_evidence_prompt_budget_exceeded",
+        "read_scope_file_bytes": 147028,
+        "required_prompt_bytes": 147761,
+        "prompt_limit_bytes": 65536,
+        "exit_code": 2
+      },
+      "native_app_execution_binding_verified": true,
+      "write_declared_marker_created": false,
+      "old_snapshots_or_requests_rewritten": false,
+      "earlier_failed_advertised_canary_preserved": true,
+      "original_separate_user_session_recovery": "UNVERIFIED",
+      "new_model_performance_pair": false,
+      "performance_effect": "UNMEASURED",
+      "caller_rust_model_effort_topology_app_trading_unchanged": true,
+      "evidence": {
+        "path": "native-host-admission-binding-20261029/advertised-binding-proof.json",
+        "sha256": "00a7d20231c71b342392a6c9142271634e6099f44f02e9ffb887236d51c97929"
+      }
     }
   },
   "exclusions": [
