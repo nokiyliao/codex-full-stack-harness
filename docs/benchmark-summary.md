@@ -1,6 +1,32 @@
 # Benchmark Observations
 
-## Plan-Only Follow-up: Quality Held
+## V3: Qualified Single-Pair Observation
+
+The current caller V471 / Switchboard `5b16a5b` / Rust V464 composition completed the same three-turn workflow using the stronger pre-frozen DCF2-v3 oracle. Both independent gates passed, including the two previously escaping requirements. Parent review covered the actual product diffs and focused tests; no confirmed remaining failure was found within that declared task and review scope. This is bounded acceptance, not universal semantic equivalence.
+
+| Metric | Efficient | Concurrent Native Sol 6.1/max |
+| --- | ---: | ---: |
+| Machine-acceptance E2E | 590.022346 s | 1,097.809486 s |
+| Complete recorded API-equivalent estimate | $0.5206696 | $1.5102848 |
+| Coordinator estimate | $0.3440380 | $0.7844528 |
+| Worker/native-child estimate | $0.1766316 | $0.7258320 |
+| Coordinator calls (plan/apply/accept) | 10 (5/3/2) | 46 (6/36/4) |
+| Worker/native-child calls | 15 (7+8) | 39 (20+19) |
+| Input tokens | 1,322,172 | 6,085,072 |
+| Cached input tokens | 1,133,312 | 5,904,768 |
+| Uncached input tokens | 188,860 | 180,304 |
+| Output tokens, including reasoning | 20,625 | 55,920 |
+| Final gate cases, including ten skips | 697 | 706 |
+
+Unrounded totals give **-46.25% time and -65.53% estimated cost**. The original machine summary uses rounded inputs and is retained unchanged. The estimates include all recorded roots/workers/native children once; reasoning is a subset of output, cumulative root totals are not added again, and overlapping worker durations are not summed into E2E. Quality validation contributes 50.591/52.937 seconds to each arm's own E2E, with no cross-arm phase/quality barrier. Concurrent resource/provider conditions are not isolated.
+
+Efficient's two workers delivered CLI, projection and runtime product changes plus tests, not test-only handoffs. All three final product hashes match the recorded EVIDENCE_VERIFIED worker batch; its post-batch verifier is PASSED/live_return. The independent final gate and actual source/test review complete parent acceptance. No parent product repair or repeated paid run was used to manufacture a pass.
+
+The observed apply-stage coordinator count is 3 versus native's 36; native also freely chose two Sol children rather than being forced serial. These are measured workflow/decomposition differences, not proof that the runtime speeds up a model's internal inference. Efficient requested Sol 6.1/max coordination and Terra 6.1/xhigh workers; native requested Sol 6.1/max. No model/effort change occurred during this pair. Uncached input is slightly higher for Efficient, so the improvement is not a claim that every token category fell.
+
+Planning used five calls, versus six in the preceding v2 follow-up, but the new oracle/task is different: no isolated effect of the plan-only guidance is established. This single accepted v3 pair does not establish stable benefit, generalization to another workload, very-large-context behavior, shared provider cache or a native-without-DCF/J-Space ablation. Source-pinned rate weights and the provider-observed/billing limitations below remain unchanged. Historical v2 quality holds are not reversed.
+
+## Historical Plan-Only V2 Follow-up: Quality Held
 
 The deployed source is caller V471 / Switchboard `5b16a5b` / Rust V464. No task, native binary or requested profile was changed for the concurrent v2 follow-up; before/after controls match within the pair. Native Sol 6.1/max again chose two children freely.
 

@@ -1,6 +1,14 @@
 # Source Provenance
 
-## Later Semantic Qualification
+## V3 Observation and Parent Acceptance
+
+The next paid pair used the already frozen, hash-pinned v3 task/manifest/validator through the same tested runner. Its 690 mandatory cases include both full-FQN collision isolation and owner-selected override retention; exclusions and skip caps are unchanged. Both final independent gates passed, with 697/706 cases including ten skips and no integrity errors. No measured subject was repaired by this engineering parent.
+
+The parent reviewed complete product diffs and focused tests. Efficient's two recorded workers are EVIDENCE_VERIFIED with evidence-only completion/cleanup, and all three final product hashes match their recorded postimages. The recorded post-batch gate is PASSED/live_return; the later independent gates cover both final subjects. Each arm retained its own exact ID through all three turns; cumulative root usage reconciles as deltas. Native freely used two Sol children, with every recorded child cost included. Before/after source/runtime controls match. The two dedicated root test chats were archived through the official App API after completion.
+
+Composition remains caller V471 / Switchboard `5b16a5b` / Rust V464; no new runtime deployment is claimed for this measurement. The single v3 observation does not erase v2 failures, establish repeatability or prove a causal prompt/cache/DCF effect. Pricing-date and provider-observed worker limitations stated below remain applicable.
+
+## Historical V2 Semantic Qualification
 
 The earlier accepted DCF2-v2 pair and its plan-only follow-up are now held for equal-quality gain claims. A new v3 oracle adds only full-FQN collision isolation and owner override-pool reachability retention, preserving prior checks, exclusions and skip caps. Its reference records 690 cases/ten skips with zero failures or integrity errors. Product-only clones reject the current Efficient implementation on both new cases; the earlier Efficient passes the new locations branch but fails override retention. Original fixtures, measured subjects and receipts are retained, not retroactively edited.
 

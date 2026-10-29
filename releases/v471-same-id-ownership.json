@@ -2706,13 +2706,13 @@
     }
   },
   "publication_files": {
-    "README.md": "70c84ccadf10825c0000f67249afa963989846554986eed81a9d4fa85a01fc93",
-    "PROVENANCE.md": "51f495f6d9e7948a460d8449b9e21e805b93f1c4b13a7e33ee571ef685b99b63",
+    "README.md": "6a9a2990aa541552bf6b2e481059c544d8db807bdb77d06be49fe2b6b51f555e",
+    "PROVENANCE.md": "222338a48a8f16bcb74d6ab25c4deadac3a56ab7d5ebcfea3e7c4b927b23fec2",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "743b19fe21417f5cf804d7d1f077178b456f7fa7e2b48f5ba9e60f5c1a82406a",
-    "docs/current-surface.md": "0b1c00940db94e6ca0f75abd814a659232f5041e111e767e159a10a64ad587b5",
-    "docs/benchmark-summary.md": "b5233b4a7f1edf6286eec427510799ed20232187d546cd30d026e44f16548155"
+    "docs/current-surface.md": "5ac21cac91fdf5e2070d49a2ade5ac6a33a60a74ac837c5501b39bfd5e5750fc",
+    "docs/benchmark-summary.md": "3a1f1eac64422720b793b145444f80ee6aaee5a2b50583f93dd111eb702ef4c8"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v471-context-file-count-diagnostics",
@@ -4905,6 +4905,41 @@
       "original_subjects_unchanged": true,
       "pricing": "Source-pinned model weights, not invoices or verified dated/current prices; provider-observed Terra identity/effort unavailable",
       "v3_paid_pair_run": false
+    },
+    "accepted_dcf2_v3_same_id_observation": {
+      "status": "ACCEPTED_SINGLE_V3_THREE_TURN_PAIR",
+      "composition": "callerV471/Switchboard5b16a5b/RustV464",
+      "frozen_oracle": "dcf2-v3",
+      "mandatory_cases": 690,
+      "quality_total_cases_including_ten_skips": {
+        "efficient": 697,
+        "native": 706
+      },
+      "seconds": {
+        "efficient": 590.0223460197449,
+        "native": 1097.8094861507416
+      },
+      "source_pinned_model_weight_estimates": {
+        "efficient": 0.5206696,
+        "native": 1.5102848
+      },
+      "time_delta_percent_unrounded": -46.25457755074197,
+      "cost_delta_percent_unrounded": -65.52507182751228,
+      "coordinator_calls": {
+        "efficient": 10,
+        "native": 46
+      },
+      "worker_or_native_child_calls": {
+        "efficient": 15,
+        "native": 39
+      },
+      "complete_recorded_participants_counted_once": true,
+      "all_three_efficient_worker_product_postimages_match": true,
+      "parent_product_repair": false,
+      "stable_or_ablation_gain_proven": false,
+      "billing_or_provider_observed_worker_identity_claim": false,
+      "prior_v2_quality_holds_unchanged": true,
+      "new_runtime_deployment": false
     }
   },
   "exclusions": [
@@ -4920,6 +4955,7 @@
     "component README files describe publication boundaries; they are not claims of source-to-binary reproducibility",
     "companion repositories and private managed-workspace DCF contracts remain external",
     "The latest plan-only guidance update passed 1,075 existing/new tests and guarded hot deployment. Its additional latency/cost effect is not yet measured. The accepted three-turn v2 observation remains bound to the preceding switchboard commit; do not attribute that historical 44.02% time / 64.66% cost observation to this later update.",
-    "Later v3 regressions hold both corrected DCF2-v2 same-ID pairs for equal-quality gain claims. Raw time/cost/frozen-PASS records are retained; current Efficient fails full-FQN collision isolation and owner override retention, earlier Efficient fails retention. The existing runner now admits an explicit hash-pinned v3 oracle, but no paid pair has used it."
+    "Later v3 regressions hold both corrected DCF2-v2 same-ID pairs for equal-quality gain claims. Raw time/cost/frozen-PASS records are retained; current Efficient fails full-FQN collision isolation and owner override retention, earlier Efficient fails retention. The existing runner now admits an explicit hash-pinned v3 oracle, but no paid pair has used it.",
+    "A new single DCF2-v3 pair passes the stronger common oracle and parent bounded source review, with complete once-only recorded participant accounting and worker product postimage matches. The derived estimates are not billing, stable/generalized or isolated runtime/prompt/DCF gain; historical v2 quality holds remain."
   ]
 }

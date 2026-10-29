@@ -1,6 +1,12 @@
 # Current Source Surface
 
-## Current Qualification
+## Current V3 Observation
+
+The deployed caller V471 / Switchboard `5b16a5b` / Rust V464 composition now has one parent-accepted DCF2-v3 paired observation: 590.022 seconds / $0.5206696 for Efficient versus 1,097.809 seconds / $1.5102848 for native Sol 6.1/max. Both passed the stronger common 690-case oracle and their focused tests, with no integrity error. Complete product/test review and three Efficient worker-to-final product hash matches support this bounded acceptance.
+
+All recorded coordinators/workers/native children are included. Unrounded observations are -46.25% time and -65.53% API-equivalent estimate, not billing or universal gain. The source was already deployed; this measurement introduced no new runtime version, service or restart. Repeatability, another workload, large-context behavior and DCF/J-Space ablation remain unproven. Earlier v2 quality holds below remain in force.
+
+## Historical V2 Qualification
 
 Current published source is caller V471, Switchboard `5b16a5b` and Rust V464. The plan-only policy update passed 1,075 source tests and guarded hot deployment; this remains source/deployment evidence, not a performance pass. Its follow-up kept six planning calls and did not demonstrate the intended round reduction.
 

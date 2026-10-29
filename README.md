@@ -1,6 +1,12 @@
 # Nokiy Full-Stack Harness
 
-## Current Measurement Qualification
+## Latest V3 Observation
+
+On the stronger DCF2-v3 task, this single concurrent pair recorded **590.022 seconds / $0.5206696** for Efficient versus native Sol 6.1/max **1,097.809 seconds / $1.5102848**: **-46.25% time and -65.53% estimated cost**, calculated from unrounded totals. Both passed the shared 690-case oracle and their focused tests (697/706 recorded cases, each including ten skips). Parent product/test review accepted this bounded observation; all three Efficient product postimages match the recorded worker batch.
+
+All recorded coordinators, workers and native children are included once: Efficient used 10 coordinator plus 15 worker calls; native used 46 coordinator plus 39 child calls. Costs use the disclosed source-pinned model weights, not invoices or provider-observed worker identity. This is not stable/universal gain, a same-model runtime acceleration claim, a DCF/J-Space ablation or an isolated test of the plan-only prompt. The earlier v2 quality holds below remain in force. See the [full qualified results](docs/benchmark-summary.md).
+
+## Historical V2 Qualification
 
 **The two latest DCF2-v2 pairs are not accepted equal-quality gains.** Later focused regressions found that the earlier Efficient implementation fails owner-selected override-cache retention; the follow-up implementation also misclassifies an unrelated symbol with the same short name as a full target FQN. Original timing, usage, source-integrity results and frozen-v2 PASS receipts remain unchanged, but do not establish those missing semantics.
 
