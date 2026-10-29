@@ -1,5 +1,35 @@
 # Benchmark Observations
 
+## V470 DCF2 Pair Accepted With Parent Semantic Correction
+
+The accepted composition was caller V470 `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` + unchanged V464 Rust `1304065c69b9c5c6a702a05754526395c9a41678` + Switchboard `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`. CONTROL.json reported matched_controls=true, issues=[] and before==after. Both root CLI counters reported REPORTED_TOTALS_MATCH. Complete retained reported coordinator/worker/native-child usage has zero missing usage records and zero unknown models; this does not establish coverage of hidden provider attempts.
+
+| Metric | Efficient | Native Sol 6.1 |
+| --- | ---: | ---: |
+| CLI execution seconds | 477.1968822921626 | 550.3145598750561 |
+| Reported API-equivalent USD | 0.36722999999999995 | 0.6576468 |
+| Total tokens (input + output) | 680,285 | 1,383,237 |
+| Input / cached input / output | 662,282 / 525,952 / 18,003 | 1,358,314 / 1,214,848 / 24,923 |
+| Uncached input | 136,330 | 143,466 |
+| Overall input cache hit | 79.415113% | 89.437936% |
+| Coordinator calls | 5 | 16 |
+| Worker / native-child calls | 12 / 0 | 0 / 8 |
+| Worker / native-child count | 2 / 0 | 0 / 1 |
+| Final quality tests run / skipped | 689 / 10 | 688 / 10 |
+| Failures / errors / integrity failures | 0 / 0 / 0 | 0 / 0 / 0 |
+
+Both coordinators were observed as Sol6.1 with max on the request wire; provider-internal effort remains unknown. Efficient used two observed Terra6.1 workers with xhigh configured; native used one Sol child. Efficient cost includes coordinator $0.22917479999999998 plus workers $0.1380552; native includes root $0.4622528 plus child $0.195394. All five Efficient coordinator calls, including the parent correction and final checking, remain counted. Prices are frozen2026-10-22 API-equivalent estimates, not invoices or subscription consumption. Engineering chat/review is excluded by operator scope. Retained reported usage is complete, but hidden attempts, internal provider effort and complete provider billing remain unknown.
+
+Observed producer adherence: core.jsonl events23/24, commands0/1, published projection.py at positive step1 before importing cli.py at positive step2 within the SAME command_run/provider call. No extra model round was needed for that publication ordering. Both workers reached terminal done/EVIDENCE_VERIFIED with cleanup; all35 command records had zero failures. The V469 missing-module race did not recur. This is one observed use of dependency-first guidance, not universal adherence or host-enforced atomicity; the earlier failed branch remains historical and is not promoted.
+
+The acceptance boundary includes a real parent semantic correction AFTER the joined live-return gate passed688 tests/10skips. Native coordinator capture/events.jsonl line13, item_6 COMPLETED, modified BOTH scripts/ops/dcf/cli.py and tests/ops/test_dcf_locations_extension.py for long-FQN metadata within final public page budgets. This changes semantics and adds regression coverage; it was not redundant checking of an unchanged gate. Root and independent final validation then passed689/10. The native arm finished688/10, with zero failures/errors/integrity failures on both final arms. The original live-return source binding covers only the state BEFORE this edit; it does not freshly bind the final state. Workers independently completed their assigned work, but final correctness was not independently delivered by workers alone. The accepted result is the complete WORKFLOW WITH parent semantic correction, including its full coordinator cost/time and meaningful review.
+
+Versus native in this pair, CLI time was13.2865% lower and reported API-equivalent cost44.1600% lower. Both arms were slower than V469. Efficient coordinator request spans increased118.449s to289.450s and calls3 to5; cache-branch verification changed from0.824s failed to39.910s passed. These are different observed workflows with uncontrolled cache warmth, not an isolated V470 patch-effect estimate. Request spans include provider, network, queue and overlap; they are neither pure reasoning time nor additive wall-time attribution.
+
+Per-arm times cover CLI execution with internal delegation/checks. Independent final audits are separate; uninterrupted per-arm user-acceptance E2E remains unmeasured. The whole two-arm runner took597.8256695410237s, which is NOT either arm's acceptance E2E. One pair establishes neither statistical stability nor isolated patch causality, long-session gains or original live Ultra recovery. Earlier observations and their negative results remain below. This is a documentation/manifest update of an accepted measurement, not a new runtime, release or benchmark replay.
+
+Evidence references: `current-v470-efficient-dcf2-pair-20261029/efficient/metrics.json`, SHA-256 `e4fcf23507a9b2b940755f1ceb75d2ac9f7849b17dc252d06263f48c2f206652`; `current-v470-efficient-dcf2-pair-20261029/native/metrics.json`, SHA-256 `107a6d4fc4471b8621edb3db9b3484476ac1c6882ac38a48152cf9864104fbcf`. The parent supplied these metrics and accepted control/lifecycle/correction evidence; the external review is not needed for this publication.
+
 ## V469 DCF2 Pair With A Branch Verification Warning
 
 | Metric | Efficient | Native Sol 6.1 |

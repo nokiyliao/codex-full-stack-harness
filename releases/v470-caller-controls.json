@@ -2700,13 +2700,13 @@
     }
   },
   "publication_files": {
-    "README.md": "d5f5b0a0e9dbba51eaa60b32ec2b3b1ea2ff86f14532a69f7a6eb2776940a8ca",
-    "PROVENANCE.md": "fef838cec49dbc09b0e704c2551463ae0f23ebc072be9e1f9f186efebe94339f",
+    "README.md": "01aae2482c7e25e0ecb2dc7ad977d8ec8c9c86a83f8e33c8b4a75c4ae8864b85",
+    "PROVENANCE.md": "42f0c22b1fb647876bdb63db55311ab2f16e1cca76f3e21fe096e142dedcc712",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "b69d7fb92ce5cbe8d9fc0a82be7194225ae18ed9e7d6cdd3817ccc39fc4199fd",
-    "docs/current-surface.md": "ca7eee5e02977aab942c1f6623625ff9791c29d6550ad0755bd46622d0590363",
-    "docs/benchmark-summary.md": "8a8ce8924e3b1d06002ccb3de508f5bc75263718e89e2884ae7a78239982259e"
+    "docs/current-surface.md": "e1019f62c85e5e39848171f4cffdadbfdcef63476012dce533ce878a695073b0",
+    "docs/benchmark-summary.md": "a8bc6e3b30a3cff3db61da8daff2c806bf7af66507b8abef1a9a2a970b3ea35d"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v470-dependency-first-publication",
@@ -4144,6 +4144,163 @@
         "reported_missing_module": "scripts.ops.dcf.projection",
         "joined_gate": "PASSED live_return",
         "no_worker_promotion": true
+      }
+    },
+    "current_v470_dcf2_observation": {
+      "schema_version": "nokiy_v470_dcf2_pair_acceptance_v1",
+      "status": "ACCEPTED_WORKFLOW_WITH_PARENT_SEMANTIC_CORRECTION",
+      "tested_composition": {
+        "caller": "V470",
+        "caller_source": "e0d039fd31aa22dd86ea321b2e4e96e5add36ae1",
+        "runtime": "V464",
+        "runtime_source": "1304065c69b9c5c6a702a05754526395c9a41678",
+        "switchboard_source": "116d1adb43f7c88aa449aaf963dd3ee9df9846f8"
+      },
+      "controls": {
+        "evidence": "CONTROL.json",
+        "matched_controls": true,
+        "issues": [],
+        "before_equals_after": true
+      },
+      "retained_reported_usage": {
+        "coverage_status": "complete",
+        "missing_usage_count": 0,
+        "unknown_models": [],
+        "both_root_cli_reconciliation": "REPORTED_TOTALS_MATCH",
+        "root_native_minus_recorded_input_cached_output": [0, 0, 0],
+        "hidden_provider_attempts_covered": false,
+        "provider_internal_effort": "UNKNOWN",
+        "reported_cache_writes_status": "UNKNOWN_OR_PARTIAL"
+      },
+      "efficient": {
+        "cli_execution_wall_seconds": 477.1968822921626,
+        "reported_api_equivalent_usd": 0.36722999999999995,
+        "input": 662282,
+        "cached": 525952,
+        "uncached": 136330,
+        "output": 18003,
+        "total_tokens": 680285,
+        "reasoning": 7568,
+        "overall_input_cache_hit_percent": 79.415113,
+        "coordinator_model": "gpt-6.1-sol",
+        "coordinator_wire_effort": "max",
+        "coordinator_calls": 5,
+        "coordinator_usd": 0.22917479999999998,
+        "coordinator_request_spans_seconds_sum": 289.45,
+        "worker_model": "gpt-6.1-terra",
+        "worker_configured_effort": "xhigh",
+        "worker_count": 2,
+        "worker_calls": 12,
+        "workers_usd": 0.1380552,
+        "native_child_count": 0,
+        "native_child_calls": 0,
+        "quality": {
+          "status": "PASS",
+          "tests": {"tests": 689, "failures": 0, "errors": 0, "skipped": 10},
+          "integrity_failures": [],
+          "exit_code": 0,
+          "scope": "Root and independent final validation AFTER parent semantic correction; offline fixed DCF two-branch episode"
+        }
+      },
+      "native": {
+        "cli_execution_wall_seconds": 550.3145598750561,
+        "reported_api_equivalent_usd": 0.6576468,
+        "input": 1358314,
+        "cached": 1214848,
+        "uncached": 143466,
+        "output": 24923,
+        "total_tokens": 1383237,
+        "reasoning": 12491,
+        "overall_input_cache_hit_percent": 89.437936,
+        "coordinator_model": "gpt-6.1-sol",
+        "coordinator_wire_effort": "max",
+        "coordinator_calls": 16,
+        "coordinator_usd": 0.4622528,
+        "coordinator_request_spans_seconds_sum": 493.73699999999997,
+        "worker_count": 0,
+        "worker_calls": 0,
+        "native_child_count": 1,
+        "native_child_model": "gpt-6.1-sol",
+        "native_child_calls": 8,
+        "native_children_usd": 0.195394,
+        "quality": {
+          "status": "PASS",
+          "tests": {"tests": 688, "failures": 0, "errors": 0, "skipped": 10},
+          "integrity_failures": [],
+          "exit_code": 0,
+          "scope": "Independent final validation; offline fixed DCF two-branch episode"
+        }
+      },
+      "producer_publication": {
+        "evidence": "V470 producer core.jsonl events23/24, commands0/1",
+        "dependency": "scripts/ops/dcf/projection.py",
+        "dependency_positive_step": 1,
+        "importer": "scripts/ops/dcf/cli.py",
+        "importer_positive_step": 2,
+        "same_command_run_and_provider_call": true,
+        "extra_model_round": false,
+        "prior_missing_module_race_recurred": false,
+        "atomic_publication_enforced": false,
+        "universal_model_adherence_proven": false
+      },
+      "worker_lifecycle": {
+        "both_terminal_status": "done",
+        "both_evidence_status": "EVIDENCE_VERIFIED",
+        "both_cleanup_verified": true,
+        "command_records": 35,
+        "command_failures": 0,
+        "prior_failed_worker_promoted": false
+      },
+      "parent_semantic_correction": {
+        "required_for_accepted_workflow": true,
+        "joined_gate_before_edit": {"status": "PASS", "tests": 688, "skipped": 10},
+        "native_coordinator_capture": "capture/events.jsonl",
+        "capture_line": 13,
+        "item": "item_6",
+        "item_status": "COMPLETED",
+        "modified_files": [
+          "scripts/ops/dcf/cli.py",
+          "tests/ops/test_dcf_locations_extension.py"
+        ],
+        "semantic_change": "Retain long-FQN metadata within final public page budgets, with regression coverage",
+        "redundant_unchanged_gate_check": false,
+        "post_gate_edit_occurred": true,
+        "original_live_return_source_binding_scope": "BEFORE parent semantic correction only; no fresh original binding for final edited state",
+        "workers_alone_independently_delivered_final_correctness": false,
+        "root_and_independent_final_validation": {"status": "PASS", "tests": 689, "skipped": 10, "failures": 0, "errors": 0, "integrity_failures": []},
+        "all_five_coordinator_calls_cost_and_time_included": true,
+        "meaningful_review_retained": true
+      },
+      "cli_time_change_percent": -13.2865,
+      "cost_change_percent": -44.1600,
+      "whole_two_arm_runner_wall_seconds": 597.8256695410237,
+      "timing": "Per-arm CLI execution includes internal delegation/checks. Independent final audits are separate. Whole two-arm runner wall is NOT per-arm acceptance E2E; uninterrupted per-arm user-acceptance E2E is NOT MEASURED.",
+      "pricing": "Frozen2026-10-22 API-equivalent prices, not invoices/subscription billing. Includes all measured root/worker/native-child calls and parent correction. Engineering chat/review excluded by operator scope; hidden attempts and complete provider billing unknown.",
+      "v469_comparison": {
+        "both_arms_slower": true,
+        "efficient_coordinator_request_spans_seconds_sum_before_after": [118.449, 289.45],
+        "efficient_coordinator_calls_before_after": [3, 5],
+        "cache_verification_seconds_before_after": [0.824, 39.910],
+        "cache_verification_status_before_after": ["failed", "passed"],
+        "request_span_scope": "Includes provider/network/queue/overlap; not pure reasoning or additive wall-time attribution"
+      },
+      "cache_warmth_controlled": false,
+      "pair_count": 1,
+      "stable_or_patch_causal_gain_proven": false,
+      "original_user_ultra_recovery": "UNVERIFIED",
+      "historical_observations_preserved": true,
+      "deployment_time_unmeasured_fields_scope": "Historical deployment observations; this later accepted pair measures only the qualified complete workflow",
+      "new_runtime_or_release": false,
+      "evidence_refs": {
+        "efficient_metrics": {
+          "path": "current-v470-efficient-dcf2-pair-20261029/efficient/metrics.json",
+          "sha256": "e4fcf23507a9b2b940755f1ceb75d2ac9f7849b17dc252d06263f48c2f206652"
+        },
+        "native_metrics": {
+          "path": "current-v470-efficient-dcf2-pair-20261029/native/metrics.json",
+          "sha256": "107a6d4fc4471b8621edb3db9b3484476ac1c6882ac38a48152cf9864104fbcf"
+        },
+        "source": "Parent-supplied arm metrics and accepted control/lifecycle/correction provenance"
       }
     },
     "dependency_first_publication_guidance": {
