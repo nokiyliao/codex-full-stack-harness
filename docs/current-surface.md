@@ -1,6 +1,12 @@
 # Current Source Surface
 
-## Current V469 Path Diagnostics
+## Current V470 Dependency Publication
+
+Caller source `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` is deployed as V470. Worker source guidance now publishes dependencies in earlier steps than importers, using the existing same-command_run barrier. It needs no extra model turn or new authority. The installed production module is byte-for-byte the accepted baseline except for this one48-byte instruction; its real installed-module guidance check and source/candidate/live288-test suites passed. Prompt regressions explicitly charge that feature while retaining prior baseline budgets and all old semantic fences.
+
+The original DCF2 missing module was a producer publication-order defect, not a broken settlement or verifier permission. The prior failed branch is not promoted or replayed. The instruction is not an atomicity guarantee; actual future model adherence and post-V470 cost/time remain unmeasured. Earlier benchmark records below remain historical observations. The native-only worker-test context and original user's latest Ultra recovery are still separate unresolved items.
+
+## Earlier V469 Path Diagnostics
 
 Caller source `eb61be3818ed34362cc03408144bd8fdd5c19303` is deployed as V469. Invalid required `workspace` or `artifact_root` directories now produce field-specific typed diagnostics, without leaking native paths/argv, creating directories or allowing execution. The existing native check interface was exercised after deployment: a missing-root canary returned `NOKIY_DEPLOYMENT_ARTIFACT_ROOT_CANONICAL_PATH_REQUIRED`, `BLOCKED_PREEXECUTION`, authority `none` and zero native control-plane mutations. Source, candidate and live each passed the same 108 focused tests; counts overlap and staged execution reused candidate evidence. This correctness deployment itself did not establish a performance gain.
 

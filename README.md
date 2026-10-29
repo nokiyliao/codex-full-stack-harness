@@ -2,6 +2,8 @@
 
 ## Current Reliability Follow-Up
 
+V470 adds dependency-first publication guidance using existing ordered steps in the SAME command_run array. It does not require another model turn or add a lock, grant or runtime rebuild. The final production delta is one48-byte instruction (including newline); all earlier instruction text is preserved, and regression tests separately account for this explicit feature cost while retaining baseline budgets. Source, candidate and live each passed288 tests, with overlapping counts. This is guidance, not enforced atomic publication; post-deployment model adherence and performance are not yet measured.
+
 V469 adds field-specific deployment/closeout path diagnostics without changing admission or execution rights. The installed native interface now identifies an invalid `artifact_root` instead of hiding it behind a generic input error; the negative canary remained pre-execution with zero control-plane mutations. Source, candidate and live focused suites each passed 108 tests (overlapping counts). A subsequent frozen DCF2 pair observed256.2s/$0.409027 versus native Sol433.5s/$0.7551816, with passing functional acceptance but an unresolved branch-verifier warning. This is CLI execution, not full acceptance E2E or causal/stable gain proof. See the benchmark summary; earlier V468 measurements retain their original composition.
 
 Current source surface: **caller-only V468 + unchanged V464 Rust + Switchboard native-catalog/continuation/observation repairs: caller b336f5b + Rust 1304065 + switchboard 35e4fe4**, synchronized on 2026-10-29.

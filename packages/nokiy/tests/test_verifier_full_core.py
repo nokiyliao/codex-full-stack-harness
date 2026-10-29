@@ -111,6 +111,7 @@ class VerifierPromptTests(unittest.TestCase):
                       "exact-write patches precede the admitted focused_verifier "
                       "at a strictly later positive step in the same command_run response.", guidance)
         self.assertIn("No dependent same-step verification or missing-evidence edits.", guidance)
+        self.assertIn("Publish deps before importers in earlier steps.", guidance)
 
     def test_verified_roots_and_verifier_inputs_are_context_not_read_grants(self):
         contract = json.loads(json.dumps(self.jspace))
@@ -473,11 +474,14 @@ class VerifierPromptTests(unittest.TestCase):
             ("edit+verifier", self.jspace, 3039),
             ("edit+verifier+sha", mixed_with_sha, 3126),
         )
+        publication_rule = "Publish deps before importers in earlier steps.\n"
         for label, contract, guidance_cap in cases:
             with self.subTest(case=label):
                 before = json.loads(json.dumps(contract))
                 projection, guidance = self._prompt_parts(task, full_core._provider_prompt(task, contract))
-                self.assertLessEqual(len(("\n" + guidance).encode("utf-8")), guidance_cap)
+                self.assertEqual(guidance.count(publication_rule), 0 if label == "read-only" else 1)
+                baseline = guidance.replace(publication_rule, "", 1)
+                self.assertLessEqual(len(("\n" + baseline).encode("utf-8")), guidance_cap)
                 if label == "edit+verifier+sha":
                     self.assertEqual(projection["known_source_sha256_by_path"], {"verify.py": "a" * 64})
                     self.assertEqual(projection["source_read_example"], {

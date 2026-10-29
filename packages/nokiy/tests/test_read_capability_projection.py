@@ -1526,6 +1526,8 @@ class FocusedVerifierProjectionTests(unittest.TestCase):
             ("mixed", True, True, True, False, 3040, 0),
             ("mixed_with_sha", True, True, True, True, 3127, 0),
         )
+        # Charge the 48-byte publication rule separately from these baseline budgets.
+        publication_rule = "Publish deps before importers in earlier steps.\n"
         for name, read_allowed, verifier_allowed, modify_allowed, pinned, starting_bytes, delta in cases:
             with self.subTest(case=name):
                 grant = copy.deepcopy(self.grant)
@@ -1554,7 +1556,9 @@ class FocusedVerifierProjectionTests(unittest.TestCase):
                     self.assertEqual(decoded["known_source_sha256_by_path"], {"tests/verify.py": "a" * 64})
                 self.assertTrue(guidance.endswith(core.CAPABILITY_GAP_GUIDANCE))
                 guidance = guidance.removesuffix(core.CAPABILITY_GAP_GUIDANCE)
-                guidance_bytes = len(("\n" + guidance).encode("utf-8"))
+                self.assertEqual(guidance.count(publication_rule), 1 if modify_allowed else 0)
+                baseline = guidance.replace(publication_rule, "", 1)
+                guidance_bytes = len(("\n" + baseline).encode("utf-8"))
                 self.assertLessEqual(guidance_bytes, starting_bytes + delta)
                 self.assertLessEqual(guidance_bytes, starting_bytes + 99)
                 self.assertEqual(grant, before)
@@ -1848,8 +1852,11 @@ class SourceOnlyOrderedReadbackProjectionTests(unittest.TestCase):
             tail = text.split("Verified execution capability (caller projection):\n", 1)[1]
             tails.append(tail.split("\n", 1)[1])
         delta = len(tails[1].encode("utf-8")) - len(tails[0].encode("utf-8"))
+        publication_rule = "Publish deps before importers in earlier steps.\n"
+        self.assertNotIn(publication_rule, tails[0])
+        self.assertEqual(tails[1].count(publication_rule), 1)
         self.assertGreater(delta, 0)
-        self.assertLessEqual(delta, 550)
+        self.assertLessEqual(delta - len(publication_rule.encode("utf-8")), 550)
 
 
 class CapabilityGapPromptTests(unittest.TestCase):

@@ -632,6 +632,7 @@ def _provider_prompt(prompt: str, jspace: dict[str, Any],
     if read_write_allowed:
         text += ("Complete source_delta: readback per apply_patch rules; else source_read. "
                  "Task-required reads prevail.\n")
+        text += "Publish deps before importers in earlier steps.\n"
         if verifier_allowed:
             text += ("If task-required post-edit review remains: "
                      "Mechanical missing readbacks only; mandatory task_status done "

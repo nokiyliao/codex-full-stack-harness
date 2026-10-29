@@ -1,6 +1,14 @@
 # Source Provenance
 
-## Current V469 Caller
+## Current V470 Caller
+
+Current caller source is `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1`, installed as V470 (`0.3.470.dev0`). The retained DCF2 case established a dependency-unsafe publication sequence: the producer exposed a new CLI import while its new projection module was unavailable. Both writes used the same step. A deterministic import fixture observed pass/fail/pass for importer-first and pass at every checkpoint for dependency-first; no exact cross-worker wall interval is claimed.
+
+The correction adds one48-byte source-publication instruction, including newline, using the runtime's existing positive-step groups inside the same command_run. It preserves every prior production instruction; the attempted broad wording compaction was rejected. Baseline prompt-budget tests remain, with the deliberate48-byte feature cost separately counted and duplicate instructions rejected. Source/candidate/live suites each passed288 tests; staged execution reused candidate evidence. An installed-module functional check also passed without inference. Existing settlement behavior was verified correct and not changed: original failed workers and their absent done evidence remain failed/incomplete even when a joined parent gate passes.
+
+This is a prompt-level prevention, not host-enforced multi-file atomicity or proof that every future worker follows it. No new model benchmark, model/effort/permission change, App restart, Rust rebuild, trading effect or original-request replay accompanied V470. A changed global config preimage was freshly bound and preserved, not edited. Earlier V469 and V468 measurements keep their actual tested compositions.
+
+## Earlier V469 Caller
 
 Current caller source is `eb61be3818ed34362cc03408144bd8fdd5c19303`, installed as V469 (`0.3.469.dev0`). Required workspace/artifact directory failures retain a safe, field-specific typed blocker before any execution, rather than falling through to a generic input error. Missing directories are not silently created and all existing path, identity, ownership, pin, expiry and effect checks remain. Source/candidate/live focused suites each passed 108 tests; staged execution reused candidate evidence. The real native-interface negative canary returned `NOKIY_DEPLOYMENT_ARTIFACT_ROOT_CANONICAL_PATH_REQUIRED`, pre-execution and with zero native control-plane mutations. Earlier model observations were not rerun or relabeled as V469 performance evidence.
 
