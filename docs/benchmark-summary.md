@@ -1,5 +1,13 @@
 # Benchmark Observations
 
+## V472 Deployment: No New Performance Measurement
+
+Caller V472 (`0.3.472.dev0`, source `48342f2df96710be9e1ebcdbc6b8101bb521a9ac`) is deployed; Switchboard `5b16a5b` and Rust V464 are unchanged. It adds `exit_code`, `execution_proof` and `receipt_check` from already validated matched commands to context-bearing verifier receipts, matching receipts without context. This fixes demonstrated missing evidence that prompted extra coordinator reads, without new success inference, live freshness, dependency coverage or acceptance authority. Models, prompts and permissions are unchanged; Rust was not rebuilt.
+
+The installed-function check used historical R19 resident and closeout receipts, adding exactly three already validated facts to each projection while preserving all other content. It made zero provider calls and was not a fresh model run. No latency or cost gain attributable to V472 has been measured. [Provenance](../PROVENANCE.md) records the deployment and test evidence.
+
+The accepted DCF2-v3 and R19 pairs below remain single observations measured on caller V471 / Switchboard `5b16a5b` / Rust V464. Their numbers, source identities, price assumptions, negative results and quality holds retain their original scope; they are not V472 measurements or stable/universal improvement claims. Older release descriptions below are historical.
+
 ## R19: Second-Workload Observation
 
 Composition and requested profiles are unchanged from the accepted DCF2-v3 pair: caller V471 / Switchboard `5b16a5b` / Rust V464, Efficient Sol 6.1/max with requested Terra 6.1/xhigh workers versus native Sol 6.1/max. Native chose two Sol children freely. The existing R19 reference passed its corrected 67-case gate immediately before the paid experiment; no exclusion, skip cap, task scope or model effort was relaxed.
@@ -21,11 +29,11 @@ Unrounded observations are **-31.33% time and -56.24% estimate**. All observed p
 
 This is the first accepted pair on a second workload, not repeated-trial stability or proof of universal/runtime-only/DCF-isolated benefit. Costs use the same disclosed source-pinned weights, not billing, independently dated current prices or proven downstream Terra identity/effort. All per-pair controls match, but provider/cache/shared-resource variation across pairs is not controlled. Both root test chats were archived through the official App API; no live research, trading service, broker/order or production source effect occurred.
 
-The remaining measured concentration is coordination: 81.23% of Efficient's estimate. Its separate acceptance phase used three model requests (128.276 seconds of recorded upstream spans) while two completed commands reopened already verified inspection summaries. Whether the original projected result lacked necessary visible facts remains unproven; these spans are not all assumed removable. No additional prompt rule or new runtime was shipped to claim that saving.
+The remaining measured concentration is coordination: 81.23% of Efficient's estimate. Its separate acceptance phase used three model requests (128.276 seconds of recorded upstream spans) while two completed commands reopened already verified inspection summaries. At the time of that V471 observation, whether the original projected result lacked necessary visible facts remained unproven; no additional prompt rule or new runtime was shipped with the measurement to claim that saving. Subsequent receipt inspection demonstrated missing verifier facts and motivated the V472 repair above. These spans are not all assumed removable, and no saving attributable to V472 has been measured.
 
 ## V3: Qualified Single-Pair Observation
 
-The current caller V471 / Switchboard `5b16a5b` / Rust V464 composition completed the same three-turn workflow using the stronger pre-frozen DCF2-v3 oracle. Both independent gates passed, including the two previously escaping requirements. Parent review covered the actual product diffs and focused tests; no confirmed remaining failure was found within that declared task and review scope. This is bounded acceptance, not universal semantic equivalence.
+The measured caller V471 / Switchboard `5b16a5b` / Rust V464 composition completed the same three-turn workflow using the stronger pre-frozen DCF2-v3 oracle. Both independent gates passed, including the two previously escaping requirements. Parent review covered the actual product diffs and focused tests; no confirmed remaining failure was found within that declared task and review scope. This is bounded acceptance, not universal semantic equivalence.
 
 | Metric | Efficient | Concurrent Native Sol 6.1/max |
 | --- | ---: | ---: |
@@ -51,7 +59,7 @@ Planning used five calls, versus six in the preceding v2 follow-up, but the new 
 
 ## Historical Plan-Only V2 Follow-up: Quality Held
 
-The deployed source is caller V471 / Switchboard `5b16a5b` / Rust V464. No task, native binary or requested profile was changed for the concurrent v2 follow-up; before/after controls match within the pair. Native Sol 6.1/max again chose two children freely.
+The source deployed for that follow-up was caller V471 / Switchboard `5b16a5b` / Rust V464. No task, native binary or requested profile was changed for the concurrent v2 follow-up; before/after controls match within the pair. Native Sol 6.1/max again chose two children freely.
 
 | Metric | Efficient | Concurrent Native |
 | --- | ---: | ---: |
@@ -163,7 +171,7 @@ The longest worker was 215.0 seconds in the high/Sol observation versus 97.1 sec
 
 ## Post-Deployment V470 R19 Pair
 
-The current `0d9434476edc90ce3e2c7d0dc9548437799b0a30` composition completed a new matched R19 pair with unchanged caller V470 and Rust V464. Both arms passed the fixed quality gate and source integrity: Efficient 67 tests, native 73, zero failures/errors/skips. Complete recorded usage reconciles; there are no missing usage records or unknown models.
+That `0d9434476edc90ce3e2c7d0dc9548437799b0a30` composition completed a new matched R19 pair with unchanged caller V470 and Rust V464. Both arms passed the fixed quality gate and source integrity: Efficient 67 tests, native 73, zero failures/errors/skips. Complete recorded usage reconciles; there are no missing usage records or unknown models.
 
 | Metric | Efficient | Native Sol 6.1/max |
 | --- | ---: | ---: |
@@ -176,7 +184,7 @@ The current `0d9434476edc90ce3e2c7d0dc9548437799b0a30` composition completed a n
 
 Observed CLI time fell 47.8% and complete reported cost fell 36.3%. Efficient used two Terra 6.1/xhigh workers; native autonomously used no child this time. Both workers have exact-request verified done/cleanup evidence and a joined source-bound live-return gate. There were no coordinator preparation refusals or post-gate parent commands. Failed worker verifiers and native shell lookups/repairs remain included, not removed to improve totals.
 
-The current run used exact/discovery read scopes, so it did not directly exercise filename-glob expansion. Three coordinator calls versus four in the preceding observation is measured, but cannot isolate patch causality. Cache warmth, provider load and autonomous decomposition vary, and the native baseline differs across runs. This is a qualified single pair, not a stable/universal gain. Frozen 2026-10-22 API-equivalent pricing is not invoice/subscription billing; hidden provider attempts and internal effort remain unknown. CLI timing excludes setup and the independent after-barrier audit. No further source deployment accompanied this measurement.
+That run used exact/discovery read scopes, so it did not directly exercise filename-glob expansion. Three coordinator calls versus four in the preceding observation is measured, but cannot isolate patch causality. Cache warmth, provider load and autonomous decomposition vary, and the native baseline differs across runs. This is a qualified single pair, not a stable/universal gain. Frozen 2026-10-22 API-equivalent pricing is not invoice/subscription billing; hidden provider attempts and internal effort remain unknown. CLI timing excludes setup and the independent after-barrier audit. No further source deployment accompanied this measurement.
 
 ## Earlier V470 R19 Pair On The Repaired Binding
 
@@ -305,7 +313,7 @@ The fixed required quality gate passed on both arms; optional added tests explai
 
 Per-arm timing covers native CLI execution including its internal delegation and checks. Setup and post-barrier independent quality audits are excluded, so full contiguous user-acceptance E2E is unmeasured. Source-publication checks ran during model waits without changing benchmark inputs or deployment. Cache warmth was not controlled. This one pair shows a qualified joint gain, not statistical stability or an isolated causal effect of V465 diff dedup or V466 diagnostics. The original live Ultra task recovery and unexpected-EOF origin remain unverified.
 
-## Current Caller-Only V468
+## Earlier Caller-Only V468
 
 At V468, caller source b336f5b retained unchanged V464 Rust and Switchboard35e4fe4. Optional complete safe UTF-8 logs come from existing verifier scratch reads, within unchanged output budgets; duplicate visible stdout/stderr is not repeated. File text yields before original previews, proof, results and diffs, and remains untrusted context. Native source/candidate/live stages each passed 260 focused tests with equivalent staged evidence reused. The source-bound original-output replay added the previously separate 1,041-byte log, increasing encoded summary bytes43,210to44,279 while preserving old metadata/previews/diffs. It does not prove fewer model rounds or lower cost/time, and no such effect is claimed at publication. The existing worker-focused signal-isolation gap remains; native parent verification did not disable it.
 
@@ -457,7 +465,7 @@ Earlier whole-workflow reports that counted only the last response's tokens are 
 
 ## Earlier V464 / 89c7889 Efficient R19 Pair
 
-On2026-10-28, one fresh pair used the earlier V464 caller/runtime and Switchboard89c7889 composition, the same frozen R19 task, concurrent arms and independent fixed quality gate. This is not a measurement of the current 35e4fe4 source. Both coordinators used Sol6.1/max; Efficient selected two Terra6.1/xhigh workers. Source/configuration controls, including server/profile/route/policy bytes before and after, matched. Root reported input/cached/output usage reconciled exactly to each CLI, and all worker/native-child usage was complete. Costs retain frozen2026-10-22 API-equivalent weights, not subscription billing or current invoices.
+On2026-10-28, one fresh pair used the earlier V464 caller/runtime and Switchboard89c7889 composition, the same frozen R19 task, concurrent arms and independent fixed quality gate. This is not a measurement of the later 35e4fe4 source. Both coordinators used Sol6.1/max; Efficient selected two Terra6.1/xhigh workers. Source/configuration controls, including server/profile/route/policy bytes before and after, matched. Root reported input/cached/output usage reconciled exactly to each CLI, and all worker/native-child usage was complete. Costs retain frozen2026-10-22 API-equivalent weights, not subscription billing or current invoices.
 
 | Metric | Efficient | Native Sol6.1 | Difference |
 | --- | ---: | ---: | ---: |
@@ -505,4 +513,4 @@ On2026-10-29, one sequential fresh-CLI acceptance-only pair compared Efficient b
 
 Both root CLI usage totals reconciled exactly (REPORTED_TOTALS_MATCH). Controls were stable within each arm; the only cross-arm changes were coordinator observation-guidance source and admission release metadata. Totals include measured coordinator/correlated usage; engineering-chat usage is excluded by operator scope. Removing cached input reduces tokens with a lower API cost weight, so token savings need not equal cost savings.
 
-This one pair does not establish full repair-workflow or same-ID/multiturn stability. The small 2.52% wall-time difference is insufficient for a stable speedup claim. Costs use frozen2026-10-22 standard API-equivalent rates, not subscription consumption or invoices. Current Switchboard source is 35e4fe4 with caller-only V468 and unchanged V464 Rust. The complete R19 pair above was measured at 372c9b2 before the native-catalog repair; no model measurement here proves that repair caused a gain.
+This one pair does not establish full repair-workflow or same-ID/multiturn stability. The small 2.52% wall-time difference is insufficient for a stable speedup claim. Costs use frozen2026-10-22 standard API-equivalent rates, not subscription consumption or invoices. That publication's Switchboard source was 35e4fe4 with caller-only V468 and unchanged V464 Rust. The complete R19 pair above was measured at 372c9b2 before the native-catalog repair; no model measurement here proves that repair caused a gain.

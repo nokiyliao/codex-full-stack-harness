@@ -1158,7 +1158,9 @@ def _verifier_delivery(inspection: dict[str, Any]) -> dict[str, Any] | None:
     commands = inspection.get("commands") or []
     if not isinstance(commands, list):
         return None
-    matched = {c.get("event_index") for c in commands
+    matched = {c["event_index"]: {key: c[key] for key in
+                                ("exit_code", "execution_proof", "receipt_check")}
+               for c in commands
                if isinstance(c, dict) and type(c.get("event_index")) is int
                and c.get("execution_proof") == "known_success"
                and c.get("receipt_check") == "matched"
@@ -1177,6 +1179,7 @@ def _verifier_delivery(inspection: dict[str, Any]) -> dict[str, Any] | None:
                 or event["event_index"] not in matched):
             continue
         receipts.append({"source_event": event,
+                         **matched[event["event_index"]],
                          "source_postimages": [
                              {key: file[key] for key in
                               ("path", "preimage_sha256", "postimage_sha256") if key in file}
@@ -1202,8 +1205,8 @@ def _verifier_delivery(inspection: dict[str, Any]) -> dict[str, Any] | None:
         receipts.append({"source_event": {"event_index": command["event_index"],
                                           "verifier_index": locator["verifier_index"],
                                           "terminal_sha256": inspection.get("terminal_sha256")},
-                         "execution_proof": "known_success", "receipt_check": "matched",
-                         "exit_code": 0, "source_postimages": [],
+                         **matched[command["event_index"]],
+                         "source_postimages": [],
                          "source_context_available": False})
     if not receipts:
         return None

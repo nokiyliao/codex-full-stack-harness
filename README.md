@@ -1,8 +1,16 @@
 # Nokiy Full-Stack Harness
 
+## Current Deployment: Caller V472
+
+As of 2026-10-29, the deployed caller is V472 (`0.3.472.dev0`), source `48342f2df96710be9e1ebcdbc6b8101bb521a9ac`. Switchboard `5b16a5b666b2c91f78399dbb40bbfeacafd7ced8` and Rust V464 `1304065c69b9c5c6a702a05754526395c9a41678` are unchanged.
+
+V472 adds `exit_code`, `execution_proof` and `receipt_check` from already validated matched commands to context-bearing verifier receipts, matching existing receipts without context. This fixes missing evidence that prompted extra coordinator reads; it adds no success inference, live freshness, dependency coverage or acceptance authority. Models, prompts and permissions are unchanged; Rust was not rebuilt.
+
+No latency or cost gain has been measured for V472. The accepted DCF2-v3 and R19 pairs below remain single observations measured on V471, with their original source identities and limits. Older release descriptions retain their historical scope. See [verification provenance](PROVENANCE.md) and [current surface](docs/current-surface.md).
+
 ## Two Different Frozen Tasks
 
-The deployed caller V471 / Switchboard `5b16a5b` / Rust V464 workflow now has one parent-accepted pair on each of two different real-engineering snapshots:
+The measured caller V471 / Switchboard `5b16a5b` / Rust V464 workflow has one parent-accepted pair on each of two different real-engineering snapshots:
 
 | Task | Efficient E2E / estimate | Native Sol 6.1/max E2E / estimate |
 | --- | ---: | ---: |
@@ -29,15 +37,15 @@ On the corrected DCF2-v2 task, Efficient observed **699.0 seconds / $0.5245** ve
 
 The observed workflow now matches the deployed ownership contract: Efficient's apply phase used one batch and two coordinator model calls; workers delivered the product implementations and tests, not tests after parent implementation. Earlier negative results remain below and in the [benchmark summary](docs/benchmark-summary.md). Source composition is unchanged by this measurement.
 
-## Deployed Same-ID Ownership Workflow
+## Earlier Same-ID Ownership Workflow
 
-Switchboard `914f345` is hot-deployed with bounded planning/apply ownership guidance; caller V471 and Rust V464 are unchanged. Ultra/Efficient now explicitly carry planned branch ownership through navigation, implementation, focused tests and verification, instead of implementing the products first and delegating only tests. Read-only planning remains read-only, serial routing is unchanged, and ownership grants no authority. Canonical Node verification passed 1,074 tests. Deployed contract generation was checked without a provider call; improved model behavior or performance after this repair is not yet measured.
+Switchboard `914f345` was hot-deployed with bounded planning/apply ownership guidance; caller V471 and Rust V464 were unchanged. Ultra/Efficient now explicitly carry planned branch ownership through navigation, implementation, focused tests and verification, instead of implementing the products first and delegating only tests. Read-only planning remains read-only, serial routing is unchanged, and ownership grants no authority. Canonical Node verification passed 1,074 tests. Deployed contract generation was checked without a provider call; improved model behavior or performance after this repair was not yet measured at that release.
 
 The earlier v1 three-turn same-ID observation did **not** establish a cost win: recorded machine E2E was 11.91% lower but cost 18.06% higher. The coordinator cost was almost native's, with workers added late for tests. Both saved machine quality gates passed, but semantic review found a resolved-reference omission in Efficient and a retention CLI reporting gap in native, so that pair's equal-quality acceptance remains held. It was not repaired into the newer result. See [benchmark observations](docs/benchmark-summary.md).
 
 ## Previous Context-Count Diagnostics
 
-Caller V471 (`560cc0e`) and Switchboard `e4192b7` are deployed; Rust V464 is unchanged. Oversized exact-file context now reports its actual and maximum unique file count, the scopes being counted, and a supported correction instead of generic `action/invalid_shape`. The canonical 32-file bound and all authority checks remain unchanged. An actual advertised-tool canary returned 37/32 before provider execution, without changing its fixture. Caller release verification passed 481 tests; the canonical Node candidate passed 1,073. Counts overlap and are not additive. This diagnostic repair has no newly measured performance claim.
+Caller V471 (`560cc0e`) and Switchboard `e4192b7` were deployed for this repair; Rust V464 was unchanged. Oversized exact-file context now reports its actual and maximum unique file count, the scopes being counted, and a supported correction instead of generic `action/invalid_shape`. The canonical 32-file bound and all authority checks remain unchanged. An actual advertised-tool canary returned 37/32 before provider execution, without changing its fixture. Caller release verification passed 481 tests; the canonical Node candidate passed 1,073. Counts overlap and are not additive. This diagnostic repair has no newly measured performance claim.
 
 A separately measured second DCF workload on the preceding V470/`0d94344` composition observed 49.46% lower CLI workflow time and 61.98% lower reported API-equivalent cost than native Sol 6.1/max, including all recorded coordinator, worker and native-child usage. Independent final audits were deliberately held behind a two-arm barrier; their completion timestamps are not standalone user-acceptance E2E. See [benchmark observations](docs/benchmark-summary.md) for timing, quality and accounting limits.
 
@@ -73,7 +81,7 @@ The accepted V470 workflow measured Efficient477.2s/$0.36723 versus native Sol55
 
 V469 adds field-specific deployment/closeout path diagnostics without changing admission or execution rights. The installed native interface now identifies an invalid `artifact_root` instead of hiding it behind a generic input error; the negative canary remained pre-execution with zero control-plane mutations. Source, candidate and live focused suites each passed 108 tests (overlapping counts). A subsequent frozen DCF2 pair observed256.2s/$0.409027 versus native Sol433.5s/$0.7551816, with passing functional acceptance but an unresolved branch-verifier warning. This is CLI execution, not full acceptance E2E or causal/stable gain proof. See the benchmark summary; earlier V468 measurements retain their original composition.
 
-Current source surface: **caller-only V470 `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` + unchanged V464 Rust `1304065c69b9c5c6a702a05754526395c9a41678` + Switchboard `bd9ade07e95fe5abdcad28a2760a02c23f5667e9`**, synchronized on 2026-10-29. The accepted V470 pair above used earlier Switchboard `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`.
+Historical V470 source surface: **caller-only V470 `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` + unchanged V464 Rust `1304065c69b9c5c6a702a05754526395c9a41678` + Switchboard `bd9ade07e95fe5abdcad28a2760a02c23f5667e9`**, synchronized on 2026-10-29. The accepted V470 pair above used earlier Switchboard `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`.
 
 This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V464 keeps failed-patch feedback fast: an already-finished provider uses its normal metrics path, while a still-running provider is cancelled without waiting just for accounting. Cancelled usage remains UNKNOWN, never zero. The intermediate V463 forced-drain approach was rejected for delaying repair. V462 optional worker notes and single-branch-only Efficient native implementation remain. These changes do not expand permissions or change models.
 
@@ -99,11 +107,11 @@ Native Codex thread / Goal / UI
 
 | Component | Published directory | Source identity | License |
 | --- | --- | --- | --- |
-| Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` | MIT |
+| Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `48342f2df96710be9e1ebcdbc6b8101bb521a9ac` | MIT |
 | Modified Tura-derived execution engine | [runtime](runtime) | `1304065c69b9c5c6a702a05754526395c9a41678` | AGPL-3.0-or-later |
-| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `bd9ade07e95fe5abdcad28a2760a02c23f5667e9` | Repository AGPL-3.0-or-later |
+| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `5b16a5b666b2c91f78399dbb40bbfeacafd7ced8` | Repository AGPL-3.0-or-later |
 
-[Current source manifest](releases/v470-caller-controls.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
+[Historical V470 source manifest](releases/v470-caller-controls.json) records that release's per-file hashes, executable bits and installed-source correspondence; `CURRENT.json` selects the current release manifest. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
 
 ## What Is Included
 
@@ -140,7 +148,7 @@ cd runtime
 cargo build --locked --release --bin tura_router --bin tura_runtime --bin tura_session_db --bin tura_exec
 ```
 
-The Rust names preserve their actual source lineage. The caller source package version is `0.3.309.dev0`; the deployed release wheel is `0.3.470.dev0`. The existing V464 release rebuilt the actual four-binary payload with cargo --locked. V465 through V470 change only the caller: there is no Rust rebuild or new universal runtime version.
+The Rust names preserve their actual source lineage. The caller source package version is `0.3.309.dev0`; the current deployed release wheel is `0.3.472.dev0` (the historical V470 wheel was `0.3.470.dev0`). The existing V464 release rebuilt the actual four-binary payload with cargo --locked. V465 through V472 change only the caller: there is no Rust rebuild or new universal runtime version.
 
 Switchboard source requires Node.js 22.15+ and Python 3.11+ for its host/tests:
 

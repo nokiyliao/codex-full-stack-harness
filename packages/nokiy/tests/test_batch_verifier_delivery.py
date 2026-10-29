@@ -331,6 +331,27 @@ class VerifierDeliveryTests(unittest.TestCase):
         self.assertEqual(len(row["verifier_delivery"]["receipts"]), 1)
         self.assertEqual(row["result_text"], "bounded answer")
 
+    def test_context_receipt_preserves_matched_facts_through_compaction(self):
+        evidence = self.evidence()
+        context = evidence["parent_review_context"]["verifier_contexts"][0]
+        context["source_event"].update(exit_code=1, execution_proof="unknown", receipt_check="mismatch")
+        evidence["commands"].append({**evidence["commands"][0], "event_index": 19,
+                                     "command": '{"verifier_index":1}'})
+        before = copy.deepcopy(evidence)
+        result = fixture(1)
+        result["members"][0]["terminal"]["result_inspection"].update(evidence)
+        row = batch.expand_summary(batch._compact_summary(batch.summarize(result)))["members"][0]
+        receipts = row["verifier_delivery"]["receipts"]
+        expected = {"exit_code": 0, "execution_proof": "known_success", "receipt_check": "matched"}
+        self.assertEqual(len(receipts), 2)
+        for receipt in receipts:
+            self.assertEqual({key: receipt[key] for key in expected}, expected)
+            self.assertIs(type(receipt["exit_code"]), int)
+        self.assertEqual(receipts[0]["source_event"], context["source_event"])
+        self.assertEqual(receipts[0]["source_postimage_context"], context["source_postimages"])
+        self.assertFalse(receipts[1]["source_context_available"])
+        self.assertEqual(evidence, before)
+
     def test_success_does_not_require_optional_source_context(self):
         evidence = self.evidence()
         evidence["parent_review_context"] = {}

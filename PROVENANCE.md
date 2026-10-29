@@ -1,5 +1,19 @@
 # Source Provenance
 
+## Current V472 Verifier Fact Parity
+
+The deployed caller is V472 (`0.3.472.dev0`), source `48342f2df96710be9e1ebcdbc6b8101bb521a9ac`. Its source delta is limited to `src/codex_collaboration_harness/batch.py` and `tests/test_batch_verifier_delivery.py`. Switchboard remains `5b16a5b666b2c91f78399dbb40bbfeacafd7ced8`; Rust remains V464 source `1304065c69b9c5c6a702a05754526395c9a41678`, without a rebuild.
+
+Context-bearing verifier receipts now include `exit_code`, `execution_proof` and `receipt_check` from already validated matched commands, consistent with receipts without context. This repairs demonstrated missing evidence that prompted extra coordinator reads. It introduces no new success inference, live freshness, dependency coverage or acceptance authority. Models, prompts and permissions are unchanged; Rust was not rebuilt.
+
+Native full discovery ran 2,310 tests with 124 skips and zero failures/errors. The existing guarded publisher source/candidate/live suites each ran 247 tests with one skip and zero failures/errors; these counts overlap and must not be added. The original mutation worker's incomplete verifier-environment result remains retained; the parent-native exact full suite passed without replaying that worker.
+
+The installed V472 function was verified through an isolated installed interpreter on historical R19 resident and closeout receipts. Each projection gained exactly the three already validated facts, preserving all other projection content, false live freshness and required parent acceptance. This was historical receipt replay with zero provider calls, not a fresh model run or live-freshness test. No latency or cost gain attributable to V472 has been measured.
+
+Supplied evidence: `nokiy-verifier-fact-parity-20261029/LIVE_ACCEPTANCE.json`, SHA-256 `216ddd5833f05f8bd674e984b11b70e6aaecfd1c3143a1abe941828d1bae461a`; `nokiy-verifier-fact-parity-20261029/source-acceptance.json`, SHA-256 `5de3a1ee49d84ce19df8299f94b854fc283b5d4a139eca1c369cda9cf1f231c7`.
+
+The accepted R19 and DCF2-v3 pairs below were measured on caller V471 / Switchboard `5b16a5b` / Rust V464. They remain single observations, not V472 measurements or stable/universal improvements. Older source and deployment descriptions below retain their release-time scope.
+
 ## R19 Generalization Observation
 
 The second task reuses the existing frozen R19 fixture and its corrected validator, not a newly easier challenge: task template `a902cc48`, manifest `7b75c76e`, validator `8486eb40`. The historical initial validator identity was superseded by the recorded corrected preflight; the approved corrected identity and all original checks remain. Before model execution the accepted reference was revalidated with the task's venv interpreter: 67 cases, zero failures/errors/skips/integrity errors.
@@ -14,7 +28,7 @@ The next paid pair used the already frozen, hash-pinned v3 task/manifest/validat
 
 The parent reviewed complete product diffs and focused tests. Efficient's two recorded workers are EVIDENCE_VERIFIED with evidence-only completion/cleanup, and all three final product hashes match their recorded postimages. The recorded post-batch gate is PASSED/live_return; the later independent gates cover both final subjects. Each arm retained its own exact ID through all three turns; cumulative root usage reconciles as deltas. Native freely used two Sol children, with every recorded child cost included. Before/after source/runtime controls match. The two dedicated root test chats were archived through the official App API after completion.
 
-Composition remains caller V471 / Switchboard `5b16a5b` / Rust V464; no new runtime deployment is claimed for this measurement. The single v3 observation does not erase v2 failures, establish repeatability or prove a causal prompt/cache/DCF effect. Pricing-date and provider-observed worker limitations stated below remain applicable.
+Measured composition was caller V471 / Switchboard `5b16a5b` / Rust V464; no new runtime deployment is claimed for this measurement. The single v3 observation does not erase v2 failures, establish repeatability or prove a causal prompt/cache/DCF effect. Pricing-date and provider-observed worker limitations stated below remain applicable.
 
 ## Historical V2 Semantic Qualification
 
@@ -30,7 +44,7 @@ The CLI oracle was integrated into the CLI/locations test file rather than the r
 
 In the fresh three-turn pair, source/runtime controls matched, cumulative root usage reconciled on every turn, and both independent final gates passed (Efficient 696/native 713, ten skips each). Parent reviewed both complete product diffs and matched all three Efficient product identities to the recorded member postimages. There was no parent product repair. Two main test sessions were archived through the official API. Both native child turns were observed completed, but one child archival call returned `Inactive thread archive did not persist`; it was not replayed, and the sibling archival was deferred. That local cleanup gap is not treated as a benchmark failure or a reason to alter native storage.
 
-## Current Same-ID Ownership Workflow
+## Earlier Same-ID Ownership Workflow
 
 Switchboard source `914f34522909b552fea4e239ddd0d16cfc7d5040` exports only `src/nokiy-coordinator-policy.mjs`, `tests/nokiy-efficient-first-dispatch.test.mjs` and `tests/nokiy-efficient-adaptive-loop.test.mjs` over the previous public surface. Caller source/version, Rust, profiles, reasoning efforts, permissions and signed App are unchanged. The policy adds a net 341 UTF-8 bytes to existing guidance; it does not create state, a router or a new execution plane. Serial routing remains unchanged.
 
@@ -58,7 +72,7 @@ Switchboard source `bd9ade07e95fe5abdcad28a2760a02c23f5667e9` adds only the publ
 
 ## Earlier Switchboard Native-Host and Publisher Correctness
 
-Current Switchboard source is `b856bc102833bae2b348b13be6842a5f4a4c47b7`, following native-host fix `5ab348c8451e15868298c6d45ee8397e20e9f4e7`. The parent exported exactly `src/nokiy-native-host.py`, `src/workflow-update.mjs`, `tests/test_nokiy_external_evidence.py`, `tests/workflow-update-prepare.test.mjs` and `tests/native-source-update.test.mjs` from that committed source into `packages/switchboard`. Only their five component file hashes and the current Switchboard source identity are refreshed; all other component hashes/modes and historical observations are retained. The installed native-host hash matched the prior component source hash and is updated to the exported host identity, without relabeling any frozen historical binding.
+At that release, Switchboard source was `b856bc102833bae2b348b13be6842a5f4a4c47b7`, following native-host fix `5ab348c8451e15868298c6d45ee8397e20e9f4e7`. The parent exported exactly `src/nokiy-native-host.py`, `src/workflow-update.mjs`, `tests/test_nokiy_external_evidence.py`, `tests/workflow-update-prepare.test.mjs` and `tests/native-source-update.test.mjs` from that committed source into `packages/switchboard`. Only their five component file hashes and the then-current Switchboard source identity were refreshed; all other component hashes/modes and historical observations are retained. The installed native-host hash matched the prior component source hash and is updated to the exported host identity, without relabeling any frozen historical binding.
 
 The diagnostic returns `NOKIY_NATIVE_INPUT_INVALID`, indexed `action.read_scopes[n]` and `external_evidence_prompt_budget_exceeded`, exact byte-budget facts and actionable correction when inline external UTF-8 evidence cannot fit the unchanged 65,536-byte total prompt budget, before caller/provider execution on the corrected native-host path. No cap increase, dropped/truncated evidence, authority expansion or new store is introduced; valid small evidence, path/symlink/UTF-8 and verifier-dependency fences remain. Publisher source admission adds only the exact named `src/nokiy-native-host.py` to its existing targets, not arbitrary Python/config. Succession preserves complete historical predecessor pins separately from fresh same-byte CURRENT executor bindings; mismatched, stale and missing-pin negatives remain rejected.
 
@@ -68,9 +82,9 @@ Supplied small evidence is referenced in [current surface](docs/current-surface.
 
 The V470 locations worker had the complete requirement and validator and admitted/read `query.py` size rules before editing. Its pagination miss was semantic implementation error, not lost harness/DCF handoff context; no speculative handoff-pipeline change follows. Useful parent review and repair remain part of the accepted measured workflow. The V470 pair below used Switchboard `116d1ad`, not current `b856bc1`; no new model performance benchmark or speed/cost percentage is assigned to these correctness fixes. Caller V470 `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` and Rust V464 `1304065c69b9c5c6a702a05754526395c9a41678` retain their identities, without a new version or rebuild. Git publication, durable reconciliation and parent acceptance remain parent-owned.
 
-## Current V470 Caller
+## Earlier V470 Caller
 
-Current caller source is `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1`, installed as V470 (`0.3.470.dev0`). The retained DCF2 case established a dependency-unsafe publication sequence: the producer exposed a new CLI import while its new projection module was unavailable. Both writes used the same step. A deterministic import fixture observed pass/fail/pass for importer-first and pass at every checkpoint for dependency-first; no exact cross-worker wall interval is claimed.
+At V470, caller source was `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1`, installed as V470 (`0.3.470.dev0`). The retained DCF2 case established a dependency-unsafe publication sequence: the producer exposed a new CLI import while its new projection module was unavailable. Both writes used the same step. A deterministic import fixture observed pass/fail/pass for importer-first and pass at every checkpoint for dependency-first; no exact cross-worker wall interval is claimed.
 
 The correction adds one48-byte source-publication instruction, including newline, using the runtime's existing positive-step groups inside the same command_run. It preserves every prior production instruction; the attempted broad wording compaction was rejected. Baseline prompt-budget tests remain, with the deliberate48-byte feature cost separately counted and duplicate instructions rejected. Source/candidate/live suites each passed288 tests; staged execution reused candidate evidence. An installed-module functional check also passed without inference. Existing settlement behavior was verified correct and not changed: original failed workers and their absent done evidence remain failed/incomplete even when a joined parent gate passes.
 
@@ -122,7 +136,7 @@ The complete concurrent frozen R19 pair used earlier Switchboard `372c9b26b65b3c
 
 The earlier 89c7889 R19 observation (253.9s/$0.2467354 versus 439.4s/$0.4943428) remains separate. The negative same-ID cost result (+15.66%, with end-of-run native-binary identity drift) and the Efficient-only acceptance observation-policy pair (-13.42% cost/-2.52% time) retain their existing measurement and control limits.
 
-These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in [releases/v470-caller-controls.json](releases/v470-caller-controls.json) identify the current published contents; the V468 composition above remains historical. Publication-only documentation and preserved licenses are identified separately.
+These source repositories have separate histories. Their commits are provenance references, not claims that they are ancestors in this aggregate repository. Per-file hashes in [releases/v470-caller-controls.json](releases/v470-caller-controls.json) identify that historical V470 release; the V468 composition above also remains historical. `CURRENT.json` selects the current release manifest. Publication-only documentation and preserved licenses are identified separately.
 
 The caller working tree contains pre-existing local-context test changes, and the runtime working tree contains pending-message deletions; neither was adopted. Source was exported from exact commits, not by copying dirty worktrees or installed environment directories.
 
