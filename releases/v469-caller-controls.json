@@ -2700,13 +2700,13 @@
     }
   },
   "publication_files": {
-    "README.md": "f65ab98e47f1ba4a6f7850cf71d99a3a7e50f2c726e2921df9117366fbb4a47a",
+    "README.md": "20955f6b6a693c34d75410d9944ed24e03e8e90d81598f3b77ab15eb0acec4f7",
     "PROVENANCE.md": "aae1f2df67122056eebfcb72acd1d585392fe4bb841d0e79006dadc5f4595be9",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "4428eed26b6a470649514a828c8878c6afcb37cd1dbe9caae3b9da37ce1fc6cd",
-    "docs/current-surface.md": "c50a61dfaa2c942ed941a5f93494407447a77faf9c9863c00e9599c50dea6089",
-    "docs/benchmark-summary.md": "3c107c8a1d6e790ace0a509a186e3f2477368eb583b5a8a259ce28ecc5ba1456"
+    "docs/current-surface.md": "a8b25019d9131d7117a12b85c75f8186431d8ae7e9e12725a1d2c37d66dfeaea",
+    "docs/benchmark-summary.md": "8a8ce8924e3b1d06002ccb3de508f5bc75263718e89e2884ae7a78239982259e"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v469-deployment-path-diagnostics",
@@ -4020,6 +4020,131 @@
       "runtime_app_models_and_trading_unchanged": true,
       "model_performance_result": "NOT_MEASURED_FOR_V469",
       "producer_diagnosis": "Current maintained Switchboard producer already creates native artifact directory; do not use a predecessor immutable execution entry as the preparation producer."
+    },
+    "current_v469_dcf2_observation": {
+      "schema_version": "nokiy_v469_dcf2_pair_acceptance_v1",
+      "observed_at": "2026-10-29T00:22:18.225150+00:00",
+      "status": "ACCEPTED_FUNCTIONAL_AND_REPORTED_GAIN_WITH_BRANCH_VERIFIER_WARNING",
+      "tested_composition": {
+        "caller_source": "eb61be3818ed34362cc03408144bd8fdd5c19303",
+        "caller": "V469",
+        "switchboard_source": "116d1adb43f7c88aa449aaf963dd3ee9df9846f8",
+        "runtime": "V464 source1304065",
+        "native": "0.165.0-alpha.1.2 d84a54b"
+      },
+      "efficient": {
+        "cli_execution_wall_seconds": 256.2,
+        "reported_api_equivalent_usd": 0.409027,
+        "coordinator_usd": 0.2268368,
+        "workers_usd": 0.1821902,
+        "native_children_usd": 0,
+        "coordinator_calls": 3,
+        "worker_calls": 15,
+        "native_child_calls": 0,
+        "worker_count": 2,
+        "native_child_count": 0,
+        "input": 676186,
+        "cached": 472192,
+        "uncached": 203994,
+        "output": 13601,
+        "reasoning": 4107,
+        "total_tokens": 689787,
+        "overall_input_cache_hit_percent": 69.83167353361354,
+        "coordinator_input_cache_hit_percent": 28.9811320754717,
+        "quality": {
+          "status": "PASS",
+          "tests": {
+            "tests": 691,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 10
+          },
+          "branch": "all",
+          "integrity_failures": [],
+          "exit_code": 0,
+          "scope": "offline fixed DCF two-branch episode; no live or performance claim"
+        },
+        "root_cli_reconciliation": "REPORTED_TOTALS_MATCH",
+        "wire_effort": {
+          "status": "complete",
+          "dispatch_count": 3,
+          "missing_effort_count": 0,
+          "effort_counts": {
+            "max": 3
+          },
+          "scope": "request_wire_not_provider_observed",
+          "provider_effort_observed": null
+        }
+      },
+      "native": {
+        "cli_execution_wall_seconds": 433.5,
+        "reported_api_equivalent_usd": 0.7551816,
+        "coordinator_usd": 0.5140716000000001,
+        "workers_usd": 0,
+        "native_children_usd": 0.24111,
+        "coordinator_calls": 24,
+        "worker_calls": 0,
+        "native_child_calls": 14,
+        "worker_count": 0,
+        "native_child_count": 1,
+        "input": 2131795,
+        "cached": 1979136,
+        "uncached": 152659,
+        "output": 25195,
+        "reasoning": 9779,
+        "total_tokens": 2156990,
+        "overall_input_cache_hit_percent": 92.83894558341679,
+        "coordinator_input_cache_hit_percent": 93.57715201009856,
+        "quality": {
+          "status": "PASS",
+          "tests": {
+            "tests": 703,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 10
+          },
+          "branch": "all",
+          "integrity_failures": [],
+          "exit_code": 0,
+          "scope": "offline fixed DCF two-branch episode; no live or performance claim"
+        },
+        "root_cli_reconciliation": "REPORTED_TOTALS_MATCH",
+        "wire_effort": {
+          "status": "complete",
+          "dispatch_count": 24,
+          "missing_effort_count": 0,
+          "effort_counts": {
+            "max": 24
+          },
+          "scope": "request_wire_not_provider_observed",
+          "provider_effort_observed": null
+        }
+      },
+      "cli_time_change_percent": -40.89965397923876,
+      "cost_change_percent": -45.837266162205225,
+      "tokens_change_percent": -68.0208531333015,
+      "uncached_change_percent": 33.62723455544712,
+      "controls_matched": true,
+      "root_usage_reconciled": true,
+      "retained_known_reported_usage_complete": true,
+      "bound_joined_gate": "PASSED live_return",
+      "worker_warning_not_promoted": true,
+      "aggregate_batch_status_preserved": "BLOCKED COMMAND_FAILURE",
+      "branch_dependency_root_cause": "Missing scripts.ops.dcf.projection reported by cache worker while sibling owns cli.py/projection.py. Cross-branch verification timing/closure needs causal reproduction, not assumed model slowness.",
+      "pricing": "Fixed2026-10-22 API-equivalent weights, not invoices/subscription billing. Includes root+workers+correlated native child; engineering parent excluded. Hidden provider attempts not established.",
+      "timing": "CLI execution includes internal delegation/checks. Independent quality audits run after both model arms; per-arm uninterrupted user-acceptance E2E is NOT MEASURED.",
+      "whole_two_arm_benchmark_wall_seconds": 484.280193625018,
+      "cache_warmth_controlled": false,
+      "stable_or_patch_causal_gain_proven": false,
+      "original_user_ultra_recovery": "UNVERIFIED",
+      "worker_warning": {
+        "branch": "cache",
+        "first_typed_blocker": "COMMAND_FAILURE",
+        "evidence_status": "INCOMPLETE_EVIDENCE",
+        "reported_missing_module": "scripts.ops.dcf.projection",
+        "joined_gate": "PASSED live_return",
+        "no_worker_promotion": true
+      }
     }
   },
   "exclusions": [

@@ -1,5 +1,26 @@
 # Benchmark Observations
 
+## V469 DCF2 Pair With A Branch Verification Warning
+
+| Metric | Efficient | Native Sol 6.1 |
+| --- | ---: | ---: |
+| CLI execution wall | 256.2s | 433.5s |
+| Reported API-equivalent cost | $0.409027 | $0.7551816 |
+| Total tokens | 689,787 | 2,156,990 |
+| Uncached input | 203,994 | 152,659 |
+| Overall input cache hit | 69.83% | 92.84% |
+| Coordinator input cache hit | 28.98% | 93.58% |
+| Coordinator calls | 3 | 24 |
+| Worker / native-child calls | 15 / 0 | 0 / 14 |
+| Quality tests run / skipped | 691 / 10 | 703 / 10 |
+
+Current V469/eb61be3, Switchboard116d1ad and V464 runtime observed CLI time -40.90%, cost -45.84% and tokens -68.02%, while uncached input increased33.63%. Both arms passed the same frozen acceptance/integrity rules with zero failures/errors; optional added tests differ. Controls matched and root CLI usage reconciled exactly. Complete retained reported usage includes the Sol6.1/max coordinator plus two Terra6.1/xhigh workers, and native Sol6.1/max plus its one Sol child. Internal provider effort remains unobserved. Fixed2026-10-22 API-equivalent pricing is neither invoices nor subscription consumption; engineering-parent usage is excluded by the operator's measurement scope.
+
+Important lifecycle warning: the cache worker reported a missing sibling-owned projection module during its assigned verifier. Its terminal evidence remains incomplete and the raw batch remains BLOCKED/COMMAND_FAILURE. The joined live-return gate later passed691 tests and independent validation also passed; this permits functional snapshot acceptance, not promotion of that worker to verified/done. Cost includes the reported failed-check activity. Cross-branch verification timing/dependency remains an optimization gap, not a proven provider-speed cause.
+
+Timing is CLI execution with internal checks, not complete user acceptance. Both independent quality audits ran after the model barrier; the whole two-arm benchmark took484.280s, but individual uninterrupted acceptance E2E was not measured. One concurrent pair with uncontrolled cache warmth proves neither stable long-session gains nor isolated V469 patch causality. Earlier V468/R19 and negative observations below are retained.
+
+
 These are descriptive engineering measurements, not universal speedups, subscription billing or isolated causal estimates. Complete reported coordinator, worker and native-child usage is included; unreported provider attempts are not asserted to be covered.
 
 ## Current V468 Frozen R19 Pair
