@@ -4,7 +4,7 @@
 
 Switchboard source `0d9434476edc90ce3e2c7d0dc9548437799b0a30` exports four exact committed files: `src/nokiy-native-host.py`, `src/nokiy-native-tool.mjs`, `tests/test_nokiy_read_globs.py` and `tests/test_nokiy_verifier_completion.py`. Caller V470 and Rust V464 are unchanged. Native host SHA-256 is `c12b272339dd43ee6e342a8fdb3d9ce50605fd9d595cbe4dacc7e3d0772b62fa`; source, admission and the newly executed advertised-tool snapshot agree. The bounded source deployment passed all three stages without an App restart.
 
-The implementation worker did not reach verified done: its required gate exposed an obsolete literal call-shape assertion. Parent correction preserves the intended ordering through AST checks, then passes the complete Python gate (227 tests, two skips), canonical candidate Node gate (1,073 tests) and six installed focused tests. Original failed worker evidence remains incomplete, not promoted to success. The R19 observation in the benchmark summary predates this patch and includes the original preparation correction cost.
+The implementation worker did not reach verified done: its required gate exposed an obsolete literal call-shape assertion. Parent correction preserves the intended ordering through AST checks, then passes the complete Python gate (227 tests, two skips), canonical candidate Node gate (1,073 tests) and six installed focused tests. Original failed worker evidence remains incomplete, not promoted to success. The preceding R19 observation predates this patch and retains its preparation correction cost; a separate post-deployment observation on `0d94344` is now recorded in the benchmark summary. That measurement introduced no further runtime change.
 
 ## Previous Native-Host Admission Binding
 

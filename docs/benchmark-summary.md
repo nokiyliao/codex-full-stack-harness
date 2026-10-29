@@ -1,6 +1,23 @@
 # Benchmark Observations
 
-## V470 R19 Pair On The Repaired Binding
+## Post-Deployment V470 R19 Pair
+
+The current `0d9434476edc90ce3e2c7d0dc9548437799b0a30` composition completed a new matched R19 pair with unchanged caller V470 and Rust V464. Both arms passed the fixed quality gate and source integrity: Efficient 67 tests, native 73, zero failures/errors/skips. Complete recorded usage reconciles; there are no missing usage records or unknown models.
+
+| Metric | Efficient | Native Sol 6.1/max |
+| --- | ---: | ---: |
+| CLI workflow seconds | 250.756823 | 479.972637 |
+| Reported API-equivalent USD | 0.2520500 | 0.3956116 |
+| Input plus output tokens | 489,656 | 905,505 |
+| Uncached input tokens | 116,472 | 69,145 |
+| Coordinator calls | 3 | 13 |
+| Worker calls | 12 | 0 |
+
+Observed CLI time fell 47.8% and complete reported cost fell 36.3%. Efficient used two Terra 6.1/xhigh workers; native autonomously used no child this time. Both workers have exact-request verified done/cleanup evidence and a joined source-bound live-return gate. There were no coordinator preparation refusals or post-gate parent commands. Failed worker verifiers and native shell lookups/repairs remain included, not removed to improve totals.
+
+The current run used exact/discovery read scopes, so it did not directly exercise filename-glob expansion. Three coordinator calls versus four in the preceding observation is measured, but cannot isolate patch causality. Cache warmth, provider load and autonomous decomposition vary, and the native baseline differs across runs. This is a qualified single pair, not a stable/universal gain. Frozen 2026-10-22 API-equivalent pricing is not invoice/subscription billing; hidden provider attempts and internal effort remain unknown. CLI timing excludes setup and the independent after-barrier audit. No further source deployment accompanied this measurement.
+
+## Earlier V470 R19 Pair On The Repaired Binding
 
 One accepted frozen R19 pair used caller V470, Rust V464 and Switchboard `bd9ade07e95fe5abdcad28a2760a02c23f5667e9`. Both arms passed the unchanged fixed quality gate with no integrity failures; Efficient passed 67 tests and native passed 73, including different optional additions. Controls matched. All recorded coordinator, worker and native-child usage is included and reconciled.
 

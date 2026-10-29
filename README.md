@@ -4,7 +4,7 @@
 
 Switchboard `0d9434476edc90ce3e2c7d0dc9548437799b0a30` accepts filename read patterns such as `tests/test_resident*.py` by expanding them into deterministic exact-file reads. Directory grants and write authority are not enlarged; unsafe paths and symlinks remain rejected, and original request recovery is preserved. The guarded hot deployment passed, including actual source/admission/native-tool snapshot identity. Python verification ran 227 tests with two skips; the canonical Node candidate passed 1,073 tests. Counts overlap with focused checks.
 
-The newly accepted R19 pair, measured on the preceding `bd9ade0` surface, observed CLI workflow time -19.2% and reported API-equivalent cost -42.7%, including coordinator and all recorded children. This is one qualified observation, not the incremental benefit of the new routing fix. See [benchmark observations](docs/benchmark-summary.md).
+The post-deployment R19 pair on `0d94344` observed CLI workflow time -47.8% and reported API-equivalent cost -36.3%, including the coordinator and both recorded workers. Quality passed on both arms. These are single-pair composition results, not proof of stable gain or isolated routing-patch benefit; the earlier `bd9ade0` observation remains retained. See [benchmark observations](docs/benchmark-summary.md).
 
 ## Previous Admitted Host Binding
 
