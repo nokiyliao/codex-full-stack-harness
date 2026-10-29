@@ -1,5 +1,13 @@
 # Current Source Surface
 
+## Accepted V2 Continuation Observation
+
+The unchanged deployed caller V471/Switchboard `914f345`/Rust V464 composition now has one accepted three-turn observation on the strengthened DCF2-v2 task. Both arms retained their own exact native ID for planning, implementation and acceptance, with matched controls and no cross-arm phase/quality barrier. The stricter oracle retained all prior checks/exclusions, added four declared cases, passed its positive reference, and rejected both retained v1 counterexamples. It also preserved independently verifiable product branches.
+
+Efficient passed 696 total cases and native 713, each with ten skips and zero failures/errors/integrity failures; 688 cases are the shared immutable minimum. Counts are not a quality ranking. Parent source review and three current-to-recorded Efficient postimage checks found no remaining failure for this declared task. The observed apply phase contains one Nokiy batch/two root calls, delivering runtime, CLI and projection changes plus focused tests from the workers. It no longer shows the v1 native-products-then-test-workers pattern.
+
+Machine acceptance was 698.992787 versus 1,248.648999 seconds; recorded full cost was $0.5245276 versus $1.4840416, including native's two Sol/max-wire children. This establishes one qualified continuation observation, not stability, pure runtime causality, provider billing, cross-role prefix-cache reuse, navigation ablation or large-context/compaction performance. Planning remains a measured cost center: six Efficient model calls, $0.2360292, about 45% of that arm. That is not proof that every planning read can be removed.
+
 ## Current Same-ID Ownership Workflow
 
 The current composition is caller V471 `560cc0e359cdb9651648834da2c7f3ec09c00b2a`, Switchboard `914f34522909b552fea4e239ddd0d16cfc7d5040` and Rust V464 `1304065c69b9c5c6a702a05754526395c9a41678`. The source-only hot deployment is `nokiy-same-id-branch-ownership-20261029`; all three guarded stages passed with cleanup. No caller/Rust rebuild or model/effort/permission change was made.

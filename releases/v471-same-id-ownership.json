@@ -2706,13 +2706,13 @@
     }
   },
   "publication_files": {
-    "README.md": "417317cad87e87c81d2fcedbec53adb9eb830461b09b44e93d35a3067f5522b3",
-    "PROVENANCE.md": "3af605627a84df76f23db5a8f6dc42c0649da84fcc4f23eea565a11f250f1c2b",
+    "README.md": "4e2b438763639c0a57af0ea39d225fc497d56ee435a6cf73e35a00a9641cf772",
+    "PROVENANCE.md": "2b0df16d4bfa53c5d2e1af23a7f0dc53f39d49b23e21ca43317f90c9df8974f7",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "743b19fe21417f5cf804d7d1f077178b456f7fa7e2b48f5ba9e60f5c1a82406a",
-    "docs/current-surface.md": "db1455aee26c7966c30b203a0476c8ee700e6d9654b56860b5e2cb3028dfa797",
-    "docs/benchmark-summary.md": "db711e5c580fb6c32bca698cd383a2d20ff05a0f2568ed49a4a309dccfb19e91"
+    "docs/current-surface.md": "a107023daa97bfa21bc6cf004a42b641cc1bfb0fae7a54adf9d5e413bf70e3f8",
+    "docs/benchmark-summary.md": "999bc2f21041e0c39b1bfa90d089eb871bafc593b868fdc5e46a216d20a0ea62"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v471-context-file-count-diagnostics",
@@ -4741,6 +4741,107 @@
       "cross_arm_barrier": false,
       "resource_contention_controlled": false,
       "historical_outputs_preserved": true
+    },
+    "accepted_dcf2_v2_same_id_observation": {
+      "status": "ACCEPTED_SINGLE_THREE_TURN_V2_PAIR",
+      "composition": {
+        "caller": "V471",
+        "switchboard": "914f34522909b552fea4e239ddd0d16cfc7d5040",
+        "rust": "V464"
+      },
+      "fixture_revision": "dcf2-v2",
+      "fixed_minimum_cases": 688,
+      "pair_count": 1,
+      "matched_controls": true,
+      "root_wire_model": "gpt-6.1-sol/max for both",
+      "efficient_workers": "2 Terra6.1/xhigh requested workers",
+      "native_children": "2 native Sol6.1/max-wire children, included in full accounting",
+      "machine_seconds": {
+        "efficient": 698.9927868843079,
+        "native": 1248.6489989757538
+      },
+      "costs": {
+        "efficient_total": 0.5245276,
+        "native_total": 1.4840415999999998,
+        "efficient_root": 0.39615999999999996,
+        "native_root": 0.7867331999999998,
+        "efficient_workers": 0.1283676,
+        "native_children": 0.6973084
+      },
+      "time_change_percent": -44.020073899255905,
+      "cost_change_percent": -64.65546518372531,
+      "full_recorded_usage_counted_once": true,
+      "cumulative_totals_not_readded": true,
+      "same_ids_for_three_turns": true,
+      "quality": {
+        "efficient": {
+          "tests": 696,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 10
+        },
+        "native": {
+          "tests": 713,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 10
+        }
+      },
+      "usage": {
+        "efficient": {
+          "input": 1157813,
+          "cached": 994432,
+          "uncached": 163381,
+          "output": 22669,
+          "reasoning": 9125,
+          "calls": 22,
+          "usage_coverage_status": "complete",
+          "missing_usage_count": 0,
+          "cost_estimate_complete": true
+        },
+        "native": {
+          "input": 6056263,
+          "cached": 5874176,
+          "uncached": 182087,
+          "output": 53245,
+          "reasoning": 25180,
+          "calls": 87,
+          "usage_coverage_status": "complete",
+          "missing_usage_count": 0,
+          "cost_estimate_complete": true
+        }
+      },
+      "root_calls": {
+        "efficient": 11,
+        "native": 48
+      },
+      "apply_root_calls": {
+        "efficient": 2,
+        "native": 33
+      },
+      "semantic_review": "Both complete product diffs reviewed; three Efficient product postimages matched recorded bound members; no parent product repair",
+      "oracle_counterexamples": "Staged positive688/10PASS; both preserved v1 negatives688/10 with exactly2 failures each; no integrity failures",
+      "branch_closure": "locations90/1,cache141/0 pass with only branch-owned product changes; no new deselections",
+      "ownership_behavior_observed": "Efficient applies through one batch; both workers deliver products and focused tests rather than late tests-only handoff",
+      "limitations": {
+        "stable_gain_proven": false,
+        "isolated_v1_patch_gain_proven": false,
+        "dcf_jspace_ablation_proven": false,
+        "shared_cross_role_provider_cache_proven": false,
+        "large_context_compaction_stress_test": false,
+        "cache_warmth_controlled": false,
+        "concurrent_resource_contention_controlled": false,
+        "human_parent_acceptance_in_machine_timing": false,
+        "billing": "Frozen2026-10-22 API-equivalent; not subscription/complete hidden attempts"
+      },
+      "cleanup": "Two main test chats archived; native child turns completed but child archive persistence has a local API gap; no manual native-state edits",
+      "planning_remaining": {
+        "plan_calls": 6,
+        "plan_cost": 0.2360292,
+        "fraction_of_efficient_cost": 0.44998432875600824,
+        "plan_seconds": 271.6195282919798,
+        "claim": "Measured component, not proof every read is unnecessary or a saving forecast"
+      }
     }
   },
   "exclusions": [

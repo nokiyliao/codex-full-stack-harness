@@ -1,5 +1,13 @@
 # Source Provenance
 
+## Latest Measurement and Oracle Revision
+
+The new observation changes no published runtime source: caller V471, Switchboard `914f345` and Rust V464 remain current. A separately versioned private DCF2-v2 fixture adds four focused cases for resolution-edge targets and current-only CLI cache reporting. Its staged positive reference passed 688 tests with ten skips. Two candidates containing the original recorded v1 product bytes each failed exactly two cases with no integrity failure. V1 fixtures, outputs and reports were not overwritten. Positive reference code is test data, not production adoption; private contracts/raw logs are not published.
+
+The CLI oracle was integrated into the CLI/locations test file rather than the runtime-only cache file. Branch closure passed with only each branch's own products: locations 90 cases/one skip and cache 141/zero skips. No new deselection or relaxed skip cap was introduced. The existing recipe gained an explicit approved `dcf2-v2` selector; old modes and the same native executor remain. Both arms received identical neutral phase instructions and the same clarified v2 task, so no isolated causal comparison with v1 is claimed.
+
+In the fresh three-turn pair, source/runtime controls matched, cumulative root usage reconciled on every turn, and both independent final gates passed (Efficient 696/native 713, ten skips each). Parent reviewed both complete product diffs and matched all three Efficient product identities to the recorded member postimages. There was no parent product repair. Two main test sessions were archived through the official API. Both native child turns were observed completed, but one child archival call returned `Inactive thread archive did not persist`; it was not replayed, and the sibling archival was deferred. That local cleanup gap is not treated as a benchmark failure or a reason to alter native storage.
+
 ## Current Same-ID Ownership Workflow
 
 Switchboard source `914f34522909b552fea4e239ddd0d16cfc7d5040` exports only `src/nokiy-coordinator-policy.mjs`, `tests/nokiy-efficient-first-dispatch.test.mjs` and `tests/nokiy-efficient-adaptive-loop.test.mjs` over the previous public surface. Caller source/version, Rust, profiles, reasoning efforts, permissions and signed App are unchanged. The policy adds a net 341 UTF-8 bytes to existing guidance; it does not create state, a router or a new execution plane. Serial routing remains unchanged.

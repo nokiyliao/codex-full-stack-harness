@@ -1,5 +1,35 @@
 # Benchmark Observations
 
+## Accepted Corrected Three-Turn V2 Pair
+
+Composition: caller V471, Switchboard `914f345`, Rust V464. The separately versioned DCF2-v2 task clarifies already intended resolved-edge targets and CLI cache reporting, with four frozen regression cases. The staged reference passes 688 tests/ten skips; both retained v1 product candidates fail exactly two cases, without source-integrity failure. Branch closure passes independently with only owned product changes: locations 90 cases/one skip, cache 141/zero skips. Original exclusions are unchanged. CLI reporting is checked by the CLI-owned locations branch, not made a dependency of runtime-only cache verification.
+
+Both arms use the same three phase prompts and task. Efficient requests Sol 6.1/max and Terra 6.1/xhigh workers. Native requests Sol 6.1/max and independently chooses two native Sol children, each observed at max on the request wire; their 39 calls are fully included. Neither side was forced to be serial. All three phases retain each arm's exact ID; cumulative native usage is reconciled as deltas, not added repeatedly. Before/after source/runtime controls match.
+
+| Recorded metric | Efficient | Native Sol 6.1/max |
+| --- | ---: | ---: |
+| Machine-acceptance E2E seconds | 698.992787 | 1,248.648999 |
+| Active CLI seconds, all three turns | 648.794768 | 1,197.850259 |
+| Independent quality seconds | 50.084876 | 50.625021 |
+| Root API-equivalent USD | 0.3961600 | 0.7867332 |
+| Worker/native-child API-equivalent USD | 0.1283676 | 0.6973084 |
+| Complete recorded USD | 0.5245276 | 1.4840416 |
+| Root calls | 11 | 48 |
+| Worker/native-child calls | 11 | 39 |
+| Total input tokens | 1,157,813 | 6,056,263 |
+| Cached input tokens | 994,432 | 5,874,176 |
+| Uncached input tokens | 163,381 | 182,087 |
+| Output tokens | 22,669 | 53,245 |
+| Reasoning tokens, included in output | 9,125 | 25,180 |
+
+The observed change is **-44.0201% machine time / -64.6555% recorded cost**. All observed root, worker and native-child records are priced and reconciled; missing usage count is zero for those records, not proof of complete hidden provider-attempt billing. Prices remain the frozen 2026-10-22 API-equivalent weights, not subscription invoices.
+
+Both independent final gates pass: Efficient 696/native 713 total cases, each with ten skips, no failures/errors/integrity failures and at least the common 688 immutable cases. Additional tests are not treated as a quality score. Parent reviewed both complete product diffs and matched all three current Efficient products to recorded member postimages, with no parent product repair. Efficient's apply phase has two root model calls and one batch: workers deliver both implementation branches and focused tests. The old late test-only handoff is absent in this observation. Native uses 33 root model calls in its apply phase, in addition to its children; no claim is made that every native call was avoidable.
+
+This is one concurrent pair with possible validator/resource contention, uncontrolled cache warmth, and human/parent final acceptance outside the machine timer. It is not a large-context/compaction test, a DCF/J-Space or model/effort ablation, proof of shared coordinator/worker provider cache, or an isolated effect of the ownership text. V2 task clarification, stronger oracles, neutral prompt continuation and native decomposition differ from v1. The prior negative pair remains negative and held; it is not replaced or retroactively accepted. No new runtime deployment accompanied this measurement.
+
+The remaining measured planning component is six Efficient calls, 271.619528 seconds and $0.2360292 (about 45% of Efficient cost). This identifies an investigation target, not a predicted saving or license to remove necessary dependency reads. Two main sessions were formally archived. Two native child turns are completed; archival persistence for those children remains a local API limitation and does not invalidate source/usage evidence.
+
 ## Three-Turn Same-ID Cost Regression
 
 The same frozen two-branch DCF task ran as read-only planning, implementation and acceptance on one exact newly created native session per arm. Composition was caller V471, Rust V464 and Switchboard `e4192b7`. Efficient used Sol 6.1/max plus two Terra 6.1/xhigh workers; native used Sol 6.1/max and no children. Controls matched. CLI resume retained exact identities/configuration; public cumulative usage was reconciled into phase deltas, not summed repeatedly. Each arm proceeded independently through its own quality gate with no cross-arm phase or quality barrier.

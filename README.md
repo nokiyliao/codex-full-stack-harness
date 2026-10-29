@@ -1,10 +1,16 @@
 # Nokiy Full-Stack Harness
 
-## Current Same-ID Ownership Workflow
+## Latest Three-Turn Observation
+
+On the corrected DCF2-v2 task, Efficient observed **699.0 seconds / $0.5245** versus native Sol 6.1/max **1,248.6 seconds / $1.4840**: machine-acceptance time **-44.02%** and complete recorded API-equivalent cost **-64.66%**. Both kept the same session ID through all three turns and passed the strengthened 688-case frozen contract plus their own focused tests. Native freely chose two Sol children; their entire recorded cost is included. This is one concurrent pair, not a stable/universal or isolated-patch gain, a billing statement, a large-context stress test or a DCF/J-Space ablation.
+
+The observed workflow now matches the deployed ownership contract: Efficient's apply phase used one batch and two coordinator model calls; workers delivered the product implementations and tests, not tests after parent implementation. Earlier negative results remain below and in the [benchmark summary](docs/benchmark-summary.md). Source composition is unchanged by this measurement.
+
+## Deployed Same-ID Ownership Workflow
 
 Switchboard `914f345` is hot-deployed with bounded planning/apply ownership guidance; caller V471 and Rust V464 are unchanged. Ultra/Efficient now explicitly carry planned branch ownership through navigation, implementation, focused tests and verification, instead of implementing the products first and delegating only tests. Read-only planning remains read-only, serial routing is unchanged, and ownership grants no authority. Canonical Node verification passed 1,074 tests. Deployed contract generation was checked without a provider call; improved model behavior or performance after this repair is not yet measured.
 
-The new three-turn same-ID DCF observation did **not** establish a cost win: recorded machine E2E was 11.91% lower but cost 18.06% higher. The coordinator cost was almost native's, with workers added late for tests. Both saved machine quality gates passed, but semantic review found a resolved-reference omission in Efficient and a retention CLI reporting gap in native, so equal-quality acceptance is held. Earlier one-turn gains below remain qualified historical observations, not proof of long-workflow gain. See [benchmark observations](docs/benchmark-summary.md).
+The earlier v1 three-turn same-ID observation did **not** establish a cost win: recorded machine E2E was 11.91% lower but cost 18.06% higher. The coordinator cost was almost native's, with workers added late for tests. Both saved machine quality gates passed, but semantic review found a resolved-reference omission in Efficient and a retention CLI reporting gap in native, so that pair's equal-quality acceptance remains held. It was not repaired into the newer result. See [benchmark observations](docs/benchmark-summary.md).
 
 ## Previous Context-Count Diagnostics
 
