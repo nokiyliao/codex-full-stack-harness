@@ -1,6 +1,17 @@
 # Nokiy Full-Stack Harness
 
-## Latest V3 Observation
+## Two Different Frozen Tasks
+
+The deployed caller V471 / Switchboard `5b16a5b` / Rust V464 workflow now has one parent-accepted pair on each of two different real-engineering snapshots:
+
+| Task | Efficient E2E / estimate | Native Sol 6.1/max E2E / estimate |
+| --- | ---: | ---: |
+| DCF2-v3 navigation and shared-cache repair | 590.022 s / $0.5206696 | 1,097.809 s / $1.5102848 |
+| R19 resident-cache and ignored-directory closeout | 821.286 s / $0.5716726 | 1,196.011 s / $1.3063272 |
+
+The R19 pair records **-31.33% time / -56.24% estimated cost**, with all recorded coordinators/workers/native children counted once. Both R19 gates pass the same 67 mandatory cases plus focused tests (68/74 total, no failures/errors/skips/integrity errors); bounded independent source review found no confirmed task defect. Both Efficient product hashes match the recorded worker batch and its PASSED/live_return combined gate. This supports observed transfer beyond the DCF task, not repeatability or universal gain: there is only one accepted pair per workload, not repeated trials or live-service benchmarking. Estimates retain the pricing/provider limitations below.
+
+## DCF2-v3 Observation
 
 On the stronger DCF2-v3 task, this single concurrent pair recorded **590.022 seconds / $0.5206696** for Efficient versus native Sol 6.1/max **1,097.809 seconds / $1.5102848**: **-46.25% time and -65.53% estimated cost**, calculated from unrounded totals. Both passed the shared 690-case oracle and their focused tests (697/706 recorded cases, each including ten skips). Parent product/test review accepted this bounded observation; all three Efficient product postimages match the recorded worker batch.
 

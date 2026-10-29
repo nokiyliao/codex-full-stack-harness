@@ -1,5 +1,28 @@
 # Benchmark Observations
 
+## R19: Second-Workload Observation
+
+Composition and requested profiles are unchanged from the accepted DCF2-v3 pair: caller V471 / Switchboard `5b16a5b` / Rust V464, Efficient Sol 6.1/max with requested Terra 6.1/xhigh workers versus native Sol 6.1/max. Native chose two Sol children freely. The existing R19 reference passed its corrected 67-case gate immediately before the paid experiment; no exclusion, skip cap, task scope or model effort was relaxed.
+
+| Metric | Efficient | Concurrent Native |
+| --- | ---: | ---: |
+| Machine-acceptance E2E | 821.286103 s | 1,196.010894 s |
+| Complete recorded API-equivalent estimate | $0.5716726 | $1.3063272 |
+| Coordinator estimate | $0.4643764 | $0.7413168 |
+| Worker/native-child estimate | $0.1072962 | $0.5650104 |
+| Coordinator calls (plan/apply/accept) | 11 (6/2/3) | 33 (7/20/6) |
+| Worker/native-child calls | 10 (5+5) | 25 (17+8) |
+| Input tokens | 1,054,875 | 4,010,802 |
+| Uncached input tokens | 172,827 | 170,930 |
+| Output tokens, including reasoning | 24,511 | 58,048 |
+| Final gate cases, no skips | 68 | 74 |
+
+Unrounded observations are **-31.33% time and -56.24% estimate**. All observed participant sums and fixed-weight arithmetic reconcile; cumulative root input/cached/output/reasoning are not counted repeatedly, and overlapping workers are not added to wall time. The two actual Efficient product hashes match the recorded worker batch, whose combined gate is PASSED/live_return. Independent code/test review found no confirmed defect within the declared task; original Stack/F2, baseline, ownership and containment boundaries are retained. Tests counts are not a quality ranking.
+
+This is the first accepted pair on a second workload, not repeated-trial stability or proof of universal/runtime-only/DCF-isolated benefit. Costs use the same disclosed source-pinned weights, not billing, independently dated current prices or proven downstream Terra identity/effort. All per-pair controls match, but provider/cache/shared-resource variation across pairs is not controlled. Both root test chats were archived through the official App API; no live research, trading service, broker/order or production source effect occurred.
+
+The remaining measured concentration is coordination: 81.23% of Efficient's estimate. Its separate acceptance phase used three model requests (128.276 seconds of recorded upstream spans) while two completed commands reopened already verified inspection summaries. Whether the original projected result lacked necessary visible facts remains unproven; these spans are not all assumed removable. No additional prompt rule or new runtime was shipped to claim that saving.
+
 ## V3: Qualified Single-Pair Observation
 
 The current caller V471 / Switchboard `5b16a5b` / Rust V464 composition completed the same three-turn workflow using the stronger pre-frozen DCF2-v3 oracle. Both independent gates passed, including the two previously escaping requirements. Parent review covered the actual product diffs and focused tests; no confirmed remaining failure was found within that declared task and review scope. This is bounded acceptance, not universal semantic equivalence.

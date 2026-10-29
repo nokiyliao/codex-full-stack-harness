@@ -2706,13 +2706,13 @@
     }
   },
   "publication_files": {
-    "README.md": "6a9a2990aa541552bf6b2e481059c544d8db807bdb77d06be49fe2b6b51f555e",
-    "PROVENANCE.md": "222338a48a8f16bcb74d6ab25c4deadac3a56ab7d5ebcfea3e7c4b927b23fec2",
+    "README.md": "0a135d56b97fe6819a7130845c36e5939b9563b5cc41a1fb3130e02474ac8149",
+    "PROVENANCE.md": "795ae226f1417a63300c0c2841b618a6b91b655112ff9fb68f0e0d58b607ee1b",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "743b19fe21417f5cf804d7d1f077178b456f7fa7e2b48f5ba9e60f5c1a82406a",
-    "docs/current-surface.md": "5ac21cac91fdf5e2070d49a2ade5ac6a33a60a74ac837c5501b39bfd5e5750fc",
-    "docs/benchmark-summary.md": "3a1f1eac64422720b793b145444f80ee6aaee5a2b50583f93dd111eb702ef4c8"
+    "docs/current-surface.md": "0628a89b2cd1870768ebe891452d081220ff3432c94867ffd305b8e4b6ff450d",
+    "docs/benchmark-summary.md": "3f6035dca17ff488d7088ef15789114e2c70bef66f7060e54647099752d022ce"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v471-context-file-count-diagnostics",
@@ -4940,6 +4940,42 @@
       "billing_or_provider_observed_worker_identity_claim": false,
       "prior_v2_quality_holds_unchanged": true,
       "new_runtime_deployment": false
+    },
+    "accepted_r19_same_id_generalization_observation": {
+      "status": "ACCEPTED_SINGLE_R19_THREE_TURN_PAIR",
+      "same_source_composition_as_dcf2_v3": true,
+      "shared_mandatory_cases": 67,
+      "final_quality_total_cases": {
+        "efficient": 68,
+        "native": 74
+      },
+      "quality_failures_errors_skips_integrity_errors": 0,
+      "seconds": {
+        "efficient": 821.286102771759,
+        "native": 1196.0108938217163
+      },
+      "source_pinned_model_weight_estimates": {
+        "efficient": 0.5716726000000001,
+        "native": 1.3063272000000001
+      },
+      "time_change_percent": -31.33121888652427,
+      "cost_change_percent": -56.23817677531326,
+      "coordinator_calls": {
+        "efficient": 11,
+        "native": 33
+      },
+      "worker_or_native_child_calls": {
+        "efficient": 10,
+        "native": 25
+      },
+      "all_observed_participants_once": true,
+      "same_exact_id_through_three_turns": true,
+      "independent_bounded_source_review": "No confirmed declared-task defect, no product repair or production adoption",
+      "both_efficient_worker_to_final_product_postimages_match": true,
+      "repeatability_large_context_isolated_dcf_cache_gain": "UNPROVEN",
+      "pricing": "Source-pinned API-equivalent weights, not billing/independently dated current rates/provider-observed Terra identity/effort",
+      "new_runtime_deployment": false,
+      "previous_v2_holds_retained": true
     }
   },
   "exclusions": [
@@ -4956,6 +4992,7 @@
     "companion repositories and private managed-workspace DCF contracts remain external",
     "The latest plan-only guidance update passed 1,075 existing/new tests and guarded hot deployment. Its additional latency/cost effect is not yet measured. The accepted three-turn v2 observation remains bound to the preceding switchboard commit; do not attribute that historical 44.02% time / 64.66% cost observation to this later update.",
     "Later v3 regressions hold both corrected DCF2-v2 same-ID pairs for equal-quality gain claims. Raw time/cost/frozen-PASS records are retained; current Efficient fails full-FQN collision isolation and owner override retention, earlier Efficient fails retention. The existing runner now admits an explicit hash-pinned v3 oracle, but no paid pair has used it.",
-    "A new single DCF2-v3 pair passes the stronger common oracle and parent bounded source review, with complete once-only recorded participant accounting and worker product postimage matches. The derived estimates are not billing, stable/generalized or isolated runtime/prompt/DCF gain; historical v2 quality holds remain."
+    "A new single DCF2-v3 pair passes the stronger common oracle and parent bounded source review, with complete once-only recorded participant accounting and worker product postimage matches. The derived estimates are not billing, stable/generalized or isolated runtime/prompt/DCF gain; historical v2 quality holds remain.",
+    "A second distinct frozen R19 engineering task now has one bounded parent-accepted same-ID pair with complete observed coordinator/worker/native-child accounting and matching worker product postimages. This supports transfer across two task types, not repeated-trial stability, production trading effect or universal/isolated runtime gain."
   ]
 }

@@ -1,5 +1,13 @@
 # Source Provenance
 
+## R19 Generalization Observation
+
+The second task reuses the existing frozen R19 fixture and its corrected validator, not a newly easier challenge: task template `a902cc48`, manifest `7b75c76e`, validator `8486eb40`. The historical initial validator identity was superseded by the recorded corrected preflight; the approved corrected identity and all original checks remain. Before model execution the accepted reference was revalidated with the task's venv interpreter: 67 cases, zero failures/errors/skips/integrity errors.
+
+The task has two independent product targets: immutable lexical fold-header caching, and recovery of later descendants beneath an admitted literal ignored directory. It preserves current fold/F2 checks, mutable-result isolation, bounded LRU behavior, baseline immutability, competing-writer checks, containment and symlink handling. Both measured final gates passed (68/74 cases); the independent bounded review covered complete product diffs and focused tests, without another full-gate run or a production adoption. Both current Efficient products match their recorded EVIDENCE_VERIFIED worker postimages; the combined gate is PASSED/live_return.
+
+Models/efforts, native binary, per-pair before/after controls and exact three-turn session IDs were retained. Complete observed usage is counted once: Efficient has 11 coordinator and ten Terra-worker calls, native 33 coordinator and 25 Sol-child calls. Root cumulative totals reconcile as deltas. The two dedicated root test chats were officially archived after completion. Private logs, contracts, research/account data and native state were not published or privately edited. This remains a frozen offline engineering observation, not an actual trading deployment or stable performance proof.
+
 ## V3 Observation and Parent Acceptance
 
 The next paid pair used the already frozen, hash-pinned v3 task/manifest/validator through the same tested runner. Its 690 mandatory cases include both full-FQN collision isolation and owner-selected override retention; exclusions and skip caps are unchanged. Both final independent gates passed, with 697/706 cases including ten skips and no integrity errors. No measured subject was repaired by this engineering parent.

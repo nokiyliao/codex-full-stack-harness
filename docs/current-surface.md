@@ -1,5 +1,11 @@
 # Current Source Surface
 
+## Current Accepted Scope
+
+The same deployed V471 / Switchboard `5b16a5b` / Rust V464 workflow has now passed bounded parent acceptance on two different frozen tasks, one pair each. The new R19 cache/closeout pair records 821.286 s / $0.5716726 versus native Sol 6.1/max 1,196.011 s / $1.3063272: -31.33% time / -56.24% source-weight estimate. Both final gates pass all 67 common mandatory cases and focused tests, with zero skips/failures/errors/integrity errors; the independent review found no confirmed task defect. Current Efficient products match the original verified worker postimages.
+
+No new source/runtime deployment, service or restart was needed for this observation. It supports transfer beyond the earlier DCF2-v3 task, not repeated-trial stability, large-context behavior or isolated DCF/J-Space/provider-cache effects. R19 coordination remains the largest measured cost component (81.23%); a possible redundant receipt-inspection step is a bounded investigation target, not yet a proven saving. Historical v2 holds remain unchanged.
+
 ## Current V3 Observation
 
 The deployed caller V471 / Switchboard `5b16a5b` / Rust V464 composition now has one parent-accepted DCF2-v3 paired observation: 590.022 seconds / $0.5206696 for Efficient versus 1,097.809 seconds / $1.5102848 for native Sol 6.1/max. Both passed the stronger common 690-case oracle and their focused tests, with no integrity error. Complete product/test review and three Efficient worker-to-final product hash matches support this bounded acceptance.
