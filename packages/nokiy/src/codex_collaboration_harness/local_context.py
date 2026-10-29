@@ -28,6 +28,7 @@ _MAX_SECTION_LINES = 400
 _MAX_SECTIONS_BYTES = 12_000
 _MAX_SUMMARY_CHARS = 12_000
 _SOURCE_READ_FILE_BYTES = 1_048_576
+_MAX_CONTEXT_FILES = 32
 
 
 class _InputTooLarge(caller.EmbeddedNokiyError):
@@ -989,8 +990,10 @@ def compile_context(workspace: Path, action: dict, *, artifact_root: Path | None
     if parent_shell and "command" not in operations:
         operations = sorted(set(operations) | {"command"})
     names = sorted(set(reads + writes + targets))
-    if (not names and not directories) or len(names) > 32:
+    if not names and not directories:
         raise _invalid("declare 1..32 exact context files", "action", "invalid_shape")
+    if len(names) > _MAX_CONTEXT_FILES:
+        raise caller.ContextFileLimitExceeded(actual=len(names), maximum=_MAX_CONTEXT_FILES)
     # Attribute shared inputs to reads first, then writes, then target-only paths.
     # Only static action field names enter diagnostics, never the input names.
     issue_fields = {name: "action." + field

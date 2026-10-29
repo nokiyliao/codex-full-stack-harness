@@ -1,6 +1,12 @@
 # Nokiy Full-Stack Harness
 
-## Current Bounded Read Routing
+## Current Context-Count Diagnostics
+
+Caller V471 (`560cc0e`) and Switchboard `e4192b7` are deployed; Rust V464 is unchanged. Oversized exact-file context now reports its actual and maximum unique file count, the scopes being counted, and a supported correction instead of generic `action/invalid_shape`. The canonical 32-file bound and all authority checks remain unchanged. An actual advertised-tool canary returned 37/32 before provider execution, without changing its fixture. Caller release verification passed 481 tests; the canonical Node candidate passed 1,073. Counts overlap and are not additive. This diagnostic repair has no newly measured performance claim.
+
+A separately measured second DCF workload on the preceding V470/`0d94344` composition observed 49.46% lower CLI workflow time and 61.98% lower reported API-equivalent cost than native Sol 6.1/max, including all recorded coordinator, worker and native-child usage. Independent final audits were deliberately held behind a two-arm barrier; their completion timestamps are not standalone user-acceptance E2E. See [benchmark observations](docs/benchmark-summary.md) for timing, quality and accounting limits.
+
+## Previous Bounded Read Routing
 
 Switchboard `0d9434476edc90ce3e2c7d0dc9548437799b0a30` accepts filename read patterns such as `tests/test_resident*.py` by expanding them into deterministic exact-file reads. Directory grants and write authority are not enlarged; unsafe paths and symlinks remain rejected, and original request recovery is preserved. The guarded hot deployment passed, including actual source/admission/native-tool snapshot identity. Python verification ran 227 tests with two skips; the canonical Node candidate passed 1,073 tests. Counts overlap with focused checks.
 

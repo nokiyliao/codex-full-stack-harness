@@ -1,8 +1,16 @@
 # Current Source Surface
 
-## Current Bounded Read Routing
+## Current Context-Count Diagnostics
 
-Current Switchboard source is `0d9434476edc90ce3e2c7d0dc9548437799b0a30`; caller V470 and Rust V464 are unchanged. Full run and batch read scopes can use basename patterns inside literal non-hidden directories. Expansion produces sorted exact regular files without directory or write grants. Traversal, hidden components, recursive/directory patterns, symlink ancestry, matching symlinks and zero matches remain typed refusals. Existing bounds, planned absent exact reads, discovery and original-request recovery remain intact.
+The deployed composition is caller V471 `560cc0e359cdb9651648834da2c7f3ec09c00b2a`, Switchboard `e4192b78f2857e2b920a6b585f8b9799d2e21482` and unchanged Rust V464 `1304065c69b9c5c6a702a05754526395c9a41678`. Canonical context admission still permits at most 32 unique exact files across read scopes, write scopes and target paths. Duplicate paths count once; directory-discovery routes retain their existing contract.
+
+The caller now emits the typed `action.read_scopes/context_file_limit_exceeded` issue. The host forwards only validated integer counts and fixed scope/correction vocabulary; malformed or private extra fields are omitted. The bound is defined by the caller, not duplicated in the host. Tool guidance explains narrowing exact inputs instead of investigating a generic action type error. There is no automatic scope widening, file dropping, cap increase or retry.
+
+Both guarded deployment transactions passed preflight, apply and verify. Host publication precedes caller publication to satisfy the existing cross-component vocabulary test. Source/candidate release verification each passed 481 tests, with live verification passing; the canonical Node candidate passed 1,073. An actual advertised-tool negative canary returned actual 37/maximum 32 with `provider_execution_started=false`, and all 37 fixture files stayed unchanged. Its immutable host snapshot, installed source and admission match SHA-256 `32d0eda00eae48202c2a9e03524fc879bdc3a2d4536139614a52caa8a3759a5e`. Counts overlap and are not additive. No new model benchmark is attributed to this repair.
+
+## Previous Bounded Read Routing
+
+The preceding Switchboard source was `0d9434476edc90ce3e2c7d0dc9548437799b0a30`, with caller V470 and Rust V464. Full run and batch read scopes can use basename patterns inside literal non-hidden directories. Expansion produces sorted exact regular files without directory or write grants. Traversal, hidden components, recursive/directory patterns, symlink ancestry, matching symlinks and zero matches remain typed refusals. Existing bounds, planned absent exact reads, discovery and original-request recovery remain intact.
 
 Deployment `nokiy-bounded-read-globs-20261029` passed preflight/apply/verify. Installed source, admission and an actual newly executed native-tool snapshot agree on host SHA-256 `c12b272339dd43ee6e342a8fdb3d9ce50605fd9d595cbe4dacc7e3d0772b62fa`. Complete Python verification ran 227 tests with two skips; the exact canonical Node candidate passed 1,073/1,073; installed focused verification passed six tests. These overlapping counts are not additive. A deterministic recovery read retained the original rejected request, with no preparation replay or model invocation. No model, permission, signed-App or trading setting changed. Incremental performance of this fix has not been measured.
 

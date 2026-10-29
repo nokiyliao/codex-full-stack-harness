@@ -33,6 +33,7 @@ _ACTION_ISSUE_PAIRS = {
     ('action.read_scopes', 'exact_file_scope_required'),
     ('action.read_scopes', 'exact_file_unavailable'),
     ('action.read_scopes', 'exact_file_too_large'),
+    ('action.read_scopes', 'context_file_limit_exceeded'),
     ('action.read_scopes', 'directory_grant_required'),
     ('action.read_scopes', 'unsupported_glob'),
     ('action.read_scopes', 'unsafe_path'),
@@ -170,6 +171,25 @@ def _safe_action_issues(value):
             return None
         issues.append({'path': path, 'reason': reason})
     return issues
+
+
+def _safe_context_file_limit(value, issues):
+    """Project only caller facts attached to the precise, validated count issue."""
+    issue = {'path': 'action.read_scopes', 'reason': 'context_file_limit_exceeded'}
+    fields = {'maximum', 'actual', 'counted_scopes', 'next_action'}
+    if not issues or issue not in issues or type(value) is not dict or set(value) != fields:
+        return None
+    counted_scopes = ['read_scopes', 'write_scopes', 'target_paths']
+    if (type(value['maximum']) is not int or value['maximum'] <= 0
+            or type(value['actual']) is not int or value['actual'] <= value['maximum']
+            or type(value['counted_scopes']) is not list
+            or any(type(scope) is not str for scope in value['counted_scopes'])
+            or value['counted_scopes'] != counted_scopes
+            or type(value['next_action']) is not str
+            or value['next_action'] != 'narrow_exact_context_files'):
+        return None
+    return {'maximum': value['maximum'], 'actual': value['actual'],
+            'counted_scopes': counted_scopes, 'next_action': 'narrow_exact_context_files'}
 
 
 def worker_capacity(config_path=None):
@@ -1720,6 +1740,9 @@ def preparation_evidence(artifact, input_id, thread):
         result['diagnostics'] = diagnostics
     if issues is not None:
         result['issues'] = issues
+        context_file_limit = _safe_context_file_limit(failure.get('context_file_limit'), issues)
+        if context_file_limit is not None:
+            result['context_file_limit'] = context_file_limit
     return result
 
 
@@ -2381,6 +2404,7 @@ def prepare_action(envelope, entry, thread, worker, effort, tier, payload, draft
         if outcome.get('status') == 'REJECTED_PREPARATION':
             issues = _safe_action_issues(outcome.pop('issues', None))
             diagnostics = _safe_preparation_diagnostics(outcome.pop('diagnostics', None))
+            context_file_limit = _safe_context_file_limit(outcome.pop('context_file_limit', None), issues)
             if (outcome.get('schema_version') == 'nokiy_native_prepare_outcome_v1'
                     and outcome.get('provider_execution_started') is False
                     and outcome.get('same_input_retry_allowed') is False):
@@ -2389,6 +2413,8 @@ def prepare_action(envelope, entry, thread, worker, effort, tier, payload, draft
                 if issues is not None and (outcome.get('first_typed_blocker') in _ISSUE_BLOCKERS
                         or diagnostics is not None):
                     outcome['issues'] = issues
+                    if context_file_limit is not None:
+                        outcome['context_file_limit'] = context_file_limit
             outcome['preparation_ref'] = {'artifact_root': str(artifact), 'input_id': inputs.name}
             return None, outcome
         if outcome.get('status') != 'PREPARED' or not prepared.exists():
@@ -2476,6 +2502,9 @@ def prepare_action(envelope, entry, thread, worker, effort, tier, payload, draft
                 if issues is not None and (blocker in _ISSUE_BLOCKERS
                         or diagnostics is not None):
                     outcome['issues'] = issues
+                    context_file_limit = _safe_context_file_limit(detail.get('context_file_limit'), issues)
+                    if context_file_limit is not None:
+                        outcome['context_file_limit'] = context_file_limit
             outcome['diagnostic_sha256'] = hashlib.sha256(
                 (result.stdout + result.stderr).encode()).hexdigest()
             outcome['preparation_ref'] = {'artifact_root': str(artifact), 'input_id': inputs.name}

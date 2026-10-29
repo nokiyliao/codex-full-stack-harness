@@ -128,6 +128,17 @@ class EmbeddedNokiyError(RuntimeError):
         super().__init__(f"{code}: {detail}")
 
 
+class ContextFileLimitExceeded(EmbeddedNokiyError):
+    """The canonical exact-context-file bound was exceeded."""
+
+    def __init__(self, *, actual: int, maximum: int) -> None:
+        self.actual = actual
+        self.maximum = maximum
+        super().__init__("NOKIY_LOCAL_CONTEXT_INVALID", "exact context file limit exceeded",
+                         issues=[{"path": "action.read_scopes",
+                                  "reason": "context_file_limit_exceeded"}])
+
+
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -1444,6 +1455,7 @@ _ACTION_ISSUE_PAIRS = {
     ("action.read_scopes", "exact_file_scope_required"),
     ("action.read_scopes", "exact_file_unavailable"),
     ("action.read_scopes", "exact_file_too_large"),
+    ("action.read_scopes", "context_file_limit_exceeded"),
     ("action.read_scopes", "directory_grant_required"),
     ("action.read_scopes", "unsupported_glob"),
     ("action.read_scopes", "unsafe_path"),
@@ -1585,6 +1597,18 @@ def _failure(error: EmbeddedNokiyError) -> dict[str, Any]:
               else None)
     if issues is not None:
         failure["issues"] = issues
+    if (isinstance(error, ContextFileLimitExceeded)
+            and error.code == "NOKIY_LOCAL_CONTEXT_INVALID"
+            and issues is not None
+            and {"path": "action.read_scopes", "reason": "context_file_limit_exceeded"} in issues
+            and type(error.maximum) is int and error.maximum > 0
+            and type(error.actual) is int and error.actual > error.maximum):
+        failure["context_file_limit"] = {
+            "maximum": error.maximum,
+            "actual": error.actual,
+            "counted_scopes": ["read_scopes", "write_scopes", "target_paths"],
+            "next_action": "narrow_exact_context_files",
+        }
     if (error.code == "NOKIY_BATCH_INVALID"
             and error.detail == "cross-member read/write or write/write overlap"):
         failure["batch_recovery"] = {

@@ -1,6 +1,14 @@
 # Source Provenance
 
-## Current Bounded Read Routing
+## Current Context-Count Diagnostics
+
+Caller source is `560cc0e359cdb9651648834da2c7f3ec09c00b2a`, deployed as V471; Switchboard source is `e4192b78f2857e2b920a6b585f8b9799d2e21482`. The six exact committed exports are caller `src/codex_collaboration_harness/local_context.py`, `src/codex_collaboration_harness/embedded_nokiy.py`, `tests/test_context_file_limit_diagnostics.py`, and Switchboard `src/nokiy-native-host.py`, `src/nokiy-native-tool.mjs`, `tests/test_nokiy_context_file_limit.py`. Rust and unrelated source are unchanged. The unrelated dirty caller test was not adopted or overwritten.
+
+Guarded host deployment preceded caller deployment because the caller's existing live-host vocabulary test requires the new projection to be installed first. The first preparation failed that check and is retained as a failure, not promoted or hidden. Corrected source and candidate gates each passed 481 tests; the live release gate passed. The host worker completed verified evidence-only delivery; the caller worker's incomplete terminal evidence remains incomplete, with parent-native checks completing acceptance. The canonical Node candidate passed 1,073 tests. These overlapping checks must not be summed.
+
+Source, admission and an actual advertised-tool snapshot agree on native-host SHA-256 `32d0eda00eae48202c2a9e03524fc879bdc3a2d4536139614a52caa8a3759a5e`. A fresh 37-file canary returned `context_file_limit_exceeded`, actual 37, maximum 32 and no provider execution, with all fixture files unchanged. Reading the original benchmark coordinator's preparation from this different parent identity was correctly refused; it was not replayed, reinterpreted or treated as recovered. Recovery of the separate user's session remains unverified. No model, effort, permission, signed-App or trading change is claimed.
+
+## Previous Bounded Read Routing
 
 Switchboard source `0d9434476edc90ce3e2c7d0dc9548437799b0a30` exports four exact committed files: `src/nokiy-native-host.py`, `src/nokiy-native-tool.mjs`, `tests/test_nokiy_read_globs.py` and `tests/test_nokiy_verifier_completion.py`. Caller V470 and Rust V464 are unchanged. Native host SHA-256 is `c12b272339dd43ee6e342a8fdb3d9ce50605fd9d595cbe4dacc7e3d0772b62fa`; source, admission and the newly executed advertised-tool snapshot agree. The bounded source deployment passed all three stages without an App restart.
 

@@ -1,6 +1,27 @@
 # Benchmark Observations
 
-## Current Ultra Worker Routes
+## Timed Second DCF Workload
+
+One matched pair used caller V470, Rust V464 and Switchboard `0d94344`, before the V471 diagnostic repair. Efficient used Sol 6.1/max with Terra 6.1/xhigh workers; the native control used Sol 6.1/max, including its recorded native child. Source and runtime controls matched before and after the pair. Both frozen independent quality gates passed: Efficient 686 tests and native 718, each with 10 skips and no failures, errors or integrity failures. Counts differ because of branch-added tests; passing the unchanged acceptance contract, not equal counts, is the quality condition.
+
+| Metric | Efficient | Native Sol 6.1/max |
+| --- | ---: | ---: |
+| CLI workflow seconds | 377.147312 | 746.301213 |
+| Reported API-equivalent USD | 0.3777580 | 0.9934568 |
+| Input tokens | 915,735 | 3,416,660 |
+| Cached input tokens | 774,016 | 3,283,328 |
+| Uncached input tokens | 141,719 | 133,332 |
+| Output tokens | 15,928 | 39,846 |
+| Reasoning tokens, included in output | 5,076 | 20,760 |
+| Recorded model calls | 22 | 51 |
+
+Observed CLI workflow time was 49.4645% lower and reported cost 61.9754% lower. Efficient includes all ten root and twelve worker calls; native includes 27 root and 24 child calls. Failed preparation and coordinator diagnostic work remain charged. All recorded usage reconciled; unknown provider attempts and actual subscription billing remain unknown. Prices are the frozen 2026-10-22 API-equivalent weights, not invoices. Uncached input increased despite the overall cost reduction.
+
+Timing instrumentation exposes the deliberate benchmark barrier: independent quality waits for both model CLI arms to finish to avoid overlapping validation load. Efficient waited 369.341232 seconds after its CLI exit before its 46.720131-second quality audit; native waited 0.190656 seconds before its 48.553610-second audit. Dispatch-to-audit completion was 793.207243 versus 795.041092 seconds. The faster arm's barrier wait is not runtime latency. These observations do not measure each arm's uninterrupted standalone acceptance E2E, parent semantic acceptance duration, stable gain or isolated patch causality. Task, validator, model controls and barrier were not changed for a better result.
+
+The initial glob expansion produced 37 unique exact context files against the canonical maximum of 32, but the old caller only returned generic `action/invalid_shape`. That forced several coordinator source investigations before narrowing the read set. V471 fixes this diagnostic and is separately deployed/verified; this pre-repair pair does not quantify V471's incremental savings. Historical negative and earlier single-pair observations remain below.
+
+## Earlier Ultra Worker Routes
 
 Two additional matched R19 pairs use the unchanged `0d94344` composition, Astra/xhigh coordinators and native Astra/xhigh controls. The explicit high picker selects Sol 6.1/xhigh workers; the already-deployed default medium picker selects Terra 6.1/xhigh. No model, effort, routing or runtime setting changed to run these cases. Each row has its own contemporaneous native control, including its recorded Astra child.
 
