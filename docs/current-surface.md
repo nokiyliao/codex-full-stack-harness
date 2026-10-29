@@ -1,6 +1,12 @@
 # Current Source Surface
 
-## Current Native-Host Admission Binding
+## Current Bounded Read Routing
+
+Current Switchboard source is `0d9434476edc90ce3e2c7d0dc9548437799b0a30`; caller V470 and Rust V464 are unchanged. Full run and batch read scopes can use basename patterns inside literal non-hidden directories. Expansion produces sorted exact regular files without directory or write grants. Traversal, hidden components, recursive/directory patterns, symlink ancestry, matching symlinks and zero matches remain typed refusals. Existing bounds, planned absent exact reads, discovery and original-request recovery remain intact.
+
+Deployment `nokiy-bounded-read-globs-20261029` passed preflight/apply/verify. Installed source, admission and an actual newly executed native-tool snapshot agree on host SHA-256 `c12b272339dd43ee6e342a8fdb3d9ce50605fd9d595cbe4dacc7e3d0772b62fa`. Complete Python verification ran 227 tests with two skips; the exact canonical Node candidate passed 1,073/1,073; installed focused verification passed six tests. These overlapping counts are not additive. A deterministic recovery read retained the original rejected request, with no preparation replay or model invocation. No model, permission, signed-App or trading setting changed. Incremental performance of this fix has not been measured.
+
+## Previous Native-Host Admission Binding
 
 Current Switchboard source is `bd9ade07e95fe5abdcad28a2760a02c23f5667e9`; caller V470 and Rust V464 are unchanged. The missing publication step was concrete: source-only apply installed the corrected Python file but retained admitted digest `7ce125...`, so actual tool commands still selected that predecessor snapshot. The fix refreshes the digest only for the explicitly authorized exact host entry, preserves the other host/profile/contract fields, and verifies the requested postimage. Independent admission and source preimages permit a byte-unchanged recovery without discarding authority checks.
 

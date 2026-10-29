@@ -324,12 +324,22 @@ class VerifierCompletionTests(unittest.TestCase):
         self.assertEqual(action['verifier_commands'][0]['python_import_roots'], [str(self.workspace / 'pkg')])
 
     def test_prepare_action_applies_completion_before_request_identity(self):
-        source = Path(host.__file__).read_text()
-        inline = source.index('inline_external_reads(action, draft, directory(')
-        complete = source.index('complete_verifier_commands(action, draft, directory(')
-        identity = source.index("normalized_envelope = {**envelope, 'payload'")
-        self.assertLess(inline, complete)
-        self.assertLess(complete, identity)
+        import ast
+
+        tree = ast.parse(Path(host.__file__).read_text())
+        prepare = next(node for node in tree.body
+                       if isinstance(node, ast.FunctionDef) and node.name == 'prepare_action')
+        calls = {name: [node.lineno for node in ast.walk(prepare)
+                        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id == name]
+                 for name in ('inline_external_reads', 'complete_verifier_commands')}
+        identities = [node.lineno for node in ast.walk(prepare)
+                      if isinstance(node, ast.Assign) and any(
+                          isinstance(target, ast.Name) and target.id == 'normalized_envelope'
+                          for target in node.targets)]
+        self.assertLess(max(calls['inline_external_reads']),
+                        min(calls['complete_verifier_commands']))
+        self.assertLess(max(calls['complete_verifier_commands']), min(identities))
 
 
 if __name__ == '__main__':

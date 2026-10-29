@@ -1,6 +1,22 @@
 # Benchmark Observations
 
-## Current Binding Repair: No New Performance Benchmark
+## V470 R19 Pair On The Repaired Binding
+
+One accepted frozen R19 pair used caller V470, Rust V464 and Switchboard `bd9ade07e95fe5abdcad28a2760a02c23f5667e9`. Both arms passed the unchanged fixed quality gate with no integrity failures; Efficient passed 67 tests and native passed 73, including different optional additions. Controls matched. All recorded coordinator, worker and native-child usage is included and reconciled.
+
+| Metric | Efficient | Native Sol 6.1/max |
+| --- | ---: | ---: |
+| CLI workflow seconds | 321.277002 | 397.608706 |
+| Reported API-equivalent USD | 0.3094348 | 0.5399996 |
+| Input plus output tokens | 499,409 | 1,508,951 |
+| Uncached input tokens | 142,871 | 105,276 |
+| Model calls | 15 | 30 |
+
+Observed CLI time fell 19.2% and estimated cost fell 42.7%, despite higher uncached input. Efficient used two Terra 6.1/xhigh workers; native used one Sol 6.1/max child. A pre-provider filename-glob rejection and the 33.85-second coordinator correction interval remain included, as do each worker's initial failing tests exposing missing requested behavior. No failed work or useful verification was removed from accounting.
+
+This is a single pair with uncontrolled provider load/cache warmth, using frozen 2026-10-22 API-equivalent prices rather than invoices/subscription billing. CLI workflow timing excludes setup and the independent after-barrier audit; whole paired-job wall time is not per-arm uninterrupted acceptance E2E. Hidden provider attempts and internal provider effort remain unknown. The later `0d94344` bounded read-glob fix has correctness/deployment evidence, not a new performance measurement; no stable or isolated patch gain is claimed.
+
+## Previous Binding Repair: No New Performance Benchmark
 
 Switchboard `bd9ade07e95fe5abdcad28a2760a02c23f5667e9` corrects source-only publication leaving stale admitted host metadata. The 1,073-test canonical candidate suite and both guarded hot deployments passed; native App evidence confirms the corrected snapshot, and the original-shaped read-only advertised-tool canary now returns the indexed budget refusal before provider execution. The earlier inspection-worker launch remains a negative historical observation, not a successful zero-provider test. This is verified correctness, not a new model performance pair; the accepted V470 cost/time observations below retain Switchboard `116d1ad` and their original scope.
 

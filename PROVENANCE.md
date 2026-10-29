@@ -1,6 +1,12 @@
 # Source Provenance
 
-## Current Native-Host Admission Binding
+## Current Bounded Read Routing
+
+Switchboard source `0d9434476edc90ce3e2c7d0dc9548437799b0a30` exports four exact committed files: `src/nokiy-native-host.py`, `src/nokiy-native-tool.mjs`, `tests/test_nokiy_read_globs.py` and `tests/test_nokiy_verifier_completion.py`. Caller V470 and Rust V464 are unchanged. Native host SHA-256 is `c12b272339dd43ee6e342a8fdb3d9ce50605fd9d595cbe4dacc7e3d0772b62fa`; source, admission and the newly executed advertised-tool snapshot agree. The bounded source deployment passed all three stages without an App restart.
+
+The implementation worker did not reach verified done: its required gate exposed an obsolete literal call-shape assertion. Parent correction preserves the intended ordering through AST checks, then passes the complete Python gate (227 tests, two skips), canonical candidate Node gate (1,073 tests) and six installed focused tests. Original failed worker evidence remains incomplete, not promoted to success. The R19 observation in the benchmark summary predates this patch and includes the original preparation correction cost.
+
+## Previous Native-Host Admission Binding
 
 Switchboard source `bd9ade07e95fe5abdcad28a2760a02c23f5667e9` adds only the publisher's conditional host-admission refresh and its focused regressions after `b856bc1`. The two exact committed exports are `src/workflow-update.mjs` and `tests/native-source-update.test.mjs`; all other source identities remain unchanged. Both guarded hot deployments and the 1,073-test canonical candidate suite passed. Actual native App command metadata and source/admission/snapshot SHA-256 now agree on `b9fe14d272ad64fe7214a486d2e171bb4733ad57627c33ca0ae00196d86c840d`; the original-shaped read-only tool canary rejects before provider execution. This closes the current advertised-route disagreement, not recovery of every historical user session or a new performance claim. Details and historical limits remain in [current surface](docs/current-surface.md).
 

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import importlib.util
 import fcntl
+import fnmatch
 import json
 import math
 import os
@@ -464,6 +465,81 @@ def normalize_local_discovery(action, workspace):
         normalized.pop('source_read')
         repairs.append({'path': 'action.source_read', 'rule': 'directory_only_to_discovery'})
     return normalized, repairs
+
+
+def normalize_read_globs(action, workspace):
+    """Expand filename patterns only; discovery and all compiler authority stay intact."""
+    reads = action.get('read_scopes')
+    if type(reads) is not list or any(type(name) is not str for name in reads):
+        return action, []
+    exact, seen, expanded = [], set(), False
+    for index, name in enumerate(reads):
+        names = [name]
+        if any(char in name for char in '*?[]{}'):
+            def refuse(reason):
+                raise IntakeError([{'path': f'action.read_scopes[{index}]', 'reason': reason}])
+
+            parts = name.split('/')
+            if name.startswith('/'):
+                refuse('read_glob_absolute_path')
+            if ('\\' in name or any(part in ('', '.', '..') for part in parts)
+                    or any(ord(char) < 32 or ord(char) == 127 for char in name)):
+                refuse('read_glob_unsafe_path')
+            if any(part.startswith('.') for part in parts):
+                refuse('read_glob_hidden_component')
+            if len(parts) < 2 or any(char in part for part in parts[:-1] for char in '*?[]{}'):
+                refuse('read_glob_literal_directory_required')
+            pattern = parts[-1]
+            if pattern == '**':
+                # Existing dir/** discovery is not a filename expansion, even if absent.
+                exact.append(name)
+                seen.add(name)
+                continue
+            if '**' in pattern or any(char in pattern for char in '{}'):
+                refuse('read_glob_unsupported_pattern')
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            fd = None
+            names = []
+            try:
+                fd = os.open(workspace, flags)
+                for part in parts[:-1]:
+                    if stat.S_ISLNK(os.stat(part, dir_fd=fd, follow_symlinks=False).st_mode):
+                        refuse('read_glob_symlink_ancestry')
+                    child = os.open(part, flags, dir_fd=fd)
+                    os.close(fd)
+                    fd = child
+                with os.scandir(fd) as entries:
+                    for entry in entries:
+                        if entry.name.startswith('.') or not fnmatch.fnmatchcase(entry.name, pattern):
+                            continue
+                        mode = entry.stat(follow_symlinks=False).st_mode
+                        if stat.S_ISLNK(mode):
+                            refuse('read_glob_matching_symlink')
+                        if not stat.S_ISREG(mode):
+                            continue
+                        if (any(char in entry.name for char in '*?[]{}\\')
+                                or any(ord(char) < 32 or ord(char) == 127 for char in entry.name)):
+                            refuse('read_glob_non_exact_match')
+                        names.append('/'.join(parts[:-1] + [entry.name]))
+            except OSError:
+                refuse('read_glob_directory_unavailable')
+            finally:
+                if fd is not None:
+                    os.close(fd)
+            if not names:
+                refuse('read_glob_no_matches')
+            names.sort()
+            expanded = True
+        for item in names:
+            if item not in seen:
+                exact.append(item)
+                seen.add(item)
+    if not expanded:
+        return action, []
+    limit = CONTRACT['action']['properties'].get('read_scopes', {}).get('maxItems')
+    if limit is not None and len(exact) > limit:
+        raise IntakeError([{'path': 'action.read_scopes', 'reason': 'read_glob_expansion_exceeds_scope_bound'}])
+    return dict(action, read_scopes=exact), [{'path': 'action.read_scopes', 'rule': 'filename_globs_to_exact_reads'}]
 
 
 # The installed caller refuses a worker prompt above this many UTF-8 bytes (MAX_PROMPT_BYTES).
@@ -2320,6 +2396,15 @@ def prepare_action(envelope, entry, thread, worker, effort, tier, payload, draft
     if not prepared.exists():
         if inputs.exists():
             raise ValueError('NOKIY_NATIVE_PREPARATION_UNCERTAIN: reconcile the original input directory')
+        # Directory observations affect compiler input, never the existing recovery key.
+        # Cached outcomes above must return without expanding or replaying preparation.
+        action, glob_repairs = normalize_read_globs(action, directory(draft['workspace']))
+        if glob_repairs:
+            repairs += glob_repairs
+            normalized_envelope = {**envelope, 'payload': {**payload, 'draft': draft, 'action': action}}
+            checked_expansion_bytes(normalized_envelope, 'Read glob expansion')
+            normalized_digest = hashlib.sha256(canonical(
+                {'thread': thread, 'envelope': normalized_envelope}).encode()).hexdigest()
         binding = json.loads((entry.parents[2] / 'caller-binding.json').read_text())
         image = binding['runtime_image']
         if sha(image['path']) != image['sha256']:

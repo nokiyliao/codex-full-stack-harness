@@ -1,6 +1,12 @@
 # Nokiy Full-Stack Harness
 
-## Current Admitted Host Binding
+## Current Bounded Read Routing
+
+Switchboard `0d9434476edc90ce3e2c7d0dc9548437799b0a30` accepts filename read patterns such as `tests/test_resident*.py` by expanding them into deterministic exact-file reads. Directory grants and write authority are not enlarged; unsafe paths and symlinks remain rejected, and original request recovery is preserved. The guarded hot deployment passed, including actual source/admission/native-tool snapshot identity. Python verification ran 227 tests with two skips; the canonical Node candidate passed 1,073 tests. Counts overlap with focused checks.
+
+The newly accepted R19 pair, measured on the preceding `bd9ade0` surface, observed CLI workflow time -19.2% and reported API-equivalent cost -42.7%, including coordinator and all recorded children. This is one qualified observation, not the incremental benefit of the new routing fix. See [benchmark observations](docs/benchmark-summary.md).
+
+## Previous Admitted Host Binding
 
 Switchboard `bd9ade07e95fe5abdcad28a2760a02c23f5667e9` fixes source-only publication retaining the predecessor host digest. Exact native-host updates now refresh and verify that admitted identity; ordinary module updates preserve the host binding. Independent admission/source preimages also permit recovery when source bytes were already installed. The combined canonical candidate suite passed 1,073 tests with no failures or skips.
 

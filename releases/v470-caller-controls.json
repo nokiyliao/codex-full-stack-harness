@@ -2382,7 +2382,7 @@
       }
     },
     "packages/switchboard": {
-      "source_head": "bd9ade07e95fe5abdcad28a2760a02c23f5667e9",
+      "source_head": "0d9434476edc90ce3e2c7d0dc9548437799b0a30",
       "includes_uncommitted_changes": false,
       "export": "committed source with documented exclusions and publication-only notices",
       "files": {
@@ -2409,9 +2409,9 @@
         "src/nokiy-direct-route.mjs": "ef73031b3c41497ecfc1be9b10d321db4660ad4fdd8dff28665b38305e61bb90",
         "src/nokiy-http-evidence.py": "66fc8f5b15039d5829d4e5bc69f51617469c5e1ebc3116f06e43fc612abef57f",
         "src/nokiy-native-contract.json": "f95d35bb2ef9b2de1aaeea7f27f5945fb768a934401b0e8a30c711af250a4961",
-        "src/nokiy-native-host.py": "b9fe14d272ad64fe7214a486d2e171bb4733ad57627c33ca0ae00196d86c840d",
+        "src/nokiy-native-host.py": "c12b272339dd43ee6e342a8fdb3d9ce50605fd9d595cbe4dacc7e3d0772b62fa",
         "src/nokiy-native-observation.mjs": "07140e0ed9e510f6d2094fb84a878a7bdae3e966f734108d97fc9e99b4d8ceaa",
-        "src/nokiy-native-tool.mjs": "5c67183181e66a8af23a8d1bb4c3a1d0d76af6c4001459b90a0d42ce7879a2a3",
+        "src/nokiy-native-tool.mjs": "a73a36a255a023e1f98d7f945d5e39ecbab819b3b5134763b067da8bfa0fb3b4",
         "src/nokiy-replay-restore.mjs": "4c74e69e2c9ea8adcd78b2d42c89633a7eb4c9f5fdf04bd7584ca9469083dc3f",
         "src/nokiy-result-delivery.mjs": "6b979a179c2f36ebb43eac7361295d236dc70090599c5ee44b7244cda0131496",
         "src/nokiy-workflow-profiles.mjs": "bca39f5ca12c9d14a21a6f91abbaa6f7e3c1cd1f9d87eda1c4f847dd03308b01",
@@ -2526,7 +2526,7 @@
         "tests/test_nokiy_post_batch_verifier.py": "0dfe2a966151350aa90af6622f9015f9a78e06572d72ed3707a592500d66fa57",
         "tests/test_nokiy_preparation_recovery.py": "356a0cc89d6f6c0f116094a0a0ff01ef0c2511ab5dbca2a5a5967cc0c30bec95",
         "tests/test_nokiy_surface_query.py": "b77608a399f26892058f3ed146d8599043906456579bb2a31864f3f90abaf392",
-        "tests/test_nokiy_verifier_completion.py": "6d88942e6a6d54a60bec457d3663326f9ef500986a3e1fccc04f4ab114862dea",
+        "tests/test_nokiy_verifier_completion.py": "1e6db5dd0dad5e615b1696252e4ac98b4f2c8156ae1b3199fc92ae4859eaf4ca",
         "tests/test_nokiy_verifier_reference.py": "c8f72096d770aa2da4733e02ee0836f6bda9d52dc0acb5d2d053a01571d46380",
         "tests/test_nokiy_write_effect_synonyms.py": "c91c1809448463ea05aae886e7632c603e99e3c02cf772a6acd53e01acc01da9",
         "tests/tool-handoff-evidence.test.mjs": "43b67d347f024184b62b4ba6df16e7bcae3fba5c4d91ab4ebbcae164c2a83e4c",
@@ -2539,7 +2539,8 @@
         "tests/workflow-update-prepare.test.mjs": "f3740d8cdf1798eb9e3a98b4eeea832a49c89fd89870c55a1a6c53ba82da4d84",
         "tests/workflow-update-restart.test.mjs": "a7b67bbfac8f32698fe8f034f87e52e3c05681fefd7ad40b4223bded4d6605f5",
         "tests/ws-error-diagnostic.test.mjs": "c9f10fb604adbcee920c92b47f6202f8c4e7e597944b4b9c6ee46c8281788cce",
-        "tests/xai-worker.test.mjs": "645e70f94cadea0cc11864de43e84876b303d0aeb62d8ef31375bb040a0e98d2"
+        "tests/xai-worker.test.mjs": "645e70f94cadea0cc11864de43e84876b303d0aeb62d8ef31375bb040a0e98d2",
+        "tests/test_nokiy_read_globs.py": "e3dbc21e396aa2853c050904acec0c0cf0e000dd8c338fd18664699118e4a645"
       },
       "modes": {
         ".gitignore": "100644",
@@ -2695,18 +2696,19 @@
         "tests/workflow-update-prepare.test.mjs": "100644",
         "tests/workflow-update-restart.test.mjs": "100644",
         "tests/ws-error-diagnostic.test.mjs": "100644",
-        "tests/xai-worker.test.mjs": "100644"
+        "tests/xai-worker.test.mjs": "100644",
+        "tests/test_nokiy_read_globs.py": "100644"
       }
     }
   },
   "publication_files": {
-    "README.md": "a174257beda5db58357c9765a6b5b3b6d6e9850755fb011a5dd6133578d2da42",
-    "PROVENANCE.md": "a724b98d240b8f87b84c07ea5b31cd981058e55914cf834657c28ae0bf9b4ad6",
+    "README.md": "16ad2dc4bbac4909ccf63854752b7743ef4fb553b89b24c9c94fda5adbb22b00",
+    "PROVENANCE.md": "710cbdea4018c259a3cc726e1f03917e302294e64e2863d59803be656ac92884",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "b69d7fb92ce5cbe8d9fc0a82be7194225ae18ed9e7d6cdd3817ccc39fc4199fd",
-    "docs/current-surface.md": "6219183ac68d9c5e0b85be0e6ceb5d908ec3be8be03a2e5a082d32dc9dfbde1f",
-    "docs/benchmark-summary.md": "7f99468a3294ba39a8d4e0e7503d34feb888259ab301e28983cc22ba6e0650fd"
+    "docs/current-surface.md": "8c102ce78ed6925c2f880ef48998d67f06891d5185c7f621ae827018c64c2240",
+    "docs/benchmark-summary.md": "a23a85831bab6d11cbe2e8b9b553b7a4ad416fe9ca758bfec83d59d587db50cc"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v470-dependency-first-publication",
@@ -3606,7 +3608,7 @@
         "bytes": 7602928
       }
     },
-    "switchboard_deployment": "nokiy-native-host-binding-refresh-20261029",
+    "switchboard_deployment": "nokiy-bounded-read-globs-20261029",
     "switchboard_regression_tests": {
       "passed": 1073,
       "failed": 0,
@@ -3619,7 +3621,7 @@
       "conditional_frozen_host_interop_tests": 2,
       "frozen_baseline_exported": false
     },
-    "switchboard_native_host_sha256": "b9fe14d272ad64fe7214a486d2e171bb4733ad57627c33ca0ae00196d86c840d",
+    "switchboard_native_host_sha256": "c12b272339dd43ee6e342a8fdb3d9ce50605fd9d595cbe4dacc7e3d0772b62fa",
     "caller_release_tests": {
       "source_ran": 260,
       "candidate_ran": 260,
