@@ -1,5 +1,18 @@
 # Benchmark Observations
 
+## Current Ultra Worker Routes
+
+Two additional matched R19 pairs use the unchanged `0d94344` composition, Astra/xhigh coordinators and native Astra/xhigh controls. The explicit high picker selects Sol 6.1/xhigh workers; the already-deployed default medium picker selects Terra 6.1/xhigh. No model, effort, routing or runtime setting changed to run these cases. Each row has its own contemporaneous native control, including its recorded Astra child.
+
+| Ultra worker route | Ultra seconds / USD | Native seconds / USD | Time change | Cost change |
+| --- | ---: | ---: | ---: | ---: |
+| High: Sol 6.1/xhigh | 375.366500 / 0.944942 | 351.133785 / 2.849460 | +6.9% | -66.8% |
+| Default medium: Terra 6.1/xhigh | 229.714605 / 0.6975272 | 385.988216 / 2.907558 | -40.5% | -76.0% |
+
+Both Ultra coordinators used three calls with verified xhigh request-wire settings. All four arms passed fixed quality/source-integrity gates: high Ultra/native 69/72 tests, default Ultra/native 67/73, with zero failures/errors/skips. Optional additions differ. Both pairs have complete reconciled reported root/worker/native-child usage, verified worker done/cleanup, joined source-bound live-return gates and no post-gate parent commands. Initial failed worker checks remain included. The slower high/Sol result is a tradeoff, not joint gain.
+
+The longest worker was 215.0 seconds in the high/Sol observation versus 97.1 seconds in the default/Terra observation. This identifies worker execution as a material critical-path contributor, not an isolated model-throughput explanation. Prompts, optional work, provider load and cache warmth vary; this is not a controlled worker-model ablation or proof that Terra is preferable for every task. Existing routes remain unchanged. Costs use the same frozen 2026-10-22 API-equivalent rates, not invoices/subscription billing. CLI timings exclude setup and independent after-barrier audits; hidden provider attempts and internal effort remain unknown. Cross-task and sustained same-ID gains remain unproven.
+
 ## Post-Deployment V470 R19 Pair
 
 The current `0d9434476edc90ce3e2c7d0dc9548437799b0a30` composition completed a new matched R19 pair with unchanged caller V470 and Rust V464. Both arms passed the fixed quality gate and source integrity: Efficient 67 tests, native 73, zero failures/errors/skips. Complete recorded usage reconciles; there are no missing usage records or unknown models.

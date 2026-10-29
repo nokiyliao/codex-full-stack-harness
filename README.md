@@ -4,7 +4,7 @@
 
 Switchboard `0d9434476edc90ce3e2c7d0dc9548437799b0a30` accepts filename read patterns such as `tests/test_resident*.py` by expanding them into deterministic exact-file reads. Directory grants and write authority are not enlarged; unsafe paths and symlinks remain rejected, and original request recovery is preserved. The guarded hot deployment passed, including actual source/admission/native-tool snapshot identity. Python verification ran 227 tests with two skips; the canonical Node candidate passed 1,073 tests. Counts overlap with focused checks.
 
-The post-deployment R19 pair on `0d94344` observed CLI workflow time -47.8% and reported API-equivalent cost -36.3%, including the coordinator and both recorded workers. Quality passed on both arms. These are single-pair composition results, not proof of stable gain or isolated routing-patch benefit; the earlier `bd9ade0` observation remains retained. See [benchmark observations](docs/benchmark-summary.md).
+The post-deployment R19 Efficient pair on `0d94344` observed CLI workflow time -47.8% and reported API-equivalent cost -36.3%. Ultra with its existing default Terra/xhigh workers observed -40.5% time and -76.0% cost against native Astra/xhigh; the explicit Sol/xhigh route saved 66.8% cost but was 6.9% slower. All recorded coordinators/workers/native children are included and fixed quality passed. These are separate single-pair composition observations, not stable/universal or isolated-patch gains. No defaults were changed. See [benchmark observations](docs/benchmark-summary.md).
 
 ## Previous Admitted Host Binding
 

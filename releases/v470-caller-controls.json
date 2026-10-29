@@ -2702,13 +2702,13 @@
     }
   },
   "publication_files": {
-    "README.md": "3bc8b65134a8697ffd76304873e66fc09aa5805f970a972711db8e40fc667ea0",
+    "README.md": "6c23b287b56881a178f3bcdd9e55df3a44f31475c78becf728c0886f91c5ec40",
     "PROVENANCE.md": "acde26a1a8dfaeee77d2b92ce8d3b861a9555b5906cdb054e83c90f1b459a84a",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "b69d7fb92ce5cbe8d9fc0a82be7194225ae18ed9e7d6cdd3817ccc39fc4199fd",
     "docs/current-surface.md": "8c102ce78ed6925c2f880ef48998d67f06891d5185c7f621ae827018c64c2240",
-    "docs/benchmark-summary.md": "fa5e21cc82109ce75e42f26dc8d8abdc136977720e103f441326fd65020153c6"
+    "docs/benchmark-summary.md": "a0c0c0db47dfd45f2f3d80f03cae542c359a0a557ec2888fdf9f52aa409d0bee"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v470-dependency-first-publication",
