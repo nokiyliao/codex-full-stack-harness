@@ -649,6 +649,34 @@ async fn native_auth_rewrite_window_settles_instead_of_failing() {
     assert!(waited >= std::time::Duration::from_millis(1800) && waited < std::time::Duration::from_secs(10), "{waited:?}");
 }
 
+#[test]
+fn unavailable_oauth_access_has_a_fixed_secret_free_diagnostic() {
+    let _lock = crate::test_support::env_lock();
+    let fixture = SyntheticAuthFixture::new();
+    // SAFETY: this test holds the shared environment lock.
+    #[allow(unsafe_code, reason = "test owns the shared environment lock")]
+    unsafe {
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::set_var("OPENAI_ACCOUNT_ID", "fixture-account");
+    }
+    let conf = crate::TuraConfig::new("unused.env");
+    let error = super::select_openai_access_token(&conf).unwrap_err();
+    match &error {
+        super::TuraError::Config { message } => assert_eq!(
+            message,
+            "NOKIY_OAUTH_ACCESS_UNAVAILABLE: Native Codex access is unavailable and the provider-key fallback is absent"
+        ),
+        other => panic!("expected Config error, got {other:?}"),
+    }
+    for diagnostic in [error.to_string(), format!("{error:?}")] {
+        for secret in ["fixture-access", "fixture-owned-refresh", "fixture-account"] {
+            assert!(!diagnostic.contains(secret));
+        }
+        assert!(!diagnostic.contains(fixture.root.to_string_lossy().as_ref()));
+        assert!(!diagnostic.contains(fixture.auth_path.to_string_lossy().as_ref()));
+    }
+}
+
 #[tokio::test]
 async fn provider_api_key_fallback_never_waits_for_native_auth() {
     let _lock = crate::test_support::env_lock_async().await;

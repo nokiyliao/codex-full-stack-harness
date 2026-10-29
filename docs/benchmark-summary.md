@@ -1,5 +1,9 @@
 # Benchmark Observations
 
+## V473 Diagnostic Deployment Boundary
+
+V473 is deployed with Rust source `392130d`, unchanged caller source `48342f2` and Switchboard `5b16a5b`. Its fixed OAuth access-selection diagnostic and 284 passing provider tests are correctness evidence, not a speed or cost measurement. There was no new model benchmark or original failed-request replay. The accepted V472 confirmation and all earlier results below remain bound to their original compositions; none is relabeled a V473 result.
+
 ## Complete V472 R19 Confirmation
 
 The unchanged frozen R19 task ran as read-only planning, implementation and acceptance on one exact dedicated native ID per arm. Composition was caller V472 (`48342f2`), Switchboard `5b16a5b` and unchanged Rust V464. Efficient requested Sol 6.1/max with two Terra 6.1/xhigh workers; native Sol 6.1/max freely used two native children. Arms ran concurrently and proceeded independently to their own complete quality gates, without a cross-arm phase barrier. Source/configuration controls matched, and cumulative root usage reconciled into phase deltas.

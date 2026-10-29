@@ -643,7 +643,7 @@ fn select_openai_access_token(conf: &TuraConfig) -> Result<SelectedAccess, TuraE
         .filter(|value| !value.trim().is_empty())
         .map(SelectedAccess::provider_owned)
         .ok_or_else(|| TuraError::Config {
-            message: "Configuration key 'OPENAI_API_KEY' not found".to_string(),
+            message: "NOKIY_OAUTH_ACCESS_UNAVAILABLE: Native Codex access is unavailable and the provider-key fallback is absent".to_string(),
         })
 }
 

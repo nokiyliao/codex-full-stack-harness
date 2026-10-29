@@ -1,5 +1,11 @@
 # Current Source Surface
 
+## Current V473 Deployment
+
+The deployed release is V473 (`0.3.473.dev0`): Rust source `392130d`, unchanged caller source `48342f2` and Switchboard `5b16a5b`. It changes only the OAuth access-selection error wording plus a synthetic regression. `NOKIY_OAUTH_ACCESS_UNAVAILABLE` describes unavailable native access and absent provider-key fallback without requesting a key or exposing secrets. Authentication selection, fallback, retries, refresh, models and permissions are unchanged.
+
+All 284 provider tests passed. The guarded publisher completed preparation, preflight, apply and verify; installed four-bin hashes match the source-bound build and the runtime contains the diagnostic. Existing source/candidate/staged/live checks and paired-wire verification passed. The original failed worker was not replayed, its historical cause remains unknown, and this correctness/diagnostic deployment has no measured incremental performance claim. Earlier V472 deployment and benchmark descriptions below retain their historical scope.
+
 ## Current Deployment: Caller V472
 
 As of 2026-10-29, caller V472 (`0.3.472.dev0`) is deployed from `48342f2df96710be9e1ebcdbc6b8101bb521a9ac`. Switchboard is unchanged at `5b16a5b666b2c91f78399dbb40bbfeacafd7ced8`; Rust remains V464 source `1304065c69b9c5c6a702a05754526395c9a41678`, without a rebuild. Models, prompts and permissions are unchanged.

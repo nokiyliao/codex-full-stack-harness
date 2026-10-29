@@ -1,5 +1,13 @@
 # Source Provenance
 
+## Current V473 OAuth Diagnostic
+
+Rust source `392130d3990b8a1c7917a7b0f6a414aef9ebff07` changes only `crates/provider/src/tura_llm.rs` and `crates/provider/src/tura_llm_tests.rs`. The OAuth-selection Config error gains a fixed reason token without credential, account or path data; its variant, selection, fallback and retry semantics remain unchanged. One synthetic regression covers the diagnostic and secret-free display. All 284 provider unit tests passed, including existing rewrite-window and fallback coverage.
+
+The four optimized binaries were rebuilt with locked dependencies using Cargo/rustc 1.94.1, then packaged by the existing guarded publisher. All 602 original build-input paths reconcile to the two accepted changes. The build acquired missing public dependencies; it is not a reproduction of the old V464 toolchain or proof of reproducible binaries. Candidate and installed binary hashes match the new build receipt. Source/candidate/staged/live publisher checks and the required paired-wire receipt passed; stage counts overlap and are not additive. No model benchmark, credential change or original-request replay accompanied deployment.
+
+V473 contains unchanged caller source `48342f2df96710be9e1ebcdbc6b8101bb521a9ac` and Switchboard `5b16a5b666b2c91f78399dbb40bbfeacafd7ced8`. The original OAuth incident remains causally unresolved. No new latency/cost benefit is claimed. All sections below describe their release-time source and measurement boundaries.
+
 ## Current V472 Verifier Fact Parity
 
 The deployed caller is V472 (`0.3.472.dev0`), source `48342f2df96710be9e1ebcdbc6b8101bb521a9ac`. Its source delta is limited to `src/codex_collaboration_harness/batch.py` and `tests/test_batch_verifier_delivery.py`. Switchboard remains `5b16a5b666b2c91f78399dbb40bbfeacafd7ced8`; Rust remains V464 source `1304065c69b9c5c6a702a05754526395c9a41678`, without a rebuild.

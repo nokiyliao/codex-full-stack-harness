@@ -1,5 +1,11 @@
 # Nokiy Full-Stack Harness
 
+## Current Deployment: V473
+
+V473 deploys Rust source `392130d3990b8a1c7917a7b0f6a414aef9ebff07` with unchanged caller source `48342f2` and Switchboard `5b16a5b`. OAuth access selection now reports the fixed, secret-free reason `NOKIY_OAUTH_ACCESS_UNAVAILABLE` instead of implying that an API key is required. Authentication preference, fallback, retries, models and permissions are unchanged. All 284 provider unit tests and the existing guarded candidate/live release checks passed. The original failed request was not replayed; its historical root cause remains unknown.
+
+No performance gain is attributed to this diagnostic repair. The V472 and earlier benchmark observations below retain their original measured compositions. [Current manifest](releases/v473-oauth-selection-diagnostic.json) and [provenance](PROVENANCE.md) describe the deployed source; older deployment descriptions are historical.
+
 ## Current Deployment: Caller V472
 
 As of 2026-10-29, the deployed caller is V472 (`0.3.472.dev0`), source `48342f2df96710be9e1ebcdbc6b8101bb521a9ac`. Switchboard `5b16a5b666b2c91f78399dbb40bbfeacafd7ced8` and Rust V464 `1304065c69b9c5c6a702a05754526395c9a41678` are unchanged.
