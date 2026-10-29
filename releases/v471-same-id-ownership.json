@@ -2384,7 +2384,7 @@
       }
     },
     "packages/switchboard": {
-      "source_head": "914f34522909b552fea4e239ddd0d16cfc7d5040",
+      "source_head": "5b16a5b666b2c91f78399dbb40bbfeacafd7ced8",
       "includes_uncommitted_changes": false,
       "export": "committed source with documented exclusions and publication-only notices",
       "files": {
@@ -2407,7 +2407,7 @@
         "src/image-model-route.mjs": "fe1b3796c769b1508e67cf959064313f6486d65d9866618228811976b2f8bf34",
         "src/inference-attempt-evidence.mjs": "0660914425927767292dede0b759e1d9937fe53d600851cace360ac594bbb758",
         "src/log-rotation.mjs": "cc383fdc5dab1ed3b7c1ef5f37b4899844a4fe80173817acb4567f51532e2ae4",
-        "src/nokiy-coordinator-policy.mjs": "d08a2e1affbe1c286149ade653dc6c12cd3634c963cfb4199d1df32ef78117f5",
+        "src/nokiy-coordinator-policy.mjs": "f485c8cdc679fa5972b221cffbc9497fe43ecae51798e628dd222ef5ac2e2fb6",
         "src/nokiy-direct-route.mjs": "ef73031b3c41497ecfc1be9b10d321db4660ad4fdd8dff28665b38305e61bb90",
         "src/nokiy-http-evidence.py": "66fc8f5b15039d5829d4e5bc69f51617469c5e1ebc3116f06e43fc612abef57f",
         "src/nokiy-native-contract.json": "f95d35bb2ef9b2de1aaeea7f27f5945fb768a934401b0e8a30c711af250a4961",
@@ -2462,7 +2462,7 @@
         "tests/nokiy-efficient-adaptive-loop.test.mjs": "d051629aab8de19f0b77c7dde44f92c60dcefd8b9fb4c972ea9aba6c0cf71221",
         "tests/nokiy-efficient-artifact-root.test.mjs": "1e13036c420123e54eccb083db99ae42e13157984ab7b3c3deb1020233005cc4",
         "tests/nokiy-efficient-create-read.test.mjs": "6cb1bcd25f54211013242d0ee3fa22d11968f370c1f27a3a39b95d1601c43487",
-        "tests/nokiy-efficient-first-dispatch.test.mjs": "7a77a596b6f72245f052e67e40b70083217a27a0cbe86a839bfec465ee3d1310",
+        "tests/nokiy-efficient-first-dispatch.test.mjs": "41a0a6f7bfbdd1c57335af402b8678fe8b8abb9fefe5c341e30c9e5980002e37",
         "tests/nokiy-efficient-known-context.test.mjs": "b99579a3fc9c11862fd42a73a36b2f0c6fcd65c5132514585f6fc4ab1cda7bd4",
         "tests/nokiy-efficient-observation-policy.test.mjs": "65bafdc0094f4734ec1ad965b0ea309d761c71a326723059518fe8d43b55cf76",
         "tests/nokiy-efficient-tool-rejection.test.mjs": "47d7d77ce7c83a6669275c3fc62a54479ca8e7e46cb4ac77ed3031fb053b2780",
@@ -4842,6 +4842,22 @@
         "plan_seconds": 271.6195282919798,
         "claim": "Measured component, not proof every read is unnecessary or a saving forecast"
       }
+    },
+    "latest_plan_only_guidance": {
+      "status": "GUARDED_WORKFLOW_UPDATE_VERIFIED",
+      "action_id": "nokiy-plan-only-economy-20261029",
+      "switchboard_source_head": "5b16a5b666b2c91f78399dbb40bbfeacafd7ced8",
+      "coordinator_policy_sha256": "f485c8cdc679fa5972b221cffbc9497fe43ecae51798e628dd222ef5ac2e2fb6",
+      "regression_test_sha256": "41a0a6f7bfbdd1c57335af402b8678fe8b8abb9fefe5c341e30c9e5980002e37",
+      "test_count": 1075,
+      "failures": 0,
+      "provider_benchmark_calls": 0,
+      "native_deployment_plan_sha256": "a53b0de426a6530bdb554f12b2ce87cfa21088c72fb9c7cb6f55f23bd534affd",
+      "reload_mode": "hot_reload",
+      "app_restart_performed": false,
+      "prior_measurement_unchanged": true,
+      "additional_time_or_cost_gain_measured": false,
+      "scope": "Ultra/Efficient planning reuses supplied targets/interfaces/checks and stops at established facts. Needed dependency/unclear-contract reads and authority remain; serial behavior unchanged."
     }
   },
   "exclusions": [
@@ -4855,6 +4871,7 @@
   "publication_notices": [
     "runtime/LICENSE retained from the existing public publication",
     "component README files describe publication boundaries; they are not claims of source-to-binary reproducibility",
-    "companion repositories and private managed-workspace DCF contracts remain external"
+    "companion repositories and private managed-workspace DCF contracts remain external",
+    "The latest plan-only guidance update passed 1,075 existing/new tests and guarded hot deployment. Its additional latency/cost effect is not yet measured. The accepted three-turn v2 observation remains bound to the preceding switchboard commit; do not attribute that historical 44.02% time / 64.66% cost observation to this later update."
   ]
 }

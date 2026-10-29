@@ -72,6 +72,22 @@ test("read-only discovery stays read-only and prose does not acquire authority",
   assert.match(contract, /no broad directory read grant or automatic escalation from write-only intent/);
 });
 
+test("Ultra and Efficient stop plan-only reads at established planning facts", () => {
+  for (const configured of [profile(),
+    ...["luna", "sol", "astra"].map((family) => profile(`nokiy-direct-${family}`, "nokiy-direct"))]) {
+    const text = coordinatorContract(configured);
+    const planning = text.split("\n").find((line) => line.startsWith("Plan-only:"));
+    assert.ok(planning, "planning must have its own rule before implementation dispatch");
+    assert.ok(text.indexOf(planning) < text.indexOf("\nDispatch-first:"));
+    assert.match(planning, /reuse supplied branch targets, interfaces and exact check commands/);
+    assert.match(planning, /stop once owners, interfaces, dependencies and required checks are established/);
+    assert.match(planning, /Read source, tests or validator internals only for missing or unclear planning facts, not to design branch implementations/);
+    assert.match(planning, /Record unresolved facts for apply; continue discovery when dependencies or contracts are unclear/);
+    assert.match(planning, /Plan-only grants no edits, mutating checks or implementation dispatch; existing owner\/CAS checks remain controlling/);
+  }
+  assert.doesNotMatch(coordinatorContract(profile("nokiy", "nokiy")), /Plan-only:/);
+});
+
 test("Ultra and Efficient retain read-only branch ownership through apply", () => {
   for (const configured of [profile(), profile("nokiy-direct-sol", "nokiy-direct")]) {
     const text = coordinatorContract(configured);
