@@ -1,5 +1,31 @@
 # Benchmark Observations
 
+## Three-Turn Same-ID Cost Regression
+
+The same frozen two-branch DCF task ran as read-only planning, implementation and acceptance on one exact newly created native session per arm. Composition was caller V471, Rust V464 and Switchboard `e4192b7`. Efficient used Sol 6.1/max plus two Terra 6.1/xhigh workers; native used Sol 6.1/max and no children. Controls matched. CLI resume retained exact identities/configuration; public cumulative usage was reconciled into phase deltas, not summed repeatedly. Each arm proceeded independently through its own quality gate with no cross-arm phase or quality barrier.
+
+| Recorded metric | Efficient | Native Sol 6.1/max |
+| --- | ---: | ---: |
+| Machine-acceptance E2E seconds | 909.713025 | 1,032.728111 |
+| Active CLI seconds, all three turns | 854.271302 | 982.700637 |
+| Independent quality seconds | 55.295879 | 49.910782 |
+| Root API-equivalent USD | 0.7249744 | 0.7291424 |
+| Worker API-equivalent USD | 0.1358212 | 0 |
+| Total API-equivalent USD | 0.8607956 | 0.7291424 |
+| Recorded calls, root plus workers | 22 + 12 | 25 + 0 |
+| Input tokens | 2,570,032 | 2,181,332 |
+| Cached input tokens | 2,364,288 | 2,081,664 |
+| Uncached input tokens | 205,744 | 99,668 |
+| Output tokens | 34,870 | 32,164 |
+
+Recorded machine time was 11.91% lower, but total cost was 18.06% higher. Worker cost $0.1358212 was offset by only $0.0041680 root savings, leaving the exact $0.1316532 premium. Root implemented both product branches before dispatching two test-only workers 557.038 seconds after initial CLI start. Both assignments said product implementations were already written and returned diffs were tests only. Workers provided useful tests; their entire cost is not avoidable waste. The planning turn accounted for $0.3553844 (41.29% of Efficient cost) and 244.963773 seconds. These locate affected work, not a forecast saving from removing required checks.
+
+The saved unchanged machine validator passed Efficient 709 cases and native 711, each with ten skips and zero failures/errors/integrity failures. **Parent semantic acceptance is held for both outputs**, not upgraded by those green checks. A direct frozen-output witness confirmed Efficient drops a graph `MAY_RESOLVE_TO` target not present in syntactic payload targets, producing direction `other` instead of required `in`. Static review found native retention CLI discards the runtime's shared/local cache label; the runtime API itself supplies it. Original outputs and passing suite observations are retained, not repaired or retrospectively repriced. The two sessions were formally archived after completion.
+
+Thus these numbers are descriptive accounting/timing, not a demonstrated equal-quality speedup. Both roots and all recorded workers are counted once; missing usage is zero only for these observed records. Prices are frozen 2026-10-22 API equivalents, not subscription billing or complete hidden provider-attempt coverage. Validators may contend with the other arm's CLI, parent/human acceptance is outside this machine timer, and a single pair proves no stable or isolated gain.
+
+Follow-up source `914f345` hot-deploys generic cross-turn ownership guidance, and the existing runner retains compact phase observations and identical neutral ownership prompts. Offline/source gates pass, but **post-repair model performance is unmeasured**. The earlier single-turn gains below do not contradict this regression: they measure different workflow shapes. No Rust/runtime rewrite or new execution service is attributed to this result.
+
 ## Timed Second DCF Workload
 
 One matched pair used caller V470, Rust V464 and Switchboard `0d94344`, before the V471 diagnostic repair. Efficient used Sol 6.1/max with Terra 6.1/xhigh workers; the native control used Sol 6.1/max, including its recorded native child. Source and runtime controls matched before and after the pair. Both frozen independent quality gates passed: Efficient 686 tests and native 718, each with 10 skips and no failures, errors or integrity failures. Counts differ because of branch-added tests; passing the unchanged acceptance contract, not equal counts, is the quality condition.

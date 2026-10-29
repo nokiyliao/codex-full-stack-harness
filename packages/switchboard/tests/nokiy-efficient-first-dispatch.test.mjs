@@ -72,6 +72,22 @@ test("read-only discovery stays read-only and prose does not acquire authority",
   assert.match(contract, /no broad directory read grant or automatic escalation from write-only intent/);
 });
 
+test("Ultra and Efficient retain read-only branch ownership through apply", () => {
+  for (const configured of [profile(), profile("nokiy-direct-sol", "nokiy-direct")]) {
+    const text = coordinatorContract(configured);
+    const dispatch = text.split("\n").find((line) => line.startsWith("Dispatch-first:"));
+    assert.ok(dispatch);
+    assert.match(dispatch, /read-only planning sets branch owners, interfaces and missing acceptance facts; defer implementation reconnaissance to owners/);
+    assert.match(dispatch, /Honor user scope\/parallelism; preserve necessary dependency discovery/);
+    assert.match(dispatch, /On apply, retain owners for navigation, implementation, focused tests and verification; never implement both branches then delegate only tests/);
+    assert.match(dispatch, /Ownership grants no authority/);
+    assert.match(dispatch, /When authorized to implement two or more known independent branches and files, dispatch them all as member intents in one run_batch/);
+  }
+  const serial = coordinatorContract(profile("nokiy", "nokiy"));
+  assert.match(serial, /Execute one bounded action at a time; no batch or fan-out/);
+  assert.doesNotMatch(serial, /Dispatch-first:|read-only planning sets branch owners/);
+});
+
 test("postimage verification and original-ID recovery advice remain present", () => {
   assert.match(contract, /expected_sha256 set to the returned postimage_sha256/);
   assert.match(contract, /Do not repeat a worker solely for an omitted field or a model-reported unattempted read/);

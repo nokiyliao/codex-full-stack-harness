@@ -1,6 +1,12 @@
 # Nokiy Full-Stack Harness
 
-## Current Context-Count Diagnostics
+## Current Same-ID Ownership Workflow
+
+Switchboard `914f345` is hot-deployed with bounded planning/apply ownership guidance; caller V471 and Rust V464 are unchanged. Ultra/Efficient now explicitly carry planned branch ownership through navigation, implementation, focused tests and verification, instead of implementing the products first and delegating only tests. Read-only planning remains read-only, serial routing is unchanged, and ownership grants no authority. Canonical Node verification passed 1,074 tests. Deployed contract generation was checked without a provider call; improved model behavior or performance after this repair is not yet measured.
+
+The new three-turn same-ID DCF observation did **not** establish a cost win: recorded machine E2E was 11.91% lower but cost 18.06% higher. The coordinator cost was almost native's, with workers added late for tests. Both saved machine quality gates passed, but semantic review found a resolved-reference omission in Efficient and a retention CLI reporting gap in native, so equal-quality acceptance is held. Earlier one-turn gains below remain qualified historical observations, not proof of long-workflow gain. See [benchmark observations](docs/benchmark-summary.md).
+
+## Previous Context-Count Diagnostics
 
 Caller V471 (`560cc0e`) and Switchboard `e4192b7` are deployed; Rust V464 is unchanged. Oversized exact-file context now reports its actual and maximum unique file count, the scopes being counted, and a supported correction instead of generic `action/invalid_shape`. The canonical 32-file bound and all authority checks remain unchanged. An actual advertised-tool canary returned 37/32 before provider execution, without changing its fixture. Caller release verification passed 481 tests; the canonical Node candidate passed 1,073. Counts overlap and are not additive. This diagnostic repair has no newly measured performance claim.
 

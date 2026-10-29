@@ -1,6 +1,16 @@
 # Current Source Surface
 
-## Current Context-Count Diagnostics
+## Current Same-ID Ownership Workflow
+
+The current composition is caller V471 `560cc0e359cdb9651648834da2c7f3ec09c00b2a`, Switchboard `914f34522909b552fea4e239ddd0d16cfc7d5040` and Rust V464 `1304065c69b9c5c6a702a05754526395c9a41678`. The source-only hot deployment is `nokiy-same-id-branch-ownership-20261029`; all three guarded stages passed with cleanup. No caller/Rust rebuild or model/effort/permission change was made.
+
+Dispatch-first guidance now explicitly carries owners/interfaces/acceptance facts from read-only planning into apply. Assigned owners perform navigation, implementation, focused tests and verification; implementing both branches then dispatching only tests is not the intended workflow. Necessary dependency discovery remains allowed and user scope/parallelism stays controlling. This is a concise contract clarification, not a runtime-enforced guarantee of compliance. The serial route does not receive it.
+
+The complete canonical candidate passed 1,074 Node tests, zero failures/skips. The installed generator independently produced the new text for Ultra/Efficient and not serial, without model inference; its inputs came from the saved controlled profile, not a new provider observation. Parent-corrected literal assertions retain the underlying delegation and source-read controls. Prior failed checks remain failures in their original evidence. Per-phase accounting and neutral ownership continuation prompts are implemented/tested in the existing runner; default single-turn controls and barrier remain unchanged.
+
+Current long-workflow evidence is negative for cost and incomplete for semantic quality: the three-turn case below costs 18.06% more. Both new test sessions finished and were archived through the official API. Their original captures/results are preserved, not resumed or repaired into an improved measurement. The confirmed projection witness and static retention reporting gap must be covered before another equal-quality gain claim. No production DCF defect is inferred from these frozen benchmark outputs.
+
+## Previous Context-Count Diagnostics
 
 The deployed composition is caller V471 `560cc0e359cdb9651648834da2c7f3ec09c00b2a`, Switchboard `e4192b78f2857e2b920a6b585f8b9799d2e21482` and unchanged Rust V464 `1304065c69b9c5c6a702a05754526395c9a41678`. Canonical context admission still permits at most 32 unique exact files across read scopes, write scopes and target paths. Duplicate paths count once; directory-discovery routes retain their existing contract.
 

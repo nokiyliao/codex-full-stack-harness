@@ -1,6 +1,14 @@
 # Source Provenance
 
-## Current Context-Count Diagnostics
+## Current Same-ID Ownership Workflow
+
+Switchboard source `914f34522909b552fea4e239ddd0d16cfc7d5040` exports only `src/nokiy-coordinator-policy.mjs`, `tests/nokiy-efficient-first-dispatch.test.mjs` and `tests/nokiy-efficient-adaptive-loop.test.mjs` over the previous public surface. Caller source/version, Rust, profiles, reasoning efforts, permissions and signed App are unchanged. The policy adds a net 341 UTF-8 bytes to existing guidance; it does not create state, a router or a new execution plane. Serial routing remains unchanged.
+
+Both implementation members delivered bound diffs with verified evidence-only terminal delivery and cleanup. The full parent gate exposed old literal assertions not covered by the focused member gate. Parent correction retained the delegated-source-read prohibition and exact one-preparatory-call condition, updated the condition's literal to distinguish read-only planning from authorized apply, and passed the canonical candidate's 1,074 tests with zero failures/skips. Original failed integration logs remain retained. Guarded source publication passed preflight/apply/verify and a fresh import of the installed contract generator produced the expected Ultra/Efficient versus serial guidance, with zero provider calls. Provider-observed compliance is unmeasured.
+
+The maintained private benchmark runner now supports three turns on a newly created exact native session ID, using the existing capture executor rather than a service or private DB. Separate captures preserve cumulative-versus-delta reconciliation and count each observed worker/child once. The latest follow-up retains compact phase calls/cost/timing without rebilling observations and uses identical neutral ownership prompts for both arms. Its offline gate passed; no post-repair model pair has run. Those engineering artifacts are not presented as a portable clean-machine benchmark distribution.
+
+## Previous Context-Count Diagnostics
 
 Caller source is `560cc0e359cdb9651648834da2c7f3ec09c00b2a`, deployed as V471; Switchboard source is `e4192b78f2857e2b920a6b585f8b9799d2e21482`. The six exact committed exports are caller `src/codex_collaboration_harness/local_context.py`, `src/codex_collaboration_harness/embedded_nokiy.py`, `tests/test_context_file_limit_diagnostics.py`, and Switchboard `src/nokiy-native-host.py`, `src/nokiy-native-tool.mjs`, `tests/test_nokiy_context_file_limit.py`. Rust and unrelated source are unchanged. The unrelated dirty caller test was not adopted or overwritten.
 

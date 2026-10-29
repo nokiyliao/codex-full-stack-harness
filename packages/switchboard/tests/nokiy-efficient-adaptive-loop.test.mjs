@@ -366,7 +366,7 @@ test("Efficient keeps independent long branches useful and its native fallback e
   assert.match(text, /A common final report is a downstream consumer, not a dependency between those outputs/);
   assert.match(text, /dispatch every such branch in one run_batch instead of implementing one yourself/);
   assert.match(text, /retain a parent implementation branch beside workers only when it needs a worker's result/);
-  assert.match(text, /Dispatch-first: when the task already names two or more independent implementation branches and their files/);
+  assert.match(text, /When authorized to implement two or more known independent branches and files, dispatch them all as member intents in one run_batch after at most one preparatory call/);
   assert.match(text, /dispatch them all as member intents in one run_batch after at most one preparatory call/);
   assert.match(text, /chain independent reads in one command or script, never one call per question/);
   assert.match(text, /Codex already loaded the applicable AGENTS\.md chain into your context; do not search for instruction files again/);
