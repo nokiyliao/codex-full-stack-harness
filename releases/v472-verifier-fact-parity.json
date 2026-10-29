@@ -2712,7 +2712,7 @@
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "ddf0aecc510d54a5fb0d361a6104a644e25800fa5e03ea97c0742205c774deb0",
     "docs/current-surface.md": "8b1afa967fb9f0b20f7594da3b9c5501a0da3529ae4e8aa8c5a4e3f8be322bd3",
-    "docs/benchmark-summary.md": "7c052a9929f13a25653bba89a3595a4412ae11c3a4c867ea20af7d14a1f6501b"
+    "docs/benchmark-summary.md": "ca78f5abcbb14ccd6d8dde08d76f93104938ccd461aea316157f2115b53bf509"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v472-verifier-fact-parity",
@@ -5004,8 +5004,70 @@
         "fresh_model_execution": false
       },
       "models_permissions_prompts_rust_changed": false,
-      "performance_delta_measured": false,
-      "benchmark_qualification": "Existing accepted paired observations remain bound to measured caller V471, not V472. No stable/universal or incremental performance gain asserted."
+      "performance_delta_measured": true,
+      "benchmark_qualification": "Existing accepted paired observations remain bound to measured caller V471, not V472. No stable/universal or incremental performance gain asserted.",
+      "performance_measurement_scope": "One file-backed historical acceptance audit only, not end-to-end or a causal live tool-delivery effect",
+      "material_cost_or_round_reduction_established": false,
+      "acceptance_stage_probe": {
+        "status": "ACCEPTED_STAGE_ONLY_PAIR_NO_ROUND_OR_MATERIAL_COST_GAIN",
+        "metrics": {
+          "coordinator_calls": {
+            "before": 6,
+            "after": 6,
+            "pct": 0.0
+          },
+          "raw_inspection_opening_commands": {
+            "before": 3,
+            "after": 4,
+            "pct": 33.33333333333333
+          },
+          "total_tokens": {
+            "before": 321223,
+            "after": 322568,
+            "pct": 0.4187122341799965
+          },
+          "uncached_input": {
+            "before": 64245,
+            "after": 66358,
+            "pct": 3.2889719044283616
+          },
+          "output": {
+            "before": 6610,
+            "after": 6098,
+            "pct": -7.7458396369137645
+          },
+          "api_equivalent_usd": {
+            "before": 0.21962680000000004,
+            "after": 0.2187072,
+            "pct": -0.4187102849015023
+          },
+          "cli_wall_seconds": {
+            "before": 167.2376815828029,
+            "after": 141.31583904195577,
+            "pct": -15.500001133424401
+          }
+        },
+        "observed_model": "gpt-6.1-sol",
+        "request_wire_effort": "max",
+        "provider_internal_effort_observed": null,
+        "workers_per_arm": 0,
+        "native_children_per_arm": 0,
+        "historical_quality_tests": 68,
+        "fresh_quality_test_execution": false,
+        "controls_matched": true,
+        "reported_usage_reconciled": true,
+        "hypothesis": "Added compact facts alone did not reduce rounds or raw-inspection opens in this file-backed historical audit. Do not infer causal live-tool or full-workflow benefit.",
+        "limits": [
+          "one sequential pair, no statistical stability",
+          "file-backed historical evidence is not an authenticated live tool handoff",
+          "cache/order, output variation and provider-duration effects not isolated",
+          "source-pinned API-equivalent price weights, not current billing; hidden attempts unknown"
+        ],
+        "measured_arm_tokens": 643791,
+        "new_runtime_deployment": false,
+        "decision": "Retain correctness fix; stop missing-facts-only prompt/version iterations. Next inspect actual planning/dispatch reconstruction in the existing accepted long-task trace, not repeat this probe.",
+        "preparation_worker_tokens": 1319836
+      }
     }
   },
   "exclusions": [

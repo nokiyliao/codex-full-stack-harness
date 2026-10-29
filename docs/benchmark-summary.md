@@ -1,6 +1,25 @@
 # Benchmark Observations
 
-## V472 Deployment: No New Performance Measurement
+## V472 Acceptance-Stage Probe
+
+One sequential before/after probe audited the same recorded R19 task using the same deployed Efficient Sol 6.1/max coordinator, zero workers and zero native children. The frozen inputs differed only by the six validated receipt facts added by V472. Both passed the recorded-fact/citation oracle and parent semantic review. The 68-case quality report was copied historical evidence, not a fresh test execution.
+
+| Metric | Before Facts | After Facts |
+| --- | ---: | ---: |
+| Coordinator model calls | 6 | 6 |
+| Commands opening raw inspection summaries | 3 | 4 |
+| Total reported tokens | 321,223 | 322,568 |
+| Uncached input tokens | 64,245 | 66,358 |
+| API-equivalent USD estimate | 0.2196268 | 0.2187072 |
+| CLI wall seconds | 167.2377 | 141.3158 |
+
+Total tokens rose 0.42%, uncached input rose 3.29%, the estimate fell only 0.42%, and wall time fell 15.50%. The primary round/read hypothesis was not supported. The automatic filename-mention hint counted three raw-inspection commands in each arm; parent review found a fourth after-arm command reading both summaries through the evidence index. This table counts commands opening those files, not physical reads. Both arms made five command-execution calls, all successful, and cited the raw inspections rather than relying on the added compact facts.
+
+Controls and frozen inputs matched, observed model identity was Sol 6.1, max effort was observed on the request wire, and complete retained-log usage reconciled with CLI totals. Provider-internal effort and hidden attempts remain unknown. Estimates use source-pinned uncached/cached/output weights of $2/$0.10/$10 per million, not verified current prices or billing. One sequential pair cannot separate cache/order, model-output or provider-duration variation. This was a file-backed historical audit, not an authenticated live-tool handoff, an Efficient-versus-native test, or an end-to-end gain measurement. No material cost or round reduction is established, and no further runtime/prompt version was shipped for this hypothesis.
+
+Preparation was also expensive: its worker reported 1,319,836 tokens, versus 643,791 across the two measured arms. Preparation is explicitly excluded from arm totals; native engineering usage is unmeasured, not zero. This experiment does not establish efficient engineering payback. Its immutable inputs and original captures are retained so the result need not be recreated.
+
+## V472 Deployment And Recorded-Receipt Check
 
 Caller V472 (`0.3.472.dev0`, source `48342f2df96710be9e1ebcdbc6b8101bb521a9ac`) is deployed; Switchboard `5b16a5b` and Rust V464 are unchanged. It adds `exit_code`, `execution_proof` and `receipt_check` from already validated matched commands to context-bearing verifier receipts, matching receipts without context. This fixes demonstrated missing evidence that prompted extra coordinator reads, without new success inference, live freshness, dependency coverage or acceptance authority. Models, prompts and permissions are unchanged; Rust was not rebuilt.
 
