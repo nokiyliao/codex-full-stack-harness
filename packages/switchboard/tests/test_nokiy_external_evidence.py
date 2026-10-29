@@ -6,9 +6,11 @@ action.read_scopes unsafe_path or came back as a capability gap, and no source w
 """
 import hashlib
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parents[1] / 'src'
 
@@ -143,8 +145,9 @@ class ExternalEvidenceTests(unittest.TestCase):
         self.assertEqual(repairs[0]['rule'], 'external_read_to_verifier_dependency')
         wrong = [{'pinned_files': [{'path': str(self.rubric), 'scope': 'verifier_only', 'sha256': '0' * 64}]}]
         mismatched = self.action(['pkg/module.py', str(self.rubric)], verifier_commands=wrong)
-        action, _, _ = host.inline_external_reads(mismatched, self.draft, self.workspace, limit=100)
-        self.assertIn(str(self.rubric), action['read_scopes'])
+        with self.assertRaises(host.ExternalEvidenceBudgetError):
+            host.inline_external_reads(mismatched, self.draft, self.workspace, limit=100)
+        self.assertIn(str(self.rubric), mismatched['read_scopes'])
 
     def test_a_relative_operand_under_the_command_cwd_is_its_dependency(self):
         self.rubric.write_text('x' * 10000)
@@ -179,10 +182,11 @@ class ExternalEvidenceTests(unittest.TestCase):
         action, _, _ = host.inline_external_reads(unpinned, self.draft, self.workspace, limit=100)
         self.assertEqual(action['read_scopes'], ['pkg/module.py'])
         self.assertEqual(action['verifier_commands'], [{'argv': argv}])
-        # A large file no verifier names stays for the caller's typed refusal.
+        # A large file no verifier names receives the native budget refusal.
         plain = self.action(['pkg/module.py', str(self.rubric)])
-        self.assertEqual(host.inline_external_reads(plain, self.draft, self.workspace, limit=100),
-                         (plain, self.draft, []))
+        with self.assertRaises(host.ExternalEvidenceBudgetError):
+            host.inline_external_reads(plain, self.draft, self.workspace, limit=100)
+        self.assertIn(str(self.rubric), plain['read_scopes'])
 
     def test_unmatched_or_conflicting_verifier_pins_do_not_remove_read(self):
         for scope, digests in [('source', [host.sha(self.rubric)]),
@@ -192,10 +196,10 @@ class ExternalEvidenceTests(unittest.TestCase):
                 commands = [{'pinned_files': [{'path': str(self.rubric), 'scope': scope, 'sha256': d}
                                              for d in digests]}]
                 source = self.action([str(self.rubric)], verifier_commands=commands)
-                action, draft, repairs = host.inline_external_reads(source, self.draft, self.workspace, limit=1)
-                self.assertEqual(action, source)
-                self.assertEqual(draft, self.draft)
-                self.assertEqual(repairs, [])
+                with self.assertRaises(host.ExternalEvidenceBudgetError):
+                    host.inline_external_reads(source, self.draft, self.workspace, limit=1)
+                self.assertEqual(source['read_scopes'], [str(self.rubric)])
+                self.assertEqual(source['verifier_commands'], commands)
 
     def test_globs_directories_binary_relative_missing_and_workspace_paths_stay(self):
         reads = ['pkg/module.py', str(self.frozen), str(self.frozen) + '/*.json',
@@ -214,16 +218,71 @@ class ExternalEvidenceTests(unittest.TestCase):
         self.assertNotIn(str(self.link), draft['prompt'])
         self.assertEqual(repairs[0]['count'], 1)
 
-    def test_only_what_fits_the_caller_prompt_limit_is_inlined(self):
-        big = self.frozen / 'big.txt'
-        big.write_text('y' * 4000)
-        limit = len(self.draft['prompt']) + len(host.INLINE_EVIDENCE_NOTE) + 1500
-        action, draft, repairs = host.inline_external_reads(
-            self.action([str(big), str(self.rubric)]), self.draft, self.workspace, limit=limit)
-        self.assertEqual(action['read_scopes'], [str(big)])
-        self.assertIn(str(self.rubric), draft['prompt'])
-        self.assertLessEqual(len(draft['prompt'].encode()), limit)
-        self.assertEqual(repairs[0]['count'], 1)
+    def test_oversized_external_json_is_typed_before_host_preparation(self):
+        report = self.frozen / 'report.json'
+        prefix, suffix = b'{"report":"', b'"}\n'
+        report.write_bytes(prefix + b'x' * (147028 - len(prefix) - len(suffix)) + suffix)
+        self.assertEqual(len(report.read_bytes()), 147028)
+        self.assertIsInstance(json.loads(report.read_text(encoding='utf-8')), dict)
+        self.assertEqual(report.resolve(strict=True), report)
+        artifact = self.workspace.parent / 'artifacts'
+        artifact.mkdir()
+        source = self.action(['pkg/module.py', str(self.rubric), str(self.tests), str(report)],
+                             forbidden_effects=['deployment', 'broker', 'order'])
+        payload = {'operation': 'run', 'action': source,
+                   'draft': {**self.draft, 'artifact_root': str(artifact), 'authority_effect': 'workspace'}}
+        draft, _, _ = host.validate_action(payload)
+        envelope = {'schema_version': 'nokiy_native_tool_v2', 'worker': 'fixture',
+                    'reasoning_effort': 'high', 'service_tier': 'priority', 'payload': payload}
+        before = host.canonical(envelope)
+        # This sentinel entry is never opened: the real host must refuse before caller preparation.
+        with patch.object(host.subprocess, 'run') as caller, patch.object(host.os, 'execv') as execute:
+            with self.assertRaises(host.ExternalEvidenceBudgetError) as caught:
+                host.prepare_action(envelope, SRC / 'unused-caller', 'fixture-thread', 'fixture',
+                                    'high', 'priority', payload, draft)
+            caller.assert_not_called()
+            execute.assert_not_called()
+        receipt = caught.exception.receipt()
+        self.assertEqual(receipt['code'], 'NOKIY_NATIVE_INPUT_INVALID')
+        self.assertEqual(receipt['status'], 'BLOCKED_BEFORE_EXECUTION')
+        self.assertEqual(receipt['phase'], 'validate')
+        self.assertIs(receipt['provider_execution_started'], False)
+        self.assertIs(receipt['safe_to_correct_input'], True)
+        self.assertEqual(receipt['issues'], [{'path': 'action.read_scopes[3]',
+                         'reason': 'external_evidence_prompt_budget_exceeded'}])
+        _, small_draft, _ = host.inline_external_reads(
+            self.action(source['read_scopes'][:-1]), draft, self.workspace)
+        block = ('\n\n%s\nSHA-256: %s\nBEGIN EVIDENCE\n%s\nEND EVIDENCE'
+                 % (report, host.sha(report), report.read_text(encoding='utf-8')))
+        used, size = len(small_draft['prompt'].encode('utf-8')), len(block.encode('utf-8'))
+        self.assertEqual(receipt['external_evidence_budget'], {
+            'read_scope_index': 3, 'file_bytes': 147028, 'evidence_block_bytes': size,
+            'prompt_bytes_before_evidence': used, 'required_prompt_bytes': used + size,
+            'prompt_limit_bytes': 65536, 'available_evidence_bytes': max(0, 65536 - used)})
+        self.assertIn('action.read_scopes', receipt['continuation'])
+        self.assertNotIn(str(report), host.canonical(receipt))
+        self.assertEqual(host.canonical(envelope), before)
+        self.assertEqual(list(artifact.iterdir()), [], 'no preparation or recovery identity is published')
+
+    def test_cumulative_evidence_budget_refuses_instead_of_partially_inlining(self):
+        self.rubric.write_bytes('{"label":"\u96ea"}\r\n'.encode('utf-8'))
+        source = self.action(['pkg/module.py', str(self.rubric), str(self.tests)])
+        _, exact, _ = host.inline_external_reads(source, self.draft, self.workspace)
+        limit = len(exact['prompt'].encode('utf-8'))
+        self.assertEqual(host.inline_external_reads(source, self.draft, self.workspace, limit=limit)[1], exact)
+        with self.assertRaises(host.ExternalEvidenceBudgetError) as caught:
+            host.inline_external_reads(source, self.draft, self.workspace, limit=limit - 1)
+        receipt = caught.exception.receipt()
+        self.assertEqual(receipt['issues'], [{'path': 'action.read_scopes[2]',
+                         'reason': 'external_evidence_prompt_budget_exceeded'}])
+        budget = receipt['external_evidence_budget']
+        self.assertEqual(budget['file_bytes'], len(self.tests.read_bytes()))
+        self.assertLess(budget['file_bytes'], budget['prompt_limit_bytes'])
+        self.assertEqual(budget['required_prompt_bytes'], limit)
+        self.assertEqual(budget['prompt_limit_bytes'], limit - 1)
+        self.assertEqual(budget['evidence_block_bytes'] - budget['available_evidence_bytes'], 1)
+        self.assertEqual(source['read_scopes'], ['pkg/module.py', str(self.rubric), str(self.tests)])
+        self.assertEqual(self.draft['prompt'], 'Implement pkg/module.py.')
 
     def test_when_every_read_was_external_the_reader_grants_are_dropped(self):
         action, draft, repairs = host.inline_external_reads(

@@ -1,6 +1,18 @@
 # Nokiy Full-Stack Harness
 
-## Current Reliability Follow-Up
+## Current Native-Host Correctness Follow-Up
+
+Switchboard `b856bc102833bae2b348b13be6842a5f4a4c47b7` includes the native-host diagnostic fix from `5ab348c8451e15868298c6d45ee8397e20e9f4e7` and the publisher succession correction. The parent exported five exact committed source/test files. Caller V470 and Rust V464 retain their existing identities; this publication creates no new caller/Rust version or rebuild.
+
+Inline external UTF-8 evidence that exceeds the unchanged 65,536-byte total prompt budget now returns `NOKIY_NATIVE_INPUT_INVALID`, indexed `action.read_scopes[n]` and `external_evidence_prompt_budget_exceeded`, with exact byte-budget facts and an actionable correction before caller/provider execution on the corrected native-host path. No cap is raised, evidence truncated or dropped, authority expanded or store added. Valid small evidence, path/symlink/UTF-8 checks and verifier-dependency fences remain. The publisher newly permits only the named `src/nokiy-native-host.py` alongside its existing source targets, not arbitrary Python/config targets. It preserves complete historical predecessor pins while binding a fresh CURRENT executor to current same-byte source, allowing verified immutable publisher succession without losing provenance.
+
+Both bounded native-parent deployments, `nokiy-publisher-native-host-support-20261029` then `nokiy-external-evidence-budget-diagnostics-20261029`, were verified, healthy and admitted with `hot_reload`, without an App restart. Inherited HOME/CODEX_HOME, clean canonical source `b856bc1`, models, efforts, topology, signed App and trading services were unchanged. The 16 focused source tests, pre-publisher 1,058-test source/candidate canonical Node suite and combined candidate canonical `npm test` result of 1,063/1,063 PASS (zero failures/skips) overlap and must not be summed. An earlier worker-only run had two official-catalog JSON parsing failures; the unchanged candidate later passed through the native parent. That failed worker has no promoted done/evidence_only proof.
+
+The deployed native-host CLI negative canary passed: a 147,028-byte regular report required 147,562 prompt bytes against 65,536; it returned the indexed budget reason at `action.read_scopes[0]`, exit 2 and `provider_execution_started=false`. The earlier current-turn advertised `functions.nokiy_execute` canary instead adapted `unsafe_path` to `read_only_refusal_to_inspect` and started a read-only Sol worker with 38,378 reported tokens. That route did not prove zero execution. Its current binding identity/refresh and target-user-session recovery remain unverified; stale binding is not a proven cause, and universal tool/session recovery is not claimed.
+
+The V470 locations worker received the complete requirement and validator and read admitted `query.py` size rules before editing. Its pagination miss was a semantic implementation error, not lost harness/DCF handoff context. The useful parent correction/review remains counted. No new model performance benchmark, speed/cost percentage or handoff-pipeline change accompanies these correctness fixes. [Current surface](docs/current-surface.md) records the supplied deployment/canary evidence references; historical measurements below keep their actual compositions.
+
+## V470 Caller Reliability Follow-Up
 
 V470 adds dependency-first publication guidance using existing ordered steps in the SAME command_run array. It does not require another model turn or add a lock, grant or runtime rebuild. The final production delta is one48-byte instruction (including newline); all earlier instruction text is preserved, and regression tests separately account for this explicit feature cost while retaining baseline budgets. Source, candidate and live each passed288 tests, with overlapping counts. In the later accepted DCF2 pair, the producer published its dependency before the importer within one provider call, and the prior missing-module race did not recur. This remains guidance, not enforced atomic publication or universal adherence.
 
@@ -8,7 +20,7 @@ The accepted V470 workflow measured Efficient477.2s/$0.36723 versus native Sol55
 
 V469 adds field-specific deployment/closeout path diagnostics without changing admission or execution rights. The installed native interface now identifies an invalid `artifact_root` instead of hiding it behind a generic input error; the negative canary remained pre-execution with zero control-plane mutations. Source, candidate and live focused suites each passed 108 tests (overlapping counts). A subsequent frozen DCF2 pair observed256.2s/$0.409027 versus native Sol433.5s/$0.7551816, with passing functional acceptance but an unresolved branch-verifier warning. This is CLI execution, not full acceptance E2E or causal/stable gain proof. See the benchmark summary; earlier V468 measurements retain their original composition.
 
-Current source surface: **caller-only V470 `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` + unchanged V464 Rust `1304065c69b9c5c6a702a05754526395c9a41678` + Switchboard `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`**, synchronized on 2026-10-29.
+Current source surface: **caller-only V470 `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` + unchanged V464 Rust `1304065c69b9c5c6a702a05754526395c9a41678` + Switchboard `b856bc102833bae2b348b13be6842a5f4a4c47b7`**, synchronized on 2026-10-29. The accepted V470 pair above used earlier Switchboard `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`.
 
 This repository publishes the source behind the verified local Nokiy execution pipeline. It supersedes the v157 snapshot. V464 keeps failed-patch feedback fast: an already-finished provider uses its normal metrics path, while a still-running provider is cancelled without waiting just for accounting. Cancelled usage remains UNKNOWN, never zero. The intermediate V463 forced-drain approach was rejected for delaying repair. V462 optional worker notes and single-branch-only Efficient native implementation remain. These changes do not expand permissions or change models.
 
@@ -20,7 +32,7 @@ V468 includes complete safe UTF-8 verifier logs as optional untrusted context fr
 
 A fresh V468 frozen R19 pair observed Efficient 245.8s/$0.2718504 versus native Sol 412.0s/$0.6797552: execution time -40.34% and historical API-equivalent cost about -60%. Totals include both coordinators, two Efficient Terra workers and the native Sol child; both fixed quality gates passed, root CLI counters reconciled and configuration controls matched. Efficient used three coordinator calls versus five in the preceding V466 observation, but it also batched its initial reads and added different optional tests, so the change is not attributed solely to log delivery. Uncached input was 8.44% higher than native. Setup and post-barrier independent audits are excluded from per-arm timing; this is one descriptive pair, not stable or isolated causal gain. [Benchmark observations](docs/benchmark-summary.md) retain the earlier V466 and negative results.
 
-Current Switchboard native-catalog fallback repair is a verified hot deployment (`hot_reload`), backed by 1,056 passing source tests. Fresh complete native catalogs can recover an exec-less chain; the exact same-connection verified fallback remains usable when tool deltas omit tools. Unsupported execution, synthetic stale catalogs and unknown unbound chains remain non-dispatching; full-request helper behavior is retained. No App restart, permission or model changes were made. Recovery of the original affected target task remains unverified, and no latency/cost percentage is assigned to this repair.
+The earlier Switchboard native-catalog fallback repair was a verified hot deployment (`hot_reload`), backed by 1,056 passing source tests. Fresh complete native catalogs can recover an exec-less chain; the exact same-connection verified fallback remains usable when tool deltas omit tools. Unsupported execution, synthetic stale catalogs and unknown unbound chains remain non-dispatching; full-request helper behavior is retained. No App restart, permission or model changes were made. Recovery of the original affected target task remains unverified, and no latency/cost percentage is assigned to this repair.
 
 Earlier response.incomplete continuation retains verified same-chain capability without claiming successful delivery. Efficient's long-observation guidance preserves actual explicit tool arguments; publisher prepare creates its declared 0700 native receipt directory. Trading behavior is unchanged.
 
@@ -34,11 +46,11 @@ Native Codex thread / Goal / UI
 
 | Component | Published directory | Source identity | License |
 | --- | --- | --- | --- |
-| Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `b336f5b82768a76844ecc0bacaa922021d54e622` | MIT |
+| Caller, navigation, recovery and verifier adapters | [packages/nokiy](packages/nokiy) | `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` | MIT |
 | Modified Tura-derived execution engine | [runtime](runtime) | `1304065c69b9c5c6a702a05754526395c9a41678` | AGPL-3.0-or-later |
-| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `35e4fe45a0e6170e539bc567def3451e93c69ca3` | Repository AGPL-3.0-or-later |
+| Model topology, capability transport and hot deployment | [packages/switchboard](packages/switchboard) | `b856bc102833bae2b348b13be6842a5f4a4c47b7` | Repository AGPL-3.0-or-later |
 
-[Current source manifest](releases/v468-caller-controls.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
+[Current source manifest](releases/v470-caller-controls.json) records per-file hashes, executable bits and installed-source correspondence. [Publication boundaries](docs/current-surface.md) distinguish source, deployment and portability. Historical version documents are not current installation instructions.
 
 ## What Is Included
 
@@ -75,7 +87,7 @@ cd runtime
 cargo build --locked --release --bin tura_router --bin tura_runtime --bin tura_session_db --bin tura_exec
 ```
 
-The Rust names preserve their actual source lineage. The caller source package version is `0.3.309.dev0`; the deployed release wheel is `0.3.468.dev0`. The existing V464 release rebuilt the actual four-binary payload with cargo --locked. V465 through V468 change only the caller: there is no Rust rebuild or new universal runtime version.
+The Rust names preserve their actual source lineage. The caller source package version is `0.3.309.dev0`; the deployed release wheel is `0.3.470.dev0`. The existing V464 release rebuilt the actual four-binary payload with cargo --locked. V465 through V470 change only the caller: there is no Rust rebuild or new universal runtime version.
 
 Switchboard source requires Node.js 22.15+ and Python 3.11+ for its host/tests:
 
@@ -97,7 +109,7 @@ That V462 Efficient surface also completed the second frozen DCF engineering tas
 
 A subsequent V462 Ultra/Astra-xhigh DCF2 pair completed in332.3s versus nativeAstra-xhigh538.7s with quality692/705PASS. One failed-patch call was cancelled without provider usage; Ultra's complete cost is UNKNOWN, not the known subtotal$0.8686608. V463's attempt to wait for usage was deployed but rejected after a fail-fast regression test. V464 preserves fast cancellation and only keeps metrics already available at completion; it cannot backfill that historical call. No causal performance gain from these failure-accounting changes is claimed. Frozen snapshot pairs do not establish sustained native-session continuation/compaction gains.
 
-An earlier V464 runtime/89c7889 Switchboard composition completed a frozen R19 pair: Efficient253.9s/$0.2467354 versus nativeSol439.4s/$0.4943428, time-42.22% and cost-50.09%, both fixed quality gates PASS. Totals include the Efficient coordinator/two Terra workers and the native coordinator/one Sol child. Efficient had three coordinator calls and no post-batch parent source read, but its uncached input was8.27% higher. This is one earlier-composition execution result, not a measurement of the current V470/116d1ad composition, isolated causality, statistical stability or long-session behavior.
+An earlier V464 runtime/89c7889 Switchboard composition completed a frozen R19 pair: Efficient253.9s/$0.2467354 versus nativeSol439.4s/$0.4943428, time-42.22% and cost-50.09%, both fixed quality gates PASS. Totals include the Efficient coordinator/two Terra workers and the native coordinator/one Sol child. Efficient had three coordinator calls and no post-batch parent source read, but its uncached input was8.27% higher. This is one earlier-composition execution result, not a measurement of current Switchboard b856bc1, isolated causality, statistical stability or long-session behavior.
 
 The complete R19 pair was measured at earlier Switchboard 372c9b2, before the native-catalog repair: Efficient 240.9s/$0.2512/489,262 total tokens versus native Sol 390.1s/$0.5439/1,399,271 tokens, time -38.25% and API-equivalent cost -53.82%. Both quality gates passed (67 versus 73 tests) with matched controls and root CLI usage reconciliation. Totals include both coordinators, Efficient's two Workers and the correlated native child. Complete reported usage uses fixed historical 2026-10-22 API-equivalent rates, not subscription billing or complete provider billing. This one concurrent frozen repair pair is not evidence that the later catalog repair caused the gain or that same-ID long-workflow gains are stable.
 

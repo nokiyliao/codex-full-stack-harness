@@ -123,9 +123,9 @@ const executorFiles = ["package-lock.json", "package.json", "src/activation.mjs"
   "src/nokiy-workflow-profiles.mjs", "src/picker-catalog.mjs", "src/route-ownership.mjs",
   "src/shared.mjs", "src/update-lock.mjs", "src/workflow-update.mjs"];
 
-async function immutableExecutor(f) {
+async function immutableExecutor(f, root = f.manifest.candidate) {
   // Reuse a saved predecessor candidate to exercise retention of its code pins.
-  const root = f.manifest.candidate, bindings = [];
+  const bindings = [];
   for (const relative_path of executorFiles) {
     const installed = path.join(f.target, relative_path), executor = path.join(root, relative_path);
     if (!f.originals.has(installed)) await f.put(installed, `installed ${relative_path}\n`);
@@ -134,11 +134,11 @@ async function immutableExecutor(f) {
     bindings.push({ relative_path, installed, executor, sha256: hash(bytes) });
   }
   const nodeModules = path.join(f.target, "node_modules");
-  await fs.mkdir(nodeModules);
+  await fs.mkdir(nodeModules, { recursive: true });
   await fs.symlink(nodeModules, path.join(root, "node_modules"), "dir");
   const proof = { status: "EXACT_SAME_BYTE_EXECUTOR_VERIFIED", installed_root: f.target,
     executor_root: root, bindings, node_modules_same_physical_directory: nodeModules };
-  f.request.executor_bindings_ref = await f.json(path.join(f.request.workspace, "executor-bindings.json"), proof);
+  f.request.executor_bindings_ref = await f.json(path.join(f.request.workspace, `${path.basename(root)}-executor-bindings.json`), proof);
   return proof;
 }
 
@@ -167,6 +167,96 @@ async function sealPrevious(f) {
     prior[key] = await f.json(prior[key].path, record);
   }
 }
+
+async function nativeHostSuccessor(f) {
+  const host = "src/nokiy-native-host.py", installed = await f.put(path.join(f.target, host), "installed native host\n");
+  f.manifest.invariants[installed.path] = installed.sha256;
+  for (const c of Object.values(f.plan.commands)) c.files.push(installed);
+  await sealPrevious(f);
+  const predecessor = await immutableExecutor(f);
+  await publisherUpdate(f);
+  const first = await f.run(), manifest = await f.read(first.manifest_ref.path), plan = await f.read(first.plan_ref.path);
+  // Model completed native receipts entirely inside the temporary fixture.
+  for (const file of manifest.files) await f.put(path.join(f.target, file.target), await fs.readFile(file.source));
+  const bindings = { action_id: manifest.action_id, native_thread_id: manifest.native_thread_id, target: f.target,
+    release: manifest.release, plan_sha256: first.plan_sha256, manifest_sha256: first.manifest_ref.sha256 };
+  f.request.previous_packet = { plan_ref: first.plan_ref, manifest_ref: first.manifest_ref,
+    apply_state_ref: await f.json(path.join(manifest.artifact_root, "apply-state.json"), {
+      ...bindings, state: "APPLIED_PENDING_VERIFY", written: manifest.files.map(file => file.target),
+      admission_sha256: manifest.admission_preimage, server_sha256: manifest.invariants[path.join(f.target, "src/server.mjs")] }),
+    verification_ref: await f.json(path.join(manifest.artifact_root, "verification.json"), {
+      ...bindings, admitted: true, verified: true, healthy: true, observed_release: manifest.release }) };
+  f.manifest = manifest; f.plan = plan;
+  f.request.action_id = f.auth.action_id = "host-action";
+  f.request.release = "host-release";
+  f.request.output = path.join(f.request.workspace, f.request.action_id);
+  f.request.candidate = path.join(path.dirname(f.request.candidate), "host-candidate");
+  const ref = await f.put(path.join(f.request.candidate, host), "# fixed native host\n");
+  f.request.files = f.auth.source_update.files = [{ target: host, source: ref.path, sha256: ref.sha256, preimage: installed.sha256 }];
+  await f.sealAuth();
+  f.evidence.test_command.cwd = f.request.candidate;
+  f.evidence.tested_host_sha256 = ref.sha256;
+  f.evidence.unchanged_test_context = [];
+  f.evidence.source_binding_ref = await f.json(path.join(f.request.workspace, "host-source-binding.json"), {
+    candidate: f.request.candidate, files: f.request.files });
+  f.request.test_evidence_ref = await f.json(path.join(f.request.workspace, "host-test-evidence.json"), f.evidence);
+  const executor = await immutableExecutor(f, path.join(path.dirname(f.request.candidate), "host-executor"));
+  f.effects.length = 0;
+  return { predecessor, executor };
+}
+
+test("prepare rotates a verified publisher executor before preparing the exact native host update", async t => {
+  const f = await fixture(t), { predecessor, executor } = await nativeHostSuccessor(f);
+  const historical = structuredClone(f.request.previous_packet);
+  const result = await f.run(), manifest = await f.read(result.manifest_ref.path), plan = await f.read(result.plan_ref.path);
+  assert.deepEqual(manifest.files, f.request.files);
+  assert.equal(manifest.files[0].target, "src/nokiy-native-host.py");
+  assert.equal(manifest.invariants[path.join(f.target, "src/workflow-update.mjs")],
+    executor.bindings.find(b => b.relative_path === "src/workflow-update.mjs").sha256);
+  assert.notEqual(executor.bindings.find(b => b.relative_path === "src/workflow-update.mjs").sha256,
+    predecessor.bindings.find(b => b.relative_path === "src/workflow-update.mjs").sha256);
+  for (const phase of ["preflight", "apply", "verify"]) {
+    const c = plan.commands[phase], pins = new Map(c.files.map(ref => [ref.path, ref.sha256]));
+    assert.deepEqual(c.argv, [f.plan.commands[phase].argv[0], path.join(executor.executor_root, "src/activation.mjs"),
+      "--workflow-update", phase, result.manifest_ref.path]);
+    for (const b of executor.bindings) assert.equal(pins.get(b.executor), b.sha256);
+    for (const b of predecessor.bindings) assert.equal(pins.has(b.executor), false);
+    for (const ref of Object.values(historical)) assert.equal(pins.has(ref.path), false);
+    assert.equal(pins.has(path.join(f.target, "src/nokiy-native-host.py")), false);
+    assert.equal(pins.get(manifest.files[0].source), manifest.files[0].sha256);
+    assert.equal(pins.get(f.request.executor_bindings_ref.path), f.request.executor_bindings_ref.sha256);
+    assert.ok(c.files.length <= 64);
+    for (const ref of c.files) assert.equal(hash(await fs.readFile(ref.path)), ref.sha256);
+  }
+  for (const ref of Object.values(historical)) assert.equal(hash(await fs.readFile(ref.path)), ref.sha256);
+  f.env.NOKIY_DEPLOYMENT_ACTION_ID = f.request.action_id;
+  f.env.NOKIY_DEPLOYMENT_PLAN_SHA256 = result.plan_sha256;
+  assert.deepEqual(await f.api.boundManifest(result.manifest_ref.path), manifest);
+});
+
+for (const stale of [false, true]) test(`executor rotation rejects ${stale ? "stale same-byte bindings" : "mismatched successor bytes"} before publication`, async t => {
+  const f = await fixture(t), { predecessor, executor } = await nativeHostSuccessor(f);
+  const binding = executor.bindings.find(b => b.relative_path === "src/workflow-update.mjs");
+  if (stale) {
+    const old = predecessor.bindings.find(b => b.relative_path === binding.relative_path);
+    await f.put(binding.executor, await fs.readFile(old.executor));
+    binding.sha256 = old.sha256;
+    f.request.executor_bindings_ref = await f.json(f.request.executor_bindings_ref.path, executor);
+  } else await f.put(binding.executor, "mismatched successor publisher\n");
+  await assert.rejects(f.run(), stale ? /Executor installed binding drift: src\/workflow-update.mjs/ : /Executor digest drift: src\/workflow-update.mjs/);
+  assert.deepEqual(f.effects, []);
+  await assert.rejects(fs.lstat(f.request.output), { code: "ENOENT" });
+});
+
+test("executor rotation requires every predecessor dependency pin in every phase", async t => {
+  const f = await fixture(t), { predecessor } = await nativeHostSuccessor(f);
+  const missing = path.join(predecessor.executor_root, "src/nokiy-coordinator-policy.mjs");
+  f.plan.commands.verify.files = f.plan.commands.verify.files.filter(ref => ref.path !== missing);
+  await sealPrevious(f);
+  await assert.rejects(f.run(), /Missing previous command pin: .*src\/nokiy-coordinator-policy.mjs/);
+  assert.deepEqual(f.effects, []);
+  await assert.rejects(fs.lstat(f.request.output), { code: "ENOENT" });
+});
 
 test("self-update command pins survive installed postimages with the complete same-byte executor", async t => {
   const f = await fixture(t), proof = await immutableExecutor(f);

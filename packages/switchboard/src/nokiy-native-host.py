@@ -472,13 +472,29 @@ INLINE_EVIDENCE_NOTE = ('\n\nExact read-only evidence inlined by the native host
                         'workspace (context only, not a read grant; do not request these paths with tools):')
 
 
+class ExternalEvidenceBudgetError(IntakeError):
+    def __init__(self, index, file_bytes, block_bytes, used, limit):
+        super().__init__([{'path': f'action.read_scopes[{index}]',
+                           'reason': 'external_evidence_prompt_budget_exceeded'}])
+        self.budget = {'read_scope_index': index, 'file_bytes': file_bytes,
+                       'evidence_block_bytes': block_bytes, 'prompt_bytes_before_evidence': used,
+                       'required_prompt_bytes': used + block_bytes, 'prompt_limit_bytes': limit,
+                       'available_evidence_bytes': max(0, limit - used)}
+
+    def receipt(self):
+        return {**super().receipt(), 'external_evidence_budget': self.budget,
+                'continuation': 'Explicitly revise the evidence selection in action.read_scopes or '
+                                'shorten draft.prompt so the exact evidence fits the existing prompt '
+                                'byte budget, then resubmit. No evidence is truncated or dropped.'}
+
+
 def inline_external_reads(action, draft, workspace, limit=INLINE_PROMPT_LIMIT_BYTES, *,
                           verifier_context=True, observations=None):
     """Exact files a task names outside the worker workspace (frozen tests, rubrics, contracts) are
     read-only evidence the workspace compiler cannot admit. Instead of refusing them as unsafe
     paths, inline their exact UTF-8 bytes with SHA-256 into the worker prompt while it fits the
-    caller's prompt limit. Anything else (globs, directories, symlinks, workspace files, binary or
-    oversized files) stays in read_scopes and meets the compiler's existing typed checks."""
+    caller's prompt limit. UTF-8 evidence exceeding that budget receives a native typed refusal.
+    Other unsupported reads retain the compiler's checks; verifier dependencies retain their route."""
     reads, prompt = action.get('read_scopes'), draft.get('prompt')
     if type(reads) is not list or type(prompt) is not str:
         return action, draft, []
@@ -510,7 +526,7 @@ def inline_external_reads(action, draft, workspace, limit=INLINE_PROMPT_LIMIT_BY
                     # A pin without a digest still names this file; completion digests it next.
                     pins.setdefault(name, set()).add(digest if isinstance(digest, str) else None)
     dependencies = {}
-    for name in reads:
+    for index, name in enumerate(reads):
         if (type(name) is not str or not name.startswith('/') or name.startswith('//')
                 or name in inlined or any(c in name for c in '*?[]\x00\r\n')):
             continue
@@ -550,6 +566,8 @@ def inline_external_reads(action, draft, workspace, limit=INLINE_PROMPT_LIMIT_BY
                 # validator reads) is that verifier's dependency, not a worker read.
                 dependencies[name] = hashlib.sha256(data).hexdigest()
                 verifier_only.append(name)
+            elif block is not None:
+                raise ExternalEvidenceBudgetError(index, len(data), size, used, limit)
             continue
         used += size
         blocks.append(block)

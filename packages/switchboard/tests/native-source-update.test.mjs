@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -161,7 +162,7 @@ function fixture(legacy = false) {
     assert.equal(host.python_sha256, hash(bytes(host.python)));
   };
   const { withUpdateLock } = load(lockSource, { ...fs, process }, ["withUpdateLock"]);
-  const { workflowUpdate } = load(updaterSource, {
+  const { workflowUpdate, exactSourceFiles } = load(updaterSource, {
     ...fs, assert, createHash, constants, path, process, execFile: command, promisify: fn => fn,
     ADMISSION_PATH, CATALOG_PATH, RUNTIME_PATH, WORKFLOW_PATH, PICKER_CATALOG_PATH, withUpdateLock, verifyNativeInterpreter,
     verifyAdmission: async () => ({ ok: control.admitted ?? true, false_predicates: ["fixture"], admission: object(ADMISSION_PATH) }),
@@ -184,13 +185,27 @@ function fixture(legacy = false) {
       return { status: 200, json: async () => url.endsWith("/ready") ? ready : (control.served ?? object(CATALOG_PATH)) };
     },
     AbortSignal: { timeout: () => undefined }, setTimeout: fn => fn(),
-  }, ["workflowUpdate"]);
-  return { nodes, effects, reads, commands, control, process, manifest, auth, seal, put, bytes, object,
+  }, ["workflowUpdate", "exactSourceFiles"]);
+  return { nodes, effects, reads, commands, control, process, manifest, auth, seal, put, bytes, object, exactSourceFiles,
     run: phase => workflowUpdate(phase, "/deployment/manifest.json"),
     noEffects() { assert.deepEqual(effects.filter(([, file]) => file !== LOCK), []); assert.equal(control.restarts, 0); },
     link(file, to) { nodes.set(file, { kind: "link", uid: 501, dev: 1, ino: ++ino, to }); },
   };
 }
+
+test("exact source scope admits only the named native host in addition to modules", async t => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "native-source-scope-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const f = fixture(), file = { target: "src/nokiy-native-host.py", source: path.join(root, "src/nokiy-native-host.py"),
+    sha256: hash("verified native host\n"), preimage: hash("installed native host\n") };
+  assert.doesNotThrow(() => f.exactSourceFiles([file]));
+  for (const target of ["src/host.py", "src/nested/nokiy-native-host.py", "src/nokiy-native-host.pyc",
+    "tests/nokiy-native-host.py", "src/nokiy-native-contract.json", "config/nokiy-workflows.json",
+    "src/../src/nokiy-native-host.py"]) {
+    assert.throws(() => f.exactSourceFiles([{ ...file, target, source: path.join(root, target) }]), undefined, target);
+  }
+  f.noEffects();
+});
 
 test("a busy service refuses the reload before any installed file changes", async () => {
   const f = fixture();

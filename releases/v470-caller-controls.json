@@ -2382,7 +2382,7 @@
       }
     },
     "packages/switchboard": {
-      "source_head": "116d1adb43f7c88aa449aaf963dd3ee9df9846f8",
+      "source_head": "b856bc102833bae2b348b13be6842a5f4a4c47b7",
       "includes_uncommitted_changes": false,
       "export": "committed source with documented exclusions and publication-only notices",
       "files": {
@@ -2409,7 +2409,7 @@
         "src/nokiy-direct-route.mjs": "ef73031b3c41497ecfc1be9b10d321db4660ad4fdd8dff28665b38305e61bb90",
         "src/nokiy-http-evidence.py": "66fc8f5b15039d5829d4e5bc69f51617469c5e1ebc3116f06e43fc612abef57f",
         "src/nokiy-native-contract.json": "f95d35bb2ef9b2de1aaeea7f27f5945fb768a934401b0e8a30c711af250a4961",
-        "src/nokiy-native-host.py": "7ce125be45d6824f85a2ef63b1f44936bcdf3d33f0cf9cc4138b40c641d393cb",
+        "src/nokiy-native-host.py": "b9fe14d272ad64fe7214a486d2e171bb4733ad57627c33ca0ae00196d86c840d",
         "src/nokiy-native-observation.mjs": "07140e0ed9e510f6d2094fb84a878a7bdae3e966f734108d97fc9e99b4d8ceaa",
         "src/nokiy-native-tool.mjs": "5c67183181e66a8af23a8d1bb4c3a1d0d76af6c4001459b90a0d42ce7879a2a3",
         "src/nokiy-replay-restore.mjs": "4c74e69e2c9ea8adcd78b2d42c89633a7eb4c9f5fdf04bd7584ca9469083dc3f",
@@ -2427,7 +2427,7 @@
         "src/tool-bridge.mjs": "aec2eb733b54109548d466d8272a0e63dcab73ac0bcd2a5faf2ca69efb51130e",
         "src/update-lock.mjs": "540cd406a82c33256ee5e3894201a533190056881700ca88f08a9114a7b8e39c",
         "src/worker-client.mjs": "f0a890259592436c306746501e9008f3091614cb83acebf832250c056658d485",
-        "src/workflow-update.mjs": "20cd2face4010fdc0492fffaf80fa0d6235b37e642b4fe8bb5f8647ea46a2ef9",
+        "src/workflow-update.mjs": "94b800790d3dc4f976b13e87599f022b5a4148cbaa601e9c331bedcb3683cd5f",
         "src/xai-worker.mjs": "48fa213818b0ac46e3ccc268bff89b5185c23564f254ff36005c805033a60b1b",
         "tests/admission-recovery.test.mjs": "8f956c18ed2c1248f36edac4d0d914b0cdec07e1ec3dde043623e556e180ccdf",
         "tests/agy-persistent-session.test.mjs": "92ea827bca88628f3e9084f601bf98742023bda2960913bdb496c8428e25eaee",
@@ -2448,7 +2448,7 @@
         "tests/log-rotation.test.mjs": "b086728e6370b98b41f68cddaaae7da93e9d0693dbe17692ed962ea45523b202",
         "tests/native-installation-paths.test.mjs": "58079975f91fe87a5ec324c850f1bd97959ad72730a3aa62a59408648711beb6",
         "tests/native-prediction-trim.test.mjs": "f2fd93c391ff7fde2153707c5c2222d0a2c6118d4da390d1a62f3298ceb84f64",
-        "tests/native-source-update.test.mjs": "334d6caec764d6e7ce336f73650ccdfe7f61aae8efcab0b4177d658c0d45680a",
+        "tests/native-source-update.test.mjs": "0ee15dca1953720b2bc8cc8030f5f874193962957bde3b44516fd772d3113664",
         "tests/native-stale-appshots.test.mjs": "7965042a76b839b39cc1ca0c8baeaaa46456c951c697e898ff3fb98fa57a4e25",
         "tests/nokiy-acceptance-intent.test.mjs": "d19bd93bba5ec5988d71ce13461b7474a934afda78d2ff969d28698ce4ddd433",
         "tests/nokiy-admission-decoupling.test.mjs": "18198e6cf68e0721e9e157b25786b73c0f4c184bcf8144efc7967bbaeb965b17",
@@ -2516,7 +2516,7 @@
         "tests/shared-terminal.test.mjs": "e91a29150c48ccc224b1b90cefd1ad1f33c66e5db671dbdfcccbc39985f58dd5",
         "tests/shared.test.mjs": "a577c378453129bdc5130cbc51dda0f13fe2d7512aae00c5a6f3056a74516a7f",
         "tests/switchboard-supervisor.test.mjs": "30ef9087995f3bab3d4cb9ba86ee97bb4181bc0665a5ffd5a626691fb30eed17",
-        "tests/test_nokiy_external_evidence.py": "35c8aaca4ba3e8509de4a3985edf865cd99d551b7c6756c7bcd6d51dee3ec6a5",
+        "tests/test_nokiy_external_evidence.py": "ca1096b6f304146535baef65b341e3d8f304a6c4b24c3a2cf03923eef8bbce83",
         "tests/test_nokiy_http_evidence.py": "b4bbdc373770020a6a9ebed4cc284d0502d4427221e3c60841f71726312d5245",
         "tests/test_nokiy_issue_vocabulary.py": "2a7ce8f25d6364ee9ea7e2789950b3404a9114e2b9c37a964d78bc126ef74d8e",
         "tests/test_nokiy_native_reference.py": "2025497ddf6587a839b392d17ac266dffe01fb1060e7659743c645fe4105f1a5",
@@ -2536,7 +2536,7 @@
         "tests/web-cancellation.test.mjs": "33d405d190c4ec84fa3d71cbfe1c6f426bcf024a6ca37eeed10a04e5cbf3a95f",
         "tests/web-native-history.test.mjs": "94d6c73dc7429b0ff3103f3dc02990d0852d46a8837dd53e61c09a6588bffa55",
         "tests/worker-client.test.mjs": "bfea40dfe937a7f7490739503143430f5a6f1130fd4706c3c37af1777b4547b6",
-        "tests/workflow-update-prepare.test.mjs": "356e96656ca6958dd50c8ef6cd3bf47f18b334363e65984592c762156caf7d11",
+        "tests/workflow-update-prepare.test.mjs": "f3740d8cdf1798eb9e3a98b4eeea832a49c89fd89870c55a1a6c53ba82da4d84",
         "tests/workflow-update-restart.test.mjs": "a7b67bbfac8f32698fe8f034f87e52e3c05681fefd7ad40b4223bded4d6605f5",
         "tests/ws-error-diagnostic.test.mjs": "c9f10fb604adbcee920c92b47f6202f8c4e7e597944b4b9c6ee46c8281788cce",
         "tests/xai-worker.test.mjs": "645e70f94cadea0cc11864de43e84876b303d0aeb62d8ef31375bb040a0e98d2"
@@ -2700,13 +2700,13 @@
     }
   },
   "publication_files": {
-    "README.md": "01aae2482c7e25e0ecb2dc7ad977d8ec8c9c86a83f8e33c8b4a75c4ae8864b85",
-    "PROVENANCE.md": "42f0c22b1fb647876bdb63db55311ab2f16e1cca76f3e21fe096e142dedcc712",
+    "README.md": "56cdd20cfbe0d816b3589d32ff6a510e1c3d45fb68b65027d0f488ace1b8f9a2",
+    "PROVENANCE.md": "12f772cff4f63508d5cdc9317d9a471d314c01e4541efa8a5a41624da3a386da",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "b69d7fb92ce5cbe8d9fc0a82be7194225ae18ed9e7d6cdd3817ccc39fc4199fd",
-    "docs/current-surface.md": "e1019f62c85e5e39848171f4cffdadbfdcef63476012dce533ce878a695073b0",
-    "docs/benchmark-summary.md": "a8bc6e3b30a3cff3db61da8daff2c806bf7af66507b8abef1a9a2a970b3ea35d"
+    "docs/current-surface.md": "c465256110c711611fb57e37a099c0b7935a58df598d5f090617d2a1be0742d5",
+    "docs/benchmark-summary.md": "108e8ed3fb37aba185782103852c7fdd882e712d673b79a2e8c63a4373ab773a"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v470-dependency-first-publication",
@@ -3606,7 +3606,7 @@
         "bytes": 7602928
       }
     },
-    "switchboard_deployment": "nokiy-native-catalog-fallback-20261029",
+    "switchboard_deployment": "nokiy-external-evidence-budget-diagnostics-20261029",
     "switchboard_regression_tests": {
       "passed": 1056,
       "failed": 0,
@@ -3624,7 +3624,7 @@
       "conditional_frozen_host_interop_tests": 2,
       "frozen_baseline_exported": false
     },
-    "switchboard_native_host_sha256": "7ce125be45d6824f85a2ef63b1f44936bcdf3d33f0cf9cc4138b40c641d393cb",
+    "switchboard_native_host_sha256": "b9fe14d272ad64fe7214a486d2e171bb4733ad57627c33ca0ae00196d86c840d",
     "caller_release_tests": {
       "source_ran": 260,
       "candidate_ran": 260,
@@ -4323,6 +4323,135 @@
       "permissions_models_app_rust_trading_unchanged": true,
       "original_global_config_preserved_with_fresh_preimage": true,
       "new_model_performance_gain": "NOT_MEASURED"
+    },
+    "native_host_correctness_followup": {
+      "switchboard_source_commit": "b856bc102833bae2b348b13be6842a5f4a4c47b7",
+      "prior_host_fix_commit": "5ab348c8451e15868298c6d45ee8397e20e9f4e7",
+      "caller_source_commit_unchanged": "e0d039fd31aa22dd86ea321b2e4e96e5add36ae1",
+      "rust_source_commit_unchanged": "1304065c69b9c5c6a702a05754526395c9a41678",
+      "caller_rust_rebuilt_or_new_version": false,
+      "exported_committed_files": [
+        "src/nokiy-native-host.py",
+        "src/workflow-update.mjs",
+        "tests/test_nokiy_external_evidence.py",
+        "tests/workflow-update-prepare.test.mjs",
+        "tests/native-source-update.test.mjs"
+      ],
+      "other_component_hashes_and_modes_preserved": true,
+      "installed_host_hash_basis": "Prior installed_composition host hash exactly matched prior component source hash; refreshed to exported native-host source identity, without changing frozen historical bindings.",
+      "historical_switchboard_deployment": "nokiy-native-catalog-fallback-20261029",
+      "diagnostic": {
+        "code": "NOKIY_NATIVE_INPUT_INVALID",
+        "issue_path": "action.read_scopes[n]",
+        "reason": "external_evidence_prompt_budget_exceeded",
+        "total_prompt_limit_bytes_unchanged": 65536,
+        "exact_byte_budget_facts_and_actionable_correction": true,
+        "corrected_native_host_blocks_before_caller_provider": true,
+        "caps_raised_evidence_dropped_or_truncated_authority_expanded_new_store": false,
+        "valid_small_evidence_path_symlink_utf8_verifier_dependency_fences_retained": true
+      },
+      "publisher_succession": {
+        "newly_admitted_source_target": "src/nokiy-native-host.py",
+        "arbitrary_python_or_config_newly_admitted": false,
+        "complete_historical_predecessor_pins_preserved": true,
+        "fresh_same_byte_current_executor_bindings_separate": true,
+        "verified_immutable_publisher_can_be_succeeded": true,
+        "mismatched_stale_missing_pin_negatives_retained": true
+      },
+      "tests": {
+        "source_focused_passed": 16,
+        "source_candidate_canonical_node_passed_before_publisher_change": 1058,
+        "combined_candidate_canonical_npm_test": {
+          "tests": 1063,
+          "passed": 1063,
+          "failed": 0,
+          "skipped": 0,
+          "execution_context": "native parent"
+        },
+        "counts_overlap_do_not_sum": true,
+        "worker_only_candidate_official_catalog_json_parsing_failures": 2,
+        "same_unchanged_candidate_later_passed_through_native_parent": true,
+        "failed_worker_done_evidence_only_promoted": false
+      },
+      "deployments_in_order": [
+        {
+          "action_id": "nokiy-publisher-native-host-support-20261029",
+          "admitted": true,
+          "verified": true,
+          "healthy": true,
+          "reload_mode": "hot_reload",
+          "app_restart_performed": false,
+          "evidence_source": "Parent-supplied bounded native deployment result"
+        },
+        {
+          "action_id": "nokiy-external-evidence-budget-diagnostics-20261029",
+          "admitted": true,
+          "verified": true,
+          "healthy": true,
+          "reload_mode": "hot_reload",
+          "app_restart_performed": false,
+          "native_catalog_loaded": true,
+          "served_catalog_matches": true,
+          "signed_app_unchanged": true,
+          "verified_at": "2026-10-29T02:56:10.560Z",
+          "verification_ref": {
+            "path": "handoff-and-external-evidence-20261029/deployment/nokiy-external-evidence-budget-diagnostics-20261029/verification.json",
+            "sha256": "f1bdb6db33cd3daf47aa9c59c202defa65b611e04fc233fb097353dfb2d92fb3",
+            "source": "Parent-supplied small external evidence; raw private logs not published"
+          }
+        }
+      ],
+      "inherited_home_codex_home_models_efforts_topology_signed_app_trading_unchanged": true,
+      "canonical_source_clean_at_b856bc1": true,
+      "deployed_native_host_cli_negative_canary": {
+        "result": "PASS",
+        "scope": "Deployed native-host CLI entry with exact current module identity and inherited native environment",
+        "exit_code": 2,
+        "status": "BLOCKED_BEFORE_EXECUTION",
+        "code": "NOKIY_NATIVE_INPUT_INVALID",
+        "issue_path": "action.read_scopes[0]",
+        "reason": "external_evidence_prompt_budget_exceeded",
+        "regular_report_file_bytes": 147028,
+        "evidence_block_bytes": 147321,
+        "prompt_bytes_before_evidence": 241,
+        "required_prompt_bytes": 147562,
+        "prompt_limit_bytes": 65536,
+        "available_evidence_bytes": 65295,
+        "provider_execution_started": false,
+        "evidence_ref": {
+          "path": "handoff-and-external-evidence-20261029/native-cli-negative-canary.json",
+          "sha256": "6a51d6de16fdcedc41cccefeee899139d2899cbbd903970e3d155e44f21b2517",
+          "source": "Parent-supplied small external evidence"
+        }
+      },
+      "earlier_current_turn_advertised_tool_canary": {
+        "tool": "functions.nokiy_execute",
+        "adaptation": ["unsafe_path", "read_only_refusal_to_inspect"],
+        "read_only_sol_worker_started": true,
+        "reported_tokens": 38378,
+        "zero_provider_execution_proven": false,
+        "current_binding_identity_or_refresh": "UNPROVEN",
+        "stale_binding_as_cause": "UNPROVEN",
+        "all_existing_sessions_or_tool_paths_recovered": "NOT_CLAIMED",
+        "all_calls_block_before_model": "NOT_CLAIMED",
+        "target_user_session_recovery": "UNVERIFIED"
+      },
+      "v470_locations_handoff_finding": {
+        "complete_requirement_and_validator_received": true,
+        "admitted_query_py_size_rules_read_before_edits": true,
+        "pagination_miss_cause": "Semantic implementation error, not lost harness/DCF handoff context",
+        "speculative_handoff_pipeline_changes": false,
+        "useful_parent_review_and_measured_repair_retained": true
+      },
+      "performance_boundary": {
+        "new_model_performance_benchmark": false,
+        "correctness_fix_speed_or_cost_percentage": "NOT_CLAIMED",
+        "retained_v470_pair_switchboard_source": "116d1adb43f7c88aa449aaf963dd3ee9df9846f8",
+        "retained_pair_includes_full_measured_coordinator_worker_child_and_parent_repair": true,
+        "retained_pair_is_latest_b856_benchmark": false,
+        "historical_positive_negative_incomplete_records_preserved": true
+      },
+      "parent_owned_git_publication_durable_reconciliation_and_acceptance": "PARENT_ACCEPTED; native Git publication and durable state are recorded outside this self-referential manifest"
     }
   },
   "exclusions": [

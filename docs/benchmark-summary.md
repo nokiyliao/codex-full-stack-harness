@@ -1,5 +1,17 @@
 # Benchmark Observations
 
+## Current Correctness Deployment: No New Performance Benchmark
+
+Current Switchboard source is `b856bc102833bae2b348b13be6842a5f4a4c47b7`, following native-host fix `5ab348c8451e15868298c6d45ee8397e20e9f4e7`. Caller remains V470 `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` and Rust remains V464 `1304065c69b9c5c6a702a05754526395c9a41678`; neither is rebuilt or versioned anew. The native-host change returns indexed, actionable byte-budget diagnostics for oversized inline external UTF-8 evidence before caller/provider execution on the corrected path, retaining the 65,536-byte total prompt cap, valid-small-evidence and path/symlink/UTF-8/verifier-dependency fences. It neither drops/truncates evidence nor expands authority or adds a store. The publisher adds only the named `src/nokiy-native-host.py` to existing source targets and separates complete historical predecessor pins from fresh same-byte CURRENT executor bindings, preserving mismatch/stale/missing-pin rejection and immutable publisher provenance.
+
+Both bounded native-parent deployments (`nokiy-publisher-native-host-support-20261029`, then `nokiy-external-evidence-budget-diagnostics-20261029`) were verified, healthy and admitted via `hot_reload`, without an App restart or changes to inherited HOME/CODEX_HOME, clean canonical source `b856bc1`, models/efforts/topology, signed App or trading services. Source focused 16 PASS, pre-publisher source/candidate canonical Node 1,058 PASS and combined candidate canonical `npm test` 1,063/1,063 PASS with zero failures/skips are overlapping correctness counts, not additive or model performance measurements. A worker-only run's two official-catalog JSON parsing failures remain historical; the unchanged candidate later passed through the native parent, without promoting the failed worker to done/evidence_only.
+
+The deployed native-host CLI negative canary rejected a 147,028-byte regular report requiring 147,562 prompt bytes against 65,536: `NOKIY_NATIVE_INPUT_INVALID`, `action.read_scopes[0]`, `external_evidence_prompt_budget_exceeded`, exit 2 and `provider_execution_started=false`. Supplied deployment verification SHA-256 is `f1bdb6db33cd3daf47aa9c59c202defa65b611e04fc233fb097353dfb2d92fb3`; native CLI canary SHA-256 is `6a51d6de16fdcedc41cccefeee899139d2899cbbd903970e3d155e44f21b2517`. [Current surface](current-surface.md) gives their relative evidence references and byte-budget facts.
+
+The earlier current-turn advertised `functions.nokiy_execute` canary remains a negative result: generic `unsafe_path` became `read_only_refusal_to_inspect` and a read-only Sol worker actually started (38,378 reported tokens). This did not prove zero execution. Current advertised-tool binding identity/refresh, stale binding as a cause and target-user-session recovery are unproven; neither universal recovery nor all-call pre-model blocking is asserted. These diagnostic observations are not a fresh performance pair or speed/cost claim.
+
+The V470 locations worker received the complete requirement and validator and admitted/read `query.py` size rules before editing. Its pagination miss was semantic implementation error, not loss of harness/DCF handoff context; no speculative handoff-pipeline change or removal of useful parent review follows. The accepted pair below remains at OLD Switchboard `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`: 477.2 versus 550.3 seconds and $0.36723 versus $0.6576468, including the full measured coordinator/worker/native-child usage and parent repair. It is not a benchmark of latest `b856bc1`. All historical positive, negative and incomplete records retain their tested composition and limits; these correctness fixes have no new model performance benchmark or attributed speed/cost percentage.
+
 ## V470 DCF2 Pair Accepted With Parent Semantic Correction
 
 The accepted composition was caller V470 `e0d039fd31aa22dd86ea321b2e4e96e5add36ae1` + unchanged V464 Rust `1304065c69b9c5c6a702a05754526395c9a41678` + Switchboard `116d1adb43f7c88aa449aaf963dd3ee9df9846f8`. CONTROL.json reported matched_controls=true, issues=[] and before==after. Both root CLI counters reported REPORTED_TOTALS_MATCH. Complete retained reported coordinator/worker/native-child usage has zero missing usage records and zero unknown models; this does not establish coverage of hidden provider attempts.
@@ -53,7 +65,7 @@ Timing is CLI execution with internal checks, not complete user acceptance. Both
 
 These are descriptive engineering measurements, not universal speedups, subscription billing or isolated causal estimates. Complete reported coordinator, worker and native-child usage is included; unreported provider attempts are not asserted to be covered.
 
-## Current V468 Frozen R19 Pair
+## Earlier V468 Frozen R19 Pair
 
 The composition was caller V468 sourceb336f5b + unchanged V464 Rust1304065 + Switchboard35e4fe4, using the same native CLI0.165.0-alpha.1.2 and frozen task/validator/manifest. Both coordinators were observed as Sol6.1 with max on the request wire. Efficient used two reported Terra6.1 workers (xhigh configured; provider-internal effort unobserved). Native used one Sol child, also counted. Before/after configuration controls matched, both root CLI usage counters reconciled and both fixed required quality gates passed.
 
@@ -97,7 +109,7 @@ Per-arm timing covers native CLI execution including its internal delegation and
 
 ## Current Caller-Only V468
 
-Current caller source b336f5b retains unchanged V464 Rust and Switchboard35e4fe4. Optional complete safe UTF-8 logs come from existing verifier scratch reads, within unchanged output budgets; duplicate visible stdout/stderr is not repeated. File text yields before original previews, proof, results and diffs, and remains untrusted context. Native source/candidate/live stages each passed 260 focused tests with equivalent staged evidence reused. The source-bound original-output replay added the previously separate 1,041-byte log, increasing encoded summary bytes43,210to44,279 while preserving old metadata/previews/diffs. It does not prove fewer model rounds or lower cost/time, and no such effect is claimed at publication. The existing worker-focused signal-isolation gap remains; native parent verification did not disable it.
+At V468, caller source b336f5b retained unchanged V464 Rust and Switchboard35e4fe4. Optional complete safe UTF-8 logs come from existing verifier scratch reads, within unchanged output budgets; duplicate visible stdout/stderr is not repeated. File text yields before original previews, proof, results and diffs, and remains untrusted context. Native source/candidate/live stages each passed 260 focused tests with equivalent staged evidence reused. The source-bound original-output replay added the previously separate 1,041-byte log, increasing encoded summary bytes43,210to44,279 while preserving old metadata/previews/diffs. It does not prove fewer model rounds or lower cost/time, and no such effect is claimed at publication. The existing worker-focused signal-isolation gap remains; native parent verification did not disable it.
 
 ## Prior Caller-Only V466
 
@@ -152,7 +164,7 @@ All totals include both coordinators, Efficient's two Workers and the correlated
 
 This one pair observed joint time/cost gains. It is not evidence that the later native-catalog repair caused the gain, and it does not establish stable same-ID long-workflow gains. The earlier negative same-ID cost result, observation-only policy comparison and incomplete cancelled usage remain below.
 
-Current Switchboard `35e4fe45a0e6170e539bc567def3451e93c69ca3` is a verified hot deployment (`hot_reload`) with 1,056 passing source tests, no App restart and no permission/model changes; Rust remains V464 and the current caller is V468. Original affected target-task recovery remains unverified, and no latency/cost percentage is assigned to this protocol repair.
+The earlier Switchboard `35e4fe45a0e6170e539bc567def3451e93c69ca3` was a verified hot deployment (`hot_reload`) with 1,056 passing source tests, no App restart and no permission/model changes; Rust remained V464 and the caller was V468. Original affected target-task recovery remains unverified, and no latency/cost percentage is assigned to this protocol repair.
 
 Fixed-quality Efficient engineering pair, 2026-10-28, integration source d53f7e4:
 

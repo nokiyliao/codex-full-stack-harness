@@ -226,7 +226,7 @@ function exactSourceFiles(files) {
   const targets = new Set();
   for (const f of files) {
     assert.deepEqual(Object.keys(f).sort(), ["preimage", "sha256", "source", "target"]);
-    assert.match(f.target, /^(?:src\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.mjs|tests\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.test\.mjs)$/);
+    assert.match(f.target, /^(?:src\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.mjs|src\/nokiy-native-host\.py|tests\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.test\.mjs)$/);
     assert.ok(!targets.has(f.target), `Duplicate source target: ${f.target}`);
     targets.add(f.target);
     assert.equal(typeof f.source, "string");
@@ -261,8 +261,9 @@ const NATIVE_COMMAND_FILE_LIMIT = 64;
 // EXACT_SAME_BYTE_EXECUTOR_VERIFIED, installed_root, executor_root, bindings
 // [{relative_path, installed, executor, sha256}] for all EXECUTOR_FILES, and
 // node_modules_same_physical_directory (canonical shared realpath). Required for
-// execution-pin target overlap or an immutable predecessor; reuse its unchanged
-// bindings after self-update, checking installed postimages via the completed packet.
+// execution-pin target overlap or an immutable predecessor. Reuse unchanged
+// bindings after self-update, or rotate to current installed bytes; the completed
+// packet and predecessor closure justify installed identities independently.
 async function preparePacket(file) {
   let r;
   try { r = await read(file); }
@@ -409,6 +410,15 @@ async function preparePacket(file) {
     refs.set(ref.path, ref.sha256);
   }
   const installedEntry = `${TARGET}/src/activation.mjs`, previousEntry = p.commands?.preflight?.argv?.[1];
+  absolute(previousEntry, "previous publisher executor");
+  const previousRoot = path.dirname(path.dirname(previousEntry));
+  assert.equal(previousEntry, path.join(previousRoot, "src/activation.mjs"), "Unsupported previous publisher executor");
+  if (previousEntry !== installedEntry) {
+    await ownedDirectory(previousRoot);
+    for (const dir of [TARGET, r.candidate, r.workspace, codexHome]) {
+      assert.ok(!within(dir, previousRoot) && !within(previousRoot, dir), "Unsafe previous executor root overlap");
+    }
+  }
   let executorEntry = installedEntry;
   const executorMappings = new Map(), executorPins = new Map();
   for (const f of r.files) if (EXECUTOR_FILES.includes(f.target)) {
@@ -420,17 +430,18 @@ async function preparePacket(file) {
     assert.equal(executor.installed_root, TARGET, "Invalid executor installed_root");
     absolute(executor.executor_root, "executor_root");
     await ownedDirectory(executor.executor_root);
-    for (const dir of [TARGET, r.candidate, r.workspace, codexHome]) {
+    const protectedRoots = [TARGET, r.candidate, r.workspace, codexHome];
+    if (previousEntry !== installedEntry && previousRoot !== executor.executor_root) protectedRoots.push(previousRoot);
+    for (const dir of protectedRoots) {
       assert.ok(!within(dir, executor.executor_root) && !within(executor.executor_root, dir), "Unsafe executor root overlap");
     }
     executorEntry = path.join(executor.executor_root, "src/activation.mjs");
-    assert.ok(previousEntry === installedEntry || previousEntry === executorEntry, "Unsupported previous publisher executor");
     assert.ok(Array.isArray(executor.bindings), "Invalid executor bindings");
     assert.equal(executor.bindings.length, EXECUTOR_FILES.length, "Incomplete executor bindings");
     assert.deepEqual(new Set(executor.bindings.map(b => b.relative_path)), new Set(EXECUTOR_FILES), "Invalid executor dependency closure");
     absolute(executor.node_modules_same_physical_directory, "executor node_modules");
     await ownedDirectory(executor.node_modules_same_physical_directory);
-    for (const root of [TARGET, executor.executor_root]) {
+    for (const root of new Set([TARGET, executor.executor_root, previousRoot])) {
       assert.equal(await realpath(path.join(root, "node_modules")), executor.node_modules_same_physical_directory, "Executor node_modules identity mismatch");
     }
     for (const b of executor.bindings) {
@@ -439,16 +450,16 @@ async function preparePacket(file) {
       assert.equal(b.executor, path.join(executor.executor_root, b.relative_path), "Invalid executor path mapping");
       assert.match(b.sha256 || "", SHA256, "Invalid executor binding sha256");
       assert.equal(await identity(b.executor), b.sha256, `Executor digest drift: ${b.relative_path}`);
-      // Once deployed, the completed manifest binds the mutable installation;
-      // the predecessor commands below still bind every immutable executor byte.
-      const installedHash = previousEntry === installedEntry ? b.sha256
-        : m.files.find(f => f.target === b.relative_path)?.sha256 ?? m.invariants[b.installed] ?? b.sha256;
+      // Only reuse may retain pre-update executor bytes. A fresh executor must
+      // match the current installation, then be justified by predecessor pins.
+      const installedHash = previousEntry === executorEntry
+        ? m.files.find(f => f.target === b.relative_path)?.sha256 ?? m.invariants[b.installed] ?? b.sha256 : b.sha256;
       assert.equal(await identity(b.installed), installedHash, `Executor installed binding drift: ${b.relative_path}`);
       executorMappings.set(b.installed, b);
       executorPins.set(b.executor, b.sha256);
     }
   }
-  assert.ok(previousEntry === installedEntry || (executorPins.size > 0 && previousEntry === executorEntry),
+  assert.ok(previousEntry === installedEntry || executorPins.size > 0,
     "Unsupported previous publisher executor: executor_bindings_ref required");
   const manifestPath = path.join(r.output, "manifest.json"), authorizationPath = path.join(r.output, "authorization.json");
   const manifest = { schema_version: m.schema_version, update_scope: SOURCE_SCOPE, target: TARGET,
@@ -481,8 +492,7 @@ async function preparePacket(file) {
     assert.equal(pins.get(m.authorization_ref.path), m.authorization_ref.sha256, "previous authorization command pin mismatch");
     await checkPinnedExecutable(c.argv[0], pins.get(c.argv[0]));
     const currentPins = new Map([[c.argv[0], pins.get(c.argv[0])]]);
-    const previousRoot = path.dirname(path.dirname(previousEntry));
-    for (const relative of executorPins.size
+    for (const relative of executorPins.size && previousEntry === installedEntry
       ? ["src/activation.mjs", "src/workflow-update.mjs", "src/update-lock.mjs"] : EXECUTOR_FILES) {
       const name = path.join(previousRoot, relative);
       assert.match(pins.get(name) || "", SHA256, `Missing previous command pin: ${name}`);
@@ -491,7 +501,14 @@ async function preparePacket(file) {
     }
     for (const b of executorMappings.values()) {
       if (previousEntry !== installedEntry) {
-        assert.equal(pins.get(b.executor), b.sha256, `Missing/mismatched previous executor pin: ${b.executor}`);
+        const previousExecutor = path.join(previousRoot, b.relative_path);
+        if (previousEntry === executorEntry) {
+          assert.equal(pins.get(previousExecutor), b.sha256, `Missing/mismatched previous executor pin: ${previousExecutor}`);
+        } else {
+          const installedHash = m.files.find(f => f.target === b.relative_path)?.sha256
+            ?? m.invariants[b.installed] ?? pins.get(previousExecutor);
+          assert.equal(b.sha256, installedHash, `Executor installed binding drift: ${b.relative_path}`);
+        }
       } else if (pins.has(b.installed)) {
         assert.equal(pins.get(b.installed), b.sha256, `previous executor binding mismatch: ${b.installed}`);
       }
