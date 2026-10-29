@@ -1,5 +1,26 @@
 # Benchmark Observations
 
+## Complete V472 R19 Confirmation
+
+The unchanged frozen R19 task ran as read-only planning, implementation and acceptance on one exact dedicated native ID per arm. Composition was caller V472 (`48342f2`), Switchboard `5b16a5b` and unchanged Rust V464. Efficient requested Sol 6.1/max with two Terra 6.1/xhigh workers; native Sol 6.1/max freely used two native children. Arms ran concurrently and proceeded independently to their own complete quality gates, without a cross-arm phase barrier. Source/configuration controls matched, and cumulative root usage reconciled into phase deltas.
+
+| Metric | Efficient | Native Sol 6.1/max |
+| --- | ---: | ---: |
+| End-to-end machine acceptance seconds | 750.859120 | 940.849648 |
+| API-equivalent USD estimate | 0.4778292 | 1.3143364 |
+| Total reported input plus output tokens | 856,296 | 4,674,741 |
+| Uncached input tokens | 149,340 | 220,195 |
+| Coordinator calls | 9 | 40 |
+| All coordinator/worker/child calls | 19 | 65 |
+| Planning / implementation / acceptance root calls | 6 / 2 / 1 | 9 / 27 / 4 |
+| Final quality cases | 72 | 72 |
+
+Using unrounded observations, time decreased 20.1935% and the estimate decreased 63.6448%. Both gates had zero failures, errors, skips and integrity failures. Complete reported accounting includes each root, worker and native child exactly once; reasoning is a subset of output. Both original Efficient implementation members were EVIDENCE_VERIFIED with evidence-only delivery and cleanup, and all four final product/test hashes matched their recorded postimages. Their combined gate was PASSED/live_return. Resident branch review found no confirmed defect in either arm. A separate closeout review worker lacked terminal evidence; it was not promoted to success or replayed. The parent completed the remaining bounded closeout diff/test review and found no concrete task violation. Both dedicated root test chats were officially archived; native child archival was not performed in this turn.
+
+Together with the earlier accepted V471 R19 pair, this is a second joint-benefit observation on this task, not proof of a universal optimum, large-context robustness, isolated DCF/J-Space effects or repeated-trial statistical stability. Acceptance root calls fell from three in the earlier complete pair to one, but causality is not established: the separate field-only probe below did not reduce calls. Provider/cache/decomposition variation and concurrent shared-resource effects remain. Source-pinned Sol uncached/cached/output weights are $2/$0.10/$10 per million; requested Terra weights are $1/$0.05/$5. These are API-equivalent estimates, not verified current prices, subscription use or invoices. Worker provider-observed identity/effort and hidden attempts remain unknown. Engineering preparation/review is outside measured arms, not zero.
+
+Evidence: `current-v472-5b16a5b-efficient-r19-same-id-confirm-20261029/PARENT_ACCEPTANCE.json` and `ACCOUNTING_REVIEW.json`, with the original phase captures and immutable quality reports retained. No production source or runtime was changed for this measurement.
+
 ## V472 Acceptance-Stage Probe
 
 One sequential before/after probe audited the same recorded R19 task using the same deployed Efficient Sol 6.1/max coordinator, zero workers and zero native children. The frozen inputs differed only by the six validated receipt facts added by V472. Both passed the recorded-fact/citation oracle and parent semantic review. The 68-case quality report was copied historical evidence, not a fresh test execution.

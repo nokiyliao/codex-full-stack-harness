@@ -2706,13 +2706,13 @@
     }
   },
   "publication_files": {
-    "README.md": "f2e3afab93ee5099202da7ac468d2c2b76b39cbf6c4df3cb19082f9e289ff416",
+    "README.md": "ca3818b3dbb27f23f92fd49c61ac23dac359007ff7f40c4a6b372439517b9e7c",
     "PROVENANCE.md": "9f4f2a94c753d22a9a137a1822faf49c790e33377355ff280c2b97d7b4e5a43f",
     "scripts/verify_release.py": "07ad2bdeb909e276d779720b0cd8b67be4c58153448785cdd968f5490e927af7",
     "tests/test_verify_release.py": "ead351a70856406d0a438bcfec0ddc3813d8e0d70622fc4874f4f4bc36981d85",
     "releases/CURRENT.json": "ddf0aecc510d54a5fb0d361a6104a644e25800fa5e03ea97c0742205c774deb0",
-    "docs/current-surface.md": "8b1afa967fb9f0b20f7594da3b9c5501a0da3529ae4e8aa8c5a4e3f8be322bd3",
-    "docs/benchmark-summary.md": "ca78f5abcbb14ccd6d8dde08d76f93104938ccd461aea316157f2115b53bf509"
+    "docs/current-surface.md": "cc473acdd0a39d45875f01e5d42502c35f42ff36778d66160c24ec885ef937a8",
+    "docs/benchmark-summary.md": "89b3ece77150f722082ed7fec1001b539f661bda05c0a04476a32a601a3ee25a"
   },
   "installed_composition": {
     "caller_release": "nokiy-20261029-v472-verifier-fact-parity",
@@ -5068,6 +5068,42 @@
         "decision": "Retain correctness fix; stop missing-facts-only prompt/version iterations. Next inspect actual planning/dispatch reconstruction in the existing accepted long-task trace, not repeat this probe.",
         "preparation_worker_tokens": 1319836
       }
+    },
+    "accepted_v472_r19_confirmation": {
+      "status": "ACCEPTED_SINGLE_V472_R19_CONFIRMATION_PAIR",
+      "metrics": {
+        "efficient_seconds": 750.8591198921204,
+        "native_seconds": 940.8496477603912,
+        "time_delta_percent": -20.193505765828412,
+        "efficient_api_equivalent_usd": 0.47782919999999995,
+        "native_api_equivalent_usd": 1.3143364,
+        "cost_delta_percent": -63.64483247972132,
+        "efficient_total_tokens": 856296,
+        "native_total_tokens": 4674741,
+        "efficient_root_calls": 9,
+        "native_root_calls": 40,
+        "efficient_total_calls": 19,
+        "native_total_calls": 65,
+        "efficient_acceptance_calls": 1,
+        "native_acceptance_calls": 4
+      },
+      "quality_each": {
+        "tests": 72,
+        "skipped": 0,
+        "errors": 0,
+        "failures": 0,
+        "integrity_errors": 0
+      },
+      "limitations": [
+        "One confirmation pair; not stable/universal optimum",
+        "V471 prior R19 accepted pair and current pair both show joint benefit, but provider/cache/decomposition variation not isolated",
+        "V472 acceptance1 versus earlier3 observed, not causal attribution: historical stage-only probe had6 versus6",
+        "API-equivalent source weights, not current billing; provider-observed worker identity/effort and hidden attempts unknown",
+        "No native-without-DCF/JSpace ablation or long-context stability proof",
+        "Engineering review/preparation not in measured arms; not zero"
+      ],
+      "source_or_runtime_changed_this_turn": false,
+      "acceptance_record_sha256": "72e4086a2acb6933a6ad40eb59186c1d3d6af3fe16ea34e5aab004ebedd9cb20"
     }
   },
   "exclusions": [

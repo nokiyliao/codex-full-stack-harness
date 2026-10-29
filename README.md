@@ -6,7 +6,7 @@ As of 2026-10-29, the deployed caller is V472 (`0.3.472.dev0`), source `48342f2d
 
 V472 adds `exit_code`, `execution_proof` and `receipt_check` from already validated matched commands to context-bearing verifier receipts, matching existing receipts without context. This fixes missing evidence that prompted extra coordinator reads; it adds no success inference, live freshness, dependency coverage or acceptance authority. Models, prompts and permissions are unchanged; Rust was not rebuilt.
 
-No latency or cost gain has been measured for V472. The accepted DCF2-v3 and R19 pairs below remain single observations measured on V471, with their original source identities and limits. Older release descriptions retain their historical scope. See [verification provenance](PROVENANCE.md) and [current surface](docs/current-surface.md).
+The current V472 workflow has now completed one accepted R19 confirmation pair: Efficient **750.859 seconds / $0.4778292** versus native Sol 6.1/max **940.850 seconds / $1.3143364**, including coordinator, workers and native children. Both passed 72 cases with zero skips, failures, errors or integrity errors. This is **20.19% less time / 63.64% lower API-equivalent estimate**, not a causal gain attributable to the V472 receipt-field change. The earlier V471 results below retain their original source identities and limits. See [benchmark boundaries](docs/benchmark-summary.md) and [current surface](docs/current-surface.md).
 
 ## Two Different Frozen Tasks
 
