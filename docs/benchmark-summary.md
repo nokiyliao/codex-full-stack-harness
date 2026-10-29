@@ -1,5 +1,9 @@
 # Benchmark Observations
 
+## V474 Navigation Operation Boundary
+
+The pre-repair deterministic fixture resolved 360 call specifications across 31 symbols even when the query returned zero symbols. V474 skips relationship resolution for empty results and retains full target lookup while masking outgoing calls of unselected identities; a focused warm-cache regression verifies no reparse, cross-file target resolution, duplicate-ID behavior and equivalent selected output. Full caller discovery passed 2,311 tests with 124 skips and zero failures/errors. No provider/model benchmark or production latency comparison was performed, so operation removal is not translated into token, cost or end-to-end speed savings. All earlier measurements below retain their original release identities.
+
 ## V473 Diagnostic Deployment Boundary
 
 V473 is deployed with Rust source `392130d`, unchanged caller source `48342f2` and Switchboard `5b16a5b`. Its fixed OAuth access-selection diagnostic and 284 passing provider tests are correctness evidence, not a speed or cost measurement. There was no new model benchmark or original failed-request replay. The accepted V472 confirmation and all earlier results below remain bound to their original compositions; none is relabeled a V473 result.

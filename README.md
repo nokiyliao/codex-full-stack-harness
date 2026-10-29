@@ -1,5 +1,9 @@
 # Nokiy Full-Stack Harness
 
+## Current Deployment: V474
+
+V474 updates caller source to `dd6dd21`: narrow full-navigation queries retain the complete target indexes but resolve outgoing calls only for selected symbol identities; empty results skip relationship resolution. The frozen canonical resolver is unchanged, including last-duplicate-ID behavior. Full caller discovery passed 2,311 tests with 124 skips and zero failures/errors, and guarded candidate/live checks passed. Rust remains V473 source `392130d`; Switchboard remains `5b16a5b`. This is an operation-count optimization, not a measured provider-token or end-to-end speed claim. [Current manifest](releases/v474-selected-navigation.json). Earlier deployment and benchmark descriptions below are historical.
+
 ## Current Deployment: V473
 
 V473 deploys Rust source `392130d3990b8a1c7917a7b0f6a414aef9ebff07` with unchanged caller source `48342f2` and Switchboard `5b16a5b`. OAuth access selection now reports the fixed, secret-free reason `NOKIY_OAUTH_ACCESS_UNAVAILABLE` instead of implying that an API key is required. Authentication preference, fallback, retries, models and permissions are unchanged. All 284 provider unit tests and the existing guarded candidate/live release checks passed. The original failed request was not replayed; its historical root cause remains unknown.

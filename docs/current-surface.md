@@ -1,5 +1,9 @@
 # Current Source Surface
 
+## Current V474 Deployment
+
+V474 deploys caller `dd6dd21`, unchanged Rust `392130d` and Switchboard `5b16a5b`. It removes unnecessary outgoing-call resolution for unselected navigation symbols while preserving full-corpus target lookup, duplicate-ID semantics, fresh source checks and pagination identities. Empty results skip the relationship pass. Full discovery passed 2,311 tests with 124 skips and zero failures/errors; guarded candidate/live verification passed. No provider-token, production elapsed-time or end-to-end gain was measured for this change. The latest bounded scheduling review found no confirmed material defect. Further speculative review and microbenchmark iteration are stopped for this stage at operator request; full optimization is not declared complete.
+
 ## Current V473 Deployment
 
 The deployed release is V473 (`0.3.473.dev0`): Rust source `392130d`, unchanged caller source `48342f2` and Switchboard `5b16a5b`. It changes only the OAuth access-selection error wording plus a synthetic regression. `NOKIY_OAUTH_ACCESS_UNAVAILABLE` describes unavailable native access and absent provider-key fallback without requesting a key or exposing secrets. Authentication selection, fallback, retries, refresh, models and permissions are unchanged.

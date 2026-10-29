@@ -1,5 +1,9 @@
 # Source Provenance
 
+## Current V474 Selected Navigation
+
+Caller source `dd6dd21b7770afd1412f0530c1375cc136327d91` changes only `navigation.py` and its focused test. Full target indexes remain available while unselected outgoing calls are omitted from resolver input. Empty queries skip resolution; last duplicate entity IDs retain existing overwrite behavior. The canonical resolver source is unchanged. Existing source/snapshot/map/pagination checks remain. Full caller discovery passed 2,311 tests, 124 skipped, zero failures/errors. The guarded publisher passed preparation and all deployment stages; installed navigation bytes match the accepted source. No new model benchmark or Rust rebuild was performed. Existing Rust `392130d` and Switchboard `5b16a5b` remain; older sections retain their release-time scope.
+
 ## Current V473 OAuth Diagnostic
 
 Rust source `392130d3990b8a1c7917a7b0f6a414aef9ebff07` changes only `crates/provider/src/tura_llm.rs` and `crates/provider/src/tura_llm_tests.rs`. The OAuth-selection Config error gains a fixed reason token without credential, account or path data; its variant, selection, fallback and retry semantics remain unchanged. One synthetic regression covers the diagnostic and secret-free display. All 284 provider unit tests passed, including existing rewrite-window and fallback coverage.

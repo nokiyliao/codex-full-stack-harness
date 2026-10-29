@@ -86,6 +86,44 @@ class NavigationTests(unittest.TestCase):
         with patch.object(nav.resolver, 'resolve_calls', side_effect=AssertionError('not needed')):
             self.assertEqual(self.query(projection='locations')['matched_symbols'], 2)
 
+    def test_selected_resolution_uses_full_corpus_and_last_duplicate(self):
+        (self.workspace / 'a.py').write_text(
+            'from b import beta\ndef alpha():\n    return 0\n'
+            'def alpha():\n    return beta()\n')
+        (self.workspace / 'b.py').write_text(
+            'def beta():\n    return 1\ndef other():\n    return beta()\n')
+        baseline = self.query()
+        counts = []
+        original = nav.resolver.resolve_calls
+
+        class CountedCalls(list):
+            def __iter__(self):
+                for spec in super().__iter__():
+                    counts.append(spec['text'])
+                    yield spec
+
+        def instrument(symbols):
+            def tracked():
+                for symbol in symbols:
+                    symbol.calls = CountedCalls(symbol.calls)
+                    yield symbol
+            return original(tracked())
+
+        with patch.object(nav.resolver, 'resolve_calls', side_effect=instrument), \
+                patch.object(nav.extractor, 'extract_python', side_effect=AssertionError('no reparse')):
+            empty = self.query(query='no-such-symbol')
+            self.assertEqual(empty['symbols'], [])
+            self.assertEqual(counts, [])
+            narrow = self.query(query='a.alpha')
+        self.assertEqual(counts, ['beta'])
+        expected = [row for row in baseline['symbols'] if row['symbol'] == 'a.alpha']
+        self.assertEqual(narrow['symbols'], expected)
+        self.assertEqual(len(expected), 2)
+        self.assertEqual(expected[0]['calls'], [
+            {'name': 'beta', 'confidence': 'exact', 'targets': ['symbol:b.beta']}])
+        self.assertEqual(narrow['source_snapshot_sha256'], baseline['source_snapshot_sha256'])
+        self.assertEqual(narrow['metrics']['file_cache_hits'], 2)
+
     def test_projection_revision_invalidates_cursor_without_reparsing(self):
         first = self.query()
         with patch.object(nav, 'PROJECTION_REVISION', nav.PROJECTION_REVISION + 1), \

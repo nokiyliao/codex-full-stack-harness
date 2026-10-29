@@ -231,10 +231,6 @@ def navigate(workspace, read_paths, *, query='', queries=None, projection='full'
             raise invalid('source snapshot unavailable; narrow scope or resolve unreadable sources')
         if expected_source_snapshot_sha256 != snapshot_sha:
             raise invalid('source snapshot changed; refresh navigation before reusing locations')
-    # Re-resolve against only today's requested corpus: removed/new files and new
-    # scopes must not leave yesterday's call targets in an otherwise warm map.
-    resolved = (resolver.resolve_calls(SimpleNamespace(**row) for row in rows)
-                if projection == 'full' else None)
     selected = [row for row in rows if not selection or any(
         (any(term[4:] in ref.casefold() for ref in row.get('references', []))
          if term.startswith('ref:') else term in (row['fqn'] + ' ' + row['path']).casefold())
@@ -248,6 +244,21 @@ def navigate(workspace, read_paths, *, query='', queries=None, projection='full'
         raise invalid('navigation changed; restart from offset zero')
     if offset > len(selected):
         raise invalid('offset exceeds result')
+    # Keep all targets in the canonical resolver's indexes. Only the last row
+    # for each requested ID supplies outgoing edges, matching its overwrite rule.
+    resolved = None
+    if projection == 'full' and selected[offset:]:
+        needed = {row['entity_id'] for row in selected[offset:]}
+        outgoing = set()
+        for index in range(len(rows) - 1, -1, -1):
+            entity_id = rows[index]['entity_id']
+            if entity_id in needed:
+                outgoing.add(index)
+                needed.remove(entity_id)
+        corpus = (SimpleNamespace(**row) if index in outgoing else
+                  SimpleNamespace(**{**row, 'calls': [], 'references': []})
+                  for index, row in enumerate(rows))
+        resolved = resolver.resolve_calls(corpus)
     page = []
     for row in selected[offset:]:
         item = {'symbol': row['fqn'], 'path': row['path'], 'line': row['line'],
